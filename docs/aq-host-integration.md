@@ -31,4 +31,33 @@ The synthetic contract catalog and stateful fake host in `aq-playbooks-cli` are 
 
 ## Live acceptance still required
 
+### Session operations, waits and human delivery extension
+
+The required [AQ operations/waits design](../../agent-q/docs/architecture/0004-session-operations-waits-and-notifications.md)
+adds typed session/usage/wait/delivery context and events through versioned host
+catalogs. It preserves the twelve ordinary commands. `message.send` and
+`findings.reconcile` route through AQ's durable delivery services;
+`decision.request` keeps authenticated human responses separate from transport
+acceptance. Digest/escalation policy consumes those same episode and schedule
+identities, including late author and uncertain external-send recovery.
+
+Engine-native waits suspend workflow execution. An agent's self-suspension,
+checkpoint, source retention and wake are AQ execution-domain operations with
+their own scoped agent API; the runner does not own a parked process or duplicate
+the continuation registry. Registered operation results/events expose their
+truthful outcomes. A dependency notification does not itself prove source success.
+Stall mechanics remain in AQ, with policy events available to workflows rather
+than an unrestricted session-control command family.
+
+AQ-27 qualifies these production services using the unchanged runner primitives;
+INT-03 adds actual external delivery and cross-node continuation evidence. These
+are planned host extensions, not capabilities established by the current synthetic
+catalog or previously qualified library candidate.
+
+### Existing pilot acceptance
+
 After AQ implements and binds these services, exercise the actual coding/integration, routing, findings-watcher, and supervisor-report pilots through the embedded runner. Include daemon restart between domain commit and event delivery, lost effect responses, revoked authority, changed candidate/base revisions, notification retry, late author completion, and protected database backup/restore with the correct keyring. Record the exact AQ/library/contract versions tested.
+
+## Revision-pinned implementation evidence
+
+The [bounded v1 reference inventory](../../agent-q/docs/research/2026-10-30-v1-implementation-reference-map.md) records implementation symbols, selected test obligations and per-file hashes at revision `9a9b8e8ef992d1ff699755a9383ed3c91e2844ea`. It distinguishes preserved behavior from remote-authority and retention adaptations. This evidence informs the owning v2 tasks; replacement coverage and product qualification remain pending.
