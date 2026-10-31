@@ -29,12 +29,18 @@ use std::{
 use zeroize::Zeroizing;
 
 const MIGRATIONS: &[(i32, &str)] = &[
+    // Ordering is part of the qualified schema.
     (1, include_str!("../migrations/0001_initial.sql")),
     (
         2,
         include_str!("../migrations/0002_indexes_and_protection.sql"),
     ),
+    (
+        3,
+        include_str!("../migrations/0003_keyed_admission_writer.sql"),
+    ),
 ];
+const WRITE_MARKER_SQL: &str = "SELECT set_config('aq_playbooks.writer_namespace',$1,true),set_config('aq_playbooks.writer_format','1',true)";
 const MIGRATION_LOCK: i64 = 0x4151504c41594d47;
 
 struct Lease {
@@ -340,15 +346,17 @@ impl Storage for PostgresStorage {
         }
         let result = (|| {
             let mut tx = conn.client.transaction().map_err(backend)?;
+            tx.query_one(WRITE_MARKER_SQL, &[&namespace])
+                .map_err(backend)?;
             let empty = self.encode(namespace, 0, &State::default())?;
-            tx.execute("INSERT INTO aq_playbooks.namespaces(namespace,snapshot,protection_key_id,protection_nonce,encrypted_snapshot,indexes_materialized) VALUES($1,$2,$3,$4,$5,true) ON CONFLICT DO NOTHING",&[&namespace,&empty.plaintext,&empty.key_id,&empty.nonce,&empty.ciphertext]).map_err(backend)?;
+            tx.execute("INSERT INTO aq_playbooks.namespaces(namespace,snapshot,protection_key_id,protection_nonce,encrypted_snapshot,indexes_materialized,writer_format) VALUES($1,$2,$3,$4,$5,true,1) ON CONFLICT DO NOTHING",&[&namespace,&empty.plaintext,&empty.key_id,&empty.nonce,&empty.ciphertext]).map_err(backend)?;
             let existing=tx.query_one("SELECT revision,snapshot,protection_key_id,protection_nonce,encrypted_snapshot FROM aq_playbooks.namespaces WHERE namespace=$1",&[&namespace]).map_err(backend)?;
             self.decode(
                 namespace,
                 existing.get::<_, i64>("revision") as u64,
                 &existing,
             )?;
-            let incarnation: i64 = tx.query_one("UPDATE aq_playbooks.namespaces SET owner=$2, owner_backend_pid=pg_backend_pid(), incarnation=incarnation+1, acquired_at=clock_timestamp() WHERE namespace=$1 RETURNING incarnation", &[&namespace,&owner]).map_err(backend)?.get(0);
+            let incarnation: i64 = tx.query_one("UPDATE aq_playbooks.namespaces SET owner=$2, writer_format=1, owner_backend_pid=pg_backend_pid(), incarnation=incarnation+1, acquired_at=clock_timestamp() WHERE namespace=$1 RETURNING incarnation", &[&namespace,&owner]).map_err(backend)?.get(0);
             tx.commit().map_err(backend)?;
             Ok(incarnation)
         })();
@@ -380,10 +388,14 @@ impl Storage for PostgresStorage {
             .filter(|l| l.owner == owner)
             .ok_or(StorageError::Ownership)?;
         let incarnation = lease.incarnation;
-        let changed = conn.client.execute("UPDATE aq_playbooks.namespaces SET owner=NULL,owner_backend_pid=NULL WHERE namespace=$1 AND owner=$2 AND incarnation=$3 AND owner_backend_pid=pg_backend_pid()", &[&namespace,&owner,&incarnation]).map_err(backend)?;
+        let mut tx = conn.client.transaction().map_err(backend)?;
+        tx.query_one(WRITE_MARKER_SQL, &[&namespace])
+            .map_err(backend)?;
+        let changed = tx.execute("UPDATE aq_playbooks.namespaces SET owner=NULL,owner_backend_pid=NULL WHERE namespace=$1 AND owner=$2 AND incarnation=$3 AND owner_backend_pid=pg_backend_pid()", &[&namespace,&owner,&incarnation]).map_err(backend)?;
         if changed != 1 {
             return Err(StorageError::Ownership);
         }
+        tx.commit().map_err(backend)?;
         let unlocked: bool = conn
             .client
             .query_one("SELECT pg_advisory_unlock($1)", &[&lock_key(namespace)])
@@ -455,6 +467,8 @@ impl PostgresStorage {
             self.profiling.clone(),
             "cas",
         );
+        tx.query_one(WRITE_MARKER_SQL, &[&namespace])
+            .map_err(backend)?;
         let advisory_key = lock_key(namespace) as u64;
         let high = (advisory_key >> 32) as i64;
         let low = (advisory_key & 0xffff_ffff) as i64;
@@ -487,6 +501,7 @@ impl PostgresStorage {
         )?;
         tx.phase("artifact_locks");
         aq_playbooks_runner::retention::verify_artifact_removals(&previous, state)?;
+        aq_playbooks_runner::admission::verify_receipt_retention(&previous, state)?;
         let addresses: std::collections::BTreeSet<_> = previous
             .artifacts
             .keys()
@@ -569,7 +584,7 @@ impl PostgresStorage {
         tx.phase("snapshot_encode");
         let snapshot = self.encode(namespace, next as u64, state)?;
         tx.phase("snapshot_write");
-        tx.execute("UPDATE aq_playbooks.namespaces SET snapshot=$2,protection_key_id=$3,protection_nonce=$4,encrypted_snapshot=$5,revision=$6,indexes_materialized=true,updated_at=clock_timestamp() WHERE namespace=$1",&[&namespace,&snapshot.plaintext,&snapshot.key_id,&snapshot.nonce,&snapshot.ciphertext,&next]).map_err(backend)?;
+        tx.execute("UPDATE aq_playbooks.namespaces SET snapshot=$2,protection_key_id=$3,protection_nonce=$4,encrypted_snapshot=$5,revision=$6,writer_format=1,indexes_materialized=true,updated_at=clock_timestamp() WHERE namespace=$1",&[&namespace,&snapshot.plaintext,&snapshot.key_id,&snapshot.nonce,&snapshot.ciphertext,&next]).map_err(backend)?;
         if self.keyring.is_some() {
             let addresses: Vec<_> = state.artifacts.keys().cloned().collect();
             tx.execute("DELETE FROM aq_playbooks.artifacts a WHERE digest=ANY($1) AND NOT EXISTS(SELECT 1 FROM aq_playbooks.namespace_artifacts n JOIN aq_playbooks.namespaces s ON s.namespace=n.namespace WHERE n.digest=a.digest AND (s.protection_key_id IS NULL OR NOT EXISTS(SELECT 1 FROM aq_playbooks.encrypted_artifacts e WHERE e.namespace=n.namespace AND e.digest=n.digest)))",&[&addresses]).map_err(backend)?;

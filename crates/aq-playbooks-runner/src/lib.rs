@@ -1,5 +1,7 @@
 //! Deterministic durable workflow transitions with explicit effect handoffs.
 //! All methods take trusted host/storage time; producer timestamps never win races.
+pub mod admission;
+pub use admission::{KeyedAdmissionDisposition, KeyedAdmissionReceipt, KeyedAdmissionRequest};
 pub mod inspection;
 pub mod metrics;
 pub mod storage;
@@ -240,6 +242,8 @@ pub struct EventDisposition {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct State {
     #[serde(default)]
+    pub keyed_admissions: BTreeMap<String, KeyedAdmissionReceipt>,
+    #[serde(default)]
     pub catalog_history: BTreeMap<u64, BTreeMap<String, Activation>>,
     #[serde(default)]
     pub catalog_history_at_ms: BTreeMap<u64, i64>,
@@ -385,6 +389,9 @@ impl<S: Storage> Engine<S> {
         Ok(self.store.load(&self.namespace)?.state)
     }
     fn transaction<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        self.transaction_choice(|state| f(state).map(|value| (value, true)))
+    }
+    fn transaction_choice<T>(&self, f: impl FnOnce(&mut State) -> Result<(T, bool)>) -> Result<T> {
         let started = std::time::Instant::now();
         let loaded = self.store.load(&self.namespace);
         self.metrics
@@ -398,7 +405,10 @@ impl<S: Storage> Engine<S> {
         let evaluated = f(&mut v.state);
         self.metrics
             .record_time(metrics::Timing::Transition, started.elapsed());
-        let result = evaluated?;
+        let (result, changed) = evaluated?;
+        if !changed {
+            return Ok(result);
+        }
         indexes::sync(&mut v.state)?;
         if v.state.runs.len() > self.config.max_runs
             || v.state.events.len() > self.config.max_events
@@ -409,7 +419,11 @@ impl<S: Storage> Engine<S> {
                 .filter(|d| d.run.is_none())
                 .count()
                 > self.config.max_queued_destinations
-            || v.state.receipts.len() > self.config.max_receipts
+            || v.state
+                .receipts
+                .len()
+                .saturating_add(v.state.keyed_admissions.len())
+                > self.config.max_receipts
             || canonical_bytes(&v.state)?.len() > self.config.max_state_bytes
         {
             return Err(Error::Refused(
