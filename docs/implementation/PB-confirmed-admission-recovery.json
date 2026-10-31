@@ -4,9 +4,10 @@
   "before_fix_revision": "b52ba857c46d9053dd7879ee0a4d7b1e1289eaa5",
   "publication_profile": "exact standalone Git source archive; no registry publication",
   "archive": {
-    "path": "/home/jkern/dev/.aq-qualification/aq14-playbooks-d3bd349/source.tar",
+    "path": "docs/implementation/evidence/confirmed-admission-d3bd349/source.tar",
     "sha256": "bd1246e8e972ee1627e94598945f398812c89044106b463151a696511412ca39",
-    "files": 248
+    "files": 248,
+    "original_qualification_path": "/home/jkern/dev/.aq-qualification/aq14-playbooks-d3bd349/source.tar"
   },
   "versions": {
     "runner": "0.1.2",
