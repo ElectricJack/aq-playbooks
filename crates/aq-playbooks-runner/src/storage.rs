@@ -127,6 +127,7 @@ impl Storage for MemoryStorage {
         }
         // Artifact addresses are append-only even for arbitrary trait callers.
         crate::retention::verify_artifact_removals(&entry.1.state, state)?;
+        crate::admission::verify_receipt_retention(&entry.1.state, state)?;
         entry.1 = VersionedState {
             revision: expected_revision
                 .checked_add(1)

@@ -129,18 +129,26 @@ fn authenticated_payload_tampering_never_falls_back_to_plaintext() {
         .get(0);
     let mut changed = original.clone();
     changed[0] ^= 1;
-    db.execute(
-        "UPDATE aq_playbooks.namespaces SET encrypted_snapshot=$2 WHERE namespace=$1",
-        &[&n, &changed],
-    )
-    .unwrap();
+    {
+        let mut tx = marked(&mut db, &n);
+        tx.execute(
+            "UPDATE aq_playbooks.namespaces SET encrypted_snapshot=$2 WHERE namespace=$1",
+            &[&n, &changed],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
     assert!(s.load(&n).is_err());
     assert!(s.compare_and_swap(&n, "owner", 1, &state).is_err());
-    db.execute(
-        "UPDATE aq_playbooks.namespaces SET encrypted_snapshot=$2 WHERE namespace=$1",
-        &[&n, &original],
-    )
-    .unwrap();
+    {
+        let mut tx = marked(&mut db, &n);
+        tx.execute(
+            "UPDATE aq_playbooks.namespaces SET encrypted_snapshot=$2 WHERE namespace=$1",
+            &[&n, &original],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
     let a = state.artifacts.keys().next().unwrap();
     let original:Vec<u8>=db.query_one("SELECT ciphertext FROM aq_playbooks.encrypted_artifacts WHERE namespace=$1 AND digest=$2",&[&n,a]).unwrap().get(0);
     let mut changed = original.clone();
@@ -197,7 +205,11 @@ fn rotation_reencrypts_snapshot_and_artifacts_and_old_backups_require_old_keys()
     let key: String = backup.get(1);
     let nonce: Vec<u8> = backup.get(2);
     let ciphertext: Vec<u8> = backup.get(3);
-    db.execute("UPDATE aq_playbooks.namespaces SET revision=$2,protection_key_id=$3,protection_nonce=$4,encrypted_snapshot=$5 WHERE namespace=$1",&[&n,&revision,&key,&nonce,&ciphertext]).unwrap();
+    {
+        let mut tx = marked(&mut db, &n);
+        tx.execute("UPDATE aq_playbooks.namespaces SET revision=$2,protection_key_id=$3,protection_nonce=$4,encrypted_snapshot=$5 WHERE namespace=$1",&[&n,&revision,&key,&nonce,&ciphertext]).unwrap();
+        tx.commit().unwrap();
+    }
     let digest: String = artifact_backup.get(0);
     let key: String = artifact_backup.get(1);
     let nonce: Vec<u8> = artifact_backup.get(2);
@@ -748,6 +760,7 @@ fn version_one_schema_upgrades_without_losing_state_and_owner_materializes_index
         .unwrap();
         let mut snapshot = serde_json::to_value(&expected).unwrap();
         snapshot["artifacts"] = json!({});
+        snapshot.as_object_mut().unwrap().remove("keyed_admissions");
         old.execute(
             "INSERT INTO aq_playbooks.namespaces(namespace,revision,snapshot) VALUES($1,1,$2)",
             &[&n, &snapshot],

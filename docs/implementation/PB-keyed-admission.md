@@ -51,3 +51,20 @@ PostgreSQL persistence, key mismatch and owner restart. Existing0.1.0 behavior a
 workspace suites remain required. Protection does not turn serialized Authority
 into authenticated AQ authority: the host owns that live authorization boundary,
 and downstream effects recheck current grants independently.
+
+
+## Writer compatibility fence
+
+Postgres0.1.1 migration003 adds a monotonic per-namespace writer format. New
+acquire/CAS/release transactions set exact namespace + format markers locally
+for that transaction; format1 namespace writes require both. Markers expire at
+commit/rollback and cannot authorize another namespace. A trigger rejects format
+downgrade or namespace deletion. New Memory/Postgres CAS also verifies that every
+existing admission receipt remains exactly unchanged. The schema version rejects
+a fresh0.1.0 constructor; the transaction marker also fences a previously opened
+old connection from reacquiring/writing a newly enrolled namespace, even where
+encrypted snapshot bytes hide the new field. This is a qualified-writer format
+fence, not authentication against a malicious DB owner who can alter triggers.
+Retire old owners before upgrade; mixed-version/online upgrade is not qualified.
+The unchanged old archive probe explicitly holds an old0.1.0 connection across
+new admission and tests warm reacquisition refusal plus cold constructor refusal.

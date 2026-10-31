@@ -197,3 +197,11 @@ pub fn assert_same(actual: &State, expected: &State) {
         serde_json::to_value(expected).unwrap()
     );
 }
+
+/// Explicit operator corruption fixtures still pass the writer-format fence so
+/// their original AEAD/revision assertions exercise the intended deeper layer.
+pub fn marked<'a>(client: &'a mut Client, namespace: &str) -> postgres::Transaction<'a> {
+    let mut tx = client.transaction().unwrap();
+    tx.query_one("SELECT set_config('aq_playbooks.writer_namespace',$1,true),set_config('aq_playbooks.writer_format','1',true)",&[&namespace]).unwrap();
+    tx
+}
