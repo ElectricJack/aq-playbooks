@@ -1,0 +1,11 @@
+   Compiling aq-playbooks-runner v0.1.2 (/tmp/aq-playbooks-accepted-recovery/crates/aq-playbooks-runner)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.00s
+     Running tests/semantics.rs (/tmp/aq14-upstream-target/debug/deps/semantics-c4cdf4af7a4eb63f)
+
+running 3 tests
+test unsafe_recovery_requires_audited_request_and_preserves_original_authority ... ok
+test accepted_recovery_does_not_uncancel_a_run_or_bypass_revoked_authority ... ok
+test confirmed_async_admission_recovery_resumes_accepted_branch_before_completion ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 29 filtered out; finished in 0.03s
+
