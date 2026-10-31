@@ -52,7 +52,7 @@ The component supports fair indexed discovery, bounded safe inspection, explicit
 
 `Engine.metrics.snapshot()` exposes bounded process timing histograms and admission/refusal/deduplication counters for host export. `metrics` reports aggregate state gauges and retained-receipt timings; this explicit diagnostic scans the snapshot and requires keys for protected stores.
 
-Live AQ integration remains an external dependency: the current daemon has not implemented the required domain services. See the [verified host integration boundary](docs/aq-host-integration.md). The fake-host pilots validate contracts without claiming live execution.
+AQ now owns the required underlying graph, messaging, selection, notification and session services, and has qualified a bounded protected embedding and first durable message adapter. The full twelve-command host and central supervision remain separately implemented and qualified. See the [verified host integration boundary](docs/aq-host-integration.md). The standalone CLI and fake-host pilots do not enable those services or claim live execution.
 
 For confidential persistence, supply `--protection-keys /path/to/owner-only-keyring.json` consistently. The keyring selects an active key and retains old keys needed for rotation/backups; it is never stored in PostgreSQL. See the adapter documentation before rotating keys or restoring an encrypted backup. Without a configured provider, runs with sensitive command contracts and events with declared sensitive payload fields are refused before admission.
 
