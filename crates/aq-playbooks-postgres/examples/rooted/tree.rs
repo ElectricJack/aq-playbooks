@@ -182,6 +182,10 @@ impl<'a, 'b> Tree<'a, 'b> {
     // This isolated experiment does not change the authoritative tree format.
     fn fetch_lookahead(&mut self, expected: &BTreeMap<String, Link>) -> Result<()> {
         let keys: Vec<_> = expected.keys().cloned().collect();
+        // Unrequested values may be opaque arrays containing all retained
+        // history. Default to map structure only; retain the broad experiment
+        // behind a second switch so its measured byte slope stays reproducible.
+        let values = std::env::var_os("AQ_PB04_LOOKAHEAD_VALUES").is_some();
         for roots in keys.chunks(128) {
             self.work.read_sql_calls += 1;
             let rows = self.tx.query(
@@ -192,14 +196,14 @@ impl<'a, 'b> Tree<'a, 'b> {
                    CROSS JOIN LATERAL (SELECT pb04_probe_json(c.payload) AS body) d
                    CROSS JOIN LATERAL (VALUES
                      (d.body#>>'{Object,hash}'),
-                     (d.body#>>'{Entry,value,hash}'),
+                     (CASE WHEN $2 THEN d.body#>>'{Entry,value,hash}' ELSE NULL END),
                      (d.body#>>'{Entry,left,hash}'),
                      (d.body#>>'{Entry,right,hash}')
                    ) child(hash)
                    JOIN pb04_nodes n ON n.hash=child.hash
                    WHERE c.depth<2
                  ) SELECT DISTINCT ON(hash) hash,payload FROM candidates ORDER BY hash LIMIT 4097",
-                &[&roots],
+                &[&roots, &values],
             )?;
             if rows.len() > 4096 {
                 return Err("prototype lookahead node bound".into());
