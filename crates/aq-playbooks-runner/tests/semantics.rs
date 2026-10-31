@@ -1667,3 +1667,105 @@ fn protected_event_fields_and_protected_trigger_closures_refuse_payload_persiste
             .contains("never-persist-this-event-value")
     );
 }
+
+#[test]
+fn confirmed_async_admission_recovery_resumes_accepted_branch_before_completion() {
+    let first = engine();
+    let (artifact, completion) = async_artifact();
+    install(&first, artifact, "async");
+    let run = first
+        .admit("async", "main", Value::Null, authority(), 0)
+        .unwrap();
+    let mut host = FakeHost {
+        responses: BTreeMap::from([(
+            "test.command".into(),
+            vec![DispatchResult::Unknown {
+                reason: "lost reply after external admission".into(),
+            }],
+        )]),
+        ..Default::default()
+    };
+    first.drive(&mut host, 0, 10).unwrap();
+    let before = first.snapshot().unwrap();
+    assert_eq!(before.runs[&run].status, RunStatus::Blocked);
+    let intent = before.intents.values().next().unwrap().clone();
+    assert!(
+        matches!(&before.runs[&run].pending,Some(Pending::Effect {intent:pending}) if pending==&intent.id)
+    );
+    first.release().unwrap();
+    let resumed = Engine::new(first.store.clone(), "test", "incarnation-2").unwrap();
+    host.responses.insert(
+        "reconcile:test.command".into(),
+        vec![DispatchResult::Accepted {
+            handle: "server-operation".into(),
+        }],
+    );
+    assert_eq!(resumed.recover(&mut host, 1).unwrap(), 1);
+    let recovered = resumed.snapshot().unwrap();
+    assert_eq!(recovered.intents[&intent.id].status, IntentStatus::Accepted);
+    assert_eq!(recovered.intents[&intent.id].authority, intent.authority);
+    assert_eq!(
+        recovered.intents[&intent.id].handle.as_deref(),
+        Some("server-operation")
+    );
+    // A known admission must resume accepted→notify/join, even before the
+    // human/external completion exists. It must not remain silently blocked.
+    assert_eq!(recovered.runs[&run].status, RunStatus::Waiting);
+    assert!(recovered.runs[&run].reason.is_none());
+    assert!(recovered.intents[&intent.id].reason.is_none());
+    resumed.drive(&mut host, 1, 10).unwrap();
+    let waiting = resumed.snapshot().unwrap();
+    assert_eq!(waiting.runs[&run].status, RunStatus::Waiting);
+    assert_eq!(waiting.runs[&run].step, "join");
+    assert!(waiting.runs[&run].outcome.is_none());
+    assert_eq!(host.dispatched.len(), 1);
+    assert_eq!(host.reconciliations, vec![intent.id.clone()]);
+    assert_eq!(waiting.runs.len(), 1);
+    assert_eq!(resumed.recover(&mut host, 2).unwrap(), 0);
+    let event = async_event(&completion, "confirmed-after-recovery");
+    resumed.admit_event("host", event.clone(), 3).unwrap();
+    resumed.drive(&mut host, 3, 20).unwrap();
+    assert_eq!(
+        resumed.snapshot().unwrap().runs[&run].outcome.as_deref(),
+        Some("ok")
+    );
+    assert!(resumed.admit_event("host", event, 4).unwrap().duplicate);
+    assert_eq!(host.dispatched.len(), 1);
+}
+
+#[test]
+fn accepted_recovery_does_not_uncancel_a_run_or_bypass_revoked_authority() {
+    let e = engine();
+    let (artifact, _) = async_artifact();
+    install(&e, artifact, "async");
+    let run = e
+        .admit("async", "main", Value::Null, authority(), 0)
+        .unwrap();
+    let mut host = FakeHost::default();
+    e.drive(&mut host, 0, 10).unwrap();
+    host.responses.insert(
+        "reconcile:test.command".into(),
+        vec![DispatchResult::Accepted {
+            handle: "server-operation".into(),
+        }],
+    );
+    host.revoked.insert("execute".into());
+    assert_eq!(e.recover(&mut host, 1).unwrap(), 0);
+    assert!(host.reconciliations.is_empty());
+    assert_eq!(e.snapshot().unwrap().runs[&run].status, RunStatus::Blocked);
+    host.revoked.clear();
+    e.cancel(&run, 2).unwrap();
+    e.recover(&mut host, 2).unwrap();
+    let cancelling = e.snapshot().unwrap();
+    assert_eq!(cancelling.runs[&run].status, RunStatus::Cancelling);
+    assert!(cancelling.runs[&run].outcome.is_none());
+    assert!(cancelling.intents.values().next().unwrap().cancel_requested);
+    host.cancellation_responses
+        .insert("test.command".into(), vec![CancellationResult::Confirmed]);
+    e.drive(&mut host, 3, 10).unwrap();
+    assert_eq!(
+        e.snapshot().unwrap().runs[&run].status,
+        RunStatus::Cancelled
+    );
+    assert_eq!(host.dispatched.len(), 1);
+}
