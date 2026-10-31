@@ -2,13 +2,42 @@
 
 The Rust engine is independently buildable. Its production host is AQ, which must bind the twelve contracts to authoritative domain services and drive the embedded runner. A passing fake-host test is not evidence that these production services exist.
 
-## Verified external dependency
+## Current dependency and implementation status
 
-On 2026-10-30 the sibling `agent-q` checkout exposes foundation routes for health/readiness, user identity/administration, enrollment, worker heartbeat/probe/revocation, and updates. Its current server and protocol crates do not expose the playbook work, judgment, decision, findings, messaging, check, or candidate integration services.
+This boundary is reconciled on2026-10-31 against committed daemon
+`0551d84c0ba9653da8310d0596a833182fe73341` (state20), rather than the old
+foundation-only inventory. AQ now has durable agent graph operations/recovery,
+task/session messaging with distinct node/harness dispositions, revisioned
+profile/project bindings and intelligence selection, human notification
+transport/unknown recovery, and session/observation/transport services. Those are
+owning services to reuse; their existence does not mean the twelve playbook
+adapters or central supervisor authority are already implemented.
 
-This matches the [AQ ecosystem design](../../../agent-q/docs/architecture/0001-ecosystem-and-releases.md), which assigns integration adapters and product acceptance to `agent-q` and states that implementation follows the foundation. Relevant current route registrations are in [`aq-server/src/lib.rs`](../../../agent-q/crates/aq-server/src/lib.rs), [`admin_api.rs`](../../../agent-q/crates/aq-server/src/admin_api.rs), and [`worker_api.rs`](../../../agent-q/crates/aq-server/src/worker_api.rs).
+| Existing AQ owner | Reuse and remaining boundary |
+| --- | --- |
+| `agent_access::mutations` | Finite scoped graph intents, guarded versions and retained operation recovery; not arbitrary work creation, task completion or a central-supervisor credential |
+| `agent_access::messaging` | Immutable task/session mail, scoped visibility and node/harness delivery; central supervisor/playbook authority adapter still required |
+| `profile_catalog`, `project_bindings`, `intelligence`, `profiled_execution` | Existing catalog, selection, policy/input/Started ownership; no second selector or fabricated worker assignment inside policy |
+| `notifications` | Durable bounded human delivery and unknown recovery; human acknowledgment/decision, episode and report-window policy remain separate |
+| `observations`, `terminal` | Typed finite inspection/control seams; native source/runtime adoption and full waits/hibernation remain separately qualified |
 
-This is a blocker for live AQ end-to-end acceptance, not for finishing or testing the standalone playbook component. Implementing missing AQ task/execution/decision services inside the workflow engine would violate the ownership boundary.
+Current code registration is in [daemon lib.rs](../../agent-q/crates/aq-server/src/lib.rs).
+The detailed staged [AQ-12-through-17 plan](../../agent-q/docs/implementation/AQ-12-through-17-plan.md)
+maps exact commands, authority, outbox/recovery and qualification gates. The
+shared [ecosystem ownership](../../agent-q/docs/architecture/0001-ecosystem-and-releases.md)
+still applies: AQ owns product/domain integration; the runner never reads AQ's
+private domain tables or recreates their state owners.
+
+The component publication profile is a pinned source archive/inventory and
+commit, not a registry-publication claim. Current playbooks source
+`42f944996eafad5af07d9ec1c72d3e3f2630c03b` retains public package identities0.1.0;
+its four library src/manifests/migrations are byte-identical to qualified
+PB04 stageA`7e669e179e6cc726185ac80627a6bdca146944f1`. Later differences are
+unlinked experiment examples/scripts. AQ must vendor/verify exact committed
+source closure without sibling live paths; it must not mutate same-version
+published artifacts or link the CLI's synthetic catalog/fake host as adapters.
+PB04 still misses its25ms budget and has no qualified normal workload envelope.
+Bounded embedding/isolation is not performance closure or a500-agent claim.
 
 ## Host responsibilities
 
@@ -51,12 +80,12 @@ than an unrestricted session-control command family.
 
 AQ-27 qualifies these production services using the unchanged runner primitives;
 INT-03 adds actual external delivery and cross-node continuation evidence. These
-are planned host extensions, not capabilities established by the current synthetic
-catalog or previously qualified library candidate.
+are planned host extensions; current AQ messaging/notification/observation owners
+are reused through explicit adapters, not inferred from synthetic pilots.
 
 ### Existing pilot acceptance
 
-After AQ implements and binds these services, exercise the actual coding/integration, routing, findings-watcher, and supervisor-report pilots through the embedded runner. Include daemon restart between domain commit and event delivery, lost effect responses, revoked authority, changed candidate/base revisions, notification retry, late author completion, and protected database backup/restore with the correct keyring. Record the exact AQ/library/contract versions tested.
+After AQ binds the existing owners and implements the remaining services, exercise the actual coding/integration, routing, findings-watcher, and supervisor-report pilots through the embedded runner. Include daemon restart between domain commit and event delivery, lost effect responses, revoked authority, changed candidate/base revisions, notification retry, late author completion, and protected database backup/restore with the correct keyring. Record the exact AQ/library/contract versions tested.
 
 ## Revision-pinned implementation evidence
 
