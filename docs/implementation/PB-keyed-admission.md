@@ -68,3 +68,25 @@ fence, not authentication against a malicious DB owner who can alter triggers.
 Retire old owners before upgrade; mixed-version/online upgrade is not qualified.
 The unchanged old archive probe explicitly holds an old0.1.0 connection across
 new admission and tests warm reacquisition refusal plus cold constructor refusal.
+
+## Frozen source qualification
+
+Sourcea463e5918f914c8365a04dfe1b6778831cfebb95 is qualified from its extracted
+Git source tar (no sibling source dependency). Archive SHA256:
+`48f19b80fc0734c403ef04e7181d570b9fe675597f35caf08f0b94571ca8cc70`.
+[Evidence JSON](PB-keyed-admission.json) inventories exact source bytes and
+[retained logs](evidence/keyed-admission-a463e59). All158 workspace/allfeatures
+test executions, strict alltargets/allfeatures lint and formatting pass;8 new
+pure admission tests and2 actual PostgreSQL tests are included. A separate
+unchanged original42/0.1.0 tar probe holds the old actual storage connection
+across a new keyed admission, then proves warm reacquisition and cold constructor
+refusal. SQL-shape tests additionally prove wrong namespace, expired transaction
+marker, downgrade and namespace deletion refusal. Deliberate original AEAD
+corruption fixtures mark their operator transactions so they still exercise
+AEAD/revision checks rather than stopping only at the new writer fence.
+
+Model/compiler0.1.0 source bytes remain identical to42; runner/Postgres/CLI are
+new0.1.1 identities. Original archive remains unchanged. Tests use only synthetic
+artifacts and disposable local PostgreSQL. This qualifies the component's atomic
+admission/compatibility boundary, not AQ's upcoming durable bridge, production
+host mounting, remote service behavior or a performance budget.
