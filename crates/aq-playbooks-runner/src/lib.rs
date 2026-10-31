@@ -2508,6 +2508,7 @@ fn record_result(s: &mut State, intent_id: &str, result: DispatchResult, now: i6
             }
             i.status = IntentStatus::Accepted;
             i.handle = Some(handle);
+            i.reason = None;
             receipt(
                 s,
                 &i.run,
@@ -2546,7 +2547,15 @@ fn record_result(s: &mut State, intent_id: &str, result: DispatchResult, now: i6
         .runs
         .get_mut(&i.run)
         .ok_or_else(|| Error::NotFound(i.run.clone()))?;
-    if run.status == RunStatus::Blocked && i.status == IntentStatus::Completed {
+    // A lost admission reply blocks this pending invoke. Confirming the same
+    // admitted handle must allow its accepted branch (e.g. notify then join)
+    // before final completion exists. Do not revive cancellation/terminal runs
+    // or unblock a different pending operation.
+    let recovered_admission = i.status == IntentStatus::Accepted
+        && matches!(&run.pending, Some(Pending::Effect { intent }) if intent == intent_id);
+    if run.status == RunStatus::Blocked
+        && (i.status == IntentStatus::Completed || recovered_admission)
+    {
         run.status = RunStatus::Waiting;
         run.reason = None;
     }
