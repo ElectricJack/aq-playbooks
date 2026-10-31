@@ -515,6 +515,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cfg!(debug_assertions) {
         return Err("release benchmark only".into());
     }
+    if std::env::args().nth(1).as_deref() == Some("--state-costs") {
+        state_costs();
+        return Ok(());
+    }
     let config = std::env::var("AQ_PLAYBOOKS_TEST_DATABASE_URL")?;
     let token = std::env::var("AQ_PB02_DISPOSABLE_TOKEN")?;
     let mut client = Client::connect(&config, NoTls)?;
@@ -638,5 +642,50 @@ fn minimal(config: &str) {
                 );
             }
         }
+    }
+}
+
+fn state_costs() {
+    use std::hint::black_box;
+    let seed = base();
+    let mut prior = 0;
+    for history in HISTORY {
+        for i in prior..history {
+            let id = seed
+                .admit("a", "main", Value::Null, authority("a"), i as i64)
+                .unwrap();
+            seed.advance(&id, i as i64).unwrap();
+            seed.admit_event("pb02", event(&format!("cpu-history-{i}")), i as i64)
+                .unwrap();
+        }
+        prior = history;
+        let state = seed.snapshot().unwrap();
+        let value = serde_json::to_value(&state).unwrap();
+        let mut clone = vec![];
+        let mut index_clone = vec![];
+        let mut quota = vec![];
+        let mut encode = vec![];
+        let mut decode = vec![];
+        for _ in 0..24 {
+            let t = Instant::now();
+            black_box(state.clone());
+            clone.push(t.elapsed().as_micros() as u64);
+            let t = Instant::now();
+            black_box(state.indexes.clone());
+            index_clone.push(t.elapsed().as_micros() as u64);
+            let t = Instant::now();
+            black_box(canonical_bytes(&state).unwrap());
+            quota.push(t.elapsed().as_micros() as u64);
+            let t = Instant::now();
+            black_box(serde_json::to_value(&state).unwrap());
+            encode.push(t.elapsed().as_micros() as u64);
+            let input = value.clone();
+            let t = Instant::now();
+            black_box(serde_json::from_value::<State>(input).unwrap());
+            decode.push(t.elapsed().as_micros() as u64);
+        }
+        emit(
+            json!({"scenario":"state_cpu_costs","history":history,"state":counts(&state),"samples":24,"state_clone_us":stats(&clone),"index_clone_us":stats(&index_clone),"exact_quota_canonical_us":stats(&quota),"serde_value_encode_us":stats(&encode),"serde_value_decode_us":stats(&decode),"rss_kib":rss_kib(),"limits":"Synthetic unprotected CPU probe; decoding input Value clone excluded; no SQL, no provider, no benchmark engine optimization."}),
+        );
     }
 }

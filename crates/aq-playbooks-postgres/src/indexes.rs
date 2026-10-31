@@ -1,11 +1,14 @@
 use crate::backend;
 use crate::profiling::ObservedTransaction;
-use aq_playbooks_runner::{
-    EffectQueueKind, IndexItem, IndexPage, IndexQuery, State, StorageError, inspection,
-};
+#[cfg(test)]
+use aq_playbooks_runner::inspection;
+use aq_playbooks_runner::{EffectQueueKind, IndexItem, IndexPage, IndexQuery, State, StorageError};
 use postgres::Client;
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 
+#[cfg(test)]
 fn record(
     kind: &str,
     lookup: &str,
@@ -16,6 +19,7 @@ fn record(
 ) -> Value {
     json!({"kind":kind,"lookup_key":lookup,"item_key":key,"scope":scope,"sequence":sequence,"at_ms":at})
 }
+#[cfg(test)]
 fn native_rows(state: &State) -> Vec<Value> {
     let mut rows = vec![];
     let idx = &state.indexes;
@@ -148,9 +152,11 @@ fn native_rows(state: &State) -> Vec<Value> {
     }
     rows
 }
+#[cfg(test)]
 fn public_rows(state: &State) -> Vec<Value> {
     inspection::rows(state).into_iter().map(|row|json!({"kind":row.kind.key(),"item_key":row.key,"run_id":row.run,"sequence":row.sequence,"public_value":row.value})).collect()
 }
+#[cfg(test)]
 fn delta(previous: Vec<Value>, next: Vec<Value>, keys: &[&str]) -> (Vec<Value>, Vec<Value>) {
     let keyed = |rows: Vec<Value>| -> std::collections::BTreeMap<Vec<String>, Value> {
         rows.into_iter()
@@ -191,22 +197,14 @@ pub(crate) fn sync(
     previous: &State,
     next: &State,
 ) -> Result<(), StorageError> {
-    let (changed, deleted) = delta(
-        native_rows(previous),
-        native_rows(next),
-        &["kind", "lookup_key", "item_key"],
-    );
+    let (changed, deleted) = crate::projection::native_delta(previous, next);
     if !deleted.is_empty() {
         tx.execute("DELETE FROM aq_playbooks.runtime_index old USING jsonb_to_recordset($2) AS d(kind text,lookup_key text,item_key text) WHERE old.namespace=$1 AND (old.kind,old.lookup_key,old.item_key)=(d.kind,d.lookup_key,d.item_key)",&[&namespace,&Value::Array(deleted)]).map_err(backend)?;
     }
     if !changed.is_empty() {
         tx.execute("INSERT INTO aq_playbooks.runtime_index(namespace,kind,lookup_key,item_key,scope,sequence,at_ms) SELECT $1,kind,lookup_key,item_key,scope,sequence,at_ms FROM jsonb_to_recordset($2) AS d(kind text,lookup_key text,item_key text,scope text,sequence bigint,at_ms bigint) ON CONFLICT(namespace,kind,lookup_key,item_key) DO UPDATE SET scope=EXCLUDED.scope,sequence=EXCLUDED.sequence,at_ms=EXCLUDED.at_ms",&[&namespace,&Value::Array(changed)]).map_err(backend)?;
     }
-    let (changed, deleted) = delta(
-        public_rows(previous),
-        public_rows(next),
-        &["kind", "item_key"],
-    );
+    let (changed, deleted) = crate::projection::public_delta(previous, next);
     if !deleted.is_empty() {
         tx.execute("DELETE FROM aq_playbooks.inspection_rows old USING jsonb_to_recordset($2) AS d(kind text,item_key text) WHERE old.namespace=$1 AND (old.kind,old.item_key)=(d.kind,d.item_key)",&[&namespace,&Value::Array(deleted)]).map_err(backend)?;
     }
@@ -261,4 +259,230 @@ pub(crate) fn query(
         _ => item.key.clone(),
     });
     Ok(IndexPage { items, next })
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use aq_playbooks_runner::{Intent, Receipt, Run, indexes::TimerIndex};
+    use std::collections::{BTreeMap, BTreeSet};
+    fn fixture() -> State {
+        let run:Run=serde_json::from_value(json!({"catalog_revision":0,"id":"run-a","root":"run-a","parent":null,"origin":null,"artifact":"artifact","entry":"main","dependencies":{},"authority":{"actor":"actor","scope":"a","capabilities":[]},"step":"return","status":"completed","input":"private","variables":{},"outcome":"ok","output":null,"reason":null,"admitted_at_ms":1,"visits":1,"depth":0,"children":[],"pending":null,"loops":[],"attempts":{},"pending_return":null,"pending_failure":false,"terminal_sequence":2})).unwrap();
+        let intent:Intent=serde_json::from_value(json!({"id":"intent-1","run":"run-a","step":"invoke","invocation":1,"deadline_at_ms":1000,"command":{"name":"command","version":"1","input":{"type":"null"},"outcomes":{"ok":{"type":"null"}},"capabilities":[],"scopes":["a"],"effect":"mutation","recovery":"keyed_idempotent","asynchronous":null,"cancellation":false,"public_result_fields":[],"sensitive_input_fields":[],"sensitive_output_fields":[],"max_payload_bytes":1024,"deadline_ms":1000},"input":null,"input_digest":"private","authority":{"actor":"actor","scope":"a","capabilities":[]},"status":"prepared","cancel_requested":false,"cancel_dispatched":false,"handle":null,"result":null,"reason":null,"late_results":[],"completion_event":null})).unwrap();
+        let mut s = State::default();
+        s.runs.insert(run.id.clone(), run);
+        s.intents.insert(intent.id.clone(), intent.clone());
+        let mut second = intent;
+        second.id = "intent-2".into();
+        s.intents.insert(second.id.clone(), second);
+        s.receipts = vec![
+            Receipt {
+                sequence: 1,
+                run: "run-a".into(),
+                step: "first".into(),
+                at_ms: 1,
+                kind: "intent".into(),
+                detail: json!({"operation":"intent-1","private":"secret"}),
+            },
+            Receipt {
+                sequence: 10,
+                run: "run-a".into(),
+                step: "second".into(),
+                at_ms: 10,
+                kind: "unclassified".into(),
+                detail: json!({"private":"secret"}),
+            },
+            Receipt {
+                sequence: 2,
+                run: "run-a".into(),
+                step: "third".into(),
+                at_ms: 2,
+                kind: "terminal".into(),
+                detail: json!({"status":"completed","outcome":"ok"}),
+            },
+        ];
+        let idx = &mut s.indexes;
+        idx.scope_cursor = Some("a".into());
+        idx.effect_cursor.insert("dispatch".into(), "b".into());
+        idx.effect_item_cursor
+            .insert("dispatch:a".into(), "intent-1".into());
+        idx.ready
+            .insert("a".into(), BTreeMap::from([(1, "run-a".into())]));
+        idx.effects.insert(
+            "dispatch".into(),
+            BTreeMap::from([(
+                "a".into(),
+                BTreeSet::from(["intent-1".into(), "intent-2".into()]),
+            )]),
+        );
+        idx.completion_ready.insert("intent-2".into());
+        idx.timers.insert(
+            "timer".into(),
+            TimerIndex {
+                key: "timer".into(),
+                run: "run-a".into(),
+                at_ms: 100,
+                intent: None,
+            },
+        );
+        idx.events.insert(
+            "correlation".into(),
+            BTreeMap::from([(2, "event-1".into())]),
+        );
+        idx.waiters
+            .insert("correlation".into(), BTreeSet::from(["run-a".into()]));
+        idx.runs.insert("run-a".into());
+        idx.receipts
+            .insert("run-a".into(), BTreeMap::from([(1, 0), (10, 1), (2, 2)]));
+        idx.all_receipts = BTreeMap::from([(1, 0), (10, 1), (2, 2)]);
+        s
+    }
+    fn equivalent(previous: &State, next: &State) {
+        assert_eq!(
+            crate::projection::native_delta(previous, next),
+            delta(
+                native_rows(previous),
+                native_rows(next),
+                &["kind", "lookup_key", "item_key"]
+            )
+        );
+        assert_eq!(
+            crate::projection::public_delta(previous, next),
+            delta(
+                public_rows(previous),
+                public_rows(next),
+                &["kind", "item_key"]
+            )
+        );
+    }
+    #[test]
+    fn borrowed_deltas_match_reference_for_empty_unchanged_and_materialization() {
+        let s = fixture();
+        equivalent(&State::default(), &s);
+        equivalent(&s, &s);
+        equivalent(&s, &State::default());
+    }
+    #[test]
+    fn borrowed_deltas_match_reference_for_scopes_removals_offsets_and_private_edits() {
+        let old = fixture();
+        for case in 0..9 {
+            let mut next = old.clone();
+            match case {
+                0 => next.runs.get_mut("run-a").unwrap().authority.scope = "changed".into(),
+                1 => {
+                    next.runs.clear();
+                }
+                2 => {
+                    next.receipts.remove(0);
+                }
+                3 => next.receipts.reverse(),
+                4 => {
+                    next.runs.get_mut("run-a").unwrap().input = json!("private changed");
+                    next.receipts[1].detail = json!({"private":"different secret"});
+                }
+                5 => {
+                    next.intents.get_mut("intent-1").unwrap().invocation += 1;
+                }
+                6 => {
+                    next.indexes
+                        .effect_item_cursor
+                        .insert("dispatch:a".into(), "intent-2".into());
+                }
+                7 => {
+                    next.runs.get_mut("run-a").unwrap().reason = Some("private reason".into());
+                }
+                8 => {
+                    next.indexes.all_receipts.insert(100, 0);
+                    next.indexes
+                        .receipts
+                        .get_mut("run-a")
+                        .unwrap()
+                        .insert(100, 0);
+                }
+                _ => unreachable!(),
+            }
+            equivalent(&old, &next);
+        }
+    }
+    #[test]
+    fn borrowed_deltas_preserve_last_duplicate_identity_and_redaction_semantics() {
+        let old = fixture();
+        let mut next = old.clone();
+        let mut duplicate = next.runs["run-a"].clone();
+        duplicate.status = aq_playbooks_runner::RunStatus::Failed;
+        next.runs.insert("zz-alias".into(), duplicate);
+        let mut receipt = next.receipts[0].clone();
+        receipt.detail = json!({"operation":"new","secret":"never project"});
+        next.receipts.push(receipt);
+        next.indexes
+            .ready
+            .insert("z".into(), BTreeMap::from([(999, "run-a".into())]));
+        next.indexes.effects.insert(
+            "completion".into(),
+            BTreeMap::from([("a".into(), BTreeSet::from(["intent-2".into()]))]),
+        );
+        equivalent(&old, &next);
+        let (changed, _) = crate::projection::public_delta(&old, &next);
+        assert!(
+            !serde_json::to_string(&changed)
+                .unwrap()
+                .contains("never project")
+        );
+    }
+}
+
+#[cfg(test)]
+mod projection_field_tests {
+    use super::*;
+    fn candidates(v: &Value) -> Vec<Value> {
+        let mut out = vec![Value::Null, json!("changed"), json!(true), json!(1)];
+        match v {
+            Value::String(s) => out.push(json!(format!("{s}-changed"))),
+            Value::Number(n) => {
+                if let Some(n) = n.as_u64() {
+                    out.push(json!(n.saturating_add(1)));
+                }
+            }
+            Value::Array(a) => {
+                let mut a = a.clone();
+                a.push(json!("changed"));
+                out.push(Value::Array(a));
+            }
+            Value::Object(o) => {
+                let mut o = o.clone();
+                o.insert("changed".into(), json!("value"));
+                out.push(Value::Object(o));
+            }
+            _ => {}
+        }
+        out
+    }
+    #[test]
+    fn source_field_mutations_cannot_change_projection_without_being_detected() {
+        // Golden source includes all serialized fields, including private ones.
+        // Valid primitive mutations exercise the quick-equivalence gate against
+        // the existing public sanitizer instead of reasserting its field list.
+        let run = serde_json::json!({"catalog_revision":0,"id":"r","root":"r","parent":null,"origin":null,"artifact":"a","entry":"main","dependencies":{},"authority":{"actor":"a","scope":"s","capabilities":[]},"step":"end","status":"completed","input":null,"variables":{},"outcome":"ok","output":null,"reason":null,"admitted_at_ms":0,"visits":1,"depth":0,"children":[],"pending":null,"loops":[],"attempts":{},"pending_return":null,"pending_failure":false,"terminal_sequence":1});
+        let mut old = State::default();
+        old.runs
+            .insert("r".into(), serde_json::from_value(run.clone()).unwrap());
+        let mut checked = 0;
+        for (field, value) in run.as_object().unwrap() {
+            for replacement in candidates(value) {
+                let mut changed = run.clone();
+                changed[field] = replacement;
+                if let Ok(run) = serde_json::from_value::<aq_playbooks_runner::Run>(changed) {
+                    let mut next = old.clone();
+                    next.runs.insert("r".into(), run);
+                    assert_eq!(
+                        crate::projection::public_delta(&old, &next),
+                        delta(public_rows(&old), public_rows(&next), &["kind", "item_key"]),
+                        "field {field}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 30);
+    }
 }

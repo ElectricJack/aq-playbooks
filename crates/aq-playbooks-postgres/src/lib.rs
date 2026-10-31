@@ -8,6 +8,7 @@
 //! This does not fence external hosts: retire a prior runner before replacement.
 mod indexes;
 mod profiling;
+mod projection;
 mod protection;
 use profiling::ObservedTransaction;
 pub use profiling::{OperationProfile, StageProfile, StorageProfile};
