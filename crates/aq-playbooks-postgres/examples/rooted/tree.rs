@@ -146,6 +146,9 @@ impl<'a, 'b> Tree<'a, 'b> {
         if expected.len() > 4096 {
             return Err("prototype frontier >4096 nodes".into());
         }
+        if std::env::var_os("AQ_PB04_LOOKAHEAD").is_some() {
+            return self.fetch_lookahead(&expected);
+        }
         let keys: Vec<_> = expected.keys().cloned().collect();
         self.work.read_sql_calls += 1;
         let rows = self.tx.query(
@@ -171,6 +174,75 @@ impl<'a, 'b> Tree<'a, 'b> {
                 return Err("proof node integrity".into());
             }
             self.cache.insert(hash, node);
+        }
+        Ok(())
+    }
+    // SQL only supplies bounded candidate bytes. Local hash/canonical checks and
+    // the ordinary expected-edge walk still establish membership and absence.
+    // This isolated experiment does not change the authoritative tree format.
+    fn fetch_lookahead(&mut self, expected: &BTreeMap<String, Link>) -> Result<()> {
+        let keys: Vec<_> = expected.keys().cloned().collect();
+        for roots in keys.chunks(128) {
+            self.work.read_sql_calls += 1;
+            let rows = self.tx.query(
+                "WITH RECURSIVE candidates(hash,payload,depth) AS (
+                   SELECT hash,payload,0 FROM pb04_nodes WHERE hash=ANY($1)
+                   UNION
+                   SELECT n.hash,n.payload,c.depth+1 FROM candidates c
+                   CROSS JOIN LATERAL (SELECT pb04_probe_json(c.payload) AS body) d
+                   CROSS JOIN LATERAL (VALUES
+                     (d.body#>>'{Object,hash}'),
+                     (d.body#>>'{Entry,value,hash}'),
+                     (d.body#>>'{Entry,left,hash}'),
+                     (d.body#>>'{Entry,right,hash}')
+                   ) child(hash)
+                   JOIN pb04_nodes n ON n.hash=child.hash
+                   WHERE c.depth<2
+                 ) SELECT DISTINCT ON(hash) hash,payload FROM candidates ORDER BY hash LIMIT 4097",
+                &[&roots],
+            )?;
+            if rows.len() > 4096 {
+                return Err("prototype lookahead node bound".into());
+            }
+            for row in rows {
+                let hash: String = row.get(0);
+                let bytes: Vec<u8> = row.get(1);
+                self.work.fetched_nodes += 1;
+                self.work.fetched_bytes += bytes.len();
+                if bytes.len() > 16 * 1024 * 1024
+                    || self.work.fetched_bytes > 128 * 1024 * 1024
+                    || self.cache.len() >= 262144
+                {
+                    return Err("prototype lookahead byte bound".into());
+                }
+                let node: Node = match serde_json::from_slice(&bytes) {
+                    Ok(node) => node,
+                    Err(_) if !expected.contains_key(&hash) => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                let actual = match node.link() {
+                    Ok(link) => link,
+                    Err(_) if !expected.contains_key(&hash) => continue,
+                    Err(e) => return Err(e),
+                };
+                if hash_bytes(&bytes) != hash
+                    || actual.hash != hash
+                    || canonical_bytes(&node)? != bytes
+                    || expected.get(&hash).is_some_and(|link| link != &actual)
+                {
+                    if expected.contains_key(&hash) {
+                        return Err("lookahead node integrity".into());
+                    }
+                    // Speculative neighbors do not widen the original read set's
+                    // corruption semantics. A later required-edge read fetches
+                    // these bytes normally and must fail its integrity check.
+                    continue;
+                }
+                self.cache.insert(hash, node);
+            }
+        }
+        if expected.keys().any(|hash| !self.cache.contains_key(hash)) {
+            return Err("missing lookahead proof root".into());
         }
         Ok(())
     }

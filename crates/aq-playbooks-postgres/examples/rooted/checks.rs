@@ -238,6 +238,30 @@ pub fn run(client: &mut Client) -> Result<()> {
     drop(tree);
     tx.rollback()?;
     passed("untouched_history_corruption_detected_by_explicit_full_audit");
+    // Speculative SQL lookahead must not make malformed unrelated bytes into
+    // authority or widen this planner's certified logical dependency set.
+    for payload in [vec![0xff, 0xfe], b"{invalid json".to_vec()] {
+        let mut tx = client.transaction()?;
+        tx.execute(
+            "UPDATE pb04_nodes SET payload=$1 WHERE hash=$2",
+            &[&payload, &receipts.hash],
+        )?;
+        let mut tree = Tree::new(&mut tx);
+        let plan = admission::plan(
+            &mut tree,
+            &root,
+            "pb02",
+            fixture::envelope("malformed-neighbor"),
+            0,
+            10_000,
+        )?;
+        let next = admission::patch(&mut tree, &root, &plan.before, &plan.after)?;
+        admission::quota(&mut tree, &next, &EngineConfig::default())?;
+        assert!(tree.prefetch_subtree(&next).is_err());
+        drop(tree);
+        tx.rollback()?;
+    }
+    passed("malformed_speculative_neighbors_remain_untrusted_and_full_audit_fails");
     // Existing hash-address rows must be rechecked even if staged payload matches.
     let mut tx = client.transaction()?;
     tx.execute(

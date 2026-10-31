@@ -54,7 +54,11 @@ fn main() -> Result<()> {
     if marker != std::env::var("AQ_PB02_DISPOSABLE_TOKEN")? {
         return Err("disposable marker".into());
     }
-    client.batch_execute("CREATE TABLE pb04_nodes(hash text PRIMARY KEY,payload bytea NOT NULL); CREATE TABLE pb04_root(singleton bool PRIMARY KEY CHECK(singleton),owner text NOT NULL,revision bigint NOT NULL,root bytea NOT NULL);")?;
+    client.batch_execute("CREATE TABLE pb04_nodes(hash text PRIMARY KEY,payload bytea NOT NULL); CREATE TABLE pb04_root(singleton bool PRIMARY KEY CHECK(singleton),owner text NOT NULL,revision bigint NOT NULL,root bytea NOT NULL);
+    CREATE FUNCTION pb04_probe_json(raw bytea) RETURNS jsonb LANGUAGE plpgsql IMMUTABLE STRICT AS $$
+    BEGIN RETURN convert_from(raw,'UTF8')::jsonb;
+    EXCEPTION WHEN invalid_text_representation OR character_not_in_repertoire OR untranslatable_character THEN RETURN NULL;
+    END $$;")?;
     println!(
         "{}",
         json!({"scenario":"prototype_configuration","authority":"isolated root row under transaction lock; one fixed owner; no lease/failover qualification","format":"prototype-only AVL JSON tree; arrays opaque","budgets_us":{"event_admission":25000},"samples":24,"batched_reads":std::env::var_os("AQ_PB04_BATCHED").is_some(),"protection":"unsupported; synthetic unprotected only","limits":"no consumer/waiter fastpath only; all other operations fallback; no production Storage implementation"})
