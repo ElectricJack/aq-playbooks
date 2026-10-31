@@ -964,3 +964,271 @@ fn actual_engine_requires_protection_before_admission_and_encrypts_sensitive_dis
     );
     assert!(store().load(&n).is_err());
 }
+
+#[test]
+fn unchanged_commit_reuses_only_freshly_verified_bytes_and_has_bounded_value_free_profile() {
+    let n = namespace("verified-reuse");
+    let expected = boundary(&n);
+    let s = store();
+    assert!(s.profiling_snapshot().is_none());
+    s.acquire(&n, "owner").unwrap();
+    s.compare_and_swap(&n, "owner", 0, &expected).unwrap();
+    s.set_profiling(true);
+    s.compare_and_swap(&n, "owner", 1, &expected).unwrap();
+    let profile = s.profiling_snapshot().unwrap();
+    let cas = &profile.operations["cas"];
+    assert_eq!(cas.completed, 1);
+    assert_eq!(cas.artifact_verifications, 1);
+    assert_eq!(cas.artifact_canonicalizations, 0);
+    assert_eq!(cas.unchanged_artifacts_skipped, 1);
+    assert_eq!(cas.stages["artifact_locks"].sql_calls, 1);
+    assert!(!cas.stages.contains_key("artifact_write"));
+    let serialized = serde_json::to_string(&profile).unwrap();
+    assert!(!serialized.contains(&n));
+    assert!(cas.stages.len() <= 16);
+    let digest = expected.artifacts.keys().next().unwrap();
+    let mut db = client();
+    let bytes: Vec<u8> = db
+        .query_one(
+            "SELECT canonical_bytes FROM aq_playbooks.artifacts WHERE digest=$1",
+            &[digest],
+        )
+        .unwrap()
+        .get(0);
+    // This dedicated test connection bypasses the immutable-row trigger only for
+    // its own corruption injection; other concurrent tests keep their triggers.
+    db.batch_execute("SET session_replication_role=replica")
+        .unwrap();
+    db.execute(
+        "UPDATE aq_playbooks.artifacts SET canonical_bytes=$2 WHERE digest=$1",
+        &[digest, &b"corrupt".as_slice()],
+    )
+    .unwrap();
+    db.batch_execute("SET session_replication_role=origin")
+        .unwrap();
+    assert!(s.compare_and_swap(&n, "owner", 2, &expected).is_err());
+    db.batch_execute("SET session_replication_role=replica")
+        .unwrap();
+    db.execute(
+        "UPDATE aq_playbooks.artifacts SET canonical_bytes=$2 WHERE digest=$1",
+        &[digest, &bytes],
+    )
+    .unwrap();
+    db.batch_execute("SET session_replication_role=origin")
+        .unwrap();
+    s.compare_and_swap(&n, "owner", 2, &expected).unwrap();
+    drop(s);
+    let cold = store();
+    cold.acquire(&n, "new-owner").unwrap();
+    cold.set_profiling(true);
+    cold.compare_and_swap(&n, "new-owner", 3, &expected)
+        .unwrap();
+    assert_eq!(
+        cold.profiling_snapshot().unwrap().operations["cas"].artifact_verifications,
+        1
+    );
+}
+
+#[test]
+fn protected_reuse_preserves_nonce_but_explicit_same_key_refresh_and_tamper_checks_remain() {
+    let n = namespace("protected-reuse");
+    let expected = secret_state(&n);
+    let s = protected("old", false);
+    s.acquire(&n, "owner").unwrap();
+    s.compare_and_swap(&n, "owner", 0, &expected).unwrap();
+    let digest = expected.artifacts.keys().next().unwrap();
+    let mut db = client();
+    let artifact_envelope = |db: &mut postgres::Client| {
+        let r=db.query_one("SELECT nonce,ciphertext FROM aq_playbooks.encrypted_artifacts WHERE namespace=$1 AND digest=$2",&[&n,digest]).unwrap();
+        (r.get::<_, Vec<u8>>(0), r.get::<_, Vec<u8>>(1))
+    };
+    let original = artifact_envelope(&mut db);
+    s.set_profiling(true);
+    s.compare_and_swap(&n, "owner", 1, &expected).unwrap();
+    assert_eq!(artifact_envelope(&mut db), original);
+    assert_eq!(
+        s.profiling_snapshot().unwrap().operations["cas"].unchanged_artifacts_skipped,
+        1
+    );
+    s.set_profiling(true);
+    s.reencrypt_namespace(&n, "owner").unwrap();
+    let refreshed = artifact_envelope(&mut db);
+    assert_ne!(refreshed.0, original.0);
+    assert_eq!(
+        s.profiling_snapshot().unwrap().operations["cas"].unchanged_artifacts_skipped,
+        0
+    );
+    let mut corrupted = refreshed.1.clone();
+    corrupted[0] ^= 1;
+    db.execute("UPDATE aq_playbooks.encrypted_artifacts SET ciphertext=$3 WHERE namespace=$1 AND digest=$2",&[&n,digest,&corrupted]).unwrap();
+    assert!(s.compare_and_swap(&n, "owner", 3, &expected).is_err());
+    db.execute("UPDATE aq_playbooks.encrypted_artifacts SET ciphertext=$3 WHERE namespace=$1 AND digest=$2",&[&n,digest,&refreshed.1]).unwrap();
+    let mut forged = expected.clone();
+    forged
+        .artifacts
+        .values_mut()
+        .next()
+        .unwrap()
+        .content
+        .playbook
+        .purpose = "changed under same address".into();
+    assert!(s.compare_and_swap(&n, "owner", 3, &forged).is_err());
+    assert_eq!(s.load(&n).unwrap().revision, 3);
+    assert_same(&s.load(&n).unwrap().state, &expected);
+    let profile = serde_json::to_vec(&s.profiling_snapshot()).unwrap();
+    assert!(!contains_secret(&profile));
+}
+
+#[test]
+fn ordered_batch_catalog_locks_serialize_multi_artifact_installation_with_gc() {
+    for iteration in 0..8 {
+        let n = namespace(&format!("batch-gc-{iteration}"));
+        let other = namespace(&format!("batch-install-{iteration}"));
+        let artifacts = [artifact(&format!("{n}-one")), artifact(&format!("{n}-two"))];
+        let before = State {
+            artifacts: artifacts
+                .iter()
+                .map(|a| (a.digest.clone(), a.clone()))
+                .collect(),
+            ..State::default()
+        };
+        let mut removed = State::default();
+        for a in &artifacts {
+            removed
+                .retention
+                .artifact_disposals
+                .insert(a.digest.clone(), 10);
+        }
+        let a = store();
+        let b = store();
+        a.acquire(&n, "gc").unwrap();
+        b.acquire(&other, "installer").unwrap();
+        a.compare_and_swap(&n, "gc", 0, &before).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        std::thread::scope(|scope| {
+            let dropper = scope.spawn(|| {
+                barrier.wait();
+                a.compare_and_swap(&n, "gc", 1, &removed)
+            });
+            let installer = scope.spawn(|| {
+                barrier.wait();
+                b.compare_and_swap(&other, "installer", 0, &before)
+            });
+            barrier.wait();
+            dropper.join().unwrap().unwrap();
+            installer.join().unwrap().unwrap();
+        });
+        assert!(a.load(&n).unwrap().state.artifacts.is_empty());
+        assert_same(&b.load(&other).unwrap().state, &before);
+        let mut db = client();
+        assert_eq!(db.query_one("SELECT count(*) FROM aq_playbooks.disposal_tombstones WHERE namespace=$1 AND kind='artifact'",&[&n]).unwrap().get::<_,i64>(0),2);
+        for artifact in &artifacts {
+            let bytes: Vec<u8> = db
+                .query_one(
+                    "SELECT canonical_bytes FROM aq_playbooks.artifacts WHERE digest=$1",
+                    &[&artifact.digest],
+                )
+                .unwrap()
+                .get(0);
+            assert_eq!(
+                bytes,
+                aq_playbooks_model::canonical_bytes(artifact).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn ordinary_commit_with_new_active_key_refreshes_unchanged_artifacts() {
+    let n = namespace("ordinary-key-change");
+    let expected = secret_state(&n);
+    let digest = expected.artifacts.keys().next().unwrap();
+    {
+        let original = protected("old", false);
+        original.acquire(&n, "old-owner").unwrap();
+        original
+            .compare_and_swap(&n, "old-owner", 0, &expected)
+            .unwrap();
+    }
+    let current = protected("new", true);
+    current.acquire(&n, "new-owner").unwrap();
+    current.set_profiling(true);
+    current
+        .compare_and_swap(&n, "new-owner", 1, &expected)
+        .unwrap();
+    assert_eq!(
+        current.profiling_snapshot().unwrap().operations["cas"].unchanged_artifacts_skipped,
+        0
+    );
+    let key: String = client()
+        .query_one(
+            "SELECT key_id FROM aq_playbooks.encrypted_artifacts WHERE namespace=$1 AND digest=$2",
+            &[&n, digest],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(key, "new");
+    drop(current);
+    assert_same(&protected("new", false).load(&n).unwrap().state, &expected);
+    assert!(protected("old", false).load(&n).is_err());
+}
+
+#[test]
+fn mixed_existing_and_new_catalog_batches_commit_without_lock_inversion() {
+    for iteration in 0..8 {
+        let n = namespace(&format!("mixed-left-{iteration}"));
+        let other = namespace(&format!("mixed-right-{iteration}"));
+        let existing_left = artifact(&format!("{n}-existing"));
+        let existing_right = artifact(&format!("{other}-existing"));
+        let fresh = artifact(&format!("{n}-new-shared"));
+        let left = State {
+            artifacts: BTreeMap::from([(existing_left.digest.clone(), existing_left.clone())]),
+            ..State::default()
+        };
+        let right = State {
+            artifacts: BTreeMap::from([(existing_right.digest.clone(), existing_right.clone())]),
+            ..State::default()
+        };
+        let after = State {
+            artifacts: [existing_left, existing_right, fresh]
+                .into_iter()
+                .map(|a| (a.digest.clone(), a))
+                .collect(),
+            ..State::default()
+        };
+        let a = store();
+        let b = store();
+        a.acquire(&n, "left").unwrap();
+        b.acquire(&other, "right").unwrap();
+        a.compare_and_swap(&n, "left", 0, &left).unwrap();
+        b.compare_and_swap(&other, "right", 0, &right).unwrap();
+        let barrier = Barrier::new(3);
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                barrier.wait();
+                a.compare_and_swap(&n, "left", 1, &after)
+            });
+            let second = scope.spawn(|| {
+                barrier.wait();
+                b.compare_and_swap(&other, "right", 1, &after)
+            });
+            barrier.wait();
+            first.join().unwrap().unwrap();
+            second.join().unwrap().unwrap();
+        });
+        assert_same(&a.load(&n).unwrap().state, &after);
+        assert_same(&b.load(&other).unwrap().state, &after);
+        for namespace in [&n, &other] {
+            assert_eq!(
+                client()
+                    .query_one(
+                        "SELECT count(*) FROM aq_playbooks.namespace_artifacts WHERE namespace=$1",
+                        &[namespace]
+                    )
+                    .unwrap()
+                    .get::<_, i64>(0),
+                3
+            );
+        }
+    }
+}

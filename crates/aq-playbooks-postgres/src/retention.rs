@@ -1,10 +1,10 @@
 use crate::backend;
+use crate::profiling::ObservedTransaction;
 use aq_playbooks_model::{canonical_bytes, hash_bytes};
 use aq_playbooks_runner::{IntentStatus, State, StorageError};
-use postgres::Transaction;
 
 fn record(
-    tx: &mut Transaction<'_>,
+    tx: &mut ObservedTransaction<'_>,
     namespace: &str,
     kind: &str,
     key: &str,
@@ -19,7 +19,7 @@ fn record(
     Ok(())
 }
 pub(crate) fn verify_and_record(
-    tx: &mut Transaction<'_>,
+    tx: &mut ObservedTransaction<'_>,
     namespace: &str,
     previous: &State,
     next: &State,
@@ -178,7 +178,7 @@ pub(crate) fn verify_and_record(
 }
 
 pub(crate) fn dispose_artifacts(
-    tx: &mut Transaction<'_>,
+    tx: &mut ObservedTransaction<'_>,
     namespace: &str,
     previous: &State,
     next: &State,

@@ -7,7 +7,10 @@
 //! from owning the same namespace, even if they supply the same owner name.
 //! This does not fence external hosts: retire a prior runner before replacement.
 mod indexes;
+mod profiling;
 mod protection;
+use profiling::ObservedTransaction;
+pub use profiling::{OperationProfile, StageProfile, StorageProfile};
 mod retention;
 use aq_playbooks_model::{Artifact, canonical_bytes};
 use aq_playbooks_runner::{
@@ -47,6 +50,7 @@ struct Connection {
 pub struct PostgresStorage {
     connection: Mutex<Connection>,
     keyring: Option<ProtectionKeyring>,
+    profiling: profiling::Sink,
 }
 struct SnapshotEnvelope {
     plaintext: Option<Value>,
@@ -137,6 +141,7 @@ impl PostgresStorage {
                 leases: BTreeMap::new(),
             }),
             keyring,
+            profiling: Default::default(),
         })
     }
     fn encode(
@@ -192,7 +197,7 @@ impl PostgresStorage {
     }
     fn read_artifacts(
         &self,
-        tx: &mut postgres::Transaction<'_>,
+        tx: &mut ObservedTransaction<'_>,
         namespace: &str,
         protected: bool,
     ) -> Result<BTreeMap<String, Artifact>, StorageError> {
@@ -200,16 +205,25 @@ impl PostgresStorage {
         for artifact_row in tx.query("SELECT n.digest,a.canonical_bytes,e.key_id,e.nonce,e.ciphertext FROM aq_playbooks.namespace_artifacts n LEFT JOIN aq_playbooks.artifacts a ON a.digest=n.digest LEFT JOIN aq_playbooks.encrypted_artifacts e ON e.namespace=n.namespace AND e.digest=n.digest WHERE n.namespace=$1 ORDER BY n.digest",&[&namespace]).map_err(backend)?{
             let digest:String=artifact_row.get(0);
             let bytes=if protected{let key_id:Option<String>=artifact_row.get(2);let key_id=key_id.ok_or_else(||backend("missing protected artifact envelope"))?;let nonce:Vec<u8>=artifact_row.get(3);let ciphertext:Vec<u8>=artifact_row.get(4);self.keyring.as_ref().ok_or_else(||backend("protected namespace requires configured keys"))?.open_artifact(namespace,&digest,&key_id,&nonce,&ciphertext)?}else{Zeroizing::new(artifact_row.get::<_,Option<Vec<u8>>>(1).ok_or_else(||backend("missing plaintext artifact payload"))?)};
-            let artifact=Artifact::from_canonical_bytes(&bytes).map_err(backend)?;if artifact.digest!=digest{return Err(backend("artifact address integrity mismatch"));}artifacts.insert(digest,artifact);
+            let started=tx.clock();let artifact=Artifact::from_canonical_bytes(&bytes).map_err(backend)?;tx.verified(started);if artifact.digest!=digest{return Err(backend("artifact address integrity mismatch"));}artifacts.insert(digest,artifact);
         }
         Ok(artifacts)
+    }
+    /// Disabled by default. Value-free fixed-stage aggregate diagnostics only.
+    pub fn set_profiling(&self, enabled: bool) {
+        if let Ok(mut p) = self.profiling.lock() {
+            *p = enabled.then(StorageProfile::default);
+        }
+    }
+    pub fn profiling_snapshot(&self) -> Option<StorageProfile> {
+        self.profiling.lock().ok().and_then(|p| p.clone())
     }
     pub fn reencrypt_namespace(&self, namespace: &str, owner: &str) -> Result<u64, StorageError> {
         if self.keyring.is_none() {
             return Err(backend("key rotation requires configured protection"));
         }
         let current = self.load(namespace)?;
-        self.compare_and_swap(namespace, owner, current.revision, &current.state)
+        self.commit_state(namespace, owner, current.revision, &current.state, true)
     }
 
     fn connection(&self) -> Result<MutexGuard<'_, Connection>, StorageError> {
@@ -384,7 +398,11 @@ impl Storage for PostgresStorage {
     fn load(&self, namespace: &str) -> Result<VersionedState, StorageError> {
         check_name(namespace)?;
         let mut conn = self.connection()?;
-        let mut tx = conn.client.transaction().map_err(backend)?;
+        let mut tx = ObservedTransaction::new(
+            conn.client.transaction().map_err(backend)?,
+            self.profiling.clone(),
+            "load",
+        );
         // The row lock gives the snapshot and its artifact references one view,
         // without holding an unbounded repeatable-read transaction.
         let Some(row) = tx.query_opt("SELECT revision,snapshot,protection_key_id,protection_nonce,encrypted_snapshot FROM aq_playbooks.namespaces WHERE namespace=$1 FOR SHARE", &[&namespace]).map_err(backend)? else {
@@ -392,7 +410,9 @@ impl Storage for PostgresStorage {
         };
         let revision = row.get::<_, i64>("revision") as u64;
         let protected = row.get::<_, Option<String>>("protection_key_id").is_some();
+        tx.phase("snapshot_decode");
         let mut state = self.decode(namespace, revision, &row)?;
+        tx.phase("artifact_read");
         state.artifacts = self.read_artifacts(&mut tx, namespace, protected)?;
         tx.commit().map_err(backend)?;
         Ok(VersionedState { revision, state })
@@ -404,6 +424,18 @@ impl Storage for PostgresStorage {
         owner: &str,
         expected_revision: u64,
         state: &State,
+    ) -> Result<u64, StorageError> {
+        self.commit_state(namespace, owner, expected_revision, state, false)
+    }
+}
+impl PostgresStorage {
+    fn commit_state(
+        &self,
+        namespace: &str,
+        owner: &str,
+        expected_revision: u64,
+        state: &State,
+        force_artifact_refresh: bool,
     ) -> Result<u64, StorageError> {
         let expected =
             i64::try_from(expected_revision).map_err(|_| backend("revision exhausted"))?;
@@ -417,7 +449,11 @@ impl Storage for PostgresStorage {
             .filter(|l| l.owner == owner)
             .ok_or(StorageError::Ownership)?;
         let incarnation = lease.incarnation;
-        let mut tx = conn.client.transaction().map_err(backend)?;
+        let mut tx = ObservedTransaction::new(
+            conn.client.transaction().map_err(backend)?,
+            self.profiling.clone(),
+            "cas",
+        );
         let advisory_key = lock_key(namespace) as u64;
         let high = (advisory_key >> 32) as i64;
         let low = (advisory_key & 0xffff_ffff) as i64;
@@ -435,12 +471,20 @@ impl Storage for PostgresStorage {
         if row.get::<_, i64>(0) != expected {
             return Err(StorageError::Conflict);
         }
+        let refresh_artifacts = force_artifact_refresh
+            || self.keyring.as_ref().is_some_and(|keys| {
+                row.get::<_, Option<String>>("protection_key_id").as_deref()
+                    != Some(keys.active_key_id())
+            });
+        tx.phase("snapshot_decode");
         let mut previous = self.decode(namespace, expected_revision, &row)?;
+        tx.phase("artifact_read");
         previous.artifacts = self.read_artifacts(
             &mut tx,
             namespace,
             row.get::<_, Option<String>>("protection_key_id").is_some(),
         )?;
+        tx.phase("artifact_locks");
         aq_playbooks_runner::retention::verify_artifact_removals(&previous, state)?;
         let addresses: std::collections::BTreeSet<_> = previous
             .artifacts
@@ -448,22 +492,46 @@ impl Storage for PostgresStorage {
             .chain(state.artifacts.keys())
             .cloned()
             .collect();
-        for address in &addresses {
-            tx.execute("INSERT INTO aq_playbooks.artifact_catalog(digest) VALUES($1) ON CONFLICT DO NOTHING",&[address]).map_err(backend)?;
-            tx.query_one(
-                "SELECT digest FROM aq_playbooks.artifact_catalog WHERE digest=$1 FOR UPDATE",
-                &[address],
-            )
-            .map_err(backend)?;
+        let new_addresses: Vec<_> = state
+            .artifacts
+            .keys()
+            .filter(|id| !previous.artifacts.contains_key(*id))
+            .cloned()
+            .collect();
+        if !new_addresses.is_empty() {
+            tx.execute("INSERT INTO aq_playbooks.artifact_catalog(digest) SELECT digest FROM unnest($1::text[]) AS pending(digest) ORDER BY digest ON CONFLICT DO NOTHING",&[&new_addresses]).map_err(backend)?;
         }
+        if !addresses.is_empty() {
+            // All previous references retain their catalog FK. New addresses are
+            // created above. Keep union locks, in the same global order as GC.
+            let addresses: Vec<_> = addresses.into_iter().collect();
+            let locked=tx.query("SELECT digest FROM aq_playbooks.artifact_catalog WHERE digest=ANY($1) ORDER BY digest FOR UPDATE",&[&addresses]).map_err(backend)?;
+            if locked.len() != addresses.len() {
+                return Err(backend("artifact catalog reference disappeared"));
+            }
+        }
+        tx.phase("retention");
         retention::verify_and_record(&mut tx, namespace, &previous, state)?;
         for (digest, artifact) in &state.artifacts {
+            tx.phase("artifact_compare");
+            // Previous bytes were freshly read, authenticated and fully verified
+            // under this namespace's row/revision/owner locks. Equality checks the
+            // entire typed artifact, never just its supplied address. No cache.
+            if !refresh_artifacts && previous.artifacts.get(digest) == Some(artifact) {
+                tx.skipped();
+                continue;
+            }
+            tx.phase("artifact_validation");
+            let started = tx.clock();
             artifact.verify().map_err(backend)?;
+            tx.verified(started);
             if &artifact.digest != digest {
                 return Err(backend("artifact key does not match digest"));
             }
+            let started = tx.clock();
             let bytes = canonical_bytes(artifact).map_err(backend)?;
-            tx.execute("INSERT INTO aq_playbooks.artifact_catalog(digest) VALUES($1) ON CONFLICT DO NOTHING",&[&digest]).map_err(backend)?;
+            tx.canonicalized(started);
+            tx.phase("artifact_write");
             if let Some(keyring) = &self.keyring {
                 if let Some(existing)=tx.query_opt("SELECT key_id,nonce,ciphertext FROM aq_playbooks.encrypted_artifacts WHERE namespace=$1 AND digest=$2",&[&namespace,&digest]).map_err(backend)?{let key_id:String=existing.get(0);let nonce:Vec<u8>=existing.get(1);let ciphertext:Vec<u8>=existing.get(2);if *keyring.open_artifact(namespace,digest,&key_id,&nonce,&ciphertext)?!=bytes{return Err(backend("immutable protected artifact address conflict"));}}
                 let sealed = keyring.seal_artifact(namespace, digest, &bytes)?;
@@ -483,8 +551,10 @@ impl Storage for PostgresStorage {
             }
             tx.execute("INSERT INTO aq_playbooks.namespace_artifacts(namespace,digest) VALUES($1,$2) ON CONFLICT DO NOTHING", &[&namespace,&digest]).map_err(backend)?;
         }
+        tx.phase("artifact_disposal");
         retention::dispose_artifacts(&mut tx, namespace, &previous, state)?;
         let empty = State::default();
+        tx.phase("indexes");
         indexes::sync(
             &mut tx,
             namespace,
@@ -495,7 +565,9 @@ impl Storage for PostgresStorage {
             },
             state,
         )?;
+        tx.phase("snapshot_encode");
         let snapshot = self.encode(namespace, next as u64, state)?;
+        tx.phase("snapshot_write");
         tx.execute("UPDATE aq_playbooks.namespaces SET snapshot=$2,protection_key_id=$3,protection_nonce=$4,encrypted_snapshot=$5,revision=$6,indexes_materialized=true,updated_at=clock_timestamp() WHERE namespace=$1",&[&namespace,&snapshot.plaintext,&snapshot.key_id,&snapshot.nonce,&snapshot.ciphertext,&next]).map_err(backend)?;
         if self.keyring.is_some() {
             let addresses: Vec<_> = state.artifacts.keys().cloned().collect();

@@ -1,8 +1,9 @@
 use crate::backend;
+use crate::profiling::ObservedTransaction;
 use aq_playbooks_runner::{
     EffectQueueKind, IndexItem, IndexPage, IndexQuery, State, StorageError, inspection,
 };
-use postgres::{Client, Transaction};
+use postgres::Client;
 use serde_json::{Value, json};
 
 fn record(
@@ -185,7 +186,7 @@ fn delta(previous: Vec<Value>, next: Vec<Value>, keys: &[&str]) -> (Vec<Value>, 
     (changed, deleted)
 }
 pub(crate) fn sync(
-    tx: &mut Transaction<'_>,
+    tx: &mut ObservedTransaction<'_>,
     namespace: &str,
     previous: &State,
     next: &State,

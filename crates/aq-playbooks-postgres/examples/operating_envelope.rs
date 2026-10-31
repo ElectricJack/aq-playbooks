@@ -278,6 +278,9 @@ fn pg(config: &str, label: &str, state: &State) -> (Engine<Measured<PostgresStor
         state,
     );
     meter.clear();
+    e.store
+        .inner
+        .set_profiling(std::env::var("AQ_PB03_STORAGE_PROFILE").as_deref() == Ok("1"));
     (e, meter)
 }
 fn phase<S: Storage>(e: &mut Engine<S>, name: &str) -> (Vec<u64>, Vec<u64>) {
@@ -311,12 +314,16 @@ fn report_phase(config: &str, state: &State, h: usize, kind: &str) {
     let mut e = e;
     let before = counts(&e.snapshot().unwrap());
     meter.clear();
+    e.store
+        .inner
+        .set_profiling(std::env::var("AQ_PB03_STORAGE_PROFILE").as_deref() == Ok("1"));
     let rss = rss_kib();
     let (wall, pure) = phase(&mut e, kind);
     let timing = meter.report();
+    let storage_profile = e.store.inner.profiling_snapshot();
     let end = e.snapshot().unwrap();
     emit(
-        json!({"scenario":kind,"history":h,"starting":before,"ending":counts(&end),"wall_us":stats(&wall),"transition_closure_us":stats(&pure),"store":timing,"process_rss_kib_before":rss,"process_rss_kib_after":rss_kib(),"engine_metrics":e.metrics.snapshot(),"budget_us":if kind=="event"{25000}else{0},"event_budget_pass":kind!="event"||stats(&wall)["p95"].as_u64().unwrap()<25000,"pure_closure_budget_pass":stats(&pure)["p95"].as_u64().unwrap()<1000}),
+        json!({"scenario":kind,"history":h,"starting":before,"ending":counts(&end),"wall_us":stats(&wall),"transition_closure_us":stats(&pure),"store":timing,"storage_profile":storage_profile,"process_rss_kib_before":rss,"process_rss_kib_after":rss_kib(),"engine_metrics":e.metrics.snapshot(),"budget_us":if kind=="event"{25000}else{0},"event_budget_pass":kind!="event"||stats(&wall)["p95"].as_u64().unwrap()<25000,"pure_closure_budget_pass":stats(&pure)["p95"].as_u64().unwrap()<1000}),
     );
     e.release().unwrap();
 }
