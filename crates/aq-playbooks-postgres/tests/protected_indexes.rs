@@ -207,7 +207,7 @@ fn rotation_reencrypts_snapshot_and_artifacts_and_old_backups_require_old_keys()
     let ciphertext: Vec<u8> = backup.get(3);
     {
         let mut tx = marked(&mut db, &n);
-        tx.execute("UPDATE aq_playbooks.namespaces SET revision=$2,protection_key_id=$3,protection_nonce=$4,encrypted_snapshot=$5 WHERE namespace=$1",&[&n,&revision,&key,&nonce,&ciphertext]).unwrap();
+        tx.execute("UPDATE aq_playbooks.namespaces SET revision=$2,catalog_projected_revision=$2,protection_key_id=$3,protection_nonce=$4,encrypted_snapshot=$5 WHERE namespace=$1",&[&n,&revision,&key,&nonce,&ciphertext]).unwrap();
         tx.commit().unwrap();
     }
     let digest: String = artifact_backup.get(0);

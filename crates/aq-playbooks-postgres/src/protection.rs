@@ -14,6 +14,12 @@ pub struct ProtectionKeyring {
     active_key_id: String,
     keys: BTreeMap<String, Zeroizing<[u8; 32]>>,
 }
+pub(crate) struct CatalogContext<'a> {
+    pub namespace: &'a str,
+    pub kind: &'a str,
+    pub key: &'a str,
+    pub revision: u64,
+}
 pub(crate) struct SealedValue {
     pub key_id: String,
     pub nonce: Vec<u8>,
@@ -158,6 +164,52 @@ impl ProtectionKeyring {
         .map_err(backend)?;
         self.open_aad(&aad, key_id, nonce, ciphertext)
     }
+    pub(crate) fn seal_catalog(
+        &self,
+        context: CatalogContext<'_>,
+        plaintext: &[u8],
+    ) -> Result<SealedValue, StorageError> {
+        let CatalogContext {
+            namespace,
+            kind,
+            key,
+            revision,
+        } = context;
+        let aad = serde_json::to_vec(&(
+            "aq-playbooks.catalog.xchacha20poly1305.v1",
+            namespace,
+            kind,
+            key,
+            revision,
+            &self.active_key_id,
+        ))
+        .map_err(backend)?;
+        self.seal_aad(&aad, plaintext)
+    }
+    pub(crate) fn open_catalog(
+        &self,
+        context: CatalogContext<'_>,
+        key_id: &str,
+        nonce: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, StorageError> {
+        let CatalogContext {
+            namespace,
+            kind,
+            key,
+            revision,
+        } = context;
+        let aad = serde_json::to_vec(&(
+            "aq-playbooks.catalog.xchacha20poly1305.v1",
+            namespace,
+            kind,
+            key,
+            revision,
+            key_id,
+        ))
+        .map_err(backend)?;
+        self.open_aad(&aad, key_id, nonce, ciphertext)
+    }
 }
 
 #[cfg(test)]
@@ -217,5 +269,60 @@ mod tests {
                 .is_err()
         );
         assert_eq!(rotated.seal("n", 8, b"next").unwrap().key_id, "new");
+    }
+    #[test]
+    fn catalog_envelopes_bind_namespace_kind_address_revision_key_and_domain() {
+        let keys = keys("old");
+        let context = || CatalogContext {
+            namespace: "n",
+            kind: "definitions",
+            key: "address",
+            revision: 7,
+        };
+        let row = keys.seal_catalog(context(), b"metadata").unwrap();
+        assert_eq!(
+            &*keys
+                .open_catalog(context(), &row.key_id, &row.nonce, &row.ciphertext)
+                .unwrap(),
+            b"metadata"
+        );
+        for changed in [
+            CatalogContext {
+                namespace: "other",
+                ..context()
+            },
+            CatalogContext {
+                kind: "activations",
+                ..context()
+            },
+            CatalogContext {
+                key: "other",
+                ..context()
+            },
+            CatalogContext {
+                revision: 8,
+                ..context()
+            },
+        ] {
+            assert!(
+                keys.open_catalog(changed, &row.key_id, &row.nonce, &row.ciphertext)
+                    .is_err()
+            );
+        }
+        assert!(
+            keys.open_catalog(context(), "new", &row.nonce, &row.ciphertext)
+                .is_err()
+        );
+        let missing =
+            ProtectionKeyring::new("new", BTreeMap::from([("new".into(), [2; 32])])).unwrap();
+        assert!(
+            missing
+                .open_catalog(context(), &row.key_id, &row.nonce, &row.ciphertext)
+                .is_err()
+        );
+        assert!(
+            keys.open("n", 7, &row.key_id, &row.nonce, &row.ciphertext)
+                .is_err()
+        );
     }
 }
