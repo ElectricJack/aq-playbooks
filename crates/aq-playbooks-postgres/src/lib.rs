@@ -6,6 +6,12 @@
 //! references and safe disposal boundaries. Session advisory locks prevent two connections
 //! from owning the same namespace, even if they supply the same owner name.
 //! This does not fence external hosts: retire a prior runner before replacement.
+#[cfg(all(test, feature = "postgres-tests"))]
+extern crate self as aq_playbooks_postgres;
+
+mod catalog;
+#[cfg(all(test, feature = "postgres-tests"))]
+mod catalog_tests;
 mod indexes;
 mod profiling;
 mod projection;
@@ -39,13 +45,15 @@ const MIGRATIONS: &[(i32, &str)] = &[
         3,
         include_str!("../migrations/0003_keyed_admission_writer.sql"),
     ),
+    (4, include_str!("../migrations/0004_catalog_inspection.sql")),
 ];
-const WRITE_MARKER_SQL: &str = "SELECT set_config('aq_playbooks.writer_namespace',$1,true),set_config('aq_playbooks.writer_format','1',true)";
+const WRITE_MARKER_SQL: &str = "SELECT set_config('aq_playbooks.writer_namespace',$1,true),set_config('aq_playbooks.writer_format','2',true)";
 const MIGRATION_LOCK: i64 = 0x4151504c41594d47;
 
 struct Lease {
     owner: String,
     incarnation: i64,
+    catalog_uncertain: bool,
 }
 struct Connection {
     client: Client,
@@ -58,6 +66,10 @@ pub struct PostgresStorage {
     connection: Mutex<Connection>,
     keyring: Option<ProtectionKeyring>,
     profiling: profiling::Sink,
+    #[cfg(test)]
+    lose_catalog_commit_reply: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_catalog_before_snapshot: std::sync::atomic::AtomicBool,
 }
 struct SnapshotEnvelope {
     plaintext: Option<Value>,
@@ -149,6 +161,10 @@ impl PostgresStorage {
             }),
             keyring,
             profiling: Default::default(),
+            #[cfg(test)]
+            lose_catalog_commit_reply: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_catalog_before_snapshot: std::sync::atomic::AtomicBool::new(false),
         })
     }
     fn encode(
@@ -254,6 +270,14 @@ impl PostgresStorage {
 }
 
 impl Storage for PostgresStorage {
+    fn inspect_catalog(
+        &self,
+        namespace: &str,
+        owner: &str,
+        query: &aq_playbooks_runner::CatalogQuery,
+    ) -> Result<aq_playbooks_runner::CatalogPage, aq_playbooks_runner::CatalogError> {
+        self.current_catalog(namespace, owner, query)
+    }
     fn protection_available(&self) -> bool {
         self.keyring.is_some()
     }
@@ -349,14 +373,14 @@ impl Storage for PostgresStorage {
             tx.query_one(WRITE_MARKER_SQL, &[&namespace])
                 .map_err(backend)?;
             let empty = self.encode(namespace, 0, &State::default())?;
-            tx.execute("INSERT INTO aq_playbooks.namespaces(namespace,snapshot,protection_key_id,protection_nonce,encrypted_snapshot,indexes_materialized,writer_format) VALUES($1,$2,$3,$4,$5,true,1) ON CONFLICT DO NOTHING",&[&namespace,&empty.plaintext,&empty.key_id,&empty.nonce,&empty.ciphertext]).map_err(backend)?;
+            tx.execute("INSERT INTO aq_playbooks.namespaces(namespace,snapshot,protection_key_id,protection_nonce,encrypted_snapshot,indexes_materialized,writer_format) VALUES($1,$2,$3,$4,$5,true,2) ON CONFLICT DO NOTHING",&[&namespace,&empty.plaintext,&empty.key_id,&empty.nonce,&empty.ciphertext]).map_err(backend)?;
             let existing=tx.query_one("SELECT revision,snapshot,protection_key_id,protection_nonce,encrypted_snapshot FROM aq_playbooks.namespaces WHERE namespace=$1",&[&namespace]).map_err(backend)?;
             self.decode(
                 namespace,
                 existing.get::<_, i64>("revision") as u64,
                 &existing,
             )?;
-            let incarnation: i64 = tx.query_one("UPDATE aq_playbooks.namespaces SET owner=$2, writer_format=1, owner_backend_pid=pg_backend_pid(), incarnation=incarnation+1, acquired_at=clock_timestamp() WHERE namespace=$1 RETURNING incarnation", &[&namespace,&owner]).map_err(backend)?.get(0);
+            let incarnation: i64 = tx.query_one("UPDATE aq_playbooks.namespaces SET owner=$2, writer_format=2, owner_backend_pid=pg_backend_pid(), incarnation=incarnation+1, acquired_at=clock_timestamp() WHERE namespace=$1 RETURNING incarnation", &[&namespace,&owner]).map_err(backend)?.get(0);
             tx.commit().map_err(backend)?;
             Ok(incarnation)
         })();
@@ -367,6 +391,7 @@ impl Storage for PostgresStorage {
                     Lease {
                         owner: owner.into(),
                         incarnation,
+                        catalog_uncertain: false,
                     },
                 );
                 Ok(())
@@ -476,7 +501,7 @@ impl PostgresStorage {
         if !owns_lock {
             return Err(StorageError::Ownership);
         }
-        let row = tx.query_opt("SELECT revision,owner,incarnation,owner_backend_pid=pg_backend_pid(),snapshot,protection_key_id,protection_nonce,encrypted_snapshot,indexes_materialized FROM aq_playbooks.namespaces WHERE namespace=$1 FOR UPDATE", &[&namespace]).map_err(backend)?.ok_or(StorageError::Ownership)?;
+        let row = tx.query_opt("SELECT revision,owner,incarnation,owner_backend_pid=pg_backend_pid(),snapshot,protection_key_id,protection_nonce,encrypted_snapshot,indexes_materialized,catalog_projected_revision,catalog_metadata_revision,catalog_supported FROM aq_playbooks.namespaces WHERE namespace=$1 FOR UPDATE", &[&namespace]).map_err(backend)?.ok_or(StorageError::Ownership)?;
         if row.get::<_, Option<String>>(1).as_deref() != Some(owner)
             || row.get::<_, i64>(2) != incarnation
             || row.get::<_, Option<bool>>(3) != Some(true)
@@ -485,6 +510,13 @@ impl PostgresStorage {
         }
         if row.get::<_, i64>(0) != expected {
             return Err(StorageError::Conflict);
+        }
+        let catalog_projected: Option<i64> = row.get("catalog_projected_revision");
+        let catalog_metadata: Option<i64> = row.get("catalog_metadata_revision");
+        if catalog_projected.is_some_and(|projected| projected != expected)
+            || catalog_projected.is_some() != catalog_metadata.is_some()
+        {
+            return Err(backend("catalog projection revision mismatch"));
         }
         let refresh_artifacts = force_artifact_refresh
             || self.keyring.as_ref().is_some_and(|keys| {
@@ -581,15 +613,55 @@ impl PostgresStorage {
             },
             state,
         )?;
+        tx.phase("catalog_projection");
+        let catalog = catalog::sync(
+            &mut tx,
+            catalog::Sync {
+                namespace,
+                previous: &previous,
+                next: state,
+                revision: next,
+                previous_metadata_revision: catalog_metadata,
+                force_reencrypt: refresh_artifacts,
+                keyring: self.keyring.as_ref(),
+            },
+        )?;
+        #[cfg(test)]
+        if self
+            .fail_catalog_before_snapshot
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(backend(
+                "synthetic rollback after catalog projection writes",
+            ));
+        }
         tx.phase("snapshot_encode");
         let snapshot = self.encode(namespace, next as u64, state)?;
         tx.phase("snapshot_write");
-        tx.execute("UPDATE aq_playbooks.namespaces SET snapshot=$2,protection_key_id=$3,protection_nonce=$4,encrypted_snapshot=$5,revision=$6,writer_format=1,indexes_materialized=true,updated_at=clock_timestamp() WHERE namespace=$1",&[&namespace,&snapshot.plaintext,&snapshot.key_id,&snapshot.nonce,&snapshot.ciphertext,&next]).map_err(backend)?;
+        tx.execute("UPDATE aq_playbooks.namespaces SET snapshot=$2,protection_key_id=$3,protection_nonce=$4,encrypted_snapshot=$5,revision=$6,writer_format=2,indexes_materialized=true,catalog_projected_revision=$7,catalog_metadata_revision=$8,catalog_supported=$9,updated_at=clock_timestamp() WHERE namespace=$1",&[&namespace,&snapshot.plaintext,&snapshot.key_id,&snapshot.nonce,&snapshot.ciphertext,&next,&catalog.revision,&catalog.metadata_revision,&catalog.supported]).map_err(backend)?;
         if self.keyring.is_some() {
             let addresses: Vec<_> = state.artifacts.keys().cloned().collect();
             tx.execute("DELETE FROM aq_playbooks.artifacts a WHERE digest=ANY($1) AND NOT EXISTS(SELECT 1 FROM aq_playbooks.namespace_artifacts n JOIN aq_playbooks.namespaces s ON s.namespace=n.namespace WHERE n.digest=a.digest AND (s.protection_key_id IS NULL OR NOT EXISTS(SELECT 1 FROM aq_playbooks.encrypted_artifacts e WHERE e.namespace=n.namespace AND e.digest=n.digest)))",&[&addresses]).map_err(backend)?;
         }
-        tx.commit().map_err(backend)?;
+        if let Err(error) = tx.commit() {
+            if let Some(lease) = conn.leases.get_mut(namespace) {
+                lease.catalog_uncertain = true;
+            }
+            return Err(backend(error));
+        }
+        #[cfg(test)]
+        if self
+            .lose_catalog_commit_reply
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            if let Some(lease) = conn.leases.get_mut(namespace) {
+                lease.catalog_uncertain = true;
+            }
+            return Err(backend("synthetic reply loss after actual catalog commit"));
+        }
+        if let Some(lease) = conn.leases.get_mut(namespace) {
+            lease.catalog_uncertain = false;
+        }
         Ok(next as u64)
     }
 }

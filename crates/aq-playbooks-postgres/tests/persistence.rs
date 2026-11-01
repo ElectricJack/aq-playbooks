@@ -219,7 +219,7 @@ fn abrupt_process_helper() {
         .unwrap();
     let mut db = client();
     let mut tx = marked(&mut db, &n);
-    tx.execute("UPDATE aq_playbooks.namespaces SET revision=2,snapshot=jsonb_set(snapshot,'{sequence}','999') WHERE namespace=$1",&[&n]).unwrap();
+    tx.execute("UPDATE aq_playbooks.namespaces SET revision=2,catalog_projected_revision=2,snapshot=jsonb_set(snapshot,'{sequence}','999') WHERE namespace=$1",&[&n]).unwrap();
     println!("CRASH_READY");
     std::io::stdout().flush().unwrap();
     loop {

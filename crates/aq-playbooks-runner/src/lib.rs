@@ -2,7 +2,9 @@
 //! All methods take trusted host/storage time; producer timestamps never win races.
 pub mod admission;
 pub use admission::{KeyedAdmissionDisposition, KeyedAdmissionReceipt, KeyedAdmissionRequest};
+pub mod catalog_inspection;
 pub mod inspection;
+pub use catalog_inspection::{CatalogError, CatalogKind, CatalogPage, CatalogQuery, CatalogStamp};
 pub mod metrics;
 pub mod storage;
 pub use inspection::{InspectionKind, InspectionPage, InspectionQuery};
@@ -387,6 +389,15 @@ impl<S: Storage> Engine<S> {
     }
     pub fn snapshot(&self) -> Result<State> {
         Ok(self.store.load(&self.namespace)?.state)
+    }
+    /// Bounded current metadata through this Engine's actual owning storage
+    /// context. Backends without the explicit contract return Unsupported.
+    pub fn inspect_catalog(
+        &self,
+        query: &CatalogQuery,
+    ) -> std::result::Result<CatalogPage, CatalogError> {
+        self.store
+            .inspect_catalog(&self.namespace, &self.owner, query)
     }
     fn transaction<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
         self.transaction_choice(|state| f(state).map(|value| (value, true)))

@@ -63,7 +63,7 @@ fn protected_keyed_receipt_survives_restart_and_cannot_be_rewritten() {
     let row=client().query_one("SELECT snapshot,encrypted_snapshot,writer_format FROM aq_playbooks.namespaces WHERE namespace=$1",&[&n]).unwrap();
     assert!(row.get::<_, Option<Value>>(0).is_none());
     assert!(!row.get::<_, Option<Vec<u8>>>(1).unwrap().is_empty());
-    assert_eq!(row.get::<_, i32>(2), 1);
+    assert_eq!(row.get::<_, i32>(2), 2);
 }
 #[test]
 fn already_open_unmarked_writer_is_fenced_and_transaction_marker_cannot_leak() {
@@ -83,7 +83,7 @@ fn already_open_unmarked_writer_is_fenced_and_transaction_marker_cannot_leak() {
     assert_eq!(e.store.load(&n).unwrap().revision, revision);
     // A correct marker is namespace-specific AND transaction-local, not sticky.
     let mut tx = old.transaction().unwrap();
-    tx.query_one("SELECT set_config('aq_playbooks.writer_namespace',$1,true),set_config('aq_playbooks.writer_format','1',true)",&[&n]).unwrap();
+    tx.query_one("SELECT set_config('aq_playbooks.writer_namespace',$1,true),set_config('aq_playbooks.writer_format','2',true)",&[&n]).unwrap();
     tx.execute(
         "UPDATE aq_playbooks.namespaces SET updated_at=updated_at WHERE namespace=$1",
         &[&n],
@@ -98,7 +98,7 @@ fn already_open_unmarked_writer_is_fenced_and_transaction_marker_cannot_leak() {
         .is_err()
     );
     let mut tx = old.transaction().unwrap();
-    tx.query_one("SELECT set_config('aq_playbooks.writer_namespace','wrong-namespace',true),set_config('aq_playbooks.writer_format','1',true)",&[]).unwrap();
+    tx.query_one("SELECT set_config('aq_playbooks.writer_namespace','wrong-namespace',true),set_config('aq_playbooks.writer_format','2',true)",&[]).unwrap();
     assert!(
         tx.execute(
             "UPDATE aq_playbooks.namespaces SET updated_at=updated_at WHERE namespace=$1",
@@ -109,7 +109,7 @@ fn already_open_unmarked_writer_is_fenced_and_transaction_marker_cannot_leak() {
     drop(tx);
     // Even a marked new transaction cannot downgrade or delete the receipt owner.
     let mut tx = old.transaction().unwrap();
-    tx.query_one("SELECT set_config('aq_playbooks.writer_namespace',$1,true),set_config('aq_playbooks.writer_format','1',true)",&[&n]).unwrap();
+    tx.query_one("SELECT set_config('aq_playbooks.writer_namespace',$1,true),set_config('aq_playbooks.writer_format','2',true)",&[&n]).unwrap();
     assert!(
         tx.execute(
             "UPDATE aq_playbooks.namespaces SET writer_format=0 WHERE namespace=$1",

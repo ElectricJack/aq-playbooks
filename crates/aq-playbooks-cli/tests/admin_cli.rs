@@ -69,6 +69,84 @@ impl Drop for Fixture {
     }
 }
 #[test]
+fn current_catalog_requires_explicit_idle_ownership_and_never_admits_work() {
+    let f = Fixture::new();
+    let scenario = pilots::scenario("routing").unwrap();
+    let artifact = scenario.artifacts.last().unwrap();
+    let a = f.write(
+        "catalog-artifact.json",
+        serde_json::to_value(artifact).unwrap(),
+    );
+    let keys = f.write(
+        "catalog-keys.json",
+        json!({"active_key_id":"a","keys":{"a":"11".repeat(32)}}),
+    );
+    // Invalid bounds/absent consent fail before even creating a namespace.
+    for args in [
+        vec!["inspect-catalog"],
+        vec![
+            "inspect-catalog",
+            "--acquire-idle-namespace",
+            "--limit",
+            "26",
+        ],
+        vec![
+            "inspect-catalog",
+            "--acquire-idle-namespace",
+            "--pages",
+            "5",
+        ],
+    ] {
+        assert!(!f.call(&args, Some(&keys)).status.success());
+    }
+    let store =
+        PostgresStorage::connect_protected(&f.database, read_keyring(&keys).unwrap()).unwrap();
+    assert_eq!(store.incarnation(&f.namespace).unwrap(), None);
+    drop(store);
+    f.ok(&["install", a.to_str().unwrap()], Some(&keys));
+    let engine = Engine::new(
+        PostgresStorage::connect_protected(&f.database, read_keyring(&keys).unwrap()).unwrap(),
+        &f.namespace,
+        "actual-live-owner",
+    )
+    .unwrap();
+    assert!(
+        !f.call(
+            &["inspect-catalog", "--acquire-idle-namespace"],
+            Some(&keys)
+        )
+        .status
+        .success()
+    );
+    let before = engine.snapshot().unwrap();
+    engine.release().unwrap();
+    drop(engine);
+    let page = f.ok(
+        &[
+            "inspect-catalog",
+            "--acquire-idle-namespace",
+            "--exact",
+            &artifact.digest,
+        ],
+        Some(&keys),
+    );
+    assert_eq!(page["api_version"], "playbooks-catalog-1");
+    assert_eq!(
+        page["items"][0]["record"]["metadata"]["artifact"],
+        artifact.digest
+    );
+    assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    let state = PostgresStorage::connect_protected(&f.database, read_keyring(&keys).unwrap())
+        .unwrap()
+        .load(&f.namespace)
+        .unwrap()
+        .state;
+    assert_eq!(
+        serde_json::to_value(state).unwrap(),
+        serde_json::to_value(before).unwrap()
+    );
+}
+#[test]
 fn protected_admin_lifecycle_control_recovery_rotation_and_paged_inspection() {
     let f = Fixture::new();
     let scenario = pilots::scenario("routing").unwrap();

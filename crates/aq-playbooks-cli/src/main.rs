@@ -4,7 +4,8 @@ use aq_playbooks_compiler::{CompileInput, compile, semantic_diff, validate};
 use aq_playbooks_model::{Artifact, Registry, canonical_bytes};
 use aq_playbooks_postgres::PostgresStorage;
 use aq_playbooks_runner::{
-    Authority, Engine, InspectionKind, InspectionQuery, RetentionPolicy, Storage,
+    Authority, CatalogKind, CatalogQuery, Engine, InspectionKind, InspectionQuery, RetentionPolicy,
+    Storage,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -115,6 +116,22 @@ enum Command {
         #[command(flatten)]
         store: StoreArgs,
     },
+    /// Inspect current metadata while explicitly owning an existing idle namespace.
+    /// Fails rather than stealing another process's lease. Never admits/drives work.
+    InspectCatalog {
+        #[arg(long, value_enum, default_value = "definitions")]
+        kind: CatalogInspectKind,
+        #[arg(long)]
+        exact: Option<String>,
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+        #[arg(long, default_value_t = 1)]
+        pages: usize,
+        #[arg(long, required = true)]
+        acquire_idle_namespace: bool,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
     Cancel {
         run: String,
         #[command(flatten)]
@@ -193,6 +210,19 @@ enum InspectKind {
     Runs,
     Effects,
     Receipts,
+}
+#[derive(Clone, Copy, ValueEnum)]
+enum CatalogInspectKind {
+    Definitions,
+    Activations,
+}
+impl From<CatalogInspectKind> for CatalogKind {
+    fn from(kind: CatalogInspectKind) -> Self {
+        match kind {
+            CatalogInspectKind::Definitions => Self::Definitions,
+            CatalogInspectKind::Activations => Self::Activations,
+        }
+    }
 }
 impl From<InspectKind> for InspectionKind {
     fn from(value: InspectKind) -> Self {
@@ -428,6 +458,57 @@ fn execute(cli: Cli) -> Result<()> {
                     limit,
                 },
             )?)
+        }
+        Command::InspectCatalog {
+            kind,
+            exact,
+            limit,
+            pages,
+            acquire_idle_namespace,
+            store,
+        } => {
+            anyhow::ensure!(
+                acquire_idle_namespace && (1..=4).contains(&pages),
+                "explicit idle ownership and 1..4 pages required"
+            );
+            let mut query = CatalogQuery::first(kind.into(), limit);
+            query.exact = exact;
+            query.validate()?;
+            let db = connect_store(&store)?;
+            anyhow::ensure!(
+                db.incarnation(&store.namespace)?.is_some(),
+                "catalog namespace does not exist"
+            );
+            let e = Engine::new(
+                db,
+                &store.namespace,
+                format!(
+                    "catalog-cli-{}-{}",
+                    std::process::id(),
+                    SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+                ),
+            )?;
+            let observed = (|| -> Result<Vec<_>> {
+                let mut output = Vec::with_capacity(pages);
+                for _ in 0..pages {
+                    let page = e.inspect_catalog(&query)?;
+                    query.after = page.next_cursor.clone();
+                    query.expected = Some(page.stamp.clone());
+                    output.push(page);
+                    if query.after.is_none() {
+                        break;
+                    }
+                }
+                Ok(output)
+            })();
+            let released = e.release();
+            let observed = observed?;
+            released?;
+            if pages == 1 {
+                print(&observed[0])
+            } else {
+                print(&observed)
+            }
         }
         Command::Controls {
             binding,
