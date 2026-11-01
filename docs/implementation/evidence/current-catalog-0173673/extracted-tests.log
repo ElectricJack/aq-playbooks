@@ -1,0 +1,260 @@
+   Compiling aq-playbooks-postgres v0.1.3 (/tmp/aq-playbooks-current-catalog-extracted-0173673/crates/aq-playbooks-postgres)
+   Compiling aq-playbooks-compiler v0.1.0 (/tmp/aq-playbooks-current-catalog-extracted-0173673/crates/aq-playbooks-compiler)
+   Compiling aq-playbooks-runner v0.1.3 (/tmp/aq-playbooks-current-catalog-extracted-0173673/crates/aq-playbooks-runner)
+   Compiling aq-playbooks-cli v0.1.3 (/tmp/aq-playbooks-current-catalog-extracted-0173673/crates/aq-playbooks-cli)
+    Finished `test` profile [unoptimized] target(s) in 9.88s
+     Running unittests src/lib.rs (/tmp/aq-native-union-target/debug/deps/aq_playbooks_cli-b36174e71cf66975)
+
+running 18 tests
+test configuration::tests::rejects_nonhex_wrong_lengths_and_unicode_without_echoing_input ... ok
+test configuration::tests::secret_error_contains_no_key_data ... ok
+test catalog::tests::catalog_is_exact_and_closed ... ok
+test fake_host::tests::host_calendar_occurrences_pin_timezone_misfire_and_configuration_across_restart ... ok
+test fake_host::tests::findings_host_commit_and_recipient_ack_crashes_keep_one_notification ... ok
+test fake_host::tests::partial_observation_can_add_positive_findings_without_clearing_unseen_episodes ... ok
+test fake_host::tests::findings_require_exact_host_evaluation_and_fake_refuses_other_scopes ... ok
+test fake_host::tests::missing_fake_checks_and_decisions_remain_unknown_and_revocation_prevents_replay ... ok
+test fake_host::tests::publication_requires_exact_revision_evidence_and_current_destination ... ok
+test fake_host::tests::partial_expired_stale_or_invisible_observations_cannot_clear_findings ... ok
+test fake_host::tests::findings_suppress_unchanged_then_remind_and_clear_from_complete_fresh_baselines ... ok
+test fake_host::tests::fresh_base_reads_capture_authoritative_revision_and_preserve_named_snapshot ... ok
+test fake_host::tests::finite_frozen_context_pages_and_report_work_respect_visibility ... ok
+test fake_host::tests::competing_holds_require_each_owners_release_and_publication_reconciles_once ... ok
+test pilots::tests::missing_mock_is_not_success ... ok
+test pilots::tests::report_fallback_and_late_author_publish_once ... ok
+test pilots::tests::coding_conflict_repairs_and_starts_independent_followup ... ok
+test pilots::tests::all_four_pilots_compile_and_execute ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.25s
+
+     Running unittests src/main.rs (/tmp/aq-native-union-target/debug/deps/aq_playbooks-29b881e5a7cbacb9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/admin_cli.rs (/tmp/aq-native-union-target/debug/deps/admin_cli-154685adb198f487)
+
+running 3 tests
+test key_file_permissions_and_invalid_configuration_fail_closed ... ok
+test current_catalog_requires_explicit_idle_ownership_and_never_admits_work ... ok
+test protected_admin_lifecycle_control_recovery_rotation_and_paged_inspection ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.90s
+
+     Running tests/cli.rs (/tmp/aq-native-union-target/debug/deps/cli-deffec94d27e070a)
+
+running 2 tests
+test finite_catalog_and_required_explicit_store ... ok
+test offline_cli_round_trip_and_invalid_input_exit ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests/host_pilots.rs (/tmp/aq-native-union-target/debug/deps/host_pilots-9c893617e794c76e)
+
+running 8 tests
+test every_pilot_uses_the_same_twelve_captured_host_contracts ... ok
+test watcher_reconciles_host_attested_observation_and_recovers_atomic_notifications ... ok
+test watcher_partial_positive_scan_keeps_unseen_episode_open ... ok
+test routing_uses_authorized_assessment_and_host_revision_preconditions ... ok
+test report_deadline_cancels_owned_author_and_late_completion_keeps_one_message ... ok
+test coding_admission_and_completed_review_with_changes_cannot_publish ... ok
+test coding_requires_explicit_accepted_review_and_exact_check_before_independent_followup ... ok
+test coding_real_publication_conflict_observes_new_base_repairs_and_checks_new_candidate ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.44s
+
+     Running unittests src/lib.rs (/tmp/aq-native-union-target/debug/deps/aq_playbooks_postgres-d2377edf2699a7fe)
+
+running 16 tests
+test protection::tests::catalog_envelopes_bind_namespace_kind_address_revision_key_and_domain ... ok
+test protection::tests::authenticated_context_nonce_and_key_rotation ... ok
+test indexes::projection_tests::borrowed_deltas_preserve_last_duplicate_identity_and_redaction_semantics ... ok
+test indexes::projection_tests::borrowed_deltas_match_reference_for_empty_unchanged_and_materialization ... ok
+test indexes::projection_field_tests::source_field_mutations_cannot_change_projection_without_being_detected ... ok
+test indexes::projection_tests::borrowed_deltas_match_reference_for_scopes_removals_offsets_and_private_edits ... ok
+test catalog_tests::actual_committed_reply_loss_holds_catalog_until_verified_boundary ... ok
+test catalog_tests::catalog_pages_are_atomic_and_unrelated_progress_preserves_metadata_stamp ... ok
+test catalog_tests::restricted_role_can_read_catalog_but_cannot_read_snapshot_or_artifact_columns ... ok
+test catalog_tests::database_fences_format1_writer_before_state_or_projection_can_change ... ok
+test catalog_tests::owner_cannot_move_foreign_namespace_rows_or_rebind_catalog_addresses ... ok
+test catalog_tests::lost_connection_and_successor_incarnation_cannot_use_cached_catalog ... ok
+test catalog_tests::projection_writes_roll_back_with_failed_state_commit_and_null_heads_are_refused ... ok
+test catalog_tests::missing_rows_refuse_reads_and_cas_without_repair_and_counts_are_guarded ... ok
+test catalog_tests::protected_catalog_bytes_context_rotation_and_tampering_are_fenced ... ok
+test catalog_tests::byte_pages_are_bounded_over_private_history_and_no_snapshot_read_is_needed ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.86s
+
+     Running tests/keyed_admission.rs (/tmp/aq-native-union-target/debug/deps/keyed_admission-b205dfcc7d02cc21)
+
+running 2 tests
+test already_open_unmarked_writer_is_fenced_and_transaction_marker_cannot_leak ... ok
+test protected_keyed_receipt_survives_restart_and_cannot_be_rewritten ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running tests/persistence.rs (/tmp/aq-native-union-target/debug/deps/persistence-0d2f978b37eb7997)
+
+running 8 tests
+test abrupt_process_helper ... ok
+test concurrent_compare_and_swap_has_one_winner ... ok
+test exclusive_connection_ownership_and_incarnations ... ok
+test failure_after_artifact_inserts_rolls_back_the_entire_boundary ... ok
+test artifacts_cannot_be_replaced_removed_or_corrupted ... ok
+test abrupt_process_death_preserves_commit_and_rolls_back_inflight_transaction ... ok
+test complete_boundary_survives_reopen_and_artifacts_are_stored_once ... ok
+test terminated_database_session_cannot_continue_writing ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+     Running tests/protected_indexes.rs (/tmp/aq-native-union-target/debug/deps/protected_indexes-2f72161bf1a5b609)
+
+running 18 tests
+test forged_disposal_cannot_erase_unresolved_children_or_external_effects ... ok
+test native_indexes_match_memory_and_inspection_uses_bounded_keyset_pages ... ok
+test protected_reuse_preserves_nonce_but_explicit_same_key_refresh_and_tamper_checks_remain ... ok
+test authenticated_payload_tampering_never_falls_back_to_plaintext ... ok
+test unchanged_commit_reuses_only_freshly_verified_bytes_and_has_bounded_value_free_profile ... ok
+test disposal_quota_refuses_atomically_and_expired_unreferenced_artifact_metadata_is_collected ... ok
+test native_same_scope_recovery_head_rotates_and_unchanged_history_rows_are_not_rewritten ... ok
+test concurrent_inspection_revision_and_materialized_rows_commit_together ... ok
+test ordinary_commit_with_new_active_key_refreshes_unchanged_artifacts ... ok
+test protected_snapshots_artifacts_and_safe_projection_have_no_plaintext_values ... ok
+test artifact_gc_and_installation_race_preserves_shared_bytes_and_disposal_records ... ok
+test version_one_schema_upgrades_without_losing_state_and_owner_materializes_indexes ... ok
+test rotation_reencrypts_snapshot_and_artifacts_and_old_backups_require_old_keys ... ok
+test enabling_protection_removes_plaintext_only_after_every_referencing_namespace_is_protected ... ok
+test actual_engine_requires_protection_before_admission_and_encrypts_sensitive_dispatch_and_output ... ok
+test event_gc_replay_tombstones_survive_restart_and_explicit_new_epoch_has_new_identity ... ok
+test ordered_batch_catalog_locks_serialize_multi_artifact_installation_with_gc ... ok
+test mixed_existing_and_new_catalog_batches_commit_without_lock_inversion ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.29s
+
+     Running unittests src/lib.rs (/tmp/aq-native-union-target/debug/deps/aq_playbooks_runner-fa0b63db1d6d8801)
+
+running 5 tests
+test inspection::tests::unbounded_or_invalid_pages_refused ... ok
+test metrics::tests::distribution_has_bounded_buckets_and_saturating_totals ... ok
+test inspection::tests::receipt_pages_are_stable_and_hide_private_diagnostics ... ok
+test metrics::tests::repeated_owner_readback_does_not_skew_command_latencies ... ok
+test metrics::tests::refusal_and_store_timings_are_observable_without_payloads ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/catalog_inspection.rs (/tmp/aq-native-union-target/debug/deps/catalog_inspection-8afad225434793b7)
+
+running 7 tests
+test decimal_contexts_are_lossless_and_malformed_queries_are_closed ... ok
+test wrappers_without_catalog_support_never_fall_back_to_loading_secrets ... ok
+test release_and_reacquire_even_same_owner_refuse_previous_incarnation ... ok
+test unsupported_metadata_does_not_change_existing_state_mutation_semantics ... ok
+test unrelated_state_progress_preserves_stamp_but_catalog_changes_refuse_old_pages ... ok
+test exact_metadata_and_controls_are_owned_bounded_and_private_values_are_omitted ... ok
+test byte_limited_pages_preserve_every_item_and_never_download_unbounded_metadata ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+
+     Running tests/keyed_admission.rs (/tmp/aq-native-union-target/debug/deps/keyed_admission-f4e74b897bfc0470)
+
+running 8 tests
+test legacy_snapshot_without_receipts_decodes_without_inventing_admissions ... ok
+test full_quotas_refuse_new_atomic_admission_without_blocking_exact_lookup ... ok
+test simultaneous_same_key_cas_has_one_commit_and_exact_recovery ... ok
+test first_admission_fences_future_revision_and_revoked_authority_but_history_remains ... ok
+test replay_is_read_only_and_changed_payload_authority_and_revision_conflict ... ok
+test before_cas_refusal_is_atomic_and_after_commit_unknown_replays_after_restart ... ok
+test gc_and_direct_storage_cas_cannot_forget_or_rebind_a_key ... ok
+test bounds_and_activation_ceiling_refuse_before_retention ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/review_regressions.rs (/tmp/aq-native-union-target/debug/deps/review_regressions-78c15109675e5f67)
+
+running 26 tests
+test ingress_rejects_missing_declared_subject_revision_and_correlation ... ok
+test persisted_protection_flag_cannot_override_the_actual_storage_provider ... ok
+test t18_protected_output_contract_is_refused_before_external_dispatch ... ok
+test retired_producer_epochs_need_no_new_tombstones_for_late_gc ... ok
+test garbage_collection_bounds_preserved_candidate_examination ... ok
+test expired_replay_tombstones_and_retired_epochs_refuse_old_identities ... ok
+test t17_quota_refusal_retains_prior_event_artifacts_and_destinations ... ok
+test garbage_collection_preserves_transitively_bound_artifacts_without_runs ... ok
+test retained_event_before_wait_is_driven_after_restart_without_manual_wakeup ... ok
+test aggregate_concurrent_children_include_independent_roots ... ok
+test t13_independent_calls_consume_origin_budget_without_becoming_owned ... ok
+test recovery_obeys_current_engine_authority_revocation ... ok
+test command_payloads_obey_tighter_run_limits_on_both_sides ... ok
+test t26_nested_captured_iteration_consumes_shared_budget_and_restores_lexical_roots ... ok
+test t18_receipts_default_deny_result_fields_and_refuse_protected_inputs_before_intent ... ok
+test t12_any_join_uses_recorded_acceptance_order_and_tracks_unselected_children ... ok
+test catalog_dependencies_reject_incompatible_versions_new_capabilities_and_digest_exclusions ... ok
+test t6_partial_fanout_restarts_with_frozen_destinations_and_no_duplicate_runs ... ok
+test execution_revocation_blocks_prepared_dispatch_without_discarding_the_intent ... ok
+test completed_children_before_join_remain_drivable_after_restart ... ok
+test catalog_dependencies_select_compatible_versions_once_then_pin_across_restart ... ok
+test unresolved_recovery_rotates_participants_within_one_scope ... ok
+test t4_transitive_dependency_bytes_stay_pinned_after_activation_and_restart ... ok
+test completed_cohort_gc_removes_ready_timer_and_dependency_index_residue ... ok
+test tiny_driver_batches_fairly_interleave_runnable_steps_and_prepared_effects ... ok
+test named_heterogeneous_join_results_feed_a_typed_command_and_return ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/semantics.rs (/tmp/aq-native-union-target/debug/deps/semantics-4dc44e3b9c75a782)
+
+running 32 tests
+test memory_store_cas_and_owner_fence_full_boundary ... ok
+test gc_tombstones_expired_event_identity_and_epoch_fence_compacts_safely ... ok
+test history_budget_stops_without_disposing_existing_records ... ok
+test failed_transition_commit_has_no_partial_intent_and_never_dispatches ... ok
+test expiry_wins_over_late_event_and_identity_conflicts ... ok
+test event_before_wait_restart_stale_revision_and_backlog_deadline ... ok
+test invalid_host_output_blocks_with_a_safe_durable_receipt ... ok
+test losing_namespace_ownership_prevents_reconciliation_handoff ... ok
+test activation_controls_separate_calls_events_and_current_execution ... ok
+test missing_dependency_destination_is_durably_blocked_then_resumes_exact_bytes ... ok
+test pruned_general_wait_history_refuses_registration_and_captured_replay_horizon_survives_policy_change ... ok
+test simulation_missing_mock_is_unknown_and_incomplete ... ok
+test protected_root_and_transitive_inputs_are_refused_before_any_snapshot_write ... ok
+test exhausted_step_budget_finishes_once_without_reentering_error_graph ... ok
+test protected_event_fields_and_protected_trigger_closures_refuse_payload_persistence ... ok
+test command_deadline_refuses_unissued_effect_and_preserves_issued_uncertainty ... ok
+test bounded_driver_uses_persisted_fair_scope_queue_and_noop_does_not_commit ... ok
+test accepted_recovery_does_not_uncancel_a_run_or_bypass_revoked_authority ... ok
+test producer_epoch_compaction_keeps_history_fences_for_existing_invocations ... ok
+test unsafe_ambiguity_is_never_automatically_repeated_or_cancelled ... ok
+test durable_intent_replay_keeps_id_business_retry_creates_new_id ... ok
+test unsafe_recovery_requires_audited_request_and_preserves_original_authority ... ok
+test confirmed_async_admission_recovery_resumes_accepted_branch_before_completion ... ok
+test gc_preserves_bound_transitive_closure_then_collects_terminal_cohorts_in_pages ... ok
+test gc_preserves_possible_async_completion_while_lost_admission_handle_is_unknown ... ok
+test owned_operation_join_uses_exact_pinned_completion_and_retained_admission ... ok
+test iteration_failure_policy_skips_or_stops_without_resetting_captured_membership ... ok
+test timeout_fallback_waits_for_truthful_owned_operation_cancellation ... ok
+test all_three_child_modes_are_atomic_and_independent_cancellation_survives ... ok
+test cancellation_dispatch_crashes_reconcile_owner_before_same_key_delivery_retry ... ok
+test retry_allowances_are_scoped_to_full_loop_invocation_paths ... ok
+test operation_join_deadline_uses_ingress_time_even_when_processing_is_late ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+   Doc-tests aq_playbooks_cli
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests aq_playbooks_postgres
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests aq_playbooks_runner
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

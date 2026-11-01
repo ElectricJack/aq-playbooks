@@ -1,0 +1,6 @@
+    Checking aq-playbooks-model v0.1.0 (/tmp/aq-playbooks-current-catalog-extracted-0173673/crates/aq-playbooks-model)
+    Checking aq-playbooks-runner v0.1.3 (/tmp/aq-playbooks-current-catalog-extracted-0173673/crates/aq-playbooks-runner)
+    Checking aq-playbooks-compiler v0.1.0 (/tmp/aq-playbooks-current-catalog-extracted-0173673/crates/aq-playbooks-compiler)
+    Checking aq-playbooks-postgres v0.1.3 (/tmp/aq-playbooks-current-catalog-extracted-0173673/crates/aq-playbooks-postgres)
+    Checking aq-playbooks-cli v0.1.3 (/tmp/aq-playbooks-current-catalog-extracted-0173673/crates/aq-playbooks-cli)
+    Finished `dev` profile [unoptimized] target(s) in 6.54s
