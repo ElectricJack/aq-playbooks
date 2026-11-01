@@ -64,7 +64,9 @@ subsequently inspected.
 Migration 4 adds component-owned catalog rows and namespace projection/revision
 markers. Native keyset indexes bound requested metadata reads. Projection rows
 are derived from State and updated/deleted inside the existing owner-validated
-State CAS transaction. The first owned CAS backfills a namespace once; read
+State CAS transaction. The database refuses row-identity changes (namespace,
+kind or address), including moving a foreign namespace row into an owned one.
+The first owned CAS backfills a namespace once; read
 paths never backfill or scan/decrypt the snapshot. Retention/GC removes metadata
 only when its authoritative artifact/binding is removed in that same CAS.
 
