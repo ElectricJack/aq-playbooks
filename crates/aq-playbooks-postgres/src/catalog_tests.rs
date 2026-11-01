@@ -411,7 +411,7 @@ fn restricted_role_can_read_catalog_but_cannot_read_snapshot_or_artifact_columns
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     );
     let mut admin = client();
-    admin.batch_execute(&format!("CREATE ROLE {role} NOLOGIN; GRANT USAGE ON SCHEMA aq_playbooks TO {role}; GRANT SELECT(namespace,revision,owner,incarnation,owner_backend_pid,writer_format,catalog_projected_revision,catalog_metadata_revision,catalog_supported,protection_key_id),UPDATE(owner) ON aq_playbooks.namespaces TO {role}; GRANT SELECT ON aq_playbooks.catalog_rows TO {role};")).unwrap();
+    admin.batch_execute(&format!("CREATE ROLE {role} NOLOGIN; GRANT USAGE ON SCHEMA aq_playbooks TO {role}; GRANT SELECT(namespace,revision,owner,incarnation,owner_backend_pid,writer_format,catalog_projected_revision,catalog_metadata_revision,catalog_supported,protection_key_id,catalog_definition_count,catalog_activation_count,catalog_actual_definition_count,catalog_actual_activation_count),UPDATE(owner) ON aq_playbooks.namespaces TO {role}; GRANT SELECT ON aq_playbooks.catalog_rows TO {role};")).unwrap();
     {
         store
             .connection()
@@ -508,4 +508,80 @@ fn owner_cannot_move_foreign_namespace_rows_or_rebind_catalog_addresses() {
             1
         );
     }
+}
+
+#[test]
+fn missing_rows_refuse_reads_and_cas_without_repair_and_counts_are_guarded() {
+    let (store, n, state) = seeded("catalog-missing-row", true);
+    let query = CatalogQuery::first(CatalogKind::Definitions, 25);
+    let before = store.inspect_catalog(&n, "owner", &query).unwrap();
+    let head = || {
+        client().query_one("SELECT revision,catalog_projected_revision,catalog_definition_count,catalog_actual_definition_count,catalog_activation_count,catalog_actual_activation_count FROM aq_playbooks.namespaces WHERE namespace=$1", &[&n]).unwrap()
+    };
+    let original = head();
+    for column in [
+        "revision",
+        "catalog_projected_revision",
+        "catalog_definition_count",
+        "catalog_actual_definition_count",
+        "catalog_activation_count",
+        "catalog_actual_activation_count",
+    ] {
+        assert_eq!(original.get::<_, i64>(column), 1);
+    }
+    {
+        let mut conn = store.connection().unwrap();
+        // Row and trigger-maintained count disappear together on rollback.
+        let mut tx = conn.client.transaction().unwrap();
+        tx.query_one(WRITE_MARKER_SQL, &[&n]).unwrap();
+        tx.execute(
+            "DELETE FROM aq_playbooks.catalog_rows WHERE namespace=$1 AND kind='definitions'",
+            &[&n],
+        )
+        .unwrap();
+        assert_eq!(tx.query_one("SELECT catalog_actual_definition_count FROM aq_playbooks.namespaces WHERE namespace=$1", &[&n]).unwrap().get::<_,i64>(0),0);
+        tx.rollback().unwrap();
+        // TRUNCATE cannot bypass row transitions, even from the live owner.
+        let mut tx = conn.client.transaction().unwrap();
+        tx.query_one(WRITE_MARKER_SQL, &[&n]).unwrap();
+        assert!(
+            tx.batch_execute("TRUNCATE aq_playbooks.catalog_rows")
+                .is_err()
+        );
+    }
+    assert_eq!(
+        store.inspect_catalog(&n, "owner", &query).unwrap().items,
+        before.items
+    );
+    {
+        let mut conn = store.connection().unwrap();
+        let mut tx = conn.client.transaction().unwrap();
+        tx.query_one(WRITE_MARKER_SQL, &[&n]).unwrap();
+        tx.execute(
+            "DELETE FROM aq_playbooks.catalog_rows WHERE namespace=$1 AND kind='definitions'",
+            &[&n],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        // A direct counter/header reset cannot disguise the missing row.
+        for sql in [
+            "UPDATE aq_playbooks.namespaces SET catalog_actual_definition_count=1 WHERE namespace=$1",
+            "UPDATE aq_playbooks.namespaces SET catalog_definition_count=0 WHERE namespace=$1",
+        ] {
+            let mut tx = conn.client.transaction().unwrap();
+            tx.query_one(WRITE_MARKER_SQL, &[&n]).unwrap();
+            assert!(tx.execute(sql, &[&n]).is_err());
+        }
+    }
+    assert!(
+        matches!(store.inspect_catalog(&n, "owner", &query),Err(CatalogError::Backend(reason)) if reason.contains("row count mismatch"))
+    );
+    assert!(
+        matches!(store.compare_and_swap(&n,"owner",1,&state),Err(StorageError::Backend(reason)) if reason.contains("row count mismatch"))
+    );
+    let missing = head();
+    assert_eq!(missing.get::<_, i64>("revision"), 1);
+    assert_eq!(missing.get::<_, i64>("catalog_definition_count"), 1);
+    assert_eq!(missing.get::<_, i64>("catalog_actual_definition_count"), 0);
+    assert_eq!(client().query_one("SELECT count(*) FROM aq_playbooks.catalog_rows WHERE namespace=$1 AND kind='definitions'", &[&n]).unwrap().get::<_,i64>(0),0, "CAS must refuse rather than repair missing rows");
 }

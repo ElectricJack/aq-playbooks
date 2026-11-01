@@ -46,7 +46,17 @@ success is returned for absent ownership, lost connection, stale incarnation or
 unmaterialized/mismatched projection.
 
 Each CAS updates the catalog's **projected state revision** to the same namespace
-revision as its authoritative snapshot. Reads require equality. A separate
+revision as its authoritative snapshot. Reads require equality. CAS also publishes
+expected definition/activation counts; INSERT/DELETE triggers separately maintain
+actual counts. Reads and the next CAS compare these fixed headers without COUNT
+or a row/snapshot scan. A missing row therefore refuses rather than becoming an
+empty/partial success, and an unchanged CAS refuses rather than repairing it.
+Row/count rollback is atomic; TRUNCATE and direct actual-counter writes are
+refused. Expected counts cannot change while retaining the same State head.
+The final State publication requires actual counts to equal the new expectation.
+This catches missing-row faults with the qualified triggers enabled, not hostile
+schema-owner disabling of guards or replay of arbitrary previously valid encrypted
+rows. It is not a cryptographic integrity claim against a malicious DBA. A separate
 **metadata revision** changes only when visible catalog metadata changes or the
 projection is first materialized. This avoids invalidating catalog pagination
 on every unrelated run transition.
