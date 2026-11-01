@@ -52,6 +52,9 @@ CREATE TABLE aq_playbooks.catalog_rows (
 CREATE FUNCTION aq_playbooks.check_catalog_writer() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE n text;
 BEGIN
+    IF TG_OP='UPDATE' AND (NEW.namespace,NEW.kind,NEW.item_key) IS DISTINCT FROM (OLD.namespace,OLD.kind,OLD.item_key) THEN
+        RAISE EXCEPTION 'current catalog row identity is immutable';
+    END IF;
     IF TG_OP='DELETE' THEN n:=OLD.namespace; ELSE n:=NEW.namespace; END IF;
     IF current_setting('aq_playbooks.writer_namespace',true) IS DISTINCT FROM n
        OR current_setting('aq_playbooks.writer_format',true) IS DISTINCT FROM '2'

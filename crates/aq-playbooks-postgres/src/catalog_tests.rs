@@ -467,3 +467,45 @@ fn database_fences_format1_writer_before_state_or_projection_can_change() {
     assert_eq!(after.stamp, before.stamp);
     assert_eq!(after.items, before.items);
 }
+
+#[test]
+fn owner_cannot_move_foreign_namespace_rows_or_rebind_catalog_addresses() {
+    let (owner, own, _) = seeded("catalog-own-identity", true);
+    let (foreign, other, _) = seeded("catalog-foreign-identity", true);
+    let mut conn = owner.connection().unwrap();
+    for (sql, values) in [
+        (
+            "UPDATE aq_playbooks.catalog_rows SET namespace=$1 WHERE namespace=$2",
+            vec![&own, &other],
+        ),
+        (
+            "UPDATE aq_playbooks.catalog_rows SET kind='activations' WHERE namespace=$1 AND kind='definitions'",
+            vec![&own],
+        ),
+        (
+            "UPDATE aq_playbooks.catalog_rows SET item_key='sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff' WHERE namespace=$1 AND kind='definitions'",
+            vec![&own],
+        ),
+    ] {
+        let mut tx = conn.client.transaction().unwrap();
+        tx.query_one(WRITE_MARKER_SQL, &[&own]).unwrap();
+        let params: Vec<&(dyn postgres::types::ToSql + Sync)> =
+            values.into_iter().map(|value| value as _).collect();
+        assert!(tx.execute(sql, &params).is_err());
+    }
+    drop(conn);
+    for (store, namespace) in [(owner, own), (foreign, other)] {
+        assert_eq!(
+            store
+                .inspect_catalog(
+                    &namespace,
+                    "owner",
+                    &CatalogQuery::first(CatalogKind::Definitions, 25)
+                )
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+    }
+}
