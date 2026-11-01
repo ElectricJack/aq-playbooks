@@ -10,6 +10,8 @@ pub(crate) struct Head {
     pub revision: i64,
     pub metadata_revision: i64,
     pub supported: bool,
+    pub definition_count: i64,
+    pub activation_count: i64,
 }
 
 pub(crate) struct Sync<'a> {
@@ -67,6 +69,8 @@ pub(crate) fn sync(
             revision,
             metadata_revision,
             supported: false,
+            definition_count: 0,
+            activation_count: 0,
         });
     };
     if let Some(previous) = &previous_rows {
@@ -112,6 +116,18 @@ pub(crate) fn sync(
         revision,
         metadata_revision,
         supported: true,
+        definition_count: next_rows
+            .keys()
+            .filter(|(kind, _)| *kind == catalog_inspection::CatalogKind::Definitions)
+            .count()
+            .try_into()
+            .map_err(backend)?,
+        activation_count: next_rows
+            .keys()
+            .filter(|(kind, _)| *kind == catalog_inspection::CatalogKind::Activations)
+            .count()
+            .try_into()
+            .map_err(backend)?,
     })
 }
 
@@ -137,7 +153,7 @@ impl PostgresStorage {
             self.profiling.clone(),
             "catalog_read",
         );
-        let row = tx.query_opt("SELECT revision,owner,incarnation,owner_backend_pid=pg_backend_pid() AS same_backend,writer_format,catalog_projected_revision,catalog_metadata_revision,catalog_supported,protection_key_id FROM aq_playbooks.namespaces WHERE namespace=$1 FOR SHARE", &[&namespace]).map_err(backend)?.ok_or(CatalogError::Ownership)?;
+        let row = tx.query_opt("SELECT revision,owner,incarnation,owner_backend_pid=pg_backend_pid() AS same_backend,writer_format,catalog_projected_revision,catalog_metadata_revision,catalog_supported,protection_key_id,catalog_definition_count,catalog_activation_count,catalog_actual_definition_count,catalog_actual_activation_count FROM aq_playbooks.namespaces WHERE namespace=$1 FOR SHARE", &[&namespace]).map_err(backend)?.ok_or(CatalogError::Ownership)?;
         let advisory_key = lock_key(namespace) as u64;
         let (high, low) = (
             (advisory_key >> 32) as i64,
@@ -164,6 +180,7 @@ impl PostgresStorage {
                 "catalog projection revision mismatch".into(),
             ));
         }
+        validate_counts(&row)?;
         if !row.get::<_, bool>("catalog_supported") {
             return Err(CatalogError::Unsupported);
         }
@@ -245,4 +262,24 @@ impl PostgresStorage {
         tx.commit().map_err(backend)?;
         Ok(page)
     }
+}
+
+pub(crate) fn validate_counts(row: &postgres::Row) -> Result<(), StorageError> {
+    for (expected, actual) in [
+        (
+            "catalog_definition_count",
+            "catalog_actual_definition_count",
+        ),
+        (
+            "catalog_activation_count",
+            "catalog_actual_activation_count",
+        ),
+    ] {
+        let expected: i64 = row.get(expected);
+        let actual: i64 = row.get(actual);
+        if expected < 0 || actual < 0 || expected != actual {
+            return Err(backend("catalog projection row count mismatch"));
+        }
+    }
+    Ok(())
 }

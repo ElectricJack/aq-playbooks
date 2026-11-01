@@ -501,7 +501,7 @@ impl PostgresStorage {
         if !owns_lock {
             return Err(StorageError::Ownership);
         }
-        let row = tx.query_opt("SELECT revision,owner,incarnation,owner_backend_pid=pg_backend_pid(),snapshot,protection_key_id,protection_nonce,encrypted_snapshot,indexes_materialized,catalog_projected_revision,catalog_metadata_revision,catalog_supported FROM aq_playbooks.namespaces WHERE namespace=$1 FOR UPDATE", &[&namespace]).map_err(backend)?.ok_or(StorageError::Ownership)?;
+        let row = tx.query_opt("SELECT revision,owner,incarnation,owner_backend_pid=pg_backend_pid(),snapshot,protection_key_id,protection_nonce,encrypted_snapshot,indexes_materialized,catalog_projected_revision,catalog_metadata_revision,catalog_supported,catalog_definition_count,catalog_activation_count,catalog_actual_definition_count,catalog_actual_activation_count FROM aq_playbooks.namespaces WHERE namespace=$1 FOR UPDATE", &[&namespace]).map_err(backend)?.ok_or(StorageError::Ownership)?;
         if row.get::<_, Option<String>>(1).as_deref() != Some(owner)
             || row.get::<_, i64>(2) != incarnation
             || row.get::<_, Option<bool>>(3) != Some(true)
@@ -518,6 +518,7 @@ impl PostgresStorage {
         {
             return Err(backend("catalog projection revision mismatch"));
         }
+        catalog::validate_counts(&row)?;
         let refresh_artifacts = force_artifact_refresh
             || self.keyring.as_ref().is_some_and(|keys| {
                 row.get::<_, Option<String>>("protection_key_id").as_deref()
@@ -638,7 +639,12 @@ impl PostgresStorage {
         tx.phase("snapshot_encode");
         let snapshot = self.encode(namespace, next as u64, state)?;
         tx.phase("snapshot_write");
-        tx.execute("UPDATE aq_playbooks.namespaces SET snapshot=$2,protection_key_id=$3,protection_nonce=$4,encrypted_snapshot=$5,revision=$6,writer_format=2,indexes_materialized=true,catalog_projected_revision=$7,catalog_metadata_revision=$8,catalog_supported=$9,updated_at=clock_timestamp() WHERE namespace=$1",&[&namespace,&snapshot.plaintext,&snapshot.key_id,&snapshot.nonce,&snapshot.ciphertext,&next,&catalog.revision,&catalog.metadata_revision,&catalog.supported]).map_err(backend)?;
+        let published = tx.execute("UPDATE aq_playbooks.namespaces SET snapshot=$2,protection_key_id=$3,protection_nonce=$4,encrypted_snapshot=$5,revision=$6,writer_format=2,indexes_materialized=true,catalog_projected_revision=$7,catalog_metadata_revision=$8,catalog_supported=$9,catalog_definition_count=$10,catalog_activation_count=$11,updated_at=clock_timestamp() WHERE namespace=$1 AND catalog_actual_definition_count=$10 AND catalog_actual_activation_count=$11",&[&namespace,&snapshot.plaintext,&snapshot.key_id,&snapshot.nonce,&snapshot.ciphertext,&next,&catalog.revision,&catalog.metadata_revision,&catalog.supported,&catalog.definition_count,&catalog.activation_count]).map_err(backend)?;
+        if published != 1 {
+            return Err(backend(
+                "catalog projection row count mismatch before State publication",
+            ));
+        }
         if self.keyring.is_some() {
             let addresses: Vec<_> = state.artifacts.keys().cloned().collect();
             tx.execute("DELETE FROM aq_playbooks.artifacts a WHERE digest=ANY($1) AND NOT EXISTS(SELECT 1 FROM aq_playbooks.namespace_artifacts n JOIN aq_playbooks.namespaces s ON s.namespace=n.namespace WHERE n.digest=a.digest AND (s.protection_key_id IS NULL OR NOT EXISTS(SELECT 1 FROM aq_playbooks.encrypted_artifacts e WHERE e.namespace=n.namespace AND e.digest=n.digest)))",&[&addresses]).map_err(backend)?;
