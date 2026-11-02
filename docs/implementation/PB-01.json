@@ -1,0 +1,246 @@
+{
+  "schema_version": 1,
+  "task": "PB-01",
+  "repository": "aq-playbooks",
+  "qualified_at": "2026-10-30T23:57:22.517805+00:00",
+  "scope": "Disposable local integration candidate; no remote publication, production deployment, hosted credentials or live resources",
+  "acceptance": {
+    "status": "qualified_local_library_candidate",
+    "passed": [
+      "106 database-free tests",
+      "20 explicitly enabled PostgreSQL/admin CLI tests",
+      "strict lint and format after mechanical isolated normalization",
+      "release library/CLI builds and executable startup",
+      "indexed storage, protection rotation/tampering, retention/replay regressions"
+    ],
+    "excluded": [
+      "production AQ Host integration",
+      "PB-02 scale envelope",
+      "deployment protection approval",
+      "remote/registry publication"
+    ]
+  },
+  "source": {
+    "origin_head": "30385b7b355f277ea38ac603d0820722739b578d",
+    "origin_state": " M README.md\n M docs/specs/0001-aq-playbooks.md\n?? Cargo.lock\n?? Cargo.toml\n?? crates/\n?? docs/acceptance.md\n?? docs/aq-host-integration.md\n?? docs/scenario-dispositions.csv\n?? docs/specs/0002-implementation.md\n?? skills/\n",
+    "selection": "tracked plus nonignored untracked files; excludes new qualification evidence",
+    "candidate_commit": "921208a780e39c9d4cb68d5970d4f37b1e7a956b",
+    "inventory_sha256": "0074bf8588ba6156b8baa58cf5bda9e5a5bebf978d1f6c9100dc2c24ca75d5a6",
+    "inventory": "source-inventory.json",
+    "archive": "source.tar.gz",
+    "git_bundle": "source.bundle",
+    "normalization": "cargo clippy --fix (eight collapsible-if transformations), cargo fmt --all; five files only; original checkout untouched"
+  },
+  "build": {
+    "binding": "Locally observed build from inventoried isolated source; all inventoried files verified unchanged after checks/build",
+    "host": "x86_64-unknown-linux-gnu",
+    "binary": "aq-playbooks",
+    "command": "CARGO_BUILD_JOBS=3 cargo build --workspace --release --locked",
+    "toolchain": "rustc.txt",
+    "git_version": "git version 2.43.0"
+  },
+  "checks": [
+    {
+      "name": "database-free core and synthetic pilots",
+      "command": "CARGO_BUILD_JOBS=3 cargo test --workspace --locked",
+      "exit_code": 0,
+      "log": "playbooks-tests-final.log",
+      "log_sha256": "5b390db971f03055deef9a04037df836e5dd97d55186260551ae7b044866e0da",
+      "tests": {
+        "passed": 106,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "name": "explicit isolated PostgreSQL and administrative CLI",
+      "command": "CARGO_BUILD_JOBS=3 crates/aq-playbooks-postgres/scripts/test-postgres.sh",
+      "exit_code": 0,
+      "log": "playbooks-postgres-final.log",
+      "log_sha256": "46d998f75ecf841c45d3e287be79f1175016c9e21ac8a70668da37642ffa905e",
+      "tests": {
+        "passed": 20,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "name": "strict lint",
+      "command": "CARGO_BUILD_JOBS=3 cargo clippy --workspace --all-targets --all-features -- -D warnings",
+      "exit_code": 0,
+      "log": "playbooks-clippy-final.log",
+      "log_sha256": "0dd68428014ee533e1b83fe86cf941396bab92afb093259d0a7f1914d606ec93"
+    },
+    {
+      "name": "format",
+      "command": "cargo fmt --all -- --check",
+      "exit_code": 0,
+      "log": "playbooks-format-final.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "release libraries and CLI",
+      "command": "CARGO_BUILD_JOBS=3 cargo build --workspace --release --locked",
+      "exit_code": 0,
+      "log": "playbooks-build-final.log",
+      "log_sha256": "c1c60e05f172080a562485ffdbb01fda33de329f7f95e2b1d61e89384ac349e5"
+    },
+    {
+      "name": "packaged CLI startup",
+      "command": "target/release/aq-playbooks --help",
+      "exit_code": 0,
+      "log": "playbooks-binary-help.log",
+      "log_sha256": "1fe2d13db9ea2f565dbc1d94787402d3c31fa72134961538821262ecfdd20e5f"
+    },
+    {
+      "name": "packaged artifact integrity and source replay",
+      "command": "sha256sum -c SHA256SUMS; clone source.bundle into fresh disposable checkout; unpack source.tar.gz; verify every source file against source-inventory.json and exact candidate commit; packaged executable --help",
+      "exit_code": 0,
+      "log": "artifact-verification.log",
+      "log_sha256": "4348f7b39c7b8816abf76e3bb0a98907b9955d98c7787abde83221b96d486498"
+    }
+  ],
+  "compatibility": {
+    "artifact_profile": "Exact source bundle/archive for Cargo library dependencies plus x86_64 Linux CLI and same-toolchain development rlibs; no registry publication or stable Rust ABI claim",
+    "versions": {
+      "crates": "0.1.0",
+      "artifact_format": 1,
+      "postgres_migrations": [
+        "0001",
+        "0002"
+      ]
+    },
+    "pin_policy": "Pin bundled commit and source/archive digest; do not substitute semver ranges or moving sibling path dependencies",
+    "host": {
+      "trait": [
+        "authorize",
+        "dispatch",
+        "reconcile",
+        "cancel"
+      ],
+      "authority": "Host owns policy, domain stores, operation/result deduplication, external effects and trusted event acceptance time; effects excluded from storage CAS",
+      "synthetic": "Twelve-command pilot catalog is FakeHost test code, not production AQ adapters"
+    },
+    "storage": {
+      "synchronous": true,
+      "layout": "Whole namespace snapshot read/write plus same-transaction runtime/inspection SQL projections",
+      "ownership": "Session advisory locks, namespace revision CAS, backend PID and incarnation; no external service fencing after partition",
+      "tls": "from_client accepts host-configured synchronous postgres Client; connect convenience uses NoTls",
+      "default_limits": {
+        "max_runs": 10000,
+        "max_events": 100000,
+        "max_queued_destinations": 10000,
+        "max_state_bytes": 67108864,
+        "max_receipts": 1000000
+      }
+    },
+    "index_retention": "Bounded persisted discovery/inspection indexes, guarded incremental GC, artifact references/disposal records and replay tombstones; unresolved work and live references refuse disposal; explicit producer epoch advances replay identity",
+    "joins": "Serial foreach; async owned children/joins provide parallelism; dynamic join-result keys have restricted downstream typing",
+    "protection": {
+      "default": "Absent provider rejects protected command contracts; host must reject protected root values before persistence unless provider configured",
+      "optional": "ProtectionKeyring uses XChaCha20-Poly1305; snapshots/artifacts encrypted with authenticated namespace/revision or digest context; missing keys/tampering fail closed",
+      "keys": "Host supplies keys; rotation reencryption tested; retain retired keys with backups",
+      "projection": "Bounded public inspection excludes raw values; opaque scheduling/scope identifiers remain metadata"
+    },
+    "platform": "Ubuntu 24.04.4 / WSL2 x86_64, rustc 1.96.1, PostgreSQL 17.11, native glibc 2.39"
+  },
+  "limits": [
+    "Whole snapshot serialization and synchronous storage/host methods must stay off AQ async control handlers.",
+    "Large-history throughput, concurrent admission envelope, scheduling fairness and 500-agent product capacity are PB-02/PERF-01 work; no production scale claim.",
+    "PostgreSQL ownership does not fence external operations after a partition.",
+    "Exact dependency artifact pins required; no compatible-version solver or active-run migration.",
+    "Parallel foreach unsupported; dynamic join-key typing remains limited.",
+    "Protection is optional and requires host key lifecycle/backup controls and deployment qualification; fixture encryption tests do not certify a production KMS or all operational paths.",
+    "Fake-host pilots do not qualify production AQ commands, real worker execution, human decisions, hosted Git, calendars or notification transports.",
+    "Initial acceptance.md and postgres README describe pre-index/protection implementation; selected candidate metadata here supersedes those stale descriptions only for this snapshot.",
+    "Original repository source untouched; initial formatting and lint failures and isolated mechanical normalization patch retained.",
+    "Native CLI/rlibs are exact-toolchain Linux development artifacts; rebuild libraries from bundled pinned source; no native Windows/macOS or older libc qualification."
+  ],
+  "artifact_directory": "/home/jkern/dev/.aq-qualification/components-2026-10-30/aq-playbooks",
+  "artifacts": {
+    "aq-playbooks": {
+      "sha256": "b2d667384a99391abe35fc1a0af86c8b1dd31679e93e28c78e3c60e463ac2bad",
+      "bytes": 11155688
+    },
+    "artifact-verification.log": {
+      "sha256": "4348f7b39c7b8816abf76e3bb0a98907b9955d98c7787abde83221b96d486498",
+      "bytes": 737
+    },
+    "cargo.txt": {
+      "sha256": "e18efb6caebf2254f7da0f021489eb09bf5eed8f325435cee5c3fe128ba9824c",
+      "bytes": 36
+    },
+    "initial-candidate-normalization.patch": {
+      "sha256": "e646ae59c6cfe878ccf9e8c44d6defe5cb0e772873efdd13b694d1dbb232a745",
+      "bytes": 22770
+    },
+    "initial-clippy.log": {
+      "sha256": "0fbcf53f0e14e1b2789619ca7086ef25c9f603080928426882e6e366815ab81d",
+      "bytes": 8823
+    },
+    "initial-format.log": {
+      "sha256": "cee4c3b7bdb044c52029551d561e2f4930a6d786b439d30311974f0a39415a02",
+      "bytes": 14268
+    },
+    "libaq_playbooks_cli.rlib": {
+      "sha256": "fbd4b3a146beb79aaab0bde3329576881d1eef4774550f91b8156e8c721c7737",
+      "bytes": 7222606
+    },
+    "libaq_playbooks_compiler.rlib": {
+      "sha256": "0197b5f19c43148649bd9b5aaf3976f125c66ef9672792ba561779cc0b556025",
+      "bytes": 1194294
+    },
+    "libaq_playbooks_model.rlib": {
+      "sha256": "82daefcf892b97ca1ebe1a28ca0039e75d7060e94f9dd9a337fcc9b0c07aaae4",
+      "bytes": 7338792
+    },
+    "libaq_playbooks_postgres.rlib": {
+      "sha256": "58ff13b4c9c0ac4079de30f133a9ffb045ecbc15d43ce884a1abc749c795a1f1",
+      "bytes": 9507412
+    },
+    "libaq_playbooks_runner.rlib": {
+      "sha256": "26096a69e2e21190d224ed23292e42ab141a385dc3ce6c84a6fa52485c6d8f5d",
+      "bytes": 8349072
+    },
+    "playbooks-binary-help.log": {
+      "sha256": "1fe2d13db9ea2f565dbc1d94787402d3c31fa72134961538821262ecfdd20e5f",
+      "bytes": 1533
+    },
+    "playbooks-build-final.log": {
+      "sha256": "c1c60e05f172080a562485ffdbb01fda33de329f7f95e2b1d61e89384ac349e5",
+      "bytes": 433
+    },
+    "playbooks-clippy-final.log": {
+      "sha256": "0dd68428014ee533e1b83fe86cf941396bab92afb093259d0a7f1914d606ec93",
+      "bytes": 692
+    },
+    "playbooks-format-final.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "playbooks-postgres-final.log": {
+      "sha256": "46d998f75ecf841c45d3e287be79f1175016c9e21ac8a70668da37642ffa905e",
+      "bytes": 2863
+    },
+    "playbooks-tests-final.log": {
+      "sha256": "5b390db971f03055deef9a04037df836e5dd97d55186260551ae7b044866e0da",
+      "bytes": 12163
+    },
+    "rustc.txt": {
+      "sha256": "2af3376cb254e69564e00978cada767f05432a299af78300c47d14c103366c1e",
+      "bytes": 196
+    },
+    "source-inventory.json": {
+      "sha256": "8daad577175db98c230155e2b3fc62f2fa8fd0bbe9691fa842c60e04cd3c6f82",
+      "bytes": 7299
+    },
+    "source.bundle": {
+      "sha256": "f2ba88eb04a11b679d9d213d7fc9aa895af9f8bc77ac0cd96b50e96934acd24b",
+      "bytes": 451784
+    },
+    "source.tar.gz": {
+      "sha256": "e0d1ece9f30971f79403bafa4dd5219bd0f28d3640ad9692fee60db40eba2bf6",
+      "bytes": 424125
+    }
+  }
+}

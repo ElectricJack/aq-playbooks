@@ -21,10 +21,10 @@ adapters or central supervisor authority are already implemented.
 | `notifications` | Durable bounded human delivery and unknown recovery; human acknowledgment/decision, episode and report-window policy remain separate |
 | `observations`, `terminal` | Typed finite inspection/control seams; native source/runtime adoption and full waits/hibernation remain separately qualified |
 
-Current code registration is in [daemon lib.rs](../../agent-q/crates/aq-server/src/lib.rs).
-The detailed staged [AQ-12-through-17 plan](../../agent-q/docs/implementation/AQ-12-through-17-plan.md)
+Current code registration is in [daemon lib.rs](../../aq-server/crates/aq-server/src/lib.rs).
+The detailed staged [AQ-12-through-17 plan](../../aq-server/docs/implementation/AQ-12-through-17-plan.md)
 maps exact commands, authority, outbox/recovery and qualification gates. The
-shared [ecosystem ownership](../../agent-q/docs/architecture/0001-ecosystem-and-releases.md)
+shared [ecosystem ownership](../../aq-server/docs/architecture/0001-ecosystem-and-releases.md)
 still applies: AQ owns product/domain integration; the runner never reads AQ's
 private domain tables or recreates their state owners.
 
@@ -62,7 +62,7 @@ The synthetic contract catalog and stateful fake host in `aq-playbooks-cli` are 
 
 ### Session operations, waits and human delivery extension
 
-The required [AQ operations/waits design](../../agent-q/docs/architecture/0004-session-operations-waits-and-notifications.md)
+The required [AQ operations/waits design](../../aq-server/docs/architecture/0004-session-operations-waits-and-notifications.md)
 adds typed session/usage/wait/delivery context and events through versioned host
 catalogs. It preserves the twelve ordinary commands. `message.send` and
 `findings.reconcile` route through AQ's durable delivery services;
@@ -89,4 +89,4 @@ After AQ binds the existing owners and implements the remaining services, exerci
 
 ## Revision-pinned implementation evidence
 
-The [bounded v1 reference inventory](../../agent-q/docs/research/2026-10-30-v1-implementation-reference-map.md) records implementation symbols, selected test obligations and per-file hashes at revision `9a9b8e8ef992d1ff699755a9383ed3c91e2844ea`. It distinguishes preserved behavior from remote-authority and retention adaptations. This evidence informs the owning v2 tasks; replacement coverage and product qualification remain pending.
+The [bounded v1 reference inventory](../../aq-server/docs/research/2026-10-30-v1-implementation-reference-map.md) records implementation symbols, selected test obligations and per-file hashes at revision `9a9b8e8ef992d1ff699755a9383ed3c91e2844ea`. It distinguishes preserved behavior from remote-authority and retention adaptations. This evidence informs the owning v2 tasks; replacement coverage and product qualification remain pending.

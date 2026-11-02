@@ -5,7 +5,7 @@
 **Implementation language:** Rust  
 **Repository:** `aq-playbooks`
 
-Related designs: [SDLC policy exploration](../research/2026-10-30-sdlc-policy-exploration.md), [AQ foundation](../../../agent-q/docs/specs/0001-infrastructure-foundation.md), [worker framework](../../../aq-worker/docs/specs/0001-worker-framework.md), [aq-git](../../../aq-git/docs/specs/0001-aq-git.md), and [aq-graph integration](../../../aq-graph/docs/aq-integration.md).
+Related designs: [SDLC policy exploration](../research/2026-10-30-sdlc-policy-exploration.md), [AQ foundation](../../../aq-server/docs/specs/0001-infrastructure-foundation.md), [worker framework](../../../aq-worker/docs/specs/0001-worker-framework.md), [aq-git](../../../aq-git/docs/specs/0001-aq-git.md), and [aq-graph integration](../../../aq-graph/docs/aq-integration.md).
 
 The [v1 capability selection](../research/0001-v1-to-v2-capability-selection.md) provides the evidence for the twelve-command host surface and reusable workflows adopted here. The existing command inventory is not a compatibility checklist.
 
@@ -427,6 +427,8 @@ Backups capture the engine schema and its canonical artifact bytes consistently.
 Protected inputs/results are separated from public receipt projections. The host supplies protected-value/key facilities or the storage adapter provides an explicitly configured implementation. Production admission refuses persistence of required protected values if that facility is unavailable. The exact encryption/key-management binding is an open design choice; the first implementation must specify it before handling production secrets. Tests use synthetic data and must verify default-deny public projections.
 
 ## 15. AQ integration
+
+The [AQ ecosystem design](../../../aq-server/docs/architecture/0001-ecosystem-and-releases.md) defines library packaging and product release compatibility. The [shared execution lifecycle](../../../aq-server/docs/architecture/0002-execution-and-recovery.md) and [daemon execution/graph-access specification](../../../aq-server/docs/specs/0002-execution-and-agent-access.md) define attempt authority and durable graph delivery. The runner consumes domain outcomes through host contracts; it does not maintain a second assignment or task lifecycle.
 
 ### Orchestrator connection
 
