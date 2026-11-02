@@ -1,0 +1,278 @@
+    Blocking waiting for file lock on build directory
+   Compiling aq-playbooks-postgres v0.1.3 (/home/jkern/dev/aq-platform-agents/projects/aq-playbooks/.aq/worktrees/slot-0/crates/aq-playbooks-postgres)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 36.40s
+     Running unittests src/lib.rs (target/debug/deps/aq_playbooks_cli-3b13caae95682f67)
+
+running 20 tests
+test configuration::tests::secret_error_contains_no_key_data ... ok
+test configuration::tests::rejects_nonhex_wrong_lengths_and_unicode_without_echoing_input ... ok
+test catalog::tests::catalog_is_exact_and_closed ... ok
+test fake_host::tests::host_calendar_occurrences_pin_timezone_misfire_and_configuration_across_restart ... ok
+test fake_host::tests::partial_observation_can_add_positive_findings_without_clearing_unseen_episodes ... ok
+test fake_host::tests::findings_host_commit_and_recipient_ack_crashes_keep_one_notification ... ok
+test fake_host::tests::findings_suppress_unchanged_then_remind_and_clear_from_complete_fresh_baselines ... ok
+test fake_host::tests::async_decision_rejects_stale_responses_and_expires_or_cancels_truthfully ... ok
+test fake_host::tests::findings_require_exact_host_evaluation_and_fake_refuses_other_scopes ... ok
+test fake_host::tests::missing_fake_checks_remain_unknown_and_decision_revocation_prevents_replay ... ok
+test fake_host::tests::partial_expired_stale_or_invisible_observations_cannot_clear_findings ... ok
+test fake_host::tests::fresh_base_reads_capture_authoritative_revision_and_preserve_named_snapshot ... ok
+test fake_host::tests::publication_requires_exact_revision_evidence_and_current_destination ... ok
+test fake_host::tests::async_decision_admission_replay_completion_and_readback_are_distinct ... ok
+test pilots::tests::missing_mock_is_not_success ... ok
+test fake_host::tests::competing_holds_require_each_owners_release_and_publication_reconciles_once ... ok
+test fake_host::tests::finite_frozen_context_pages_and_report_work_respect_visibility ... ok
+test pilots::tests::report_fallback_and_late_author_publish_once ... ok
+test pilots::tests::coding_conflict_repairs_and_starts_independent_followup ... ok
+test pilots::tests::all_four_pilots_compile_and_execute ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.49s
+
+     Running unittests src/main.rs (target/debug/deps/aq_playbooks-190ebf4e7a4f9614)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/admin_cli.rs (target/debug/deps/admin_cli-6df2a797132e1a57)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/catalog_contract.rs (target/debug/deps/catalog_contract-4d0198ea9cb05ec4)
+
+running 2 tests
+test published_catalog_manifest_schemas_and_fixtures_are_pinned ... ok
+test published_replay_fixtures_retain_admission_and_reject_conflicting_reuse ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/cli.rs (target/debug/deps/cli-20dc7021db6e6e53)
+
+running 2 tests
+test finite_catalog_and_required_explicit_store ... ok
+test offline_cli_round_trip_and_invalid_input_exit ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.54s
+
+     Running tests/host_pilots.rs (target/debug/deps/host_pilots-5106ea13dd9e92ef)
+
+running 9 tests
+test watcher_partial_positive_scan_keeps_unseen_episode_open ... ok
+test every_pilot_uses_the_same_twelve_captured_host_contracts ... ok
+test watcher_reconciles_host_attested_observation_and_recovers_atomic_notifications ... ok
+test routing_uses_authorized_assessment_and_host_revision_preconditions ... ok
+test report_deadline_cancels_owned_author_and_late_completion_keeps_one_message ... ok
+test coding_admission_and_completed_review_with_changes_cannot_publish ... ok
+test coding_requires_explicit_accepted_review_and_exact_check_before_independent_followup ... ok
+test pilots_pass_on_reconciled_catalog ... ok
+test coding_real_publication_conflict_observes_new_base_repairs_and_checks_new_candidate ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.97s
+
+     Running unittests src/lib.rs (target/debug/deps/aq_playbooks_compiler-42fdcddfc1d455e2)
+
+running 17 tests
+test tests::any_completion_rejects_ignored_outcome_qualifier ... ok
+test tests::captured_definitions_and_source_identity_are_verified ... ok
+test tests::explicit_unknown_branch_and_typed_references ... ok
+test tests::finite_foreach_and_explicit_parallel_limitation ... ok
+test tests::named_join_no_match_does_not_inherit_success_output_refinement ... ok
+test tests::t2_questions_and_unsupported_features_never_package ... ok
+test tests::public_projection_supports_mixed_business_outcomes_without_exposing_protected_fields ... ok
+test tests::sensitive_event_fields_are_validated_and_fingerprinted_with_legacy_default ... ok
+test tests::outcome_edges_narrow_nullable_and_incompatible_results ... ok
+test tests::t2_unbounded_cycles_and_recursive_calls_rejected ... ok
+test tests::semantic_diff_exposes_contract_capability_and_interface_changes ... ok
+test tests::named_catalog_selection_is_explicit_and_bounded ... ok
+test tests::t1_integrity_rejects_replaced_bytes_noncanonical_and_sealed_invalid ... ok
+test tests::t2_unknown_commands_events_and_exact_fingerprints ... ok
+test tests::t2_incompatible_schema_unhandled_outcome_and_errors ... ok
+test tests::named_join_heterogeneous_results_feed_typed_downstream_outputs ... ok
+test tests::t1_reproducible_artifact_and_narrow_source_normalization ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/debug/deps/aq_playbooks_model-ce1bc22a3dff5634)
+
+running 9 tests
+test schedules::tests::catchup_is_bounded_paged_and_does_not_scan_huge_backlogs ... ok
+test schedules::tests::skip_records_missed_work_and_emits_only_timely_latest ... ok
+test tests::bounded_union_and_callable_interface_variance ... ok
+test tests::canonical_golden_vectors ... ok
+test tests::collection_order_duplicates_and_budget ... ok
+test schedules::tests::coalescing_replay_has_stable_identity_and_complete_range ... ok
+test schedules::tests::clock_jumps_and_changed_revisions_are_explicit ... ok
+test tests::missing_null_and_unknown_are_distinct ... ok
+test tests::schemas_are_closed_and_bounded ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/aq_playbooks_postgres-dc9a2884384b8034)
+
+running 6 tests
+test protection::tests::authenticated_context_nonce_and_key_rotation ... ok
+test indexes::projection_tests::borrowed_deltas_preserve_last_duplicate_identity_and_redaction_semantics ... ok
+test protection::tests::catalog_envelopes_bind_namespace_kind_address_revision_key_and_domain ... ok
+test indexes::projection_tests::borrowed_deltas_match_reference_for_empty_unchanged_and_materialization ... ok
+test indexes::projection_field_tests::source_field_mutations_cannot_change_projection_without_being_detected ... ok
+test indexes::projection_tests::borrowed_deltas_match_reference_for_scopes_removals_offsets_and_private_edits ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/keyed_admission.rs (target/debug/deps/keyed_admission-bd7a6ced66889e41)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/persistence.rs (target/debug/deps/persistence-fcfb13536bca925e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/protected_indexes.rs (target/debug/deps/protected_indexes-03bbb0875677eaae)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/aq_playbooks_runner-f7209d406167a0a7)
+
+running 5 tests
+test inspection::tests::unbounded_or_invalid_pages_refused ... ok
+test metrics::tests::distribution_has_bounded_buckets_and_saturating_totals ... ok
+test inspection::tests::receipt_pages_are_stable_and_hide_private_diagnostics ... ok
+test metrics::tests::repeated_owner_readback_does_not_skew_command_latencies ... ok
+test metrics::tests::refusal_and_store_timings_are_observable_without_payloads ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/catalog_inspection.rs (target/debug/deps/catalog_inspection-cd5974a957f8cce0)
+
+running 7 tests
+test decimal_contexts_are_lossless_and_malformed_queries_are_closed ... ok
+test wrappers_without_catalog_support_never_fall_back_to_loading_secrets ... ok
+test unsupported_metadata_does_not_change_existing_state_mutation_semantics ... ok
+test release_and_reacquire_even_same_owner_refuse_previous_incarnation ... ok
+test unrelated_state_progress_preserves_stamp_but_catalog_changes_refuse_old_pages ... ok
+test exact_metadata_and_controls_are_owned_bounded_and_private_values_are_omitted ... ok
+test byte_limited_pages_preserve_every_item_and_never_download_unbounded_metadata ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
+     Running tests/keyed_admission.rs (target/debug/deps/keyed_admission-357b6c59f7dbc7a3)
+
+running 8 tests
+test legacy_snapshot_without_receipts_decodes_without_inventing_admissions ... ok
+test simultaneous_same_key_cas_has_one_commit_and_exact_recovery ... ok
+test full_quotas_refuse_new_atomic_admission_without_blocking_exact_lookup ... ok
+test first_admission_fences_future_revision_and_revoked_authority_but_history_remains ... ok
+test replay_is_read_only_and_changed_payload_authority_and_revision_conflict ... ok
+test before_cas_refusal_is_atomic_and_after_commit_unknown_replays_after_restart ... ok
+test gc_and_direct_storage_cas_cannot_forget_or_rebind_a_key ... ok
+test bounds_and_activation_ceiling_refuse_before_retention ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/review_regressions.rs (target/debug/deps/review_regressions-2e8370ed060a5bf5)
+
+running 26 tests
+test ingress_rejects_missing_declared_subject_revision_and_correlation ... ok
+test persisted_protection_flag_cannot_override_the_actual_storage_provider ... ok
+test expired_replay_tombstones_and_retired_epochs_refuse_old_identities ... ok
+test garbage_collection_bounds_preserved_candidate_examination ... ok
+test t18_protected_output_contract_is_refused_before_external_dispatch ... ok
+test aggregate_concurrent_children_include_independent_roots ... ok
+test t17_quota_refusal_retains_prior_event_artifacts_and_destinations ... ok
+test retained_event_before_wait_is_driven_after_restart_without_manual_wakeup ... ok
+test recovery_obeys_current_engine_authority_revocation ... ok
+test garbage_collection_preserves_transitively_bound_artifacts_without_runs ... ok
+test retired_producer_epochs_need_no_new_tombstones_for_late_gc ... ok
+test t13_independent_calls_consume_origin_budget_without_becoming_owned ... ok
+test catalog_dependencies_reject_incompatible_versions_new_capabilities_and_digest_exclusions ... ok
+test command_payloads_obey_tighter_run_limits_on_both_sides ... ok
+test execution_revocation_blocks_prepared_dispatch_without_discarding_the_intent ... ok
+test t26_nested_captured_iteration_consumes_shared_budget_and_restores_lexical_roots ... ok
+test t6_partial_fanout_restarts_with_frozen_destinations_and_no_duplicate_runs ... ok
+test catalog_dependencies_select_compatible_versions_once_then_pin_across_restart ... ok
+test completed_children_before_join_remain_drivable_after_restart ... ok
+test t18_receipts_default_deny_result_fields_and_refuse_protected_inputs_before_intent ... ok
+test t4_transitive_dependency_bytes_stay_pinned_after_activation_and_restart ... ok
+test t12_any_join_uses_recorded_acceptance_order_and_tracks_unselected_children ... ok
+test unresolved_recovery_rotates_participants_within_one_scope ... ok
+test completed_cohort_gc_removes_ready_timer_and_dependency_index_residue ... ok
+test named_heterogeneous_join_results_feed_a_typed_command_and_return ... ok
+test tiny_driver_batches_fairly_interleave_runnable_steps_and_prepared_effects ... ok
+
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/semantics.rs (target/debug/deps/semantics-91ec2c01866e5963)
+
+running 32 tests
+test gc_tombstones_expired_event_identity_and_epoch_fence_compacts_safely ... ok
+test activation_controls_separate_calls_events_and_current_execution ... ok
+test history_budget_stops_without_disposing_existing_records ... ok
+test failed_transition_commit_has_no_partial_intent_and_never_dispatches ... ok
+test memory_store_cas_and_owner_fence_full_boundary ... ok
+test expiry_wins_over_late_event_and_identity_conflicts ... ok
+test pruned_general_wait_history_refuses_registration_and_captured_replay_horizon_survives_policy_change ... ok
+test losing_namespace_ownership_prevents_reconciliation_handoff ... ok
+test event_before_wait_restart_stale_revision_and_backlog_deadline ... ok
+test accepted_recovery_does_not_uncancel_a_run_or_bypass_revoked_authority ... ok
+test simulation_missing_mock_is_unknown_and_incomplete ... ok
+test producer_epoch_compaction_keeps_history_fences_for_existing_invocations ... ok
+test invalid_host_output_blocks_with_a_safe_durable_receipt ... ok
+test protected_root_and_transitive_inputs_are_refused_before_any_snapshot_write ... ok
+test protected_event_fields_and_protected_trigger_closures_refuse_payload_persistence ... ok
+test exhausted_step_budget_finishes_once_without_reentering_error_graph ... ok
+test missing_dependency_destination_is_durably_blocked_then_resumes_exact_bytes ... ok
+test unsafe_ambiguity_is_never_automatically_repeated_or_cancelled ... ok
+test confirmed_async_admission_recovery_resumes_accepted_branch_before_completion ... ok
+test gc_preserves_possible_async_completion_while_lost_admission_handle_is_unknown ... ok
+test unsafe_recovery_requires_audited_request_and_preserves_original_authority ... ok
+test command_deadline_refuses_unissued_effect_and_preserves_issued_uncertainty ... ok
+test timeout_fallback_waits_for_truthful_owned_operation_cancellation ... ok
+test iteration_failure_policy_skips_or_stops_without_resetting_captured_membership ... ok
+test all_three_child_modes_are_atomic_and_independent_cancellation_survives ... ok
+test owned_operation_join_uses_exact_pinned_completion_and_retained_admission ... ok
+test cancellation_dispatch_crashes_reconcile_owner_before_same_key_delivery_retry ... ok
+test gc_preserves_bound_transitive_closure_then_collects_terminal_cohorts_in_pages ... ok
+test bounded_driver_uses_persisted_fair_scope_queue_and_noop_does_not_commit ... ok
+test operation_join_deadline_uses_ingress_time_even_when_processing_is_late ... ok
+test durable_intent_replay_keeps_id_business_retry_creates_new_id ... ok
+test retry_allowances_are_scoped_to_full_loop_invocation_paths ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+   Doc-tests aq_playbooks_cli
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests aq_playbooks_compiler
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests aq_playbooks_model
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests aq_playbooks_postgres
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests aq_playbooks_runner
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

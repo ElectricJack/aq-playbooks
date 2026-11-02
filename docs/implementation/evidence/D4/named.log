@@ -1,0 +1,105 @@
+   Compiling aq-playbooks-cli v0.1.3 (/home/jkern/dev/aq-platform-agents/projects/aq-playbooks/.aq/worktrees/slot-0/crates/aq-playbooks-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.48s
+     Running unittests src/lib.rs (target/debug/deps/aq_playbooks_cli-3b13caae95682f67)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/aq_playbooks-190ebf4e7a4f9614)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/admin_cli.rs (target/debug/deps/admin_cli-6df2a797132e1a57)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/catalog_contract.rs (target/debug/deps/catalog_contract-4d0198ea9cb05ec4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/cli.rs (target/debug/deps/cli-20dc7021db6e6e53)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/host_pilots.rs (target/debug/deps/host_pilots-5106ea13dd9e92ef)
+
+running 1 test
+test pilots_pass_on_reconciled_catalog ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 7.93s
+
+     Running unittests src/lib.rs (target/debug/deps/aq_playbooks_compiler-42fdcddfc1d455e2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/aq_playbooks_model-ce1bc22a3dff5634)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/aq_playbooks_postgres-dc9a2884384b8034)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/keyed_admission.rs (target/debug/deps/keyed_admission-bd7a6ced66889e41)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/persistence.rs (target/debug/deps/persistence-fcfb13536bca925e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/protected_indexes.rs (target/debug/deps/protected_indexes-03bbb0875677eaae)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/aq_playbooks_runner-f7209d406167a0a7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s
+
+     Running tests/catalog_inspection.rs (target/debug/deps/catalog_inspection-cd5974a957f8cce0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/keyed_admission.rs (target/debug/deps/keyed_admission-357b6c59f7dbc7a3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/review_regressions.rs (target/debug/deps/review_regressions-2e8370ed060a5bf5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.00s
+
+     Running tests/semantics.rs (target/debug/deps/semantics-91ec2c01866e5963)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.00s
+

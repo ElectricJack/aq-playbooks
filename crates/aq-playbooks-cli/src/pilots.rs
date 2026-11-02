@@ -293,8 +293,8 @@ fn accepted_work(root: &str, prefix: &[&str]) -> Expr {
 fn work_child(id: &str, kind: &str) -> anyhow::Result<Artifact> {
     let r = catalog();
     let event = ContractRef {
-        name: "operation.changed".into(),
-        fingerprint: r.events["operation.changed"].fingerprint()?,
+        name: "aq.operation.updated".into(),
+        fingerprint: r.events["aq.operation.updated"].fingerprint()?,
     };
     let input_schema = if kind == "repair" {
         Schema::string(128)
@@ -445,7 +445,7 @@ fn coding() -> anyhow::Result<Scenario> {
                         json!({"identity":"coding-delivered","recipient":"supervisor","visibility":"project","body":"Candidate delivered"}),
                     ),
                     "message",
-                    &[("accepted", "done")],
+                    &[("queued", "done")],
                 ),
             ),
             ("done".into(), ret("success", lit(Value::Null))),
@@ -604,7 +604,7 @@ fn coding() -> anyhow::Result<Scenario> {
                 "candidate.publish".into(),
                 vec![done("conflict"), done("published")],
             ),
-            ("message.send".into(), vec![done("accepted")]),
+            ("message.send".into(), vec![done("queued")]),
         ]),
         Value::Null,
         vec![],
@@ -809,7 +809,7 @@ fn report() -> anyhow::Result<Scenario> {
             "Supervisor report deadline elapsed; frozen context snapshot-1 remains available",
         ),
     ] {
-        steps.insert(name.into(),invoke(&r,"message.send",lit(json!({"identity":"report-window-1","recipient":"supervisor","visibility":"project","body":body})),&format!("{name}_message"),&[("accepted","done")]));
+        steps.insert(name.into(),invoke(&r,"message.send",lit(json!({"identity":"report-window-1","recipient":"supervisor","visibility":"project","body":body})),&format!("{name}_message"),&[("queued","done")]));
     }
     let root = build(
         "report",
@@ -821,11 +821,11 @@ fn report() -> anyhow::Result<Scenario> {
         &[("author", &author)],
     )?;
     let event = EventEnvelope {
-        producer: "aq.operations".into(),
+        producer: "aq.host.bridge@1".into(),
         event_id: "author-complete".into(),
         contract: ContractRef {
-            name: "operation.changed".into(),
-            fingerprint: r.events["operation.changed"].fingerprint()?,
+            name: "aq.operation.updated".into(),
+            fingerprint: r.events["aq.operation.updated"].fingerprint()?,
         },
         scope: "project".into(),
         correlation: BTreeMap::from([("operation".into(), "author-operation".into())]),
@@ -847,14 +847,14 @@ fn report() -> anyhow::Result<Scenario> {
                     handle: "author-operation".into(),
                 }],
             ),
-            ("message.send".into(), vec![done("accepted")]),
+            ("message.send".into(), vec![done("queued")]),
         ]),
         Value::Null,
         vec![
             Action::Tick { at_ms: 1001 },
             Action::Event {
                 at_ms: 2000,
-                producer: "aq.operations".into(),
+                producer: "aq.host.bridge@1".into(),
                 event: Box::new(event),
             },
         ],

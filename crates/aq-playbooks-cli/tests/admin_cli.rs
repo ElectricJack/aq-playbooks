@@ -266,7 +266,7 @@ fn protected_admin_lifecycle_control_recovery_rotation_and_paged_inspection() {
     f.ok(
         &[
             "retire-producer",
-            "aq.operations",
+            "aq.host.bridge@1",
             "1",
             "--actor",
             "operator",

@@ -1,0 +1,149 @@
+   Compiling libc v0.2.191
+   Compiling typenum v1.20.1
+   Compiling cfg-if v1.0.5
+   Compiling version_check v0.9.5
+   Compiling generic-array v0.14.7
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.27
+   Compiling getrandom v0.2.17
+   Compiling rand_core v0.6.4
+   Compiling syn v3.0.9
+   Compiling crypto-common v0.1.7
+   Compiling serde_core v1.0.229
+   Compiling zmij v1.0.23
+   Compiling serde_json v1.0.154
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling cpufeatures v0.2.17
+   Compiling block-buffer v0.10.4
+   Compiling thiserror v2.0.21
+   Compiling serde v1.0.229
+   Compiling digest v0.10.7
+   Compiling serde_derive v1.0.229
+   Compiling thiserror-impl v2.0.21
+   Compiling sha2 v0.10.9
+   Compiling hybrid-array v0.4.15
+   Compiling cmov v0.5.4
+   Compiling ctutils v0.4.7
+   Compiling block-buffer v0.12.1
+   Compiling crypto-common v0.2.2
+   Compiling aq-playbooks-model v0.1.0 (/home/jkern/dev/aq-platform-agents/projects/aq-playbooks/.aq/worktrees/slot-0/crates/aq-playbooks-model)
+   Compiling const-oid v0.10.2
+   Compiling digest v0.11.3
+   Compiling rand_core v0.10.1
+   Compiling cpufeatures v0.3.1
+   Compiling getrandom v0.4.3
+   Compiling tinyvec v1.13.3
+   Compiling bytes v1.12.1
+   Compiling unicode-normalization v0.1.26
+   Compiling chacha20 v0.10.2
+   Compiling parking_lot_core v0.9.12
+   Compiling unicode-bidi v0.3.18
+   Compiling futures-core v0.3.34
+   Compiling unicode-properties v0.1.4
+   Compiling pin-project-lite v0.2.17
+   Compiling futures-sink v0.3.34
+   Compiling stringprep v0.1.5
+   Compiling rand v0.10.3
+   Compiling aq-playbooks-runner v0.1.3 (/home/jkern/dev/aq-platform-agents/projects/aq-playbooks/.aq/worktrees/slot-0/crates/aq-playbooks-runner)
+   Compiling sha2 v0.11.1
+   Compiling hmac v0.13.0
+   Compiling md-5 v0.11.0
+   Compiling mio v1.2.4
+   Compiling socket2 v0.6.5
+   Compiling fallible-iterator v0.2.0
+   Compiling byteorder v1.5.0
+   Compiling scopeguard v1.2.0
+   Compiling siphasher v1.0.4
+   Compiling base64 v0.22.1
+   Compiling smallvec v1.16.4
+   Compiling postgres-protocol v0.6.12
+   Compiling phf_shared v0.13.1
+   Compiling lock_api v0.4.14
+   Compiling tokio v1.54.1
+   Compiling inout v0.1.4
+   Compiling subtle v2.6.1
+   Compiling zeroize v1.9.1
+   Compiling futures-task v0.3.34
+   Compiling futures-util v0.3.34
+   Compiling cipher v0.4.4
+   Compiling universal-hash v0.5.1
+   Compiling tokio-util v0.7.20
+   Compiling parking_lot v0.12.5
+   Compiling phf v0.13.1
+   Compiling postgres-types v0.2.14
+   Compiling futures-channel v0.3.34
+   Compiling async-trait v0.1.92
+   Compiling whoami v2.1.3
+   Compiling opaque-debug v0.3.1
+   Compiling percent-encoding v2.3.2
+   Compiling log v0.4.35
+   Compiling tokio-postgres v0.7.18
+   Compiling poly1305 v0.8.0
+   Compiling chacha20 v0.9.1
+   Compiling aead v0.5.2
+   Compiling chacha20poly1305 v0.10.1
+   Compiling utf8parse v0.2.2
+   Compiling anstyle-parse v1.0.0
+   Compiling anstyle-query v1.1.5
+   Compiling colorchoice v1.0.5
+   Compiling anstyle v1.0.14
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling anstream v1.0.0
+   Compiling strsim v0.11.1
+   Compiling postgres v0.19.14
+   Compiling aq-playbooks-postgres v0.1.3 (/home/jkern/dev/aq-platform-agents/projects/aq-playbooks/.aq/worktrees/slot-0/crates/aq-playbooks-postgres)
+   Compiling anyhow v1.0.104
+   Compiling clap_lex v1.1.1
+   Compiling heck v0.5.0
+   Compiling clap_derive v4.6.7
+   Compiling clap_builder v4.6.7
+   Compiling clap v4.6.7
+   Compiling aq-playbooks-compiler v0.1.0 (/home/jkern/dev/aq-platform-agents/projects/aq-playbooks/.aq/worktrees/slot-0/crates/aq-playbooks-compiler)
+   Compiling aq-playbooks-cli v0.1.3 (/home/jkern/dev/aq-platform-agents/projects/aq-playbooks/.aq/worktrees/slot-0/crates/aq-playbooks-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 02s
+     Running unittests src/lib.rs (target/debug/deps/aq_playbooks_cli-3b13caae95682f67)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/aq_playbooks-190ebf4e7a4f9614)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/admin_cli.rs (target/debug/deps/admin_cli-6df2a797132e1a57)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cli.rs (target/debug/deps/cli-20dc7021db6e6e53)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/host_pilots.rs (target/debug/deps/host_pilots-5106ea13dd9e92ef)
+
+running 1 test
+test pilots_pass_on_reconciled_catalog ... FAILED
+
+failures:
+
+---- pilots_pass_on_reconciled_catalog stdout ----
+
+thread 'pilots_pass_on_reconciled_catalog' (964886) panicked at crates/aq-playbooks-cli/tests/host_pilots.rs:412:5:
+assertion failed: registry.commands["message.send"].outcomes.contains_key("queued")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    pilots_pass_on_reconciled_catalog
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p aq-playbooks-cli --test host_pilots`

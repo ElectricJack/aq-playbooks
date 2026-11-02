@@ -86,6 +86,16 @@ pub struct Notification {
     pub acknowledged: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Decision {
+    pub subject: Subject,
+    pub responders: BTreeSet<String>,
+    pub expires_at_ms: u64,
+    pub actor: String,
+    pub scope: String,
+    pub completion: Option<(String, Value)>,
+    pub completed_at_ms: Option<u64>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationReceipt {
     pub request_digest: String,
     pub actor: String,
@@ -124,6 +134,8 @@ pub struct FakeHost {
     pub outbox: BTreeMap<String, Notification>,
     pub recipient_receipts: BTreeMap<String, String>,
     pub operations: BTreeMap<String, OperationReceipt>,
+    #[serde(default)]
+    pub decisions: BTreeMap<String, Decision>,
     pub messages: BTreeMap<String, Value>,
     pub calendars: BTreeMap<String, CalendarConfiguration>,
     pub occurrences: BTreeMap<String, CalendarOccurrence>,
@@ -336,9 +348,9 @@ impl FakeHost {
                 receipt.result = completion.clone();
             }
         }
-        let contract = catalog::catalog().events["operation.changed"].clone();
+        let contract = catalog::catalog().events["aq.operation.updated"].clone();
         Ok(EventEnvelope {
-            producer: "aq.operations".into(),
+            producer: "aq.host.bridge@1".into(),
             event_id: format!("completion:{reference}"),
             contract: ContractRef {
                 name: contract.name.clone(),
@@ -352,6 +364,60 @@ impl FakeHost {
             occurred_at_ms: Some(self.now_ms as i64),
             observed_at_ms: Some(self.now_ms as i64),
             payload: json!({"outcome":"completed","output":output}),
+        })
+    }
+
+    /// The responder is an independently authenticated principal, never an
+    /// approval flag supplied by the requesting workflow.
+    pub fn complete_decision(
+        &mut self,
+        handle: &str,
+        responder: &str,
+        outcome: &str,
+    ) -> Result<EventEnvelope, String> {
+        let decision = self.decisions.get(handle).ok_or("unknown decision")?;
+        if !decision.responders.contains(responder) || !matches!(outcome, "approved" | "rejected") {
+            return Err("decision responder or outcome refused".into());
+        }
+        if decision.completion.is_none() {
+            self.check_current(&decision.subject)?;
+            if self.now_ms >= decision.expires_at_ms {
+                return Err("decision deadline elapsed".into());
+            }
+        }
+        self.settle_decision(handle, outcome)
+    }
+
+    fn settle_decision(&mut self, handle: &str, outcome: &str) -> Result<EventEnvelope, String> {
+        let decision = self.decisions.get_mut(handle).ok_or("unknown decision")?;
+        let output = result(format!("decision:{handle}"), &decision.subject);
+        if let Some((old, _)) = &decision.completion {
+            if old != outcome {
+                return Err("decision completion is immutable".into());
+            }
+        } else {
+            decision.completion = Some((outcome.into(), output.clone()));
+            decision.completed_at_ms = Some(self.now_ms);
+        }
+        if let Some(receipt) = self.operations.get_mut(handle) {
+            receipt.result = completed(outcome, output.clone());
+        }
+        let contract = &catalog::catalog().events["aq.decision.completed"];
+        Ok(EventEnvelope {
+            producer: "aq.host.bridge@1".into(),
+            event_id: format!("decision-completion:{handle}"),
+            contract: ContractRef {
+                name: contract.name.clone(),
+                fingerprint: contract.fingerprint().map_err(|e| e.to_string())?,
+            },
+            scope: decision.scope.clone(),
+            correlation: BTreeMap::from([("operation".into(), handle.into())]),
+            subject: Some(decision.subject.id.clone()),
+            revision: Some(decision.subject.revision),
+            causation: Some(handle.into()),
+            occurred_at_ms: decision.completed_at_ms.map(|at| at as i64),
+            observed_at_ms: decision.completed_at_ms.map(|at| at as i64),
+            payload: json!({"outcome":outcome,"output":output}),
         })
     }
 
@@ -821,7 +887,7 @@ impl FakeHost {
                 }
                 self.messages.insert(identity.into(), input.clone());
                 Ok(completed(
-                    "accepted",
+                    "queued",
                     result(
                         identity,
                         &Subject {
@@ -832,7 +898,40 @@ impl FakeHost {
                 ))
             }
             "findings.reconcile" => self.reconcile_findings(intent),
-            "judgment.request" | "decision.request" => {
+            "decision.request" => {
+                let subject = subject_field(input, "subject")?;
+                self.check_current(&subject)?;
+                let expires_at_ms = input["expires_at_ms"].as_u64().ok_or("invalid expiry")?;
+                let responders: BTreeSet<String> =
+                    serde_json::from_value(input["responders"].clone())
+                        .map_err(|_| "invalid responders")?;
+                if responders.is_empty()
+                    || expires_at_ms <= self.now_ms
+                    || input["choices"]
+                        .as_array()
+                        .is_none_or(|choices| choices.is_empty())
+                {
+                    return Err(
+                        "decision needs eligible responders, choices and a future expiry".into(),
+                    );
+                }
+                self.decisions.insert(
+                    intent.id.clone(),
+                    Decision {
+                        subject,
+                        responders,
+                        expires_at_ms,
+                        actor: actor.clone(),
+                        scope: intent.authority.scope.clone(),
+                        completion: None,
+                        completed_at_ms: None,
+                    },
+                );
+                Ok(DispatchResult::Accepted {
+                    handle: intent.id.clone(),
+                })
+            }
+            "judgment.request" => {
                 let subject = subject_field(input, "subject")?;
                 self.check_current(&subject)?;
                 if let Some(outcome) = self.configured_outcomes.get(&intent.id)
@@ -863,46 +962,60 @@ impl FakeHost {
                     id: handle.into(),
                     revision: 1,
                 };
+                let operation_id = self
+                    .work
+                    .values()
+                    .find(|work| work.reference == handle)
+                    .map(|work| work.operation_id.clone())
+                    .unwrap_or_else(|| handle.into());
                 let operation = self
                     .operations
-                    .get(handle)
-                    .or_else(|| {
-                        self.work
-                            .values()
-                            .find(|work| work.reference == handle)
-                            .and_then(|work| self.operations.get(&work.operation_id))
-                    })
+                    .get(&operation_id)
                     .ok_or("unknown host operation")?;
                 if operation.actor != *actor || operation.scope != intent.authority.scope {
                     return Err("operation authority refused".into());
                 }
-                let running = matches!(operation.result, DispatchResult::Accepted { .. });
+                if let Some(decision) = self.decisions.get(handle) {
+                    if decision.completion.is_none() && self.now_ms >= decision.expires_at_ms {
+                        self.settle_decision(handle, "expired")?;
+                    }
+                    if intent.command.name == "operation.cancel" {
+                        if self.decisions[handle].completion.is_some() {
+                            return Ok(completed("too_late", result(handle, &subject)));
+                        }
+                        self.settle_decision(handle, "cancelled")?;
+                        return Ok(completed("cancelled", result(handle, &subject)));
+                    }
+                }
                 let work = self.work.values_mut().find(|work| work.reference == handle);
-                let outcome = if intent.command.name == "operation.cancel" {
-                    match work {
+                if intent.command.name == "operation.cancel" {
+                    let outcome = match work {
                         Some(work) if work.cancelled => "cancelled",
                         Some(work) if work.completion.is_none() => {
                             work.cancelled = true;
                             "cancelled"
                         }
                         _ => "too_late",
+                    };
+                    return Ok(completed(outcome, result(handle, &subject)));
+                }
+                if work.is_some_and(|work| work.cancelled && work.completion.is_none()) {
+                    return Ok(completed("cancelled", result(handle, &subject)));
+                }
+                Ok(match &self.operations[&operation_id].result {
+                    DispatchResult::Accepted { .. } => {
+                        completed("running", result(handle, &subject))
                     }
-                } else {
-                    match work {
-                        Some(work) if work.cancelled => "cancelled",
-                        Some(work)
-                            if work
-                                .completion
-                                .as_ref()
-                                .is_some_and(|output| output["disposition"] == "failed") =>
-                        {
-                            "failed"
-                        }
-                        _ if running => "running",
-                        _ => "succeeded",
+                    DispatchResult::Completed { outcome, output } => {
+                        completed("completed", json!({"outcome":outcome,"output":output}))
                     }
-                };
-                Ok(completed(outcome, result(handle, &subject)))
+                    DispatchResult::Unknown { .. } => {
+                        completed("indeterminate", result(handle, &subject))
+                    }
+                    DispatchResult::Rejected { .. } => {
+                        completed("refused", result(handle, &subject))
+                    }
+                })
             }
             _ => Err("unregistered synthetic command".into()),
         }
@@ -995,6 +1108,21 @@ impl Host for FakeHost {
     fn cancel(&mut self, intent: &Intent) -> CancellationResult {
         if !self.authorize(&intent.authority, &intent.command) {
             return CancellationResult::Refused;
+        }
+        if let Some(decision) = self.decisions.get(&intent.id) {
+            if decision.completion.is_some() {
+                return CancellationResult::TooLate;
+            }
+            let outcome = if self.now_ms >= decision.expires_at_ms {
+                "expired"
+            } else {
+                "cancelled"
+            };
+            return match self.settle_decision(&intent.id, outcome) {
+                Ok(_) if outcome == "cancelled" => CancellationResult::Confirmed,
+                Ok(_) => CancellationResult::TooLate,
+                Err(_) => CancellationResult::Unknown,
+            };
         }
         let Some(work) = self
             .work
@@ -1417,7 +1545,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_fake_checks_and_decisions_remain_unknown_and_revocation_prevents_replay() {
+    fn missing_fake_checks_remain_unknown_and_decision_revocation_prevents_replay() {
         let mut h = fixture();
         let check = intent(
             "unconfigured",
@@ -1433,16 +1561,114 @@ mod tests {
         );
         assert!(matches!(
             h.dispatch(&decision),
-            DispatchResult::Unknown { .. }
+            DispatchResult::Accepted { .. }
         ));
-        h.configured_outcomes
-            .insert("decision".into(), "approved".into());
-        assert_eq!(outcome(h.dispatch(&decision)).0, "approved");
+        h.complete_decision("decision", "alice", "approved")
+            .unwrap();
+        assert_eq!(outcome(h.reconcile(&decision)).0, "approved");
         h.grants.clear();
         assert!(matches!(
             h.reconcile(&decision),
             DispatchResult::Rejected { .. }
         ));
+    }
+
+    #[test]
+    fn async_decision_admission_replay_completion_and_readback_are_distinct() {
+        let mut h = fixture();
+        let decision = intent(
+            "decision",
+            "decision.request",
+            json!({"subject":subject(),"question":"approve?","choices":["approve","reject"],"responders":["alice"],"expires_at_ms":1000}),
+        );
+        h.lose_next_response = true;
+        assert!(matches!(
+            h.dispatch(&decision),
+            DispatchResult::Unknown { .. }
+        ));
+        h = h.restart();
+        assert!(
+            matches!(h.reconcile(&decision), DispatchResult::Accepted { handle } if handle == "decision")
+        );
+        let lookup = intent("lookup", "operation.get", json!({"handle":"decision"}));
+        assert_eq!(outcome(h.dispatch(&lookup)).0, "running");
+        assert!(h.complete_decision("decision", "bob", "approved").is_err());
+        let event = h
+            .complete_decision("decision", "alice", "approved")
+            .unwrap();
+        assert_eq!(event.contract.name, "aq.decision.completed");
+        assert_eq!(event.correlation["operation"], "decision");
+        catalog::catalog().events[&event.contract.name]
+            .payload
+            .validate(&event.payload)
+            .unwrap();
+        h = h.restart();
+        h.now_ms = 500;
+        assert_eq!(
+            serde_json::to_value(
+                h.complete_decision("decision", "alice", "approved")
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&event).unwrap()
+        );
+        assert!(
+            h.complete_decision("decision", "alice", "rejected")
+                .is_err()
+        );
+        let mut lookup = lookup;
+        lookup.id = "fresh-lookup".into();
+        let (status, output) = outcome(h.dispatch(&lookup));
+        assert_eq!(status, "completed");
+        assert_eq!(output, event.payload);
+        assert_eq!(outcome(h.reconcile(&decision)).0, "approved");
+        let mut other = lookup.clone();
+        other.id = "other-actor".into();
+        other.authority.actor = "bob".into();
+        assert!(matches!(
+            h.dispatch(&other),
+            DispatchResult::Rejected { .. }
+        ));
+        h.grants.clear();
+        assert!(matches!(
+            h.reconcile(&decision),
+            DispatchResult::Rejected { .. }
+        ));
+    }
+
+    #[test]
+    fn async_decision_rejects_stale_responses_and_expires_or_cancels_truthfully() {
+        let mut h = fixture();
+        let decision = intent(
+            "expires",
+            "decision.request",
+            json!({"subject":subject(),"question":"approve?","choices":["approve","reject"],"responders":["alice"],"expires_at_ms":1000}),
+        );
+        assert!(matches!(
+            h.dispatch(&decision),
+            DispatchResult::Accepted { .. }
+        ));
+        h.subjects.insert(subject().id, 2);
+        assert!(h.complete_decision("expires", "alice", "approved").is_err());
+        h.subjects.insert(subject().id, 1);
+        h.now_ms = 1000;
+        assert!(h.complete_decision("expires", "alice", "approved").is_err());
+        let lookup = intent(
+            "expired-status",
+            "operation.get",
+            json!({"handle":"expires"}),
+        );
+        assert_eq!(outcome(h.dispatch(&lookup)).1["outcome"], "expired");
+        h.now_ms = 0;
+        let mut decision = decision;
+        decision.id = "cancel-me".into();
+        assert!(matches!(
+            h.dispatch(&decision),
+            DispatchResult::Accepted { .. }
+        ));
+        assert!(matches!(h.cancel(&decision), CancellationResult::Confirmed));
+        assert_eq!(outcome(h.reconcile(&decision)).0, "cancelled");
+        assert!(matches!(h.cancel(&decision), CancellationResult::TooLate));
     }
 
     #[test]

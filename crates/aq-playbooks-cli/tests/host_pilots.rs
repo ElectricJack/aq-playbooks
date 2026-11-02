@@ -146,11 +146,11 @@ fn complete(
         )
         .unwrap();
     engine
-        .admit_event("aq.operations", event.clone(), now)
+        .admit_event("aq.host.bridge@1", event.clone(), now)
         .unwrap();
     assert!(
         engine
-            .admit_event("aq.operations", event, now)
+            .admit_event("aq.host.bridge@1", event, now)
             .unwrap()
             .duplicate
     );
@@ -401,7 +401,40 @@ fn every_pilot_uses_the_same_twelve_captured_host_contracts() {
                     "pilot-specific contract mutation in {name}: {command}"
                 );
             }
+            for (event, contract) in &artifact.content.registry.events {
+                assert_eq!(
+                    Some(contract),
+                    registry.events.get(event),
+                    "pilot-specific event mutation in {name}: {event}"
+                );
+            }
         }
     }
     assert_eq!(registry.commands.len(), 12);
+}
+
+#[test]
+fn pilots_pass_on_reconciled_catalog() {
+    let registry = catalog::catalog();
+    assert!(
+        registry.commands["message.send"]
+            .outcomes
+            .contains_key("queued")
+    );
+    let decision = registry.commands["decision.request"]
+        .asynchronous
+        .as_ref()
+        .unwrap();
+    assert_eq!(decision.completion_event, "aq.decision.completed");
+    assert_eq!(decision.reconciliation_command, "operation.get");
+    assert!(
+        registry.events["aq.operation.updated"]
+            .trusted_producers
+            .contains("aq.host.bridge@1")
+    );
+    every_pilot_uses_the_same_twelve_captured_host_contracts();
+    routing_uses_authorized_assessment_and_host_revision_preconditions();
+    watcher_reconciles_host_attested_observation_and_recovers_atomic_notifications();
+    coding_requires_explicit_accepted_review_and_exact_check_before_independent_followup();
+    report_deadline_cancels_owned_author_and_late_completion_keeps_one_message();
 }

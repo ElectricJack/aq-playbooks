@@ -90,3 +90,127 @@ After AQ binds the existing owners and implements the remaining services, exerci
 ## Revision-pinned implementation evidence
 
 The [bounded v1 reference inventory](../../aq-server/docs/research/2026-10-30-v1-implementation-reference-map.md) records implementation symbols, selected test obligations and per-file hashes at revision `9a9b8e8ef992d1ff699755a9383ed3c91e2844ea`. It distinguishes preserved behavior from remote-authority and retention adaptations. This evidence informs the owning v2 tasks; replacement coverage and product qualification remain pending.
+
+## Reconciled AQ host catalog 1.0.0 (D4)
+
+The authoritative [schema artifact](../contracts/aq-host/registry.json),
+[manifest](../contracts/aq-host/manifest.json) and
+[fixtures](../contracts/aq-host/fixtures.json) are published together. The CLI,
+fake host and all four pilots load that artifact. Version `1.0.0` has fingerprint
+`sha256:627125cc393d8274bfaa9ffc785c338e566cc69af362ac027a3daa355c3509e1`.
+The fingerprint covers canonical JSON of `[version, registry]`; command/event
+fingerprints cover their individual canonical definitions. See the
+[vendor instructions](../contracts/aq-host/README.md). A consumer must pin both
+the source revision and this manifest, and deliberately rebind changed contracts.
+There are twelve commands and seven events within the daemon's 262,144-byte
+registry bound. The five context views, nine work kinds and six work.change
+variants are unchanged and listed in the manifest.
+
+### Recovery and outcomes
+
+Every mutation except publication uses an immutable operation identity and input
+binding: repeating the identical identity/input/authority must return the retained
+admission or terminal result, without another domain effect. A conflicting reuse
+refuses. This is the host's keyed idempotency obligation; registration alone does
+not establish that the production adapter meets it. Observations may be re-read
+with a new invocation identity, retaining each observation. Publication must query
+the integration owner's authoritative receipt before deciding on resubmission.
+No command requires naturally idempotent or unsafe recovery in this version.
+
+| Command | Recovery | Exact named outcomes |
+| --- | --- | --- |
+| `context.read` | Observation | observed, incomplete, expired, refused |
+| `work.ensure` | KeyedIdempotent | accepted, ensured, completed, refused |
+| `work.change` | KeyedIdempotent | changed, conflict, refused |
+| `judgment.request` | KeyedIdempotent | assessed, refused |
+| `decision.request` | KeyedIdempotent | accepted, approved, rejected, expired, cancelled, refused |
+| `check.request` | KeyedIdempotent | passed, failed, infrastructure_failure, refused |
+| `candidate.prepare` | KeyedIdempotent | prepared, conflict, refused |
+| `candidate.publish` | Reconcilable | published, conflict, refused |
+| `message.send` | KeyedIdempotent | queued, refused |
+| `findings.reconcile` | KeyedIdempotent | reconciled, conflict, refused |
+| `operation.get` | Observation | running, completed, failed, cancelled, indeterminate, refused |
+| `operation.cancel` | KeyedIdempotent | accepted, refused, too_late, cancelled, indeterminate |
+
+`accepted` on an asynchronous request carries only `{handle}` and promises
+admission. `work.ensure` returns `ensured` for independent work admission and
+`completed` for a retained owned-work result. The latter contains a separate
+business `disposition` (accepted, changes_requested, failed). `message.send`'s
+`queued` records an identified enqueue; delivery and human acknowledgment remain
+separate host facts. `operation.cancel`'s `accepted` is cancellation admission,
+`cancelled` confirms termination, and `too_late` reports an already terminal
+operation. Transport rejection and uncertain transport responses remain
+`DispatchResult::Rejected` and `DispatchResult::Unknown`, respectively.
+
+`decision.request` is asynchronous. It binds a question, declared choices,
+eligible responders and expiry to an exact subject revision, admits a durable
+handle, then completes with approved/rejected/expired/cancelled/refused. The host
+authenticates the human responder separately from the workflow's JSON and checks
+eligibility, current revision and deadline. No configured approval on the request
+can complete it. Pending `operation.get` returns `running`; terminal readback
+returns `completed` with `{outcome, output}`, preserving the original work or
+decision business result. This replaces the ambiguous `succeeded` readback.
+Cancellation or indeterminate state can be observed separately. Reconciliation
+of a lost dispatch response must retain the same identity and authority.
+
+The current bounded judgment adapter is synchronous (`assessed`); making model
+assessment admission asynchronous is a future contract change. This choice
+retains the existing routing pilot's behavior and does not imply execution of
+an unimplemented production model adapter.
+
+### Event names, producers and schemas
+
+All seven events have semantic version `1.0.0`, authenticated producer
+`aq.host.bridge@1`, scope `project`, payload bound 65,536 bytes, and retention
+86,400,000 ms. Each envelope requires the correlation map field `operation`, whose
+value is the authoritative operation handle (for domain notifications without
+an admitted async handle, the originating domain operation identity). The handle
+is opaque and preserved byte-for-byte; it is not inferred from subject ID. The
+producer must be authenticated by the host bridge; a payload field claiming the
+producer confers no authority.
+
+Let `Subject = {id: bounded string, revision: nonnegative integer}` and
+`Result = {reference: bounded string, subject: Subject}`. Strings are at most
+4,096 bytes unless the artifact specifies a smaller bound. Objects are closed:
+extra keys refuse. The machine schemas in registry.json are authoritative.
+
+| Event | Authoritative source behind bridge | Payload | Envelope subject/revision paths |
+| --- | --- | --- | --- |
+| `aq.work.changed` | Work/graph owner | Result plus outcome: ensured/changed/completed/cancelled | subject.id, subject.revision |
+| `aq.artifact.recorded` | Evidence owner | Result plus outcome: recorded | subject.id, subject.revision |
+| `aq.operation.updated` | Owned work result owner | `{outcome: completed/refused, output: Result plus disposition: accepted/changes_requested/failed}` | output.subject.id, output.subject.revision |
+| `aq.check.completed` | Executed check owner | Result plus outcome: passed/failed/infrastructure_failure/refused | subject.id, subject.revision |
+| `aq.decision.completed` | Human decision owner | `{outcome: approved/rejected/expired/cancelled/refused, output: Result}` | output.subject.id, output.subject.revision |
+| `aq.integration.changed` | Integration/publication owner | Result plus outcome: prepared/published/conflict/refused | subject.id, subject.revision |
+| `aq.signal.reported` | Authorized signal owner | Result plus outcome: reported | subject.id, subject.revision |
+
+The bridge publishes stable producer/event identities and causation references,
+with occurrence and observation times. Subject and revision in the envelope must
+match the specified payload paths. Owned-work and decision completions carry
+`correlation.operation = accepted.handle`. A duplicate event with the same identity
+and content is a replay; conflicting content refuses. Events do not grant the
+workflow new authority. Domain state and the outgoing event must commit atomically
+in the owning host service (D3 outbox), and delivery may retry until admitted.
+
+The old synthetic names map as follows: work.changed → aq.work.changed,
+artifact.recorded → aq.artifact.recorded, operation.changed → aq.operation.updated,
+check.completed → aq.check.completed, decision.resolved → aq.decision.completed,
+integration.changed → aq.integration.changed, signal.reported → aq.signal.reported.
+Old producers and fingerprints are incompatible; do not alias them silently.
+The daemon's old `aq.operation.updated` queued-message payload is also incompatible
+with this work-completion schema despite sharing its name. Message enqueue is
+represented by the `queued` command receipt; message delivery events need a new
+versioned extension if required.
+
+### Production adoption boundary
+
+D5 must vendor this bundle by exact Git revision, relax the blanket
+Reconcilable-only registry guard to accept the published per-command classes,
+and replace independent command/event definitions with the exact artifact.
+The existing daemon message/decision inputs, result fields, version strings,
+producer mappings and operation lookup are also different; changing just the
+outcome names cannot satisfy fingerprint equality. Production adapters must
+translate to their owning services while enforcing this public schema and current
+authority. D3's outbox and D8's triggers must use the event table above.
+Production fixture/replay and assembled-pilot checks remain D5–D8/D11 work; D4's
+synthetic results do not claim those adapters are already bound or qualified.
