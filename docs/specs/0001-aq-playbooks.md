@@ -5,6 +5,8 @@
 **Implementation language:** Rust  
 **Repository:** `aq-playbooks`
 
+**Requirement aliases:** Cross-repository references use `PB-Pn` for requirement `Pn` and `PB-Tn` for acceptance criterion `Tn`, where `n` is the numeric ID. These aliases identify the same entries; the local IDs in this spec's tables remain unchanged.
+
 Related designs: [SDLC policy exploration](../research/2026-10-30-sdlc-policy-exploration.md), [AQ foundation](../../../aq-server/docs/specs/0001-infrastructure-foundation.md), [worker framework](../../../aq-worker/docs/specs/0001-worker-framework.md), [aq-git](../../../aq-git/docs/specs/0001-aq-git.md), and [aq-graph integration](../../../aq-graph/docs/aq-integration.md).
 
 The [v1 capability selection](../research/0001-v1-to-v2-capability-selection.md) provides the evidence for the twelve-command host surface and reusable workflows adopted here. The existing command inventory is not a compatibility checklist.
