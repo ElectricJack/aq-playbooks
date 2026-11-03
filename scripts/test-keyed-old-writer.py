@@ -23,6 +23,7 @@ assert archive_hash == 'ad516d7cc5f5bded424aa364f7185db2049a1ac21b15b767c279e906
 url = urlparse(os.environ['AQ_PLAYBOOKS_TEST_DATABASE_URL'])
 assert url.hostname == '127.0.0.1' and url.port == 55432 and url.path.startswith('/aq_pb_keyed_')
 root = Path(__file__).resolve().parents[1]
+os.environ["CARGO_INCREMENTAL"] = "0"  # bound target/ growth for every cargo child
 with tempfile.TemporaryDirectory(prefix='pb-keyed-old-') as temp:
     base = Path(temp)
     old = base / 'old'

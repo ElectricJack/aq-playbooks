@@ -24,6 +24,7 @@ url = urlparse(os.environ["AQ_PLAYBOOKS_TEST_DATABASE_URL"])
 assert url.hostname == "127.0.0.1" and url.port == 55432 and url.path.startswith("/aq_pb_catalog_")
 assert os.environ.get("CARGO_TARGET_DIR"), "root-assigned shared build cache required"
 root = Path(__file__).resolve().parents[1]
+os.environ["CARGO_INCREMENTAL"] = "0"  # bound target/ growth for every cargo child
 with tempfile.TemporaryDirectory(prefix="pb-catalog-old-") as temp:
     base = Path(temp)
     old = base / "old"

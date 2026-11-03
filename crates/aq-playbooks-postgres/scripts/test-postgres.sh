@@ -17,6 +17,8 @@ done
 port="$(docker inspect --format '{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "$container_name")"
 export AQ_PLAYBOOKS_TEST_DATABASE_URL="host=127.0.0.1 port=$port user=postgres password=synthetic-test-password dbname=playbooks_test"
 cd "$crate_dir/../.."
+# Bound target/ growth: build into the checkout's own target/ without incremental state.
+export CARGO_INCREMENTAL=0
 cargo test -p aq-playbooks-postgres --features postgres-tests "$@"
 if [[ "$#" == 0 ]]; then
   cargo test -p aq-playbooks-cli --features postgres-tests --test admin_cli

@@ -26,6 +26,8 @@ cargo run -p aq-playbooks-cli -- simulate --pilot coding
 cargo run -p aq-playbooks-cli -- simulate --pilot report
 ```
 
+Build into the checkout's own `target/` (leave `CARGO_TARGET_DIR` unset; in AQ, each slot keeps its own `target/`). The workspace dev/test profile keeps disk growth bounded: workspace crates get `line-tables-only` debuginfo (backtraces still report file:line), dependencies get none, and incremental compilation is off. Opt back in for a debugging session with `CARGO_INCREMENTAL=1` or `CARGO_PROFILE_DEV_DEBUG=2`.
+
 The generated examples include Markdown sources, explicit proposal bundles, canonical artifacts and scenarios. Pilots cover coding with bounded repair and independent follow-up, routing judgment, findings reconciliation, and supervisor reporting with fallback and late completion. Work creation is distinct from authoritative completion and assessment disposition. Missing mock results remain unresolved.
 
 `commands`, `events`, and `interfaces` support `list` and `describe`. `surface` reports the twelve synthetic host commands and their finite views/templates/change variants. `diff` compares artifacts. Run `--help` for exact arguments.
