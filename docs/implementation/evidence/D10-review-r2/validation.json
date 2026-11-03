@@ -1,0 +1,18 @@
+{
+  "review": "rev-wise-rapids",
+  "source_revision": 1,
+  "comments_covered": 7,
+  "implementation_tasks_preserved": 6,
+  "checkbox_steps_preserved": 26,
+  "global_constraints_preserved_except_corrected_main_branch": true,
+  "object_length_permutations_checked": 120,
+  "draft_bytes": 44081,
+  "draft_sha256": "1f6e90dac38056570367f358385d5a05e9b079a1ccd06de6e00dcdb90d1e89f9",
+  "scope": "Document structure and independent arithmetic example only; no new Rust implementation or PostgreSQL/performance qualification executed.",
+  "published_revision": 2,
+  "published_content_sha256": "1f6e90dac38056570367f358385d5a05e9b079a1ccd06de6e00dcdb90d1e89f9",
+  "canonical_content_matches_local_draft": true,
+  "all_comments_proposed_resolved_in_revision": 2,
+  "review_state_at_readback": "in_review",
+  "decider_acceptance_claimed": false
+}
