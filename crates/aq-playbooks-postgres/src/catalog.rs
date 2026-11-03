@@ -167,7 +167,9 @@ impl PostgresStorage {
         {
             return Err(CatalogError::Ownership);
         }
-        if row.get::<_, i32>("writer_format") != 2 {
+        if row.get::<_, i32>("writer_format") != 2
+            && row.get::<_, i32>("writer_format") != crate::records::FORMAT
+        {
             return Err(CatalogError::Unsupported);
         }
         let revision: i64 = row.get("revision");

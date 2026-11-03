@@ -18,6 +18,20 @@ fn record(
     tx.execute("INSERT INTO aq_playbooks.disposal_tombstones(namespace,kind,identity,content_digest,disposed_at_ms) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",&[&namespace,&kind,&key,&digest,&at]).map_err(backend)?;
     Ok(())
 }
+/// Retention GC cutoff deletes for `next`'s GC clock (shared with format 3).
+pub(crate) fn collect(
+    tx: &mut ObservedTransaction<'_>,
+    namespace: &str,
+    next: &State,
+) -> Result<(), StorageError> {
+    if let Some(now) = next.retention.last_gc_at_ms {
+        let cutoff =
+            now.saturating_sub(i64::try_from(next.retention.policy.audit_ms).unwrap_or(i64::MAX));
+        tx.execute("WITH candidates AS MATERIALIZED(SELECT c.digest FROM aq_playbooks.artifact_catalog c JOIN aq_playbooks.disposal_tombstones t ON t.identity=c.digest AND t.kind='artifact' WHERE t.namespace=$1 AND t.disposed_at_ms<$2 AND NOT EXISTS(SELECT 1 FROM aq_playbooks.namespace_artifacts n WHERE n.digest=c.digest) AND NOT EXISTS(SELECT 1 FROM aq_playbooks.artifacts a WHERE a.digest=c.digest) AND NOT EXISTS(SELECT 1 FROM aq_playbooks.encrypted_artifacts e WHERE e.digest=c.digest) ORDER BY c.digest LIMIT 1000 FOR UPDATE OF c SKIP LOCKED) DELETE FROM aq_playbooks.artifact_catalog c USING candidates x WHERE c.digest=x.digest",&[&namespace,&cutoff]).map_err(backend)?;
+        tx.execute("DELETE FROM aq_playbooks.disposal_tombstones t WHERE namespace=$1 AND disposed_at_ms<$2 AND ((kind='run' AND NOT EXISTS(SELECT 1 FROM aq_playbooks.inspection_rows r WHERE r.namespace=t.namespace AND r.kind='runs' AND r.item_key=t.identity)) OR (kind='intent' AND NOT EXISTS(SELECT 1 FROM aq_playbooks.inspection_rows r WHERE r.namespace=t.namespace AND r.kind='effects' AND r.item_key=t.identity)) OR (kind='artifact' AND NOT EXISTS(SELECT 1 FROM aq_playbooks.artifact_catalog c WHERE c.digest=t.identity)))",&[&namespace,&cutoff]).map_err(backend)?;
+    }
+    Ok(())
+}
 pub(crate) fn verify_and_record(
     tx: &mut ObservedTransaction<'_>,
     namespace: &str,
@@ -63,12 +77,7 @@ pub(crate) fn verify_and_record(
             tx.execute("DELETE FROM aq_playbooks.disposal_tombstones WHERE namespace=$1 AND kind='event' AND identity=$2",&[&namespace,id]).map_err(backend)?;
         }
     }
-    if let Some(now) = next.retention.last_gc_at_ms {
-        let cutoff =
-            now.saturating_sub(i64::try_from(next.retention.policy.audit_ms).unwrap_or(i64::MAX));
-        tx.execute("WITH candidates AS MATERIALIZED(SELECT c.digest FROM aq_playbooks.artifact_catalog c JOIN aq_playbooks.disposal_tombstones t ON t.identity=c.digest AND t.kind='artifact' WHERE t.namespace=$1 AND t.disposed_at_ms<$2 AND NOT EXISTS(SELECT 1 FROM aq_playbooks.namespace_artifacts n WHERE n.digest=c.digest) AND NOT EXISTS(SELECT 1 FROM aq_playbooks.artifacts a WHERE a.digest=c.digest) AND NOT EXISTS(SELECT 1 FROM aq_playbooks.encrypted_artifacts e WHERE e.digest=c.digest) ORDER BY c.digest LIMIT 1000 FOR UPDATE OF c SKIP LOCKED) DELETE FROM aq_playbooks.artifact_catalog c USING candidates x WHERE c.digest=x.digest",&[&namespace,&cutoff]).map_err(backend)?;
-        tx.execute("DELETE FROM aq_playbooks.disposal_tombstones t WHERE namespace=$1 AND disposed_at_ms<$2 AND ((kind='run' AND NOT EXISTS(SELECT 1 FROM aq_playbooks.inspection_rows r WHERE r.namespace=t.namespace AND r.kind='runs' AND r.item_key=t.identity)) OR (kind='intent' AND NOT EXISTS(SELECT 1 FROM aq_playbooks.inspection_rows r WHERE r.namespace=t.namespace AND r.kind='effects' AND r.item_key=t.identity)) OR (kind='artifact' AND NOT EXISTS(SELECT 1 FROM aq_playbooks.artifact_catalog c WHERE c.digest=t.identity)))",&[&namespace,&cutoff]).map_err(backend)?;
-    }
+    collect(tx, namespace, next)?;
     for row in tx.query("SELECT kind,identity,content_digest FROM aq_playbooks.disposal_tombstones WHERE namespace=$1",&[&namespace]).map_err(backend)?{
         let kind:String=row.get(0);let id:String=row.get(1);match kind.as_str(){
             "event" if next.events.contains_key(&id)=>return Err(backend("disposed event identity cannot be reused")),

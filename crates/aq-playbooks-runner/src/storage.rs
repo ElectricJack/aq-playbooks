@@ -63,6 +63,21 @@ pub trait Storage: Send + Sync {
     ) -> Result<u64, StorageError>;
     fn acquire(&self, namespace: &str, owner: &str) -> Result<(), StorageError>;
     fn release(&self, namespace: &str, owner: &str) -> Result<(), StorageError>;
+    /// Versioned bounded transition capability (D10). The default reports
+    /// `Unsupported` without running the plan; the engine then uses the full
+    /// `load`/`compare_and_swap` path.
+    fn transition_v1(
+        &self,
+        _namespace: &str,
+        _owner: &str,
+        _request: &mut crate::transition::TransitionRequest<'_>,
+    ) -> crate::Result<crate::transition::TransitionOutcome> {
+        Ok(crate::transition::TransitionOutcome::Unsupported)
+    }
+    /// Whether `transition_v1` is available for `namespace`.
+    fn transition_v1_support(&self, _namespace: &str) -> Result<bool, StorageError> {
+        Ok(false)
+    }
 }
 #[derive(Clone, Default)]
 pub struct MemoryStorage {

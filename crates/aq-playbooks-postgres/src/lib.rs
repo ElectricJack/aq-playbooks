@@ -16,8 +16,10 @@ mod indexes;
 mod profiling;
 mod projection;
 mod protection;
+mod records;
 use profiling::ObservedTransaction;
 pub use profiling::{OperationProfile, StageProfile, StorageProfile};
+pub use records::TransitionStats;
 mod retention;
 use aq_playbooks_model::{Artifact, canonical_bytes};
 use aq_playbooks_runner::{
@@ -46,18 +48,24 @@ const MIGRATIONS: &[(i32, &str)] = &[
         include_str!("../migrations/0003_keyed_admission_writer.sql"),
     ),
     (4, include_str!("../migrations/0004_catalog_inspection.sql")),
+    (5, include_str!("../migrations/0005_transition_records.sql")),
 ];
+#[cfg(all(test, feature = "postgres-tests"))]
 const WRITE_MARKER_SQL: &str = "SELECT set_config('aq_playbooks.writer_namespace',$1,true),set_config('aq_playbooks.writer_format','2',true)";
+use records::MARKER_SQL as WRITE_MARKER_FORMAT_SQL;
 const MIGRATION_LOCK: i64 = 0x4151504c41594d47;
 
 struct Lease {
     owner: String,
     incarnation: i64,
     catalog_uncertain: bool,
+    /// Writer format of the namespace row (2 snapshot, 3 records).
+    format: i32,
 }
 struct Connection {
     client: Client,
     leases: BTreeMap<String, Lease>,
+    statements: Option<records::Statements>,
 }
 
 /// Holds one database session for its lifetime. Dropping it releases all locks;
@@ -66,6 +74,9 @@ pub struct PostgresStorage {
     connection: Mutex<Connection>,
     keyring: Option<ProtectionKeyring>,
     profiling: profiling::Sink,
+    /// New unprotected namespaces use writer format 3 (records).
+    records: bool,
+    stats: Mutex<TransitionStats>,
     #[cfg(test)]
     lose_catalog_commit_reply: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -111,6 +122,16 @@ impl PostgresStorage {
     }
     pub fn from_client(client: Client) -> Result<Self, StorageError> {
         Self::initialize(client, None)
+    }
+    /// Like `connect`, but namespaces this connection creates use the bounded
+    /// record representation (writer format 3) and support `transition_v1`.
+    pub fn connect_records(config: &str) -> Result<Self, StorageError> {
+        Self::from_client_records(Client::connect(config, NoTls).map_err(backend)?)
+    }
+    pub fn from_client_records(client: Client) -> Result<Self, StorageError> {
+        let mut storage = Self::initialize(client, None)?;
+        storage.records = true;
+        Ok(storage)
     }
     pub fn from_client_protected(
         client: Client,
@@ -158,9 +179,12 @@ impl PostgresStorage {
             connection: Mutex::new(Connection {
                 client,
                 leases: BTreeMap::new(),
+                statements: None,
             }),
             keyring,
             profiling: Default::default(),
+            records: false,
+            stats: Mutex::new(TransitionStats::default()),
             #[cfg(test)]
             lose_catalog_commit_reply: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -288,6 +312,9 @@ impl Storage for PostgresStorage {
     ) -> Result<aq_playbooks_runner::IndexPage, StorageError> {
         check_name(namespace)?;
         let mut conn = self.connection()?;
+        if let Some(page) = self.query_records(&mut conn, namespace, query)? {
+            return Ok(page);
+        }
         if conn
             .client
             .query_opt(
@@ -314,7 +341,7 @@ impl Storage for PostgresStorage {
         let mut tx = conn.client.transaction().map_err(backend)?;
         let Some(row) = tx
             .query_opt(
-                "SELECT revision,indexes_materialized FROM aq_playbooks.namespaces WHERE namespace=$1 FOR SHARE",
+                "SELECT revision,indexes_materialized,writer_format,state_header FROM aq_playbooks.namespaces WHERE namespace=$1 FOR SHARE",
                 &[&namespace],
             )
             .map_err(backend)?
@@ -325,12 +352,19 @@ impl Storage for PostgresStorage {
                 revision: 0,
             });
         };
+        let revision = row.get::<_, i64>(0) as u64;
+        if row.get::<_, i32>(2) == records::FORMAT {
+            let mut tx = ObservedTransaction::new(tx, self.profiling.clone(), "inspect");
+            let artifacts = self.read_artifacts(&mut tx, namespace, false)?;
+            let state = records::assemble(&mut tx, namespace, row.get(3), artifacts)?;
+            tx.commit().map_err(backend)?;
+            return Ok(records::inspect(&state, query, revision));
+        }
         if !row.get::<_, bool>(1) {
             return Err(backend(
                 "namespace indexes require exclusive owner initialization",
             ));
         }
-        let revision = row.get::<_, i64>(0) as u64;
         let limit = (query.limit + 1) as i64;
         let rows=tx.query("SELECT item_key,public_value FROM aq_playbooks.inspection_rows WHERE namespace=$1 AND kind=$2 AND ($3::text IS NULL OR run_id=$3) AND ($4::text IS NULL OR item_key>$4) ORDER BY item_key LIMIT $5",&[&namespace,&query.kind.key(),&query.run,&query.after,&limit]).map_err(backend)?;
         let more = rows.len() > query.limit;
@@ -370,28 +404,45 @@ impl Storage for PostgresStorage {
         }
         let result = (|| {
             let mut tx = conn.client.transaction().map_err(backend)?;
-            tx.query_one(WRITE_MARKER_SQL, &[&namespace])
+            let format: i32 = match tx
+                .query_opt(
+                    "SELECT writer_format FROM aq_playbooks.namespaces WHERE namespace=$1",
+                    &[&namespace],
+                )
+                .map_err(backend)?
+            {
+                Some(row) => row.get(0),
+                None if self.records && self.keyring.is_none() => records::FORMAT,
+                None => 2,
+            };
+            tx.query_one(WRITE_MARKER_FORMAT_SQL, &[&namespace, &format.to_string()])
                 .map_err(backend)?;
-            let empty = self.encode(namespace, 0, &State::default())?;
-            tx.execute("INSERT INTO aq_playbooks.namespaces(namespace,snapshot,protection_key_id,protection_nonce,encrypted_snapshot,indexes_materialized,writer_format) VALUES($1,$2,$3,$4,$5,true,2) ON CONFLICT DO NOTHING",&[&namespace,&empty.plaintext,&empty.key_id,&empty.nonce,&empty.ciphertext]).map_err(backend)?;
-            let existing=tx.query_one("SELECT revision,snapshot,protection_key_id,protection_nonce,encrypted_snapshot FROM aq_playbooks.namespaces WHERE namespace=$1",&[&namespace]).map_err(backend)?;
-            self.decode(
-                namespace,
-                existing.get::<_, i64>("revision") as u64,
-                &existing,
-            )?;
-            let incarnation: i64 = tx.query_one("UPDATE aq_playbooks.namespaces SET owner=$2, writer_format=2, owner_backend_pid=pg_backend_pid(), incarnation=incarnation+1, acquired_at=clock_timestamp() WHERE namespace=$1 RETURNING incarnation", &[&namespace,&owner]).map_err(backend)?.get(0);
+            if format == records::FORMAT {
+                let (header, accounting) = records::empty_header()?;
+                tx.execute("INSERT INTO aq_playbooks.namespaces(namespace,snapshot,indexes_materialized,writer_format,state_header,state_accounting) VALUES($1,'null'::jsonb,false,3,$2,$3) ON CONFLICT DO NOTHING",&[&namespace,&header,&accounting]).map_err(backend)?;
+            } else {
+                let empty = self.encode(namespace, 0, &State::default())?;
+                tx.execute("INSERT INTO aq_playbooks.namespaces(namespace,snapshot,protection_key_id,protection_nonce,encrypted_snapshot,indexes_materialized,writer_format) VALUES($1,$2,$3,$4,$5,true,2) ON CONFLICT DO NOTHING",&[&namespace,&empty.plaintext,&empty.key_id,&empty.nonce,&empty.ciphertext]).map_err(backend)?;
+                let existing=tx.query_one("SELECT revision,snapshot,protection_key_id,protection_nonce,encrypted_snapshot FROM aq_playbooks.namespaces WHERE namespace=$1",&[&namespace]).map_err(backend)?;
+                self.decode(
+                    namespace,
+                    existing.get::<_, i64>("revision") as u64,
+                    &existing,
+                )?;
+            }
+            let incarnation: i64 = tx.query_one("UPDATE aq_playbooks.namespaces SET owner=$2, owner_backend_pid=pg_backend_pid(), incarnation=incarnation+1, acquired_at=clock_timestamp() WHERE namespace=$1 RETURNING incarnation", &[&namespace,&owner]).map_err(backend)?.get(0);
             tx.commit().map_err(backend)?;
-            Ok(incarnation)
+            Ok((incarnation, format))
         })();
         match result {
-            Ok(incarnation) => {
+            Ok((incarnation, format)) => {
                 conn.leases.insert(
                     namespace.into(),
                     Lease {
                         owner: owner.into(),
                         incarnation,
                         catalog_uncertain: false,
+                        format,
                     },
                 );
                 Ok(())
@@ -413,8 +464,9 @@ impl Storage for PostgresStorage {
             .filter(|l| l.owner == owner)
             .ok_or(StorageError::Ownership)?;
         let incarnation = lease.incarnation;
+        let format = lease.format.to_string();
         let mut tx = conn.client.transaction().map_err(backend)?;
-        tx.query_one(WRITE_MARKER_SQL, &[&namespace])
+        tx.query_one(WRITE_MARKER_FORMAT_SQL, &[&namespace, &format])
             .map_err(backend)?;
         let changed = tx.execute("UPDATE aq_playbooks.namespaces SET owner=NULL,owner_backend_pid=NULL WHERE namespace=$1 AND owner=$2 AND incarnation=$3 AND owner_backend_pid=pg_backend_pid()", &[&namespace,&owner,&incarnation]).map_err(backend)?;
         if changed != 1 {
@@ -443,10 +495,19 @@ impl Storage for PostgresStorage {
         );
         // The row lock gives the snapshot and its artifact references one view,
         // without holding an unbounded repeatable-read transaction.
-        let Some(row) = tx.query_opt("SELECT revision,snapshot,protection_key_id,protection_nonce,encrypted_snapshot FROM aq_playbooks.namespaces WHERE namespace=$1 FOR SHARE", &[&namespace]).map_err(backend)? else {
+        let Some(row) = tx.query_opt("SELECT revision,snapshot,protection_key_id,protection_nonce,encrypted_snapshot,writer_format,state_header FROM aq_playbooks.namespaces WHERE namespace=$1 FOR SHARE", &[&namespace]).map_err(backend)? else {
             return Ok(VersionedState::default());
         };
+        self.count(|s| s.full_loads += 1);
         let revision = row.get::<_, i64>("revision") as u64;
+        if row.get::<_, i32>("writer_format") == records::FORMAT {
+            tx.phase("artifact_read");
+            let artifacts = self.read_artifacts(&mut tx, namespace, false)?;
+            tx.phase("records_read");
+            let state = records::assemble(&mut tx, namespace, row.get("state_header"), artifacts)?;
+            tx.commit().map_err(backend)?;
+            return Ok(VersionedState { revision, state });
+        }
         let protected = row.get::<_, Option<String>>("protection_key_id").is_some();
         tx.phase("snapshot_decode");
         let mut state = self.decode(namespace, revision, &row)?;
@@ -463,7 +524,28 @@ impl Storage for PostgresStorage {
         expected_revision: u64,
         state: &State,
     ) -> Result<u64, StorageError> {
+        self.count(|s| s.full_commits += 1);
         self.commit_state(namespace, owner, expected_revision, state, false)
+    }
+    fn transition_v1(
+        &self,
+        namespace: &str,
+        owner: &str,
+        request: &mut aq_playbooks_runner::transition::TransitionRequest<'_>,
+    ) -> aq_playbooks_runner::Result<aq_playbooks_runner::transition::TransitionOutcome> {
+        self.transition_records(namespace, owner, request)
+    }
+    fn transition_v1_support(&self, namespace: &str) -> Result<bool, StorageError> {
+        check_name(namespace)?;
+        let mut conn = self.connection()?;
+        Ok(conn
+            .client
+            .query_opt(
+                "SELECT writer_format FROM aq_playbooks.namespaces WHERE namespace=$1",
+                &[&namespace],
+            )
+            .map_err(backend)?
+            .is_some_and(|row| row.get::<_, i32>(0) == records::FORMAT))
     }
 }
 impl PostgresStorage {
@@ -487,12 +569,13 @@ impl PostgresStorage {
             .filter(|l| l.owner == owner)
             .ok_or(StorageError::Ownership)?;
         let incarnation = lease.incarnation;
+        let format = lease.format;
         let mut tx = ObservedTransaction::new(
             conn.client.transaction().map_err(backend)?,
             self.profiling.clone(),
             "cas",
         );
-        tx.query_one(WRITE_MARKER_SQL, &[&namespace])
+        tx.query_one(WRITE_MARKER_FORMAT_SQL, &[&namespace, &format.to_string()])
             .map_err(backend)?;
         let advisory_key = lock_key(namespace) as u64;
         let high = (advisory_key >> 32) as i64;
@@ -501,7 +584,7 @@ impl PostgresStorage {
         if !owns_lock {
             return Err(StorageError::Ownership);
         }
-        let row = tx.query_opt("SELECT revision,owner,incarnation,owner_backend_pid=pg_backend_pid(),snapshot,protection_key_id,protection_nonce,encrypted_snapshot,indexes_materialized,catalog_projected_revision,catalog_metadata_revision,catalog_supported,catalog_definition_count,catalog_activation_count,catalog_actual_definition_count,catalog_actual_activation_count FROM aq_playbooks.namespaces WHERE namespace=$1 FOR UPDATE", &[&namespace]).map_err(backend)?.ok_or(StorageError::Ownership)?;
+        let row = tx.query_opt("SELECT revision,owner,incarnation,owner_backend_pid=pg_backend_pid(),snapshot,protection_key_id,protection_nonce,encrypted_snapshot,indexes_materialized,catalog_projected_revision,catalog_metadata_revision,catalog_supported,catalog_definition_count,catalog_activation_count,catalog_actual_definition_count,catalog_actual_activation_count,writer_format,state_header FROM aq_playbooks.namespaces WHERE namespace=$1 FOR UPDATE", &[&namespace]).map_err(backend)?.ok_or(StorageError::Ownership)?;
         if row.get::<_, Option<String>>(1).as_deref() != Some(owner)
             || row.get::<_, i64>(2) != incarnation
             || row.get::<_, Option<bool>>(3) != Some(true)
@@ -511,6 +594,10 @@ impl PostgresStorage {
         if row.get::<_, i64>(0) != expected {
             return Err(StorageError::Conflict);
         }
+        if row.get::<_, i32>("writer_format") != format {
+            return Err(backend("namespace writer format changed under the lease"));
+        }
+        let record_format = format == records::FORMAT;
         let catalog_projected: Option<i64> = row.get("catalog_projected_revision");
         let catalog_metadata: Option<i64> = row.get("catalog_metadata_revision");
         if catalog_projected.is_some_and(|projected| projected != expected)
@@ -524,14 +611,22 @@ impl PostgresStorage {
                 row.get::<_, Option<String>>("protection_key_id").as_deref()
                     != Some(keys.active_key_id())
             });
-        tx.phase("snapshot_decode");
-        let mut previous = self.decode(namespace, expected_revision, &row)?;
-        tx.phase("artifact_read");
-        previous.artifacts = self.read_artifacts(
-            &mut tx,
-            namespace,
-            row.get::<_, Option<String>>("protection_key_id").is_some(),
-        )?;
+        let previous = if record_format {
+            tx.phase("artifact_read");
+            let artifacts = self.read_artifacts(&mut tx, namespace, false)?;
+            tx.phase("records_read");
+            records::assemble(&mut tx, namespace, row.get("state_header"), artifacts)?
+        } else {
+            tx.phase("snapshot_decode");
+            let mut previous = self.decode(namespace, expected_revision, &row)?;
+            tx.phase("artifact_read");
+            previous.artifacts = self.read_artifacts(
+                &mut tx,
+                namespace,
+                row.get::<_, Option<String>>("protection_key_id").is_some(),
+            )?;
+            previous
+        };
         tx.phase("artifact_locks");
         aq_playbooks_runner::retention::verify_artifact_removals(&previous, state)?;
         aq_playbooks_runner::admission::verify_receipt_retention(&previous, state)?;
@@ -603,17 +698,19 @@ impl PostgresStorage {
         tx.phase("artifact_disposal");
         retention::dispose_artifacts(&mut tx, namespace, &previous, state)?;
         let empty = State::default();
-        tx.phase("indexes");
-        indexes::sync(
-            &mut tx,
-            namespace,
-            if row.get::<_, bool>("indexes_materialized") {
-                &previous
-            } else {
-                &empty
-            },
-            state,
-        )?;
+        if !record_format {
+            tx.phase("indexes");
+            indexes::sync(
+                &mut tx,
+                namespace,
+                if row.get::<_, bool>("indexes_materialized") {
+                    &previous
+                } else {
+                    &empty
+                },
+                state,
+            )?;
+        }
         tx.phase("catalog_projection");
         let catalog = catalog::sync(
             &mut tx,
@@ -636,10 +733,17 @@ impl PostgresStorage {
                 "synthetic rollback after catalog projection writes",
             ));
         }
-        tx.phase("snapshot_encode");
-        let snapshot = self.encode(namespace, next as u64, state)?;
-        tx.phase("snapshot_write");
-        let published = tx.execute("UPDATE aq_playbooks.namespaces SET snapshot=$2,protection_key_id=$3,protection_nonce=$4,encrypted_snapshot=$5,revision=$6,writer_format=2,indexes_materialized=true,catalog_projected_revision=$7,catalog_metadata_revision=$8,catalog_supported=$9,catalog_definition_count=$10,catalog_activation_count=$11,updated_at=clock_timestamp() WHERE namespace=$1 AND catalog_actual_definition_count=$10 AND catalog_actual_activation_count=$11",&[&namespace,&snapshot.plaintext,&snapshot.key_id,&snapshot.nonce,&snapshot.ciphertext,&next,&catalog.revision,&catalog.metadata_revision,&catalog.supported,&catalog.definition_count,&catalog.activation_count]).map_err(backend)?;
+        let published = if record_format {
+            tx.phase("records_write");
+            let export = records::export(state)?;
+            records::replace_all(&mut tx, namespace, &export)?;
+            tx.execute("UPDATE aq_playbooks.namespaces SET state_header=$2,state_accounting=$3,revision=$4,catalog_projected_revision=$5,catalog_metadata_revision=$6,catalog_supported=$7,catalog_definition_count=$8,catalog_activation_count=$9,updated_at=clock_timestamp() WHERE namespace=$1 AND catalog_actual_definition_count=$8 AND catalog_actual_activation_count=$9",&[&namespace,&export.header,&records::accounting_json(&export.accounting),&next,&catalog.revision,&catalog.metadata_revision,&catalog.supported,&catalog.definition_count,&catalog.activation_count]).map_err(backend)?
+        } else {
+            tx.phase("snapshot_encode");
+            let snapshot = self.encode(namespace, next as u64, state)?;
+            tx.phase("snapshot_write");
+            tx.execute("UPDATE aq_playbooks.namespaces SET snapshot=$2,protection_key_id=$3,protection_nonce=$4,encrypted_snapshot=$5,revision=$6,writer_format=2,indexes_materialized=true,catalog_projected_revision=$7,catalog_metadata_revision=$8,catalog_supported=$9,catalog_definition_count=$10,catalog_activation_count=$11,updated_at=clock_timestamp() WHERE namespace=$1 AND catalog_actual_definition_count=$10 AND catalog_actual_activation_count=$11",&[&namespace,&snapshot.plaintext,&snapshot.key_id,&snapshot.nonce,&snapshot.ciphertext,&next,&catalog.revision,&catalog.metadata_revision,&catalog.supported,&catalog.definition_count,&catalog.activation_count]).map_err(backend)?
+        };
         if published != 1 {
             return Err(backend(
                 "catalog projection row count mismatch before State publication",

@@ -2,7 +2,11 @@
 //! supply the database marker; no engine behavior or production data is changed.
 use aq_playbooks_model::*;
 use aq_playbooks_postgres::PostgresStorage;
-use aq_playbooks_runner::{storage::*, *};
+use aq_playbooks_runner::{
+    storage::*,
+    transition::{TransitionOutcome, TransitionRequest},
+    *,
+};
 use postgres::{Client, NoTls};
 use serde_json::{Value, json};
 use std::result::Result;
@@ -70,6 +74,37 @@ impl<S: Storage> Storage for Measured<S> {
     fn inspect(&self, n: &str, q: &InspectionQuery) -> Result<InspectionPage, StorageError> {
         self.inner.inspect(n, q)
     }
+    fn transition_v1(
+        &self,
+        n: &str,
+        o: &str,
+        request: &mut TransitionRequest<'_>,
+    ) -> aq_playbooks_runner::Result<TransitionOutcome> {
+        let t = Instant::now();
+        let r = self.inner.transition_v1(n, o, request);
+        self.meter.add("transition_us", t);
+        r
+    }
+    fn transition_v1_support(&self, n: &str) -> Result<bool, StorageError> {
+        self.inner.transition_v1_support(n)
+    }
+}
+/// Value-free D10 work counters for one measured region.
+fn work(e: &Engine<Measured<PostgresStorage>>) -> Value {
+    let s = e.store.inner.transition_stats();
+    json!({"transitions":s.transitions,"incremental":s.incremental,"heavy":s.heavy,"unchanged":s.unchanged,"full_loads":s.full_loads,"full_commits":s.full_commits,"record_reads":s.record_reads,"records_written":s.records_written,"fallbacks":s.fallbacks})
+}
+/// Every operation in the region committed through bounded record writes.
+fn bounded(work: &Value, operations: u64) -> bool {
+    work["incremental"] == operations
+        && ["heavy", "full_loads", "full_commits"]
+            .iter()
+            .all(|k| work[k] == 0)
+        && work["fallbacks"].as_array().is_some_and(Vec::is_empty)
+}
+fn clear(e: &Engine<Measured<PostgresStorage>>, meter: &Meter) {
+    meter.clear();
+    e.store.inner.reset_transition_stats();
 }
 fn stats(v: &[u64]) -> Value {
     if v.is_empty() {
@@ -271,13 +306,14 @@ fn pg(config: &str, label: &str, state: &State) -> (Engine<Measured<PostgresStor
     let meter = Meter::default();
     let e = seed(
         Measured {
-            inner: PostgresStorage::connect(config).unwrap(),
+            inner: PostgresStorage::connect_records(config).unwrap(),
             meter: meter.clone(),
         },
         label,
         state,
     );
-    meter.clear();
+    assert!(e.store.transition_v1_support(label).unwrap(), "{label}");
+    clear(&e, &meter);
     e.store
         .inner
         .set_profiling(std::env::var("AQ_PB03_STORAGE_PROFILE").as_deref() == Ok("1"));
@@ -313,17 +349,19 @@ fn report_phase(config: &str, state: &State, h: usize, kind: &str) {
     let (e, meter) = pg(config, &format!("history-{h}-{kind}"), state);
     let mut e = e;
     let before = counts(&e.snapshot().unwrap());
-    meter.clear();
+    clear(&e, &meter);
     e.store
         .inner
         .set_profiling(std::env::var("AQ_PB03_STORAGE_PROFILE").as_deref() == Ok("1"));
     let rss = rss_kib();
     let (wall, pure) = phase(&mut e, kind);
     let timing = meter.report();
+    let work = work(&e);
+    assert!(bounded(&work, SAMPLES as u64), "{kind} {h}: {work}");
     let storage_profile = e.store.inner.profiling_snapshot();
     let end = e.snapshot().unwrap();
     emit(
-        json!({"scenario":kind,"history":h,"starting":before,"ending":counts(&end),"wall_us":stats(&wall),"transition_closure_us":stats(&pure),"store":timing,"storage_profile":storage_profile,"process_rss_kib_before":rss,"process_rss_kib_after":rss_kib(),"engine_metrics":e.metrics.snapshot(),"budget_us":if kind=="event"{25000}else{0},"event_budget_pass":kind!="event"||stats(&wall)["p95"].as_u64().unwrap()<25000,"pure_closure_budget_pass":stats(&pure)["p95"].as_u64().unwrap()<1000}),
+        json!({"scenario":kind,"history":h,"starting":before,"ending":counts(&end),"wall_us":stats(&wall),"transition_closure_us":stats(&pure),"store":timing,"storage_profile":storage_profile,"process_rss_kib_before":rss,"process_rss_kib_after":rss_kib(),"engine_metrics":e.metrics.snapshot(),"transition_work":work,"bounded":true,"budget_us":if kind=="event"{25000}else{0},"event_budget_pass":kind!="event"||stats(&wall)["p95"].as_u64().unwrap()<25000,"pure_closure_budget_pass":stats(&pure)["p95"].as_u64().unwrap()<1000}),
     );
     e.release().unwrap();
 }
@@ -347,7 +385,7 @@ fn fairness(config: &str, state: &State, h: usize, groups: [usize; 3]) {
             admitted.insert(id, Instant::now());
         }
     }
-    meter.clear();
+    clear(&e, &meter);
     let mut host = FakeHost::default();
     let mut wall = vec![];
     let mut queue = vec![];
@@ -367,6 +405,8 @@ fn fairness(config: &str, state: &State, h: usize, groups: [usize; 3]) {
         queue.push(admitted[&candidate.key].elapsed().as_micros() as u64);
         order.push(candidate.scope);
     }
+    let work = work(&e);
+    let dispatches = groups.iter().sum::<usize>() as u64;
     let end = e.snapshot().unwrap();
     assert!(admitted.keys().all(|id| end.runs[id].status.terminal()));
     let roundrobin = order
@@ -375,7 +415,7 @@ fn fairness(config: &str, state: &State, h: usize, groups: [usize; 3]) {
         .enumerate()
         .all(|(i, s)| s == ["a", "b", "c"][i % 3]);
     emit(
-        json!({"scenario":"ready_queue","history":h,"groups":groups,"dispatch_call_us":stats(&wall),"admission_to_first_visit_upper_bound_us":stats(&queue),"scope_order":order,"equal_prefix_round_robin":roundrobin,"dispatch_budget_pass":stats(&wall)["p95"].as_u64().unwrap()<100000,"queue_budget_pass":stats(&queue)["p95"].as_u64().unwrap()<100000,"store":meter.report(),"ending":counts(&end)}),
+        json!({"scenario":"ready_queue","history":h,"groups":groups,"dispatch_call_us":stats(&wall),"admission_to_first_visit_upper_bound_us":stats(&queue),"scope_order":order,"equal_prefix_round_robin":roundrobin,"dispatch_budget_pass":stats(&wall)["p95"].as_u64().unwrap()<100000,"queue_budget_pass":stats(&queue)["p95"].as_u64().unwrap()<100000,"store":meter.report(),"transition_work":work,"bounded":bounded(&work,dispatches),"ending":counts(&end)}),
     );
     e.release().unwrap();
 }
@@ -383,7 +423,7 @@ fn concurrent(config: &str, state: &State, threads: usize) {
     let (e, meter) = pg(config, &format!("concurrent-{threads}"), state);
     let e = Arc::new(e);
     let barrier = Arc::new(Barrier::new(threads));
-    meter.clear();
+    clear(&e, &meter);
     let started = Instant::now();
     let mut handles = vec![];
     for tid in 0..threads {
@@ -399,8 +439,10 @@ fn concurrent(config: &str, state: &State, threads: usize) {
         .iter()
         .map(|v| v["wall_us"].as_u64().unwrap())
         .collect();
+    let work = work(&e);
+    let admitted = outcomes.iter().filter(|v| v["success"] == true).count() as u64;
     emit(
-        json!({"scenario":"concurrent_admission","threads":threads,"per_thread":8,"maximum_immediate_attempts":8,"elapsed_us":started.elapsed().as_micros(),"wall_us":stats(&wall),"outcomes":outcomes,"store":meter.report(),"ending":counts(&e.snapshot().unwrap())}),
+        json!({"scenario":"concurrent_admission","threads":threads,"per_thread":8,"maximum_immediate_attempts":8,"elapsed_us":started.elapsed().as_micros(),"wall_us":stats(&wall),"outcomes":outcomes,"store":meter.report(),"transition_work":work,"bounded":bounded(&work,admitted),"ending":counts(&e.snapshot().unwrap())}),
     );
     e.release().unwrap();
 }
@@ -425,8 +467,10 @@ fn pending(config: &str, n: usize) {
     );
     let (mut e, meter) = pg(config, &format!("pending-{n}"), &s);
     let (wall, pure) = phase(&mut e, "event");
+    let work = work(&e);
+    assert!(bounded(&work, SAMPLES as u64), "pending {n}: {work}");
     emit(
-        json!({"scenario":"pending_children","pending":n,"starting":counts(&s),"ending":counts(&e.snapshot().unwrap()),"event_wall_us":stats(&wall),"transition_closure_us":stats(&pure),"store":meter.report(),"budget_pass":stats(&wall)["p95"].as_u64().unwrap()<25000,"rss_kib":rss_kib()}),
+        json!({"scenario":"pending_children","pending":n,"starting":counts(&s),"ending":counts(&e.snapshot().unwrap()),"event_wall_us":stats(&wall),"transition_closure_us":stats(&pure),"store":meter.report(),"transition_work":work,"bounded":true,"budget_pass":stats(&wall)["p95"].as_u64().unwrap()<25000,"rss_kib":rss_kib()}),
     );
     e.release().unwrap();
 }
@@ -438,7 +482,7 @@ fn quotas(config: &str, state: &State) {
         "state_bytes",
         "queued_destinations",
     ] {
-        let (mut e, _) = pg(config, &format!("quota-{kind}"), state);
+        let (mut e, meter) = pg(config, &format!("quota-{kind}"), state);
         if kind == "queued_destinations" {
             let mut a = artifact("triggered", "a", ret());
             let c = event_contract();
@@ -479,6 +523,7 @@ fn quotas(config: &str, state: &State) {
             }
         }
         let before = e.snapshot().unwrap();
+        clear(&e, &meter);
         let t = Instant::now();
         let refusal = if matches!(kind, "events" | "queued_destinations") {
             e.admit_event("pb02", event("excess"), NOW).map(|_| ())
@@ -487,6 +532,7 @@ fn quotas(config: &str, state: &State) {
                 .map(|_| ())
         };
         let elapsed = t.elapsed().as_micros();
+        let work = work(&e);
         assert!(refusal.is_err());
         let after = e.snapshot().unwrap();
         assert_eq!(
@@ -494,7 +540,7 @@ fn quotas(config: &str, state: &State) {
             canonical_bytes(&after).unwrap()
         );
         emit(
-            json!({"scenario":"quota_refusal","quota":kind,"limits":e.config,"refused":true,"state_unchanged":true,"refusal_us":elapsed,"retained":counts(&after),"error":refusal.unwrap_err().to_string()}),
+            json!({"scenario":"quota_refusal","quota":kind,"limits":e.config,"refused":true,"state_unchanged":true,"refusal_us":elapsed,"transition_work":work,"bounded":bounded(&work,0),"retained":counts(&after),"error":refusal.unwrap_err().to_string()}),
         );
         e.release().unwrap();
     }
@@ -529,7 +575,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "disposable database marker mismatch"
     );
     emit(
-        json!({"scenario":"configuration","version":2,"samples":SAMPLES,"full_history_sizes":HISTORY,"minimal_history_sizes":[0,1,8,32],"minimal_repeats":2,"minimal_event_samples":64,"minimal_ready_batches":24,"budgets_us":{"transition":1000,"event_admission":25000,"ready_dispatch":100000},"seed":"real MemoryStorage engine admissions/transitions/events; one public Storage CAS imports each fully indexed snapshot outside measurement","protection":"disabled","payload":"null run input,128-byte event string,return-only steps; no provider/network effects","default_quotas":EngineConfig::default(),"started_unix_ms":SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()}),
+        json!({"scenario":"configuration","version":3,"writer_format":3,"transition_flatness":"store transition_us p95 at history 512 <= 2x history 0","samples":SAMPLES,"full_history_sizes":HISTORY,"minimal_history_sizes":[0,1,8,32],"minimal_repeats":2,"minimal_event_samples":64,"minimal_ready_batches":24,"budgets_us":{"transition":1000,"event_admission":25000,"ready_dispatch":100000},"seed":"real MemoryStorage engine admissions/transitions/events; one public Storage CAS imports each snapshot into record writer format 3 outside measurement; every timed admit/event cell commits only through bounded transition_v1 record writes","protection":"disabled","payload":"null run input,128-byte event string,return-only steps; no provider/network effects","default_quotas":EngineConfig::default(),"started_unix_ms":SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()}),
     );
     if std::env::args().nth(1).as_deref() == Some("--minimal") {
         minimal(&config);
@@ -538,6 +584,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let e = base();
     let empty = e.snapshot()?;
+    preflight(&config, &empty);
     let mut previous = 0;
     for h in HISTORY {
         for i in previous..h {
@@ -566,6 +613,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// D10 preflight: the non-mutating support query, then one untimed operation
+/// that must commit incrementally without a full load or full commit.
+fn preflight(config: &str, state: &State) {
+    let (e, meter) = pg(config, "preflight", state);
+    e.admit("a", "main", Value::Null, authority("a"), NOW)
+        .unwrap();
+    let work = work(&e);
+    assert!(bounded(&work, 1), "preflight: {work}");
+    clear(&e, &meter);
+    emit(json!({"scenario":"preflight","support":true,"transition_work":work,"bounded":true}));
+    e.release().unwrap();
+}
 fn minimal_config() -> EngineConfig {
     EngineConfig {
         max_runs: 35,

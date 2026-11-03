@@ -300,7 +300,8 @@ mod projection_tests {
                 kind: "terminal".into(),
                 detail: json!({"status":"completed","outcome":"ok"}),
             },
-        ];
+        ]
+        .into();
         let idx = &mut s.indexes;
         idx.scope_cursor = Some("a".into());
         idx.effect_cursor.insert("dispatch".into(), "b".into());
@@ -334,7 +335,7 @@ mod projection_tests {
         idx.runs.insert("run-a".into());
         idx.receipts
             .insert("run-a".into(), BTreeMap::from([(1, 0), (10, 1), (2, 2)]));
-        idx.all_receipts = BTreeMap::from([(1, 0), (10, 1), (2, 2)]);
+        idx.all_receipts = BTreeMap::from([(1, 0), (10, 1), (2, 2)]).into();
         s
     }
     fn equivalent(previous: &State, next: &State) {

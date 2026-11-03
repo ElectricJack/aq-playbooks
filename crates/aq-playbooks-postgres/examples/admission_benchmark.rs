@@ -67,12 +67,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         capabilities: BTreeSet::new(),
     };
     let engine = Engine::new(
-        PostgresStorage::connect(&config)?,
+        PostgresStorage::connect_records(&config)?,
         namespace,
         "benchmark-incarnation",
     )?;
     engine.install(artifact.clone())?;
     engine.activate("benchmark", &artifact.digest, authority.clone())?;
+    // D10: admissions after the first full commit use bounded record writes.
+    engine.store.reset_transition_stats();
     let mut latency_us = Vec::with_capacity(100);
     let total = Instant::now();
     for n in 0..100 {
@@ -81,13 +83,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         latency_us.push(started.elapsed().as_micros() as u64);
     }
     let elapsed = total.elapsed();
+    let work = engine.store.transition_stats();
     latency_us.sort_unstable();
     let snapshot_bytes = serde_json::to_vec(&engine.snapshot()?)?.len();
     engine.release()?;
     println!(
         "{}",
         serde_json::to_string_pretty(
-            &json!({"workload":"100 sequential root admissions; one return-only artifact; null inputs; growing retained namespace; no host effects","build":if cfg!(debug_assertions){"debug"}else{"release"},"admissions":100,"artifact_bytes":artifact_bytes,"final_state_json_bytes":snapshot_bytes,"p50_us":latency_us[49],"p95_us":latency_us[94],"maximum_us":latency_us[99],"elapsed_ms":elapsed.as_secs_f64()*1000.0,"admissions_per_second":100.0/elapsed.as_secs_f64()})
+            &json!({"workload":"100 sequential root admissions; one return-only artifact; null inputs; growing retained namespace; no host effects","build":if cfg!(debug_assertions){"debug"}else{"release"},"admissions":100,"artifact_bytes":artifact_bytes,"final_state_json_bytes":snapshot_bytes,"p50_us":latency_us[49],"p95_us":latency_us[94],"maximum_us":latency_us[99],"elapsed_ms":elapsed.as_secs_f64()*1000.0,"admissions_per_second":100.0/elapsed.as_secs_f64(),"writer_format":3,"incremental_transitions":work.incremental,"heavy_transitions":work.heavy,"full_loads":work.full_loads,"full_commits":work.full_commits,"fallbacks":work.fallbacks})
         )?
     );
     Ok(())

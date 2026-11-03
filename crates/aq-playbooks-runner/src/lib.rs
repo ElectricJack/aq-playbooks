@@ -5,18 +5,24 @@ pub use admission::{KeyedAdmissionDisposition, KeyedAdmissionReceipt, KeyedAdmis
 pub mod catalog_inspection;
 pub mod inspection;
 pub use catalog_inspection::{CatalogError, CatalogKind, CatalogPage, CatalogQuery, CatalogStamp};
+pub mod lazy;
 pub mod metrics;
 pub mod storage;
+pub mod transition;
 pub use inspection::{InspectionKind, InspectionPage, InspectionQuery};
 pub mod indexes;
 pub mod retention;
 use aq_playbooks_model::*;
 pub use indexes::{EffectQueueKind, IndexItem, IndexPage, IndexQuery, RuntimeIndexes};
+pub use lazy::{LazyMap, LazySeq, LazySet};
 pub use retention::{GcReport, RetentionPolicy, RetentionState};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 pub use storage::{MemoryStorage, Storage, StorageError, VersionedState};
+pub use transition::{
+    QuotaCounts, RecordStorage, TransitionOutcome, TransitionRequest, check_quota, quota_counts,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -244,7 +250,7 @@ pub struct EventDisposition {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct State {
     #[serde(default)]
-    pub keyed_admissions: BTreeMap<String, KeyedAdmissionReceipt>,
+    pub keyed_admissions: LazyMap<String, KeyedAdmissionReceipt>,
     #[serde(default)]
     pub catalog_history: BTreeMap<u64, BTreeMap<String, Activation>>,
     #[serde(default)]
@@ -264,12 +270,12 @@ pub struct State {
     pub artifacts: BTreeMap<String, Artifact>,
     pub bindings: BTreeMap<String, Activation>,
     pub catalog_revision: u64,
-    pub runs: BTreeMap<String, Run>,
-    pub receipts: Vec<Receipt>,
-    pub intents: BTreeMap<String, Intent>,
-    pub waits: BTreeMap<String, WaitRecord>,
-    pub events: BTreeMap<String, AcceptedEvent>,
-    pub budgets: BTreeMap<String, Budget>,
+    pub runs: LazyMap<String, Run>,
+    pub receipts: LazySeq<Receipt>,
+    pub intents: LazyMap<String, Intent>,
+    pub waits: LazyMap<String, WaitRecord>,
+    pub events: LazyMap<String, AcceptedEvent>,
+    pub budgets: LazyMap<String, Budget>,
     pub sequence: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -403,6 +409,44 @@ impl<S: Storage> Engine<S> {
         self.transaction_choice(|state| f(state).map(|value| (value, true)))
     }
     fn transaction_choice<T>(&self, f: impl FnOnce(&mut State) -> Result<(T, bool)>) -> Result<T> {
+        let protection = self.store.protection_available();
+        let mut f = Some(f);
+        let mut result = None;
+        let config = &self.config;
+        let metrics = &self.metrics;
+        let mut plan = |state: &mut State| -> Result<bool> {
+            let f = f
+                .take()
+                .ok_or_else(|| Error::Conflict("transition plan ran twice".into()))?;
+            state.protection_available = protection;
+            let started = std::time::Instant::now();
+            let evaluated = f(state);
+            metrics.record_time(metrics::Timing::Transition, started.elapsed());
+            let (value, changed) = evaluated?;
+            result = Some(value);
+            if changed {
+                indexes::sync(state)?;
+            }
+            Ok(changed)
+        };
+        let validate = |_: &State, counts: &QuotaCounts| check_quota(config, counts);
+        let started = std::time::Instant::now();
+        let outcome = self.store.transition_v1(
+            &self.namespace,
+            &self.owner,
+            &mut TransitionRequest {
+                operation: "transaction",
+                plan: &mut plan,
+                validate: &validate,
+            },
+        );
+        let outcome = outcome?;
+        if outcome != TransitionOutcome::Unsupported {
+            self.metrics
+                .record_time(metrics::Timing::Commit, started.elapsed());
+            return result.ok_or_else(|| Error::Conflict("transition plan did not run".into()));
+        }
+        let f = f.ok_or_else(|| Error::Conflict("unsupported transition ran the plan".into()))?;
         let started = std::time::Instant::now();
         let loaded = self.store.load(&self.namespace);
         self.metrics
@@ -411,7 +455,7 @@ impl<S: Storage> Engine<S> {
         if !v.state.indexes.initialized {
             indexes::rebuild(&mut v.state)?;
         }
-        v.state.protection_available = self.store.protection_available();
+        v.state.protection_available = protection;
         let started = std::time::Instant::now();
         let evaluated = f(&mut v.state);
         self.metrics
@@ -421,26 +465,7 @@ impl<S: Storage> Engine<S> {
             return Ok(result);
         }
         indexes::sync(&mut v.state)?;
-        if v.state.runs.len() > self.config.max_runs
-            || v.state.events.len() > self.config.max_events
-            || v.state
-                .events
-                .values()
-                .flat_map(|e| &e.destinations)
-                .filter(|d| d.run.is_none())
-                .count()
-                > self.config.max_queued_destinations
-            || v.state
-                .receipts
-                .len()
-                .saturating_add(v.state.keyed_admissions.len())
-                > self.config.max_receipts
-            || canonical_bytes(&v.state)?.len() > self.config.max_state_bytes
-        {
-            return Err(Error::Refused(
-                "namespace retention/admission quota exhausted".into(),
-            ));
-        }
+        check_quota(&self.config, &quota_counts(&v.state)?)?;
         let started = std::time::Instant::now();
         let committed =
             self.store
@@ -1600,29 +1625,38 @@ fn advance_inner(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
     {
         return Err(Error::Exhausted("duration".into()));
     }
-    let history = canonical_bytes(&(
-        s.receipts
-            .iter()
-            .filter(|receipt| {
-                s.runs
-                    .get(&receipt.run)
-                    .is_some_and(|run| run.root == r.root)
-            })
-            .collect::<Vec<_>>(),
-        s.intents
-            .values()
-            .filter(|intent| {
-                s.runs
-                    .get(&intent.run)
-                    .is_some_and(|run| run.root == r.root)
-            })
-            .collect::<Vec<_>>(),
-        s.runs
-            .values()
-            .filter(|run| run.root == r.root)
-            .collect::<Vec<_>>(),
-    ))?
-    .len();
+    let history = if let Some((receipts, intents, runs)) = indexes::root_history(s, &r.root) {
+        canonical_bytes(&(
+            receipts.iter().map(|i| &s.receipts[*i]).collect::<Vec<_>>(),
+            intents.iter().map(|id| &s.intents[id]).collect::<Vec<_>>(),
+            runs.iter().map(|id| &s.runs[id]).collect::<Vec<_>>(),
+        ))?
+        .len()
+    } else {
+        canonical_bytes(&(
+            s.receipts
+                .iter()
+                .filter(|receipt| {
+                    s.runs
+                        .get(&receipt.run)
+                        .is_some_and(|run| run.root == r.root)
+                })
+                .collect::<Vec<_>>(),
+            s.intents
+                .values()
+                .filter(|intent| {
+                    s.runs
+                        .get(&intent.run)
+                        .is_some_and(|run| run.root == r.root)
+                })
+                .collect::<Vec<_>>(),
+            s.runs
+                .values()
+                .filter(|run| run.root == r.root)
+                .collect::<Vec<_>>(),
+        ))?
+        .len()
+    };
     if history >= root_limits.max_history_bytes {
         return Err(Error::Exhausted("retained history".into()));
     }
@@ -1698,32 +1732,36 @@ fn advance_inner(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
                     .min(limits.max_payload_bytes)
                     .min(root_limits.max_payload_bytes),
             )?;
-            if s.intents
-                .values()
-                .filter(|i| {
-                    s.runs.get(&i.run).is_some_and(|x| x.root == r.root)
-                        && !matches!(
+            let (root_open, run_open) = match indexes::root_open_intents(s, &r.root) {
+                Some(ids) => {
+                    let run_open = ids.iter().filter(|id| s.intents[*id].run == r.id).count();
+                    (ids.len(), run_open)
+                }
+                None => {
+                    let open = |i: &&Intent| {
+                        !matches!(
                             i.status,
                             IntentStatus::Completed
                                 | IntentStatus::Rejected
                                 | IntentStatus::Cancelled
                         )
-                })
-                .count()
-                >= root_limits.max_concurrent_effects as usize
-                || s.intents
-                    .values()
-                    .filter(|intent| {
-                        intent.run == r.id
-                            && !matches!(
-                                intent.status,
-                                IntentStatus::Completed
-                                    | IntentStatus::Rejected
-                                    | IntentStatus::Cancelled
-                            )
-                    })
-                    .count()
-                    >= limits.max_concurrent_effects as usize
+                    };
+                    (
+                        s.intents
+                            .values()
+                            .filter(|i| s.runs.get(&i.run).is_some_and(|x| x.root == r.root))
+                            .filter(open)
+                            .count(),
+                        s.intents
+                            .values()
+                            .filter(|i| i.run == r.id)
+                            .filter(open)
+                            .count(),
+                    )
+                }
+            };
+            if root_open >= root_limits.max_concurrent_effects as usize
+                || run_open >= limits.max_concurrent_effects as usize
             {
                 return Err(Error::Refused("outstanding effect limit".into()));
             }
@@ -2163,12 +2201,15 @@ fn finish(
 }
 fn settled(s: &State, r: &Run) -> bool {
     r.children.iter().all(|id| s.runs[id].status.terminal())
-        && s.intents.values().filter(|i| i.run == r.id).all(|i| {
-            matches!(
-                i.status,
-                IntentStatus::Completed | IntentStatus::Rejected | IntentStatus::Cancelled
-            )
-        })
+        && match indexes::root_open_intents(s, &r.root) {
+            Some(open) => !open.iter().any(|id| s.intents[id].run == r.id),
+            None => s.intents.values().filter(|i| i.run == r.id).all(|i| {
+                matches!(
+                    i.status,
+                    IntentStatus::Completed | IntentStatus::Rejected | IntentStatus::Cancelled
+                )
+            }),
+        }
 }
 fn poll_pending(s: &mut State, r: &mut Run, pending: Pending, now: i64) -> Result<()> {
     let step = s.artifacts[&r.artifact].content.playbook.steps[&r.step].clone();

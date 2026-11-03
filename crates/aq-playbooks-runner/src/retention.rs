@@ -1,5 +1,6 @@
 //! Explicit replay horizons, disposal records and epoch fences. No unresolved
 //! obligation is evicted for quota pressure.
+use crate::lazy::{LazyMap, LazySeq};
 use crate::{Error, IntentStatus, Result, State};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -39,14 +40,14 @@ pub struct RetentionState {
     pub last_gc_at_ms: Option<i64>,
     pub policy: RetentionPolicy,
     pub producer_epochs: BTreeMap<String, u64>,
-    pub event_epochs: BTreeMap<String, u64>,
+    pub event_epochs: LazyMap<String, u64>,
     #[serde(default)]
-    pub event_expires_at_ms: BTreeMap<String, i64>,
+    pub event_expires_at_ms: LazyMap<String, i64>,
     #[serde(default)]
-    pub expired_correlations: BTreeMap<String, (String, u64)>,
-    pub event_tombstones: BTreeMap<String, EventTombstone>,
+    pub expired_correlations: LazyMap<String, (String, u64)>,
+    pub event_tombstones: LazyMap<String, EventTombstone>,
     pub artifact_disposals: BTreeMap<String, i64>,
-    pub disposals: Vec<Disposal>,
+    pub disposals: LazySeq<Disposal>,
     pub gc_cursor: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -148,17 +149,13 @@ pub(crate) fn gc(s: &mut State, now: i64, limit: usize) -> Result<GcReport> {
     while examined < limit {
         match phase {
             0 => {
-                let bound = if inclusive {
-                    std::ops::Bound::Included(cursor.clone())
+                let key = if inclusive && s.indexes.root_members.contains_key(&cursor) {
+                    Some(cursor.clone())
+                } else if inclusive && cursor.is_empty() {
+                    s.indexes.root_members.next_key::<String>(None)
                 } else {
-                    std::ops::Bound::Excluded(cursor.clone())
+                    s.indexes.root_members.next_key(Some(&cursor))
                 };
-                let key = s
-                    .indexes
-                    .root_members
-                    .range((bound, std::ops::Bound::Unbounded))
-                    .next()
-                    .map(|(key, _)| key.clone());
                 let Some(root) = key else {
                     phase = 1;
                     cursor.clear();

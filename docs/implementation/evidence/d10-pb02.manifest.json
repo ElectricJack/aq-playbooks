@@ -1,0 +1,468 @@
+{
+ "schema_version": 1,
+ "task": "crisp-meadow-36.11 D10 (PB-04)",
+ "raw_results_dir": "docs/implementation/evidence/d10-pb02",
+ "command": "crates/aq-playbooks-postgres/scripts/benchmark-envelope.sh docs/implementation/evidence/d10-pb02 full",
+ "image": "postgres@sha256:266d3c257594e195b309ae9d1805e54c788f1d7b375f56bf6c367aac6c917e7b",
+ "postgres": {
+  "version": "PostgreSQL 17.11 on x86_64-pc-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
+  "fsync": "on",
+  "synchronous_commit": "on",
+  "full_page_writes": "on",
+  "shared_buffers": "128MB",
+  "max_connections": "32"
+ },
+ "exit_code": 0,
+ "source_base_commit": "e627c3a0c6a5d40d42b418a143333ad91081b448",
+ "source_note": "source-inventory.json hashes the measured working tree (uncommitted D10 changes on top of the base commit); only examples/admission_benchmark.rs changed afterwards and it is not part of the measured binary",
+ "binary_sha256": "900d264112d4ebe64a71f744ed86381dc7ebc846c67670720d7efe56bea66d9b",
+ "file_sha256": {
+  "./benchmark.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "./binary.sha256": "780f15c60d15a671bed4a387ff0e227818f226376468b9c9d8aec6aaa5df201a",
+  "./build.log": "b924d1d8adc5d87658a89a6b13c1fe7fc2b3002dbc58d4ab61a07baac723a547",
+  "./container-host-config.json": "0f16539e922574ea0e64b2640db717895804e07327aefc9a7a1cf62722d88eea",
+  "./container.id": "80831fb3e03a7d0a8b91f480fef0b6ff95feb44920c9296a84296184b06d8359",
+  "./database-cost.json": "a849e79ad5c3f51dff19c327fd69f25b7101b748b2663683ea4b27ae7a6b7921",
+  "./database-resources.json": "6f0fce42666f225603a4ccac17ac61162c0354424d3b092ca9f612ab4076ee44",
+  "./database.log": "aa27cdafc7e06c9294b1a3c04daee2303b4516c2f23739180a72ca961f5defb5",
+  "./disposable-marker.log": "eb3311c0cbc42f7b8476f60032ae6e8f71b1bb33e5d448eaa0c79fb8d41dfd41",
+  "./environment.txt": "20f7c46209989d9b940b9c029ee7e8a69968b74e5e3505b99fe5b0d2b1d46283",
+  "./exit-code.txt": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+  "./fixture-check.json": "d088aa94b056440ce236be351933de8301237f6a5295b0d8140559e698a432a2",
+  "./loadavg-after.txt": "5a2d951aefa6a6e7d65c6b4ad759e3d20067d0e631a7f571e0c5047dbf06ac99",
+  "./lscpu.json": "76c525659ba3c454e0e4a472b3dff196274ba3fe926e06123f71203f59ddf32d",
+  "./postgres.json": "15efb4d8a0eac47d31d49d187fac9b6ba53a6aab30d118df3acb3cd7ea2d69ed",
+  "./process-time.txt": "5541fba3ffc8935134f1064f587d9beca43bba92688483f51d568600fd2e3d7d",
+  "./profile.txt": "0e716a5fef4e6dc1bcfff22ad52f73ca4eee3f4ea8292f4a1918daa32592889f",
+  "./results.jsonl": "84a330d906ee27e5f7c468fd6a89d043346fbc0db6410a59c42ae78c11e52e2f",
+  "./source-inventory.json": "6dbb4b18a2ad9cbe4c13afa41efd902371676da8cdb6dcf3fdebeed0bc3180e7"
+ },
+ "timing_units": "microseconds; p95 = nearest-rank over the retained raw values in results.jsonl",
+ "acceptance": {
+  "metric": "store transition_us p95 (the complete transition_v1 call) and operation wall p95, history 512 / history 0",
+  "limit": 2.0,
+  "ratios": {
+   "admit.wall_p95": 0.581,
+   "admit.transition_p95": 0.581,
+   "event.wall_p95": 1.165,
+   "event.transition_p95": 1.165,
+   "ready_6.dispatch_p95": 0.732,
+   "ready_6.transition_p95": 1.247,
+   "ready_24.dispatch_p95": 0.391,
+   "ready_24.transition_p95": 0.458
+  },
+  "pass": true
+ },
+ "summary": {
+  "preflight": {
+   "bounded": true,
+   "scenario": "preflight",
+   "support": true,
+   "transition_work": {
+    "fallbacks": [],
+    "full_commits": 0,
+    "full_loads": 0,
+    "heavy": 0,
+    "incremental": 1,
+    "record_reads": 13,
+    "records_written": 12,
+    "transitions": 1,
+    "unchanged": 0
+   }
+  },
+  "admit": {
+   "0": {
+    "wall_p95": 59959,
+    "wall_p50": 24663,
+    "transition_p95": 59956,
+    "closure_p95": 10354,
+    "samples": 24,
+    "bounded": true,
+    "incremental": 24,
+    "reads": 312,
+    "written": 288,
+    "fallbacks": [],
+    "loads": 0,
+    "commits": 0,
+    "heavy": 0
+   },
+   "32": {
+    "wall_p95": 68662,
+    "wall_p50": 33502,
+    "transition_p95": 68657,
+    "closure_p95": 8398,
+    "samples": 24,
+    "bounded": true,
+    "incremental": 24,
+    "reads": 312,
+    "written": 288,
+    "fallbacks": [],
+    "loads": 0,
+    "commits": 0,
+    "heavy": 0
+   },
+   "128": {
+    "wall_p95": 69543,
+    "wall_p50": 35678,
+    "transition_p95": 69519,
+    "closure_p95": 15528,
+    "samples": 24,
+    "bounded": true,
+    "incremental": 24,
+    "reads": 312,
+    "written": 288,
+    "fallbacks": [],
+    "loads": 0,
+    "commits": 0,
+    "heavy": 0
+   },
+   "512": {
+    "wall_p95": 34844,
+    "wall_p50": 25856,
+    "transition_p95": 34837,
+    "closure_p95": 2679,
+    "samples": 24,
+    "bounded": true,
+    "incremental": 24,
+    "reads": 312,
+    "written": 288,
+    "fallbacks": [],
+    "loads": 0,
+    "commits": 0,
+    "heavy": 0
+   }
+  },
+  "event": {
+   "0": {
+    "wall_p95": 31408,
+    "wall_p50": 24370,
+    "transition_p95": 31361,
+    "closure_p95": 7771,
+    "samples": 24,
+    "bounded": true,
+    "incremental": 24,
+    "reads": 168,
+    "written": 120,
+    "fallbacks": [],
+    "loads": 0,
+    "commits": 0,
+    "heavy": 0
+   },
+   "32": {
+    "wall_p95": 112962,
+    "wall_p50": 26826,
+    "transition_p95": 112881,
+    "closure_p95": 12792,
+    "samples": 24,
+    "bounded": true,
+    "incremental": 24,
+    "reads": 168,
+    "written": 120,
+    "fallbacks": [],
+    "loads": 0,
+    "commits": 0,
+    "heavy": 0
+   },
+   "128": {
+    "wall_p95": 62300,
+    "wall_p50": 28893,
+    "transition_p95": 57923,
+    "closure_p95": 12635,
+    "samples": 24,
+    "bounded": true,
+    "incremental": 24,
+    "reads": 168,
+    "written": 120,
+    "fallbacks": [],
+    "loads": 0,
+    "commits": 0,
+    "heavy": 0
+   },
+   "512": {
+    "wall_p95": 36603,
+    "wall_p50": 26250,
+    "transition_p95": 36545,
+    "closure_p95": 4045,
+    "samples": 24,
+    "bounded": true,
+    "incremental": 24,
+    "reads": 168,
+    "written": 120,
+    "fallbacks": [],
+    "loads": 0,
+    "commits": 0,
+    "heavy": 0
+   }
+  },
+  "memory_event": {
+   "0": 798,
+   "32": 3100,
+   "128": 17420,
+   "512": 65718
+  },
+  "ready_6": {
+   "0": {
+    "dispatch_p95": 104390,
+    "queue_p95": 623289,
+    "transition_p95": 37969,
+    "rr": true,
+    "bounded": true,
+    "work": {
+     "incremental": 6,
+     "heavy": 0,
+     "full_loads": 0,
+     "full_commits": 0,
+     "fallbacks": []
+    }
+   },
+   "32": {
+    "dispatch_p95": 202061,
+    "queue_p95": 808955,
+    "transition_p95": 97565,
+    "rr": true,
+    "bounded": true,
+    "work": {
+     "incremental": 6,
+     "heavy": 0,
+     "full_loads": 0,
+     "full_commits": 0,
+     "fallbacks": []
+    }
+   },
+   "128": {
+    "dispatch_p95": 117786,
+    "queue_p95": 591232,
+    "transition_p95": 60399,
+    "rr": true,
+    "bounded": true,
+    "work": {
+     "incremental": 6,
+     "heavy": 0,
+     "full_loads": 0,
+     "full_commits": 0,
+     "fallbacks": []
+    }
+   },
+   "512": {
+    "dispatch_p95": 76450,
+    "queue_p95": 523216,
+    "transition_p95": 47351,
+    "rr": true,
+    "bounded": true,
+    "work": {
+     "incremental": 6,
+     "heavy": 0,
+     "full_loads": 0,
+     "full_commits": 0,
+     "fallbacks": []
+    }
+   }
+  },
+  "ready_24": {
+   "0": {
+    "dispatch_p95": 177518,
+    "queue_p95": 3190891,
+    "transition_p95": 88110,
+    "rr": true,
+    "bounded": true,
+    "work": {
+     "incremental": 24,
+     "heavy": 0,
+     "full_loads": 0,
+     "full_commits": 0,
+     "fallbacks": []
+    }
+   },
+   "32": {
+    "dispatch_p95": 133379,
+    "queue_p95": 2178832,
+    "transition_p95": 83833,
+    "rr": true,
+    "bounded": true,
+    "work": {
+     "incremental": 24,
+     "heavy": 0,
+     "full_loads": 0,
+     "full_commits": 0,
+     "fallbacks": []
+    }
+   },
+   "128": {
+    "dispatch_p95": 121605,
+    "queue_p95": 2103277,
+    "transition_p95": 69807,
+    "rr": true,
+    "bounded": true,
+    "work": {
+     "incremental": 24,
+     "heavy": 0,
+     "full_loads": 0,
+     "full_commits": 0,
+     "fallbacks": []
+    }
+   },
+   "512": {
+    "dispatch_p95": 69395,
+    "queue_p95": 1741172,
+    "transition_p95": 40323,
+    "rr": true,
+    "bounded": true,
+    "work": {
+     "incremental": 24,
+     "heavy": 0,
+     "full_loads": 0,
+     "full_commits": 0,
+     "fallbacks": []
+    }
+   }
+  },
+  "pending": {
+   "0": {
+    "wall_p95": 20795,
+    "transition_p95": 20747,
+    "bounded": true,
+    "budget_pass": true
+   },
+   "8": {
+    "wall_p95": 28535,
+    "transition_p95": 28456,
+    "bounded": true,
+    "budget_pass": false
+   },
+   "32": {
+    "wall_p95": 181648,
+    "transition_p95": 181562,
+    "bounded": true,
+    "budget_pass": false
+   },
+   "128": {
+    "wall_p95": 24073,
+    "transition_p95": 24020,
+    "bounded": true,
+    "budget_pass": true
+   }
+  },
+  "concurrent": {
+   "1": {
+    "wall_p95": 33266,
+    "success": 8,
+    "attempts": 8,
+    "bounded": true,
+    "work": {
+     "incremental": 8,
+     "heavy": 0,
+     "full_loads": 0,
+     "full_commits": 0,
+     "fallbacks": []
+    }
+   },
+   "2": {
+    "wall_p95": 123599,
+    "success": 16,
+    "attempts": 16,
+    "bounded": true,
+    "work": {
+     "incremental": 16,
+     "heavy": 0,
+     "full_loads": 0,
+     "full_commits": 0,
+     "fallbacks": []
+    }
+   },
+   "4": {
+    "wall_p95": 331690,
+    "success": 32,
+    "attempts": 32,
+    "bounded": true,
+    "work": {
+     "incremental": 32,
+     "heavy": 0,
+     "full_loads": 0,
+     "full_commits": 0,
+     "fallbacks": []
+    }
+   }
+  },
+  "quota": {
+   "runs": {
+    "us": 13449,
+    "unchanged": true,
+    "error": "refused: namespace retention/admission quota exhausted",
+    "work": {
+     "transitions": 1,
+     "incremental": 0,
+     "heavy": 0,
+     "full_loads": 0,
+     "full_commits": 0,
+     "fallbacks": []
+    }
+   },
+   "events": {
+    "us": 7997,
+    "unchanged": true,
+    "error": "refused: namespace retention/admission quota exhausted",
+    "work": {
+     "transitions": 1,
+     "incremental": 0,
+     "heavy": 0,
+     "full_loads": 0,
+     "full_commits": 0,
+     "fallbacks": []
+    }
+   },
+   "receipts": {
+    "us": 9351,
+    "unchanged": true,
+    "error": "refused: namespace retention/admission quota exhausted",
+    "work": {
+     "transitions": 1,
+     "incremental": 0,
+     "heavy": 0,
+     "full_loads": 0,
+     "full_commits": 0,
+     "fallbacks": []
+    }
+   },
+   "state_bytes": {
+    "us": 10954,
+    "unchanged": true,
+    "error": "refused: namespace retention/admission quota exhausted",
+    "work": {
+     "transitions": 1,
+     "incremental": 0,
+     "heavy": 0,
+     "full_loads": 0,
+     "full_commits": 0,
+     "fallbacks": []
+    }
+   },
+   "queued_destinations": {
+    "us": 10301,
+    "unchanged": true,
+    "error": "refused: namespace retention/admission quota exhausted",
+    "work": {
+     "transitions": 1,
+     "incremental": 0,
+     "heavy": 0,
+     "full_loads": 0,
+     "full_commits": 0,
+     "fallbacks": []
+    }
+   }
+  },
+  "complete": {
+   "rss_kib": 37824,
+   "scenario": "complete"
+  },
+  "ratios_512_over_0": {
+   "admit.wall_p95": 0.581,
+   "admit.transition_p95": 0.581,
+   "event.wall_p95": 1.165,
+   "event.transition_p95": 1.165,
+   "ready_6.dispatch_p95": 0.732,
+   "ready_6.transition_p95": 1.247,
+   "ready_24.dispatch_p95": 0.391,
+   "ready_24.transition_p95": 0.458
+  }
+ }
+}

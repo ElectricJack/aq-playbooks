@@ -1,5 +1,6 @@
 //! Durable bounded discovery indexes. These are maintained in the same CAS as
 //! authoritative state; adapters may mirror them into indexed native tables.
+use crate::lazy::{LazyMap, LazySet};
 use crate::{IntentStatus, Pending, Result, RunStatus, State};
 use aq_playbooks_model::{ContractRef, digest};
 use serde::{Deserialize, Serialize};
@@ -85,31 +86,34 @@ pub struct RuntimeIndexes {
     pub dispatch_turn: bool,
     pub effect_cursor: BTreeMap<String, String>,
     pub effect_item_cursor: BTreeMap<String, String>,
-    pub root_members: BTreeMap<String, BTreeSet<String>>,
-    pub root_active: BTreeMap<String, BTreeSet<String>>,
-    pub root_effects: BTreeMap<String, BTreeSet<String>>,
-    pub root_last_activity: BTreeMap<String, i64>,
-    pub run_roots: BTreeMap<String, String>,
-    pub intent_roots: BTreeMap<String, String>,
-    pub effects: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
-    pub effect_memberships: BTreeMap<String, Vec<(String, String)>>,
-    pub timers: BTreeMap<String, TimerIndex>,
-    pub due: BTreeMap<i64, BTreeSet<String>>,
-    pub run_timer: BTreeMap<String, String>,
-    pub events: BTreeMap<String, BTreeMap<u64, String>>,
-    pub event_memberships: BTreeMap<String, Vec<String>>,
-    pub waiters: BTreeMap<String, BTreeSet<String>>,
-    pub run_subscriptions: BTreeMap<String, Vec<String>>,
-    pub dependents: BTreeMap<String, BTreeSet<String>>,
-    pub run_dependencies: BTreeMap<String, Vec<String>>,
+    pub root_members: LazyMap<String, BTreeSet<String>>,
+    pub root_active: LazyMap<String, BTreeSet<String>>,
+    pub root_effects: LazyMap<String, BTreeSet<String>>,
+    /// Every intent (terminal included) per root, for bounded history checks.
+    #[serde(default)]
+    pub root_intents: LazyMap<String, BTreeSet<String>>,
+    pub root_last_activity: LazyMap<String, i64>,
+    pub run_roots: LazyMap<String, String>,
+    pub intent_roots: LazyMap<String, String>,
+    pub effects: LazyMap<String, BTreeMap<String, BTreeSet<String>>>,
+    pub effect_memberships: LazyMap<String, Vec<(String, String)>>,
+    pub timers: LazyMap<String, TimerIndex>,
+    pub due: LazyMap<i64, BTreeSet<String>>,
+    pub run_timer: LazyMap<String, String>,
+    pub events: LazyMap<String, BTreeMap<u64, String>>,
+    pub event_memberships: LazyMap<String, Vec<String>>,
+    pub waiters: LazyMap<String, BTreeSet<String>>,
+    pub run_subscriptions: LazyMap<String, Vec<String>>,
+    pub dependents: LazyMap<String, BTreeSet<String>>,
+    pub run_dependencies: LazyMap<String, Vec<String>>,
     pub completion_ready: BTreeSet<String>,
     pub uncertain_completion_contracts: BTreeMap<String, BTreeSet<String>>,
     pub uncertain_contract_membership: BTreeMap<String, String>,
     pub dirty_runs: BTreeSet<String>,
     pub dirty_intents: BTreeSet<String>,
-    pub runs: BTreeSet<String>,
-    pub receipts: BTreeMap<String, BTreeMap<u64, usize>>,
-    pub all_receipts: BTreeMap<u64, usize>,
+    pub runs: LazySet<String>,
+    pub receipts: LazyMap<String, BTreeMap<u64, usize>>,
+    pub all_receipts: LazyMap<u64, usize>,
     pub triggers: BTreeMap<String, BTreeSet<String>>,
     pub activation_triggers: BTreeMap<String, Vec<String>>,
     pub initialized: bool,
@@ -218,7 +222,14 @@ impl RuntimeIndexes {
                 }
             }
             IndexQuery::DueTimers { now_ms, .. } => {
-                for (at, ids) in self.due.range(..=*now_ms) {
+                let mut after: Option<i64> = None;
+                while let Some(at) = self.due.next_key(after.as_ref()) {
+                    if at > *now_ms {
+                        break;
+                    }
+                    after = Some(at);
+                    let at = &at;
+                    let ids = &self.due[at];
                     for id in ids {
                         let t = &self.timers[id];
                         items.push(IndexItem {
@@ -309,7 +320,7 @@ impl RuntimeIndexes {
                 let receipts = if let Some(run) = run {
                     self.receipts.get(run)
                 } else {
-                    Some(&self.all_receipts)
+                    Some(&*self.all_receipts)
                 };
                 if let Some(receipts) = receipts {
                     for (seq, offset) in receipts
@@ -496,12 +507,12 @@ fn refresh_run(s: &mut State, id: &str) -> Result<()> {
     unqueue(s, id);
     if let Some(keys) = s.indexes.run_subscriptions.remove(id) {
         for key in keys {
-            remove_member(&mut s.indexes.waiters, &key, id);
+            remove_lazy_member(&mut s.indexes.waiters, &key, id);
         }
     }
     if let Some(ids) = s.indexes.run_dependencies.remove(id) {
         for dep in ids {
-            remove_member(&mut s.indexes.dependents, &dep, id);
+            remove_lazy_member(&mut s.indexes.dependents, &dep, id);
         }
     }
     let timerkey = format!("run:{id}");
@@ -515,6 +526,7 @@ fn refresh_run(s: &mut State, id: &str) -> Result<()> {
                     s.indexes.root_members.remove(&root);
                     s.indexes.root_active.remove(&root);
                     s.indexes.root_effects.remove(&root);
+                    s.indexes.root_intents.remove(&root);
                     s.indexes.root_last_activity.remove(&root);
                 }
             }
@@ -664,7 +676,7 @@ fn refresh_intent(s: &mut State, id: &str) -> Result<()> {
     let token = format!("intent:{id}");
     if let Some(keys) = s.indexes.run_subscriptions.remove(&token) {
         for key in keys {
-            remove_member(&mut s.indexes.waiters, &key, &token);
+            remove_lazy_member(&mut s.indexes.waiters, &key, &token);
         }
     }
     if let Some(memberships) = s.indexes.effect_memberships.remove(id) {
@@ -685,10 +697,16 @@ fn refresh_intent(s: &mut State, id: &str) -> Result<()> {
     remove_timer(s, &format!("effect:{id}"));
     let Some(i) = s.intents.get(id).cloned() else {
         s.indexes.completion_ready.remove(id);
-        if let Some(root) = s.indexes.intent_roots.remove(id)
-            && let Some(ids) = s.indexes.root_effects.get_mut(&root)
-        {
-            ids.remove(id);
+        if let Some(root) = s.indexes.intent_roots.remove(id) {
+            if let Some(ids) = s.indexes.root_effects.get_mut(&root) {
+                ids.remove(id);
+            }
+            if let Some(ids) = s.indexes.root_intents.get_mut(&root) {
+                ids.remove(id);
+                if ids.is_empty() {
+                    s.indexes.root_intents.remove(&root);
+                }
+            }
         }
         return Ok(());
     };
@@ -699,6 +717,18 @@ fn refresh_intent(s: &mut State, id: &str) -> Result<()> {
         .or_else(|| s.indexes.run_roots.get(&i.run).cloned());
     if let Some(root) = root {
         s.indexes.intent_roots.insert(id.into(), root.clone());
+        if !s
+            .indexes
+            .root_intents
+            .get(&root)
+            .is_some_and(|ids| ids.contains(id))
+        {
+            s.indexes
+                .root_intents
+                .entry(root.clone())
+                .or_default()
+                .insert(id.into());
+        }
         if matches!(
             i.status,
             IntentStatus::Completed | IntentStatus::Rejected | IntentStatus::Cancelled
@@ -873,6 +903,14 @@ pub(crate) fn rebuild(s: &mut State) -> Result<()> {
     Ok(())
 }
 
+fn remove_lazy_member(map: &mut LazyMap<String, BTreeSet<String>>, key: &str, member: &str) {
+    if let Some(values) = map.get_mut(key) {
+        values.remove(member);
+        if values.is_empty() {
+            map.remove(key);
+        }
+    }
+}
 fn remove_member(map: &mut BTreeMap<String, BTreeSet<String>>, key: &str, member: &str) {
     if let Some(values) = map.get_mut(key) {
         values.remove(member);
@@ -880,4 +918,78 @@ fn remove_member(map: &mut BTreeMap<String, BTreeSet<String>>, key: &str, member
             map.remove(key);
         }
     }
+}
+
+/// Runs, intents and receipts of `root`, in the order of a full-state scan
+/// (runs and intents by id, receipts by position), using root-scoped indexes
+/// plus this transaction's dirty sets. Returns `None` before initialization.
+#[allow(clippy::type_complexity)]
+pub(crate) fn root_history(
+    s: &State,
+    root: &str,
+) -> Option<(Vec<usize>, Vec<String>, Vec<String>)> {
+    if !s.indexes.initialized {
+        return None;
+    }
+    let in_root = |run: &str| s.runs.get(run).is_some_and(|r| r.root == root);
+    let mut runs: BTreeSet<String> = s
+        .indexes
+        .root_members
+        .get(root)
+        .cloned()
+        .unwrap_or_default();
+    runs.extend(s.indexes.dirty_runs.iter().cloned());
+    runs.retain(|id| in_root(id));
+    let mut intents: BTreeSet<String> = s
+        .indexes
+        .root_intents
+        .get(root)
+        .cloned()
+        .unwrap_or_default();
+    intents.extend(s.indexes.dirty_intents.iter().cloned());
+    intents.retain(|id| s.intents.get(id).is_some_and(|i| in_root(&i.run)));
+    let mut receipts = BTreeSet::new();
+    for run in &runs {
+        if let Some(offsets) = s.indexes.receipts.get(run) {
+            receipts.extend(
+                offsets
+                    .values()
+                    .copied()
+                    .filter(|i| s.receipts.get(*i).is_some_and(|r| &r.run == run)),
+            );
+        }
+    }
+    Some((
+        receipts.into_iter().collect(),
+        intents.into_iter().collect(),
+        runs.into_iter().collect(),
+    ))
+}
+/// Non-terminal intents of `root` (indexed plus dirty), filtered by current state.
+pub(crate) fn root_open_intents(s: &State, root: &str) -> Option<Vec<String>> {
+    if !s.indexes.initialized {
+        return None;
+    }
+    let mut ids: BTreeSet<String> = s
+        .indexes
+        .root_effects
+        .get(root)
+        .cloned()
+        .unwrap_or_default();
+    ids.extend(s.indexes.dirty_intents.iter().cloned());
+    Some(
+        ids.into_iter()
+            .filter(|id| {
+                s.intents.get(id).is_some_and(|i| {
+                    s.runs.get(&i.run).is_some_and(|x| x.root == root)
+                        && !matches!(
+                            i.status,
+                            IntentStatus::Completed
+                                | IntentStatus::Rejected
+                                | IntentStatus::Cancelled
+                        )
+                })
+            })
+            .collect(),
+    )
 }
