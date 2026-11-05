@@ -80,6 +80,14 @@ pub const MANIFEST_JSON: &str = include_str!("../../../contracts/aq-host/manifes
 pub fn catalog() -> Registry {
     serde_json::from_str(REGISTRY_JSON).expect("published AQ host registry")
 }
+/// Host catalog 2.0.0: asynchronous provider judgment and registered check
+/// execution (D6). Published beside 1.0.0, whose bytes and bindings are frozen.
+pub const VERSION_2: &str = "2.0.0";
+pub const REGISTRY_2_JSON: &str = include_str!("../../../contracts/aq-host-2.0.0/registry.json");
+pub const MANIFEST_2_JSON: &str = include_str!("../../../contracts/aq-host-2.0.0/manifest.json");
+pub fn catalog_v2() -> Registry {
+    serde_json::from_str(REGISTRY_2_JSON).expect("published AQ host registry 2.0.0")
+}
 pub fn describe_surface() -> serde_json::Value {
     let mut manifest: serde_json::Value =
         serde_json::from_str(MANIFEST_JSON).expect("AQ host manifest");

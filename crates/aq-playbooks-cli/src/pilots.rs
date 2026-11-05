@@ -886,6 +886,82 @@ pub fn compile_input(artifact: &Artifact) -> CompileInput {
 mod tests {
     use super::*;
     #[test]
+    fn catalog_v2_async_judgment_and_check_compile_and_join() {
+        let r = catalog_v2();
+        let fixtures: Value = serde_json::from_str(include_str!(
+            "../../../contracts/aq-host-2.0.0/fixtures.json"
+        ))
+        .unwrap();
+        let input = |name: &str| {
+            fixtures["replay_cases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["command"] == name)
+                .unwrap()["input"]
+                .clone()
+        };
+        let steps = BTreeMap::from([
+            (
+                "judgment".into(),
+                invoke(
+                    &r,
+                    "judgment.request",
+                    lit(input("judgment.request")),
+                    "judgment",
+                    &[("accepted", "check")],
+                ),
+            ),
+            (
+                "check".into(),
+                invoke(
+                    &r,
+                    "check.request",
+                    lit(input("check.request")),
+                    "check",
+                    &[("accepted", "wait")],
+                ),
+            ),
+            (
+                "wait".into(),
+                edge(
+                    Operation::Join {
+                        member_keys: vec![],
+                        members: vec![
+                            reference("judgment", &["handle"]),
+                            reference("check", &["handle"]),
+                        ],
+                        mode: JoinMode::All,
+                        accepted_outcomes: strings(&["assessed", "passed"]),
+                        deadline_ms: 60_000,
+                        remaining: RemainingPolicy::Track,
+                        bind: "results".into(),
+                    },
+                    &[
+                        ("completed", "done"),
+                        ("timeout", "failure"),
+                        ("no_match", "failure"),
+                    ],
+                ),
+            ),
+            ("done".into(), ret("success", lit(Value::Null))),
+        ]);
+        let artifact = build(
+            "v2-adapters",
+            r,
+            Schema::Null,
+            Schema::Null,
+            "judgment",
+            steps,
+            &[],
+        )
+        .unwrap();
+        let retained = &artifact.content.registry;
+        assert_eq!(retained.commands["judgment.request"].version, "2.0.0");
+        assert!(retained.events.contains_key("aq.judgment.completed"));
+        assert!(retained.events.contains_key("aq.check.receipted"));
+    }
+    #[test]
     fn all_four_pilots_compile_and_execute() {
         for name in NAMES {
             let s = scenario(name).unwrap();

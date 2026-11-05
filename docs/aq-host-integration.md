@@ -153,10 +153,11 @@ decision business result. This replaces the ambiguous `succeeded` readback.
 Cancellation or indeterminate state can be observed separately. Reconciliation
 of a lost dispatch response must retain the same identity and authority.
 
-The current bounded judgment adapter is synchronous (`assessed`); making model
-assessment admission asynchronous is a future contract change. This choice
-retains the existing routing pilot's behavior and does not imply execution of
-an unimplemented production model adapter.
+The 1.0.0 judgment adapter is synchronous (`assessed`), and 1.0.0 `check.request`
+names a suite rather than a registered check. Both are frozen as published; the
+asynchronous provider judgment and registered check execution that D6 needs are
+host catalog 2.0.0 (below). This retains the routing pilot's 1.0.0 behavior and
+does not imply execution of an unimplemented production model adapter.
 
 ### Event names, producers and schemas
 
@@ -214,3 +215,105 @@ translate to their owning services while enforcing this public schema and curren
 authority. D3's outbox and D8's triggers must use the event table above.
 Production fixture/replay and assembled-pilot checks remain D5–D8/D11 work; D4's
 synthetic results do not claim those adapters are already bound or qualified.
+
+## AQ host catalog 2.0.0 (D6 judgment and check adapters)
+
+The [2.0.0 bundle](../contracts/aq-host-2.0.0/README.md) is published beside
+1.0.0 and does not replace it. Version `2.0.0` has fingerprint
+`sha256:e2ce7dc8ff4b37538f8d27f175a4e365ff95cf14508ae7074beea04026b143db`
+over `["2.0.0", registry]`. The manifest records the 1.0.0 version and
+fingerprint it supersedes.
+
+### Compatibility decision
+
+- **1.0.0 is frozen.** Its bytes, fingerprint, fixtures, the CLI surface, the
+  fake host and all four pilots are unchanged. Existing namespaces, grants and
+  captured artifacts stay bound to 1.0.0 contract fingerprints. A 1.0.0 host
+  refuses 2.0.0 contracts, and a 1.0.0 grant does not authorize them.
+- **Nine commands and all seven 1.0.0 events are byte-identical in 2.0.0.**
+  Their per-contract fingerprints are equal. `fixtures.json#compatibility` pins
+  them, along with the 1.0.0 registry file SHA-256.
+- **Three commands change.**
+  - `judgment.request` and `check.request` move to command version 2.0.0, are
+    asynchronous, and require the new capabilities `judgment.request.v2` and
+    `check.request.v2`. An inherited 1.0.0 capability never authorizes provider
+    spending or sandbox execution.
+  - `operation.get` moves to 2.0.0 because its `completed` union also reconciles
+    both new completions. Its capability is unchanged.
+- **Two events are new, at event version 1.0.0:** `aq.judgment.completed` and
+  `aq.check.receipted`. 1.0.0 `aq.check.completed` keeps its 1.0.0 meaning and is
+  not the 2.0.0 completion event.
+- **Consumers opt in with a new pin.** aq-server vendors the 2.0.0 directory as a
+  new catalog profile and namespace generation, pinned to the exact aq-playbooks
+  revision and this manifest fingerprint. It must not patch the vendored 1.0.0
+  fingerprint. Rebinding 1.0.0 captured artifacts is a deliberate, separate act.
+
+### judgment.request 2.0.0
+
+This is a bounded provider request, not an agent session, and has no tool loop.
+
+**Input** (closed object):
+- the subject;
+- a question;
+- explicit context: inline text of at most 32,768 bytes plus up to 32 immutable
+  context `ArtifactRef`s (`{id, version, digest}`);
+- a declared output shape: up to 64 choice labels and a rationale byte bound;
+- budgets: `max_input_tokens`, `max_output_tokens`, `max_cost_microunits` and
+  `deadline_ms` (1,000–600,000).
+
+There is no credential-profile or tool field. The host chooses a permitted
+provider credential profile.
+
+**Admission:** `accepted {handle}`, or a synchronous `refused`. The operation is
+not cancellable.
+
+**Completion** arrives on `aq.judgment.completed` and through `operation.get` as
+`{outcome: assessed|failed|refused, output}`:
+- `assessed` carries a declared `choice`, a bounded `rationale`, `provenance`,
+  `reference` and `subject`.
+- `provenance` holds provider, model, the credential profile reference (never the
+  secret), prompt and context digests, an output digest, and usage (input and
+  output tokens, cost in microunits).
+- A refusal is typed: budget_exceeded, deadline_exceeded, invalid_output,
+  invalid_request, no_permitted_profile or stale_subject.
+- A failure is typed: provider_error, provider_unavailable or indeterminate.
+
+A judgment never substitutes for a human decision or for executed check evidence.
+
+### check.request 2.0.0
+
+**Input** is `{subject, check: {id, validator: ArtifactRef}, source: {format: sha1|sha256, hex}}`:
+- The check ID and validator must already be in the pinned outcome's
+  `required_checks`, which holds at most 32.
+- `source` is the retained immutable source object ID.
+- There is no shell, URL, path or caller-asserted result field.
+
+**Admission:** `accepted {handle}`, or a synchronous `refused` with reason
+execution_limit, invalid_request, not_required, stale_subject or unavailable. The
+operation is cancellable through 1.0.0 `operation.cancel`.
+
+**Completion** arrives on `aq.check.receipted` and through `operation.get`. The
+receipt binds a receipt digest, executor version, inputs digest, up to 32 result
+artifacts, and stop/exit evidence. The schema enforces the D6 disposition mapping:
+
+| Disposition | Catalog outcome | Receipt |
+| --- | --- | --- |
+| passed | passed | Required; stop `exited` with code 0 |
+| failed | failed | Required; stop `exited` |
+| cancelled, timed_out, unknown | infrastructure_failure | Nullable; any stop (cancelled/exited/lost/signalled/timed_out) |
+| stale (or null at admission) | refused | None; typed reason |
+
+A lost or uncertain stop therefore cannot validate as `passed`.
+
+### Bounds left to the host
+
+These are host semantics, not schema:
+- the 64 KiB request bound (`max_payload_bytes`);
+- digest and OID formats (lowercase hex, `sha256:` prefix);
+- membership in `required_checks`;
+- 8 executions per subject and check, 256 operations per lineage, and 10,000
+  retained;
+- that `choice` is one of the requested choices.
+
+The fake host models 2.0.0 admission and replay only, returning a retained
+handle. Completion is the production host's event.

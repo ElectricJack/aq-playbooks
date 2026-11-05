@@ -7,7 +7,7 @@
 //! subject revision comes from the current host record. Every fresh read records
 //! its own bounded immutable snapshot and requires project visibility.
 use crate::catalog;
-use aq_playbooks_model::{CommandContract, ContractRef, EventEnvelope, digest};
+use aq_playbooks_model::{CommandContract, ContractRef, EventEnvelope, Registry, digest};
 use aq_playbooks_runner::{Authority, CancellationResult, DispatchResult, Host, Intent};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -593,6 +593,18 @@ impl FakeHost {
     fn execute(&mut self, intent: &Intent) -> Result<DispatchResult, String> {
         let input = &intent.input;
         let actor = &intent.authority.actor;
+        if intent.command.version == catalog::VERSION_2
+            && matches!(
+                intent.command.name.as_str(),
+                "judgment.request" | "check.request"
+            )
+        {
+            // 2.0.0 admission only: the durable handle completes by host event.
+            self.check_current(&subject_field(input, "subject")?)?;
+            return Ok(DispatchResult::Accepted {
+                handle: intent.id.clone(),
+            });
+        }
         match intent.command.name.as_str() {
             "context.read" => {
                 let mut subject = subject_field(input, "subject")?;
@@ -1024,8 +1036,9 @@ impl FakeHost {
 
 impl Host for FakeHost {
     fn authorize(&self, authority: &Authority, contract: &CommandContract) -> bool {
-        let registry = catalog::catalog();
-        registry.commands.get(&contract.name) == Some(contract)
+        let published =
+            |registry: Registry| registry.commands.get(&contract.name) == Some(contract);
+        (published(catalog::catalog()) || published(catalog::catalog_v2()))
             && contract.scopes.contains(&authority.scope)
             && contract.capabilities.is_subset(&authority.capabilities)
             && self
