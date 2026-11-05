@@ -961,6 +961,58 @@ mod tests {
         assert!(retained.events.contains_key("aq.judgment.completed"));
         assert!(retained.events.contains_key("aq.check.receipted"));
     }
+    fn prepared_source_check(r: Registry) -> anyhow::Result<Artifact> {
+        let check = json!({
+            "id": "unit",
+            "validator": {"id": "validator-1", "version": "1", "digest": format!("sha256:{}", "b".repeat(64))},
+        });
+        let steps = BTreeMap::from([
+            (
+                "prepare".into(),
+                invoke(
+                    &r,
+                    "candidate.prepare",
+                    lit(json!({"base": subject_value(), "sources": [subject_value()]})),
+                    "candidate",
+                    &[("prepared", "check")],
+                ),
+            ),
+            (
+                "check".into(),
+                invoke(
+                    &r,
+                    "check.request",
+                    fields(&[
+                        ("subject", reference("candidate", &["subject"])),
+                        ("check", lit(check)),
+                        ("source", reference("candidate", &["source"])),
+                    ]),
+                    "check",
+                    &[("accepted", "done")],
+                ),
+            ),
+            ("done".into(), ret("success", lit(Value::Null))),
+        ]);
+        build(
+            "prepared-source-check",
+            r,
+            Schema::Null,
+            Schema::Null,
+            "prepare",
+            steps,
+            &[],
+        )
+    }
+    #[test]
+    fn catalog_v2_1_check_binds_the_prepared_candidate_source() {
+        let artifact = prepared_source_check(catalog_v2_1()).unwrap();
+        let retained = &artifact.content.registry;
+        assert_eq!(retained.commands["candidate.prepare"].version, "2.1.0");
+        assert_eq!(retained.commands["check.request"].version, "2.0.0");
+        // 2.0.0 has no prepared source, so the same binding cannot compile.
+        let err = prepared_source_check(catalog_v2()).unwrap_err().to_string();
+        assert!(err.contains("unknown field source"), "{err}");
+    }
     #[test]
     fn all_four_pilots_compile_and_execute() {
         for name in NAMES {

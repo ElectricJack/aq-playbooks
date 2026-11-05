@@ -317,3 +317,46 @@ These are host semantics, not schema:
 
 The fake host models 2.0.0 admission and replay only, returning a retained
 handle. Completion is the production host's event.
+
+## AQ host catalog 2.1.0 (prepared candidate source)
+
+The [2.1.0 bundle](../contracts/aq-host-2.1.0/README.md) is published beside
+1.0.0 and 2.0.0 and replaces neither. Version `2.1.0` has fingerprint
+`sha256:24407a41481dba1bc9618e4c9239e0282083cca2ef57316a42d5f61df32d1716`
+over `["2.1.0", registry]`. The manifest records the 2.0.0 version and
+fingerprint it supersedes.
+
+### Why
+
+In 2.0.0, `check.request` takes `source`, the immutable object ID it executes,
+but `candidate.prepare` does not return one. A policy can only bind `source`
+to a caller input, which need not match the candidate the host prepared. 2.1.0
+returns the source from the host that prepared it. A policy binds
+`check.request.source` to the prepare step's `source` (for example,
+`candidate.source`). A compile against 2.0.0 refuses that binding
+(`expression_type`: unknown field source).
+
+### Compatibility decision
+
+- **1.0.0 and 2.0.0 are frozen.** Their bytes, fingerprints and fixtures are
+  unchanged. The fake host still returns no source for an earlier
+  `candidate.prepare` contract.
+- **Eleven commands and all nine 2.0.0 events are byte-identical in 2.1.0.**
+  `fixtures.json#compatibility` pins their fingerprints and the 2.0.0 registry
+  file SHA-256.
+- **`candidate.prepare` moves to command version 2.1.0.** Its `prepared` outcome
+  requires `source: {format: sha1|sha256, hex}`, with the same schema as
+  `check.request` 2.0.0 `input.source`. `source` is a public result field.
+  `conflict` and `refused` are unchanged. The capability stays
+  `candidate.prepare`: the effect and its authority are the same, and only the
+  result gains a field.
+- **Consumers opt in with a new pin.** aq-server vendors the directory as a new
+  catalog profile (Host8), pinned to the exact aq-playbooks revision and this
+  manifest fingerprint, beside the untouched 2.0.0 (Host7) pin. Its
+  `candidate.prepare` adapter emits the prepared candidate OID as
+  `output.source`. A host-side guard that substitutes or checks the prepared OID
+  for a 2.0.0 `check.request` becomes either unnecessary for 2.1.0 policies or a
+  consistency check (refuse when `input.source` differs from the prepared OID).
+
+The host still owns the OID format bound: lowercase hex, 40 characters for
+`sha1` and 64 for `sha256`.
