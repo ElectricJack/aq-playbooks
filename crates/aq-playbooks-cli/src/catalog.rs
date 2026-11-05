@@ -88,6 +88,15 @@ pub const MANIFEST_2_JSON: &str = include_str!("../../../contracts/aq-host-2.0.0
 pub fn catalog_v2() -> Registry {
     serde_json::from_str(REGISTRY_2_JSON).expect("published AQ host registry 2.0.0")
 }
+/// Host catalog 2.1.0: candidate.prepare's `prepared` outcome also returns the
+/// immutable candidate `source` OID, so a check binds the prepared source rather
+/// than a caller-supplied one. Published beside the frozen 1.0.0 and 2.0.0.
+pub const VERSION_2_1: &str = "2.1.0";
+pub const REGISTRY_2_1_JSON: &str = include_str!("../../../contracts/aq-host-2.1.0/registry.json");
+pub const MANIFEST_2_1_JSON: &str = include_str!("../../../contracts/aq-host-2.1.0/manifest.json");
+pub fn catalog_v2_1() -> Registry {
+    serde_json::from_str(REGISTRY_2_1_JSON).expect("published AQ host registry 2.1.0")
+}
 pub fn describe_surface() -> serde_json::Value {
     let mut manifest: serde_json::Value =
         serde_json::from_str(MANIFEST_JSON).expect("AQ host manifest");

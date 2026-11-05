@@ -841,7 +841,14 @@ impl FakeHost {
                         sources,
                     },
                 );
-                Ok(completed("prepared", result(&subject.id, &subject)))
+                let mut output = result(&subject.id, &subject);
+                if intent.command.version == catalog::VERSION_2_1 {
+                    // 2.1.0 returns the immutable candidate OID that checks bind.
+                    let hex = aq_playbooks_model::hash_bytes(subject.id.as_bytes());
+                    output["source"] =
+                        json!({"format": "sha256", "hex": hex.trim_start_matches("sha256:")});
+                }
+                Ok(completed("prepared", output))
             }
             "candidate.publish" => {
                 let candidate = subject_field(input, "candidate")?;
@@ -1038,7 +1045,9 @@ impl Host for FakeHost {
     fn authorize(&self, authority: &Authority, contract: &CommandContract) -> bool {
         let published =
             |registry: Registry| registry.commands.get(&contract.name) == Some(contract);
-        (published(catalog::catalog()) || published(catalog::catalog_v2()))
+        (published(catalog::catalog())
+            || published(catalog::catalog_v2())
+            || published(catalog::catalog_v2_1()))
             && contract.scopes.contains(&authority.scope)
             && contract.capabilities.is_subset(&authority.capabilities)
             && self
