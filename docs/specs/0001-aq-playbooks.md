@@ -1,6 +1,6 @@
 # aq-playbooks design
 
-**Status:** Draft with the agreed minimal command surface  
+**Status:** Draft with the agreed minimal command surface. As of 2026-11-12 the engine (model, compiler, runner, PostgreSQL store, CLI) is implemented and tested. The four AQ pilots (P17), including routing judgment, have run only against a fake host. aq-server embeds the runner and registers the twelve commands, with `judgment.request` and `check.request` unbound; its live stack loads an inspection-only artifact. Platform state: aq-server `docs/status.md`.  
 **Date:** 2026-10-30  
 **Implementation language:** Rust  
 **Repository:** `aq-playbooks`
