@@ -1076,6 +1076,52 @@ fn the_routing_document_draft_checks_against_catalog_2_2_0() {
     for name in ["aq.work.route_needed", "aq.judgment.assessed"] {
         assert!(retained.events.contains_key(name), "{name}");
     }
+    // The labels are read by position only where `judgment.assess` answered
+    // `assessed` (one label per requested field): in the `route` step, which
+    // only the join's `completed` edge reaches, and the join accepts only
+    // `assessed`.
+    fn label_reads(value: &Value, found: &mut usize) {
+        match value {
+            Value::Object(o) => {
+                if o.get("op") == Some(&json!("ref"))
+                    && o.get("path")
+                        .and_then(Value::as_array)
+                        .is_some_and(|p| p.iter().any(|s| s == "labels"))
+                {
+                    *found += 1;
+                }
+                o.values().for_each(|v| label_reads(v, found));
+            }
+            Value::Array(a) => a.iter().for_each(|v| label_reads(v, found)),
+            _ => {}
+        }
+    }
+    for (name, step) in ws.draft["steps"].as_object().unwrap() {
+        let mut found = 0;
+        label_reads(step, &mut found);
+        assert_eq!(found > 0, name == "route", "{name}");
+    }
+    let edges_to_route: Vec<(&String, &String)> = ws.draft["steps"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .flat_map(|(n, s)| {
+            s["edges"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(_, t)| *t == "route")
+                .map(move |(e, _)| (n, e))
+        })
+        .collect();
+    assert_eq!(
+        edges_to_route,
+        [(&"await".to_string(), &"completed".to_string())]
+    );
+    assert_eq!(
+        ws.draft["steps"]["await"]["op"]["accepted_outcomes"],
+        json!(["assessed"])
+    );
     // The strict draft rules still bite: reading the labels where the
     // judgment may have failed is refused.
     let mut wrong = ws.clone();
@@ -1563,11 +1609,11 @@ fn the_routing_draft_routes_as_the_document_says() {
             failed(task("feature", "low", &[]), 1),
             expect("standard-high", ANY, &["level_from_kind"]),
         ),
-        // 77: "Never spend Deep on bug fixes, escalated or not." With 31: asking for Deep gives Complex, high.
+        // 77: "Never spend Deep on bug fixes, escalated or not." The recorded reason says so.
         (
             "bugfix, asked for Deep, two failures, flagged hard",
             failed(hint(task("bugfix", "high", HARD), "deep-high"), 2),
-            expect("complex-high", CC, &["deep_reserved", "harnesses_limited"]),
+            expect("complex-high", CC, &["policy", "harnesses_limited"]),
         ),
         // 29: "If whoever filed the task asked for a level, respect it, ..."
         (
@@ -1601,11 +1647,11 @@ fn the_routing_draft_routes_as_the_document_says() {
             hint(task("sync", "low", &[]), "deep-high"),
             expect("standard-high", ANY, &["hint_capped"]),
         ),
-        // 30: "... or above Complex for ordinary implementation work." 31: Deep needs the rule.
+        // 30: "... or above Complex for ordinary implementation work." The cap is the reason.
         (
             "feature, asked for Deep",
             hint(task("feature", "low", &[]), "deep-high"),
-            expect("complex-high", ANY, &["deep_reserved"]),
+            expect("complex-high", ANY, &["hint_capped"]),
         ),
         // 31: "Asking for Deep is not enough to get it: ... otherwise it gets Complex, high effort."
         (
@@ -1623,7 +1669,8 @@ fn the_routing_draft_routes_as_the_document_says() {
             hint(task("analysis", "low", HARD), "deep-low"),
             expect("deep-low", ANY, &["hint_respected"]),
         ),
-        // 33: "If the level asked for isn't available, use the nearest available level below it, ..."
+        // 33: "If the level asked for isn't available, use the nearest available level below it."
+        // It is then treated like any level asked for: it may be below the kind's level.
         (
             "feature, asked for Complex max (not offered)",
             hint(task("feature", "low", &[]), "complex-max"),
@@ -1632,18 +1679,42 @@ fn the_routing_draft_routes_as_the_document_says() {
         (
             "spec, asked for Standard max (not offered)",
             hint(task("spec", "low", &[]), "standard-max"),
-            expect("complex-high", ANY, &["policy"]),
+            expect("standard-high", ANY, &["policy"]),
         ),
-        // 34: "... but never below what the other rules give."
         (
             "chore, asked for Simple medium (not offered)",
             hint(task("chore", "low", &[]), "simple-medium"),
-            expect("simple-high", ANY, &["policy"]),
+            expect("simple-low", ANY, &["policy"]),
         ),
         (
             "analysis, asked for Deep medium (not offered), flagged hard",
             hint(task("analysis", "low", HARD), "deep-medium"),
-            expect("deep-high", ANY, &["policy"]),
+            expect("deep-low", ANY, &["policy"]),
+        ),
+        // 34: "The risk and failure rules still apply to it, as to any level asked for."
+        (
+            "docs, medium, asked for Simple medium (not offered)",
+            hint(task("docs", "medium", &[]), "simple-medium"),
+            expect(
+                "standard-high",
+                CC,
+                &["policy", "raised_for_risk", "harnesses_limited"],
+            ),
+        ),
+        (
+            "bugfix, high, asked for Simple medium (not offered), one failure",
+            failed(hint(task("bugfix", "high", &[]), "simple-medium"), 1),
+            expect(
+                "complex-high",
+                CC,
+                &["policy", "escalated_after_failure", "harnesses_limited"],
+            ),
+        ),
+        // 30 with 33: a kind cap applies before the nearest available level is taken.
+        (
+            "docs, asked for Complex max (not offered)",
+            hint(task("docs", "low", &[]), "complex-max"),
+            expect("standard-high", ANY, &["hint_capped"]),
         ),
         // 86: "An unknown risk counts as medium, and you say that it was assumed."
         // 89: "Keep the task on Claude or Codex." (no local model, though narrow and covered)
@@ -1664,6 +1735,15 @@ fn the_routing_draft_routes_as_the_document_says() {
                 ..task("", "low", NT)
             },
             expect("standard-high", CC, &["level_from_kind", "policy"]),
+        ),
+        // 88: the unknown-kind floor applies over a low level asked for, as the risk floors do.
+        (
+            "unknown kind, low, asked for Simple low",
+            Task {
+                labels: Some(["unknown", "low"]),
+                ..hint(task("", "low", &[]), "simple-low")
+            },
+            expect("standard-high", CC, &["policy"]),
         ),
         // 88: "A risk that is known still applies in full."
         (
@@ -1795,6 +1875,37 @@ fn the_routing_draft_routes_as_the_document_says() {
         }
         // Under the owner's Settings, nothing the document allows is refused.
         assert!(host_keeps(&r).is_some(), "{name}: {r}");
+    }
+    // A hint above its top is lowered for the true reason (lines 30, 31, 77).
+    for (t, said) in [
+        (
+            failed(hint(task("bugfix", "high", HARD), "deep-high"), 2),
+            "Never spend Deep on bug fixes",
+        ),
+        (
+            hint(task("feature", "low", &[]), "deep-high"),
+            "Ordinary implementation work doesn't go above Complex",
+        ),
+        (
+            hint(task("docs", "low", &[]), "deep-high"),
+            "Tests, docs, chores and syncs don't go above Standard",
+        ),
+        (
+            hint(task("review", "low", &[]), "deep-high"),
+            "Asking for Deep is not enough to get it",
+        ),
+    ] {
+        let r = route_for(&t);
+        let details: Vec<&str> = r["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["detail"].as_str())
+            .collect();
+        assert!(
+            details.iter().any(|d| d.starts_with(said)),
+            "{said}: {details:?}"
+        );
     }
     // The host drops a preference the level does not offer; it never refuses.
     let spec = route_for(&task("spec", "low", NT));

@@ -432,10 +432,11 @@ These are host semantics, not schema.
 - **One trigger per cause for "nothing could ever take it":**
   - Settings: `work.route` refused `not_offered`. The host raises the task
     itself, once. The playbook only ends.
-  - The document: `work.unroutable {subject, reasons}`. The host leaves the
-    task unrouted and visible, shows the reasons, raises it, and does not
-    re-emit `aq.work.route_needed` until the task or the active playbook
-    changes.
+  - The document: `work.unroutable {subject, reasons}`. The host clears a
+    router route the task may have (never an owner route: `owner_route`),
+    leaves the task unrouted and visible, shows the reasons, raises it, and
+    does not re-emit `aq.work.route_needed` until the task or the active
+    playbook changes.
 
   A playbook's entry outcome is never read as this signal.
 - **`work.read` facts:**
@@ -445,9 +446,9 @@ These are host semantics, not schema.
 - **`aq.work.route_needed`:**
   - It is not emitted again for a task version while a run started for that
     version is unfinished.
-  - Once a task is raised as unroutable (`not_offered` or
-    `work.unroutable`), it is not emitted again until the task or the active
-    playbook changes.
+  - Once a task is raised as unroutable it is not emitted again until the
+    task or the active playbook changes, or, after `not_offered`, Settings
+    change.
 
 `operation.get` 2.0.0 is unchanged, so its `completed` union does not include
 the `judgment.assess` outputs. A host reconciles a `judgment.assess` intent

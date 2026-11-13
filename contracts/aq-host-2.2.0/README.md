@@ -90,7 +90,7 @@ it to a neighbour, and especially never down.
 
 A complete example is `crates/aq-playbooks-cli/tests/data/routing_draft.json`,
 the owner's routing document written as a draft. The contract test checks it
-against this catalog and evaluates the routes of 55 concrete tasks against the
+against this catalog and evaluates the routes of 59 concrete tasks against the
 document's sentences. That document allows somebody for every task, so the
 draft never calls `work.unroutable`.
 
@@ -216,7 +216,8 @@ Settings may have changed since.
 - **Nothing in Settings can take it.** Write the route the document gives.
   If the host refuses it with `not_offered`, end the run. The host itself
   leaves the task unrouted and visible, records the refused route with its
-  reasons on the task, and raises it for the owner, once.
+  reasons on the task, and raises it for the owner, once. It asks for a route
+  again when the task, the active playbook or Settings changes.
 - **The document allows nobody for it.** Call `work.unroutable` with the
   reasons, usually `policy` with the document's sentence. Do not write a
   route.
@@ -237,8 +238,11 @@ Deadline 10 s. `reference` and `subject` are public result fields.
 | `reasons` | ≤ 16 `{code, detail?}` | Why nobody may take it, with the same codes and optional sentence as `work.route`. Give at least one. |
 
 The host leaves the task unrouted and visible, shows the reasons on it, and
-raises it for the owner's attention. It does not ask for a route again
-(`aq.work.route_needed`) until the task or the active playbook changes.
+raises it for the owner's attention. If the task has a route the router set
+earlier (for example, a retried task now judged unroutable), the host clears
+that route; an owner's route is never cleared (`refused owner_route`). It does
+not ask for a route again (`aq.work.route_needed`) until the task or the
+active playbook changes.
 
 **Outcomes:**
 - `recorded`: `{reference, subject}`. End the run.
@@ -339,10 +343,12 @@ event:
 - again for the same version at most every two minutes while the task stays
   unrouted, but **not while a run started for that version is unfinished**.
 
-Once a task has been raised as unroutable (after `not_offered`, or through
-`work.unroutable`), the server does not emit the event again until the task
-or the active playbook changes. So a
-playbook never sees two live runs for one task version. A run that ends
+Once a task has been raised as unroutable, the server does not emit the
+event again until something that could change the answer changes:
+- after `not_offered`: the task, the active playbook, or Settings;
+- after `work.unroutable`: the task or the active playbook.
+
+So a playbook never sees two live runs for one task version. A run that ends
 without routing is not started again every two minutes for ever.
 
 ## What stays with the host
