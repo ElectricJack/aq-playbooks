@@ -199,3 +199,31 @@ branch), protected format 2, never calling `collect_garbage`:
 - How window entries are ordered and stored inside the record.
 - Whether cohort removal can be a light commit on format 3.
 - The exact error text for a stale request.
+
+## Rulings after the builder check (2026-11-13)
+
+The plan (`docs/superpowers/plans/2026-11-13-live-state-only.md`, "Spec
+check") tested this spec against the code. Where the two differ, these
+rulings apply:
+
+- **Waits and expired events.** Correlation fences are not kept. A wait
+  registered after its event's window has passed times out; it is no longer
+  refused at registration. This is the one playbook-visible change.
+- **Late results.** A cancelled operation already counts as settled, so its
+  cohort leaves at once and a late result for it gets "not found". The
+  example in §1 is wrong on this point.
+- **Producer time.** `occurred_at_ms` is business time and is not used. The
+  stale check uses an optional request time passed to new engine methods and
+  not included in any digest.
+- **Deferral.** An expired event that a live wait, a queued destination or an
+  unknown completion handle still needs, and an expired keyed receipt whose
+  run is still live, stay until that need ends.
+- **History rows.** One row per inspection item, not one per run. Receipts
+  owned by no run (`admin`, `event:<key>`) also go to history.
+- **Acceptance 2, last clause.** Replaced by: drain with the clock frozen,
+  move the clock past the window once more, complete one more run, then
+  compare the record with its size at run 1 (within 1.2×). The literal
+  figure for the original wording is reported too.
+- **Burst bound.** The 2 KB per run bound stands. If the measurement
+  exceeds it, report the figure; do not change the bound.
+- **Version.** The engine crates go to 0.2.0.
