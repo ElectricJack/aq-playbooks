@@ -2,7 +2,11 @@
 //! waits, child admissions and effect intents, or none of them. Backends must
 //! serialize ingress with expiry through this same revision. External dispatch
 //! is deliberately excluded from transactions.
-use crate::State;
+//!
+//! A commit also carries `State::settled`: the cohorts it removes. A backend
+//! writes their public history items in the same atomic commit, or the commit
+//! fails, and never stores `settled` with the State.
+use crate::{HistoryItem, SettledCohort, State, history};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -34,13 +38,40 @@ pub trait Storage: Send + Sync {
     ) -> Result<crate::CatalogPage, crate::CatalogError> {
         Err(crate::CatalogError::Unsupported)
     }
+    /// Live state plus history. History is read after the state, so an item
+    /// that left the state in between is found in history.
     fn inspect(
         &self,
         namespace: &str,
         query: &crate::InspectionQuery,
     ) -> Result<crate::InspectionPage, StorageError> {
         let versioned = self.load(namespace)?;
-        crate::inspection::page(&versioned.state, versioned.revision, query)
+        let history = self.history_page(namespace, query)?;
+        crate::inspection::page_with_history(&versioned.state, versioned.revision, query, history)
+    }
+    /// Whether commits write `State::settled` as history. `Engine::new`
+    /// refuses a backend that does not, so a wrapper that forgets to forward
+    /// the history methods fails closed.
+    fn persists_history(&self) -> bool {
+        false
+    }
+    /// At most `query.limit + 1` history items matching `query`, in key order.
+    fn history_page(
+        &self,
+        _namespace: &str,
+        _query: &crate::InspectionQuery,
+    ) -> Result<Vec<HistoryItem>, StorageError> {
+        Ok(vec![])
+    }
+    /// Delete the history of runs finished before `before_ms`; returns the
+    /// number of history items deleted.
+    fn delete_history(
+        &self,
+        _namespace: &str,
+        _owner: &str,
+        _before_ms: i64,
+    ) -> Result<u64, StorageError> {
+        Err(StorageError::Backend("history deletion unsupported".into()))
     }
     fn protection_available(&self) -> bool {
         false
@@ -82,6 +113,8 @@ pub trait Storage: Send + Sync {
 #[derive(Clone, Default)]
 pub struct MemoryStorage {
     inner: Arc<Mutex<MemoryNamespaces>>,
+    /// Also keep every settled cohort in full (for tests).
+    retain_settled: bool,
 }
 type MemoryNamespaces = BTreeMap<String, MemoryNamespace>;
 #[derive(Default)]
@@ -92,8 +125,73 @@ struct MemoryNamespace {
     catalog: Option<Arc<crate::catalog_inspection::CatalogProjection>>,
     catalog_projected_revision: u64,
     catalog_metadata_revision: u64,
+    history: history::HistoryRows,
+    settled: Vec<SettledCohort>,
+}
+impl MemoryStorage {
+    /// Like `default()`, and also keeps each settled cohort in full, so tests
+    /// can read what a commit removed from the State.
+    pub fn retaining_settled() -> Self {
+        Self {
+            retain_settled: true,
+            ..Self::default()
+        }
+    }
+    /// The cohorts committed as settled in `namespace`, oldest first. Empty
+    /// unless built with [`MemoryStorage::retaining_settled`].
+    pub fn settled_cohorts(&self, namespace: &str) -> Vec<SettledCohort> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(namespace)
+            .map(|entry| entry.settled.clone())
+            .unwrap_or_default()
+    }
+    /// A run as it was when its cohort settled (see `settled_cohorts`).
+    pub fn settled_run(&self, namespace: &str, id: &str) -> Option<crate::Run> {
+        self.settled_cohorts(namespace)
+            .into_iter()
+            .flat_map(|cohort| cohort.runs)
+            .find(|run| run.id == id)
+    }
 }
 impl Storage for MemoryStorage {
+    fn persists_history(&self) -> bool {
+        true
+    }
+    fn history_page(
+        &self,
+        namespace: &str,
+        query: &crate::InspectionQuery,
+    ) -> Result<Vec<HistoryItem>, StorageError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        match guard.get(namespace) {
+            Some(entry) => history::page(&entry.history, query),
+            None => query.validate().map(|()| vec![]),
+        }
+    }
+    fn delete_history(
+        &self,
+        namespace: &str,
+        owner: &str,
+        before_ms: i64,
+    ) -> Result<u64, StorageError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        let entry = guard.entry(namespace.into()).or_default();
+        if entry.owner.as_deref() != Some(owner) {
+            return Err(StorageError::Ownership);
+        }
+        entry
+            .settled
+            .retain(|cohort| cohort.finished_at_ms >= before_ms);
+        Ok(history::delete_before(&mut entry.history, before_ms))
+    }
     fn inspect_catalog(
         &self,
         namespace: &str,
@@ -235,6 +333,8 @@ impl Storage for MemoryStorage {
         let revision = expected_revision
             .checked_add(1)
             .ok_or_else(|| StorageError::Backend("revision exhausted".into()))?;
+        let items = crate::history_items(&state.settled);
+        history::check_new(&entry.history, &items)?;
         // An old otherwise admissible State can exceed this new metadata
         // profile. Preserve existing mutations while refusing catalog reads.
         let catalog = crate::catalog_inspection::project(state).ok().map(Arc::new);
@@ -243,9 +343,15 @@ impl Storage for MemoryStorage {
         }
         entry.catalog = catalog;
         entry.catalog_projected_revision = revision;
+        history::insert(&mut entry.history, items);
+        let mut stored = state.clone();
+        let settled = std::mem::take(&mut stored.settled);
+        if self.retain_settled {
+            entry.settled.extend(settled);
+        }
         entry.versioned = VersionedState {
             revision,
-            state: state.clone(),
+            state: stored,
         };
         Ok(entry.versioned.revision)
     }

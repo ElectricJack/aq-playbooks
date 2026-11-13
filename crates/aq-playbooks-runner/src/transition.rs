@@ -300,6 +300,7 @@ struct RecordNamespace {
     revision: u64,
     data: Arc<RecordData>,
     accounting: Accounting,
+    history: crate::history::HistoryRows,
 }
 /// Observability for the in-memory record backend.
 #[derive(Debug, Default)]
@@ -539,6 +540,39 @@ impl RecordStorage {
     }
 }
 impl Storage for RecordStorage {
+    fn persists_history(&self) -> bool {
+        true
+    }
+    fn history_page(
+        &self,
+        namespace: &str,
+        query: &crate::InspectionQuery,
+    ) -> std::result::Result<Vec<crate::HistoryItem>, StorageError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        match guard.get(namespace) {
+            Some(ns) => crate::history::page(&ns.history, query),
+            None => query.validate().map(|()| vec![]),
+        }
+    }
+    fn delete_history(
+        &self,
+        namespace: &str,
+        owner: &str,
+        before_ms: i64,
+    ) -> std::result::Result<u64, StorageError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        let ns = guard.entry(namespace.into()).or_default();
+        if ns.owner.as_deref() != Some(owner) {
+            return Err(StorageError::Ownership);
+        }
+        Ok(crate::history::delete_before(&mut ns.history, before_ms))
+    }
     fn load(&self, namespace: &str) -> std::result::Result<VersionedState, StorageError> {
         self.stats.full_loads.fetch_add(1, Ordering::Relaxed);
         let guard = self
@@ -585,7 +619,11 @@ impl Storage for RecordStorage {
         let revision = expected_revision
             .checked_add(1)
             .ok_or_else(|| StorageError::Backend("revision exhausted".into()))?;
+        let items = crate::history_items(&state.settled);
+        crate::history::check_new(&ns.history, &items)?;
+        // `settled` is not part of the stored header (serde skip).
         let (data, accounting) = export(state).map_err(to_storage)?;
+        crate::history::insert(&mut ns.history, items);
         ns.data = Arc::new(data);
         ns.accounting = accounting;
         ns.revision = revision;
@@ -701,6 +739,8 @@ impl Storage for RecordStorage {
         let previous = header_state(&ns.data.header)?;
         crate::retention::verify_artifact_removals(&previous, &state)?;
         source.check()?;
+        let items = crate::history_items(&std::mem::take(&mut state.settled));
+        crate::history::check_new(&ns.history, &items)?;
         drop(state);
         drop(source);
         let revision = ns
@@ -708,6 +748,7 @@ impl Storage for RecordStorage {
             .checked_add(1)
             .ok_or_else(|| backend("revision exhausted"))?;
         apply(Arc::make_mut(&mut ns.data), patch)?;
+        crate::history::insert(&mut ns.history, items);
         ns.accounting = accounting;
         ns.revision = revision;
         Ok(TransitionOutcome::Committed { revision })

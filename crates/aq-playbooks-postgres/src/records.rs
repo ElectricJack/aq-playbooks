@@ -479,6 +479,7 @@ impl PostgresStorage {
             if !changed {
                 return Ok(None);
             }
+            crate::refuse_settled(&state)?;
             let patch = take_patch(&mut state)?;
             let stripped = stripped_header(&mut state)?;
             source.check()?;

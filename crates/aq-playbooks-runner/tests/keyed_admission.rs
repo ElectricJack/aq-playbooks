@@ -149,6 +149,24 @@ struct Fault {
     mode: Arc<AtomicU8>,
 }
 impl Storage for Fault {
+    fn persists_history(&self) -> bool {
+        self.store.persists_history()
+    }
+    fn history_page(
+        &self,
+        n: &str,
+        q: &InspectionQuery,
+    ) -> std::result::Result<Vec<HistoryItem>, StorageError> {
+        self.store.history_page(n, q)
+    }
+    fn delete_history(
+        &self,
+        n: &str,
+        o: &str,
+        before_ms: i64,
+    ) -> std::result::Result<u64, StorageError> {
+        self.store.delete_history(n, o, before_ms)
+    }
     fn load(&self, n: &str) -> std::result::Result<storage::VersionedState, StorageError> {
         self.store.load(n)
     }
@@ -264,6 +282,24 @@ struct Racing {
     barrier: Arc<std::sync::Barrier>,
 }
 impl Storage for Racing {
+    fn persists_history(&self) -> bool {
+        self.store.persists_history()
+    }
+    fn history_page(
+        &self,
+        n: &str,
+        q: &InspectionQuery,
+    ) -> std::result::Result<Vec<HistoryItem>, StorageError> {
+        self.store.history_page(n, q)
+    }
+    fn delete_history(
+        &self,
+        n: &str,
+        o: &str,
+        before_ms: i64,
+    ) -> std::result::Result<u64, StorageError> {
+        self.store.delete_history(n, o, before_ms)
+    }
     fn load(&self, n: &str) -> std::result::Result<storage::VersionedState, StorageError> {
         let loaded = self.store.load(n)?;
         if self

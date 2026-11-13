@@ -305,6 +305,15 @@ impl Measured {
     }
 }
 impl Storage for Measured {
+    fn persists_history(&self) -> bool {
+        self.inner.persists_history()
+    }
+    fn history_page(&self, n: &str, q: &InspectionQuery) -> Result<Vec<HistoryItem>, StorageError> {
+        self.inner.history_page(n, q)
+    }
+    fn delete_history(&self, n: &str, o: &str, before_ms: i64) -> Result<u64, StorageError> {
+        self.inner.delete_history(n, o, before_ms)
+    }
     fn inspect_catalog(
         &self,
         n: &str,

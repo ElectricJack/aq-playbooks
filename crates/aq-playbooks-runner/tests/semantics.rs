@@ -980,6 +980,24 @@ struct FailOnceStore {
     fail: std::sync::atomic::AtomicBool,
 }
 impl Storage for FailOnceStore {
+    fn persists_history(&self) -> bool {
+        self.inner.persists_history()
+    }
+    fn history_page(
+        &self,
+        n: &str,
+        q: &InspectionQuery,
+    ) -> std::result::Result<Vec<HistoryItem>, StorageError> {
+        self.inner.history_page(n, q)
+    }
+    fn delete_history(
+        &self,
+        n: &str,
+        o: &str,
+        before_ms: i64,
+    ) -> std::result::Result<u64, StorageError> {
+        self.inner.delete_history(n, o, before_ms)
+    }
     fn load(&self, ns: &str) -> std::result::Result<VersionedState, StorageError> {
         self.inner.load(ns)
     }

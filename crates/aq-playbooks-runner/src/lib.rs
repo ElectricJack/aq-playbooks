@@ -3,8 +3,10 @@
 pub mod admission;
 pub use admission::{KeyedAdmissionDisposition, KeyedAdmissionReceipt, KeyedAdmissionRequest};
 pub mod catalog_inspection;
+pub mod history;
 pub mod inspection;
 pub use catalog_inspection::{CatalogError, CatalogKind, CatalogPage, CatalogQuery, CatalogStamp};
+pub use history::{HistoryItem, SettledCohort, history_items};
 pub mod lazy;
 pub mod metrics;
 pub mod storage;
@@ -265,6 +267,10 @@ pub struct State {
     pub recovery_requests: BTreeMap<String, RecoveryRequest>,
     #[serde(skip)]
     pub protection_available: bool,
+    /// Cohorts this commit removes from the State, handed to storage as
+    /// history in the same commit. Never stored with the State.
+    #[serde(skip)]
+    pub settled: Vec<SettledCohort>,
     #[serde(default)]
     pub indexes: RuntimeIndexes,
     pub artifacts: BTreeMap<String, Artifact>,
@@ -349,6 +355,12 @@ pub struct Engine<S: Storage> {
 }
 impl<S: Storage> Engine<S> {
     pub fn new(store: S, namespace: impl Into<String>, owner: impl Into<String>) -> Result<Self> {
+        // A backend (or wrapper) that would drop history fails closed.
+        if !store.persists_history() {
+            return Err(Error::Refused(
+                "storage backend does not persist run history".into(),
+            ));
+        }
         let e = Self {
             store,
             namespace: namespace.into(),
@@ -404,6 +416,17 @@ impl<S: Storage> Engine<S> {
     ) -> std::result::Result<CatalogPage, CatalogError> {
         self.store
             .inspect_catalog(&self.namespace, &self.owner, query)
+    }
+    /// Public inspection over this namespace's live state and run history.
+    pub fn inspect(&self, query: &InspectionQuery) -> Result<InspectionPage> {
+        Ok(self.store.inspect(&self.namespace, query)?)
+    }
+    /// Delete the history of runs finished before `before_ms`; returns the
+    /// number of history items deleted.
+    pub fn delete_history_before(&self, before_ms: i64) -> Result<u64> {
+        Ok(self
+            .store
+            .delete_history(&self.namespace, &self.owner, before_ms)?)
     }
     fn transaction<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
         self.transaction_choice(|state| f(state).map(|value| (value, true)))

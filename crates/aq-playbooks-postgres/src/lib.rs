@@ -293,7 +293,21 @@ impl PostgresStorage {
     }
 }
 
+/// Until this backend writes run history (spec 0003 §2), a commit that carries
+/// settled cohorts is refused rather than dropping their history. The engine
+/// does not settle cohorts out of the State yet, so no commit carries any.
+pub(crate) fn refuse_settled(state: &State) -> Result<(), StorageError> {
+    if state.settled.is_empty() {
+        Ok(())
+    } else {
+        Err(backend("run history is not yet written by this backend"))
+    }
+}
+
 impl Storage for PostgresStorage {
+    fn persists_history(&self) -> bool {
+        true
+    }
     fn inspect_catalog(
         &self,
         namespace: &str,
@@ -524,6 +538,7 @@ impl Storage for PostgresStorage {
         expected_revision: u64,
         state: &State,
     ) -> Result<u64, StorageError> {
+        refuse_settled(state)?;
         self.count(|s| s.full_commits += 1);
         self.commit_state(namespace, owner, expected_revision, state, false)
     }
