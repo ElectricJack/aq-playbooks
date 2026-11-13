@@ -183,10 +183,10 @@ impl Storage for MemoryStorage {
             .inner
             .lock()
             .map_err(|e| StorageError::Backend(e.to_string()))?;
-        let entry = guard.entry(namespace.into()).or_default();
-        if entry.owner.as_deref() != Some(owner) {
-            return Err(StorageError::Ownership);
-        }
+        let entry = guard
+            .get_mut(namespace)
+            .filter(|entry| entry.owner.as_deref() == Some(owner))
+            .ok_or(StorageError::Ownership)?;
         entry
             .settled
             .retain(|cohort| cohort.finished_at_ms >= before_ms);
@@ -354,5 +354,18 @@ impl Storage for MemoryStorage {
             state: stored,
         };
         Ok(entry.versioned.revision)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn delete_history_of_an_unknown_namespace_creates_no_entry() {
+        let store = MemoryStorage::default();
+        assert_eq!(
+            store.delete_history("unknown", "w", 10),
+            Err(StorageError::Ownership)
+        );
+        assert!(!store.inner.lock().unwrap().contains_key("unknown"));
     }
 }

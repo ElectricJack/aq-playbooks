@@ -479,7 +479,6 @@ impl PostgresStorage {
             if !changed {
                 return Ok(None);
             }
-            crate::refuse_settled(&state)?;
             let patch = take_patch(&mut state)?;
             let stripped = stripped_header(&mut state)?;
             source.check()?;
@@ -516,12 +515,14 @@ impl PostgresStorage {
         if heavy {
             let mut records = all_records(&mut tx, namespace)?;
             apply(&mut records, patch)?;
-            let next = assemble_state(&staged.full_header, |f| {
+            let mut next = assemble_state(&staged.full_header, |f| {
                 Ok(records
                     .remove(f)
                     .map(|c| c.into_iter().collect())
                     .unwrap_or_default())
             })?;
+            // `settled` is not in the header; `commit_state` writes it.
+            next.settled = std::mem::take(&mut state.settled);
             drop(tx);
             drop(lent);
             drop(conn);
@@ -552,6 +553,11 @@ impl PostgresStorage {
             &staged.fields,
             &staged.keys,
             &staged.values,
+        )?;
+        crate::history::insert(
+            &mut tx,
+            namespace,
+            &aq_playbooks_runner::history_items(&state.settled),
         )?;
         let published = tx.execute("UPDATE aq_playbooks.namespaces SET state_header=$2,state_accounting=$3,revision=$4,catalog_projected_revision=$4,updated_at=clock_timestamp() WHERE namespace=$1 AND revision=$5",&[&namespace,&stripped,&accounting_json(&staged.accounting),&next,&expected]).map_err(backend)?;
         if published != 1 {
@@ -842,11 +848,14 @@ impl PostgresStorage {
         Ok(Some(page))
     }
 }
-/// Inspection page of a complete format 3 State (O(state); see D10 limits).
+/// Inspection page of a complete format 3 State (O(state); see D10 limits)
+/// merged with `history`, as `inspection::page_with_history` does: key order,
+/// and a key present in both is returned once (the live item).
 pub(crate) fn inspect(
     state: &State,
     query: &aq_playbooks_runner::InspectionQuery,
     revision: u64,
+    history: Vec<aq_playbooks_runner::HistoryItem>,
 ) -> aq_playbooks_runner::InspectionPage {
     let kind = query.kind.key();
     let mut rows: Vec<(String, Value)> = crate::projection::public_delta(&State::default(), state)
@@ -867,8 +876,20 @@ pub(crate) fn inspect(
                 .is_none_or(|after| key.as_str() > after)
                 .then(|| (key, r["public_value"].clone()))
         })
+        .chain(
+            history
+                .into_iter()
+                .filter(|item| {
+                    item.kind == query.kind
+                        && query.run.as_ref().is_none_or(|run| &item.run == run)
+                        && query.after.as_ref().is_none_or(|after| &item.key > after)
+                })
+                .map(|item| (item.key, item.value)),
+        )
         .collect();
+    // Stable: for a key present in both, the live item stays first.
     rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows.dedup_by(|later, earlier| later.0 == earlier.0);
     let more = rows.len() > query.limit;
     rows.truncate(query.limit);
     aq_playbooks_runner::InspectionPage {

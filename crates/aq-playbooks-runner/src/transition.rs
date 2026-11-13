@@ -567,10 +567,10 @@ impl Storage for RecordStorage {
             .inner
             .lock()
             .map_err(|e| StorageError::Backend(e.to_string()))?;
-        let ns = guard.entry(namespace.into()).or_default();
-        if ns.owner.as_deref() != Some(owner) {
-            return Err(StorageError::Ownership);
-        }
+        let ns = guard
+            .get_mut(namespace)
+            .filter(|ns| ns.owner.as_deref() == Some(owner))
+            .ok_or(StorageError::Ownership)?;
         Ok(crate::history::delete_before(&mut ns.history, before_ms))
     }
     fn load(&self, namespace: &str) -> std::result::Result<VersionedState, StorageError> {
@@ -752,5 +752,18 @@ impl Storage for RecordStorage {
         ns.accounting = accounting;
         ns.revision = revision;
         Ok(TransitionOutcome::Committed { revision })
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn delete_history_of_an_unknown_namespace_creates_no_entry() {
+        let store = RecordStorage::new();
+        assert_eq!(
+            store.delete_history("unknown", "w", 10),
+            Err(StorageError::Ownership)
+        );
+        assert!(!store.inner.lock().unwrap().contains_key("unknown"));
     }
 }

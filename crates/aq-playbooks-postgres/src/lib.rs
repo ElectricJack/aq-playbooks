@@ -12,6 +12,7 @@ extern crate self as aq_playbooks_postgres;
 mod catalog;
 #[cfg(all(test, feature = "postgres-tests"))]
 mod catalog_tests;
+mod history;
 mod indexes;
 mod profiling;
 mod projection;
@@ -49,6 +50,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
     ),
     (4, include_str!("../migrations/0004_catalog_inspection.sql")),
     (5, include_str!("../migrations/0005_transition_records.sql")),
+    (6, include_str!("../migrations/0006_run_history.sql")),
 ];
 #[cfg(all(test, feature = "postgres-tests"))]
 const WRITE_MARKER_SQL: &str = "SELECT set_config('aq_playbooks.writer_namespace',$1,true),set_config('aq_playbooks.writer_format','2',true)";
@@ -293,20 +295,56 @@ impl PostgresStorage {
     }
 }
 
-/// Until this backend writes run history (spec 0003 §2), a commit that carries
-/// settled cohorts is refused rather than dropping their history. The engine
-/// does not settle cohorts out of the State yet, so no commit carries any.
-pub(crate) fn refuse_settled(state: &State) -> Result<(), StorageError> {
-    if state.settled.is_empty() {
-        Ok(())
-    } else {
-        Err(backend("run history is not yet written by this backend"))
-    }
-}
-
 impl Storage for PostgresStorage {
     fn persists_history(&self) -> bool {
         true
+    }
+    fn history_page(
+        &self,
+        namespace: &str,
+        query: &aq_playbooks_runner::InspectionQuery,
+    ) -> Result<Vec<aq_playbooks_runner::HistoryItem>, StorageError> {
+        check_name(namespace)?;
+        query.validate()?;
+        let mut conn = self.connection()?;
+        let mut tx = ObservedTransaction::new(
+            conn.client.transaction().map_err(backend)?,
+            self.profiling.clone(),
+            "history_page",
+        );
+        let items = history::page(&mut tx, namespace, query)?;
+        tx.commit().map_err(backend)?;
+        Ok(items)
+    }
+    /// An ordinary indexed delete by finish time, by the lease owner.
+    fn delete_history(
+        &self,
+        namespace: &str,
+        owner: &str,
+        before_ms: i64,
+    ) -> Result<u64, StorageError> {
+        check_name(namespace)?;
+        let mut conn = self.connection()?;
+        let lease = conn
+            .leases
+            .get(namespace)
+            .filter(|l| l.owner == owner)
+            .ok_or(StorageError::Ownership)?;
+        let incarnation = lease.incarnation;
+        let format = lease.format.to_string();
+        let mut tx = ObservedTransaction::new(
+            conn.client.transaction().map_err(backend)?,
+            self.profiling.clone(),
+            "delete_history",
+        );
+        tx.query_one(WRITE_MARKER_FORMAT_SQL, &[&namespace, &format])
+            .map_err(backend)?;
+        if !records::owns_lock(&mut tx, namespace)? || tx.query_opt("SELECT 1 FROM aq_playbooks.namespaces WHERE namespace=$1 AND owner=$2 AND incarnation=$3 AND owner_backend_pid=pg_backend_pid()",&[&namespace,&owner,&incarnation]).map_err(backend)?.is_none() {
+            return Err(StorageError::Ownership);
+        }
+        let deleted = history::delete_before(&mut tx, namespace, before_ms)?;
+        tx.commit().map_err(backend)?;
+        Ok(deleted)
     }
     fn inspect_catalog(
         &self,
@@ -371,8 +409,10 @@ impl Storage for PostgresStorage {
             let mut tx = ObservedTransaction::new(tx, self.profiling.clone(), "inspect");
             let artifacts = self.read_artifacts(&mut tx, namespace, false)?;
             let state = records::assemble(&mut tx, namespace, row.get(3), artifacts)?;
+            // Read after the State: an item that left it is found here.
+            let history = history::page(&mut tx, namespace, query)?;
             tx.commit().map_err(backend)?;
-            return Ok(records::inspect(&state, query, revision));
+            return Ok(records::inspect(&state, query, revision, history));
         }
         if !row.get::<_, bool>(1) {
             return Err(backend(
@@ -380,7 +420,9 @@ impl Storage for PostgresStorage {
             ));
         }
         let limit = (query.limit + 1) as i64;
-        let rows=tx.query("SELECT item_key,public_value FROM aq_playbooks.inspection_rows WHERE namespace=$1 AND kind=$2 AND ($3::text IS NULL OR run_id=$3) AND ($4::text IS NULL OR item_key>$4) ORDER BY item_key LIMIT $5",&[&namespace,&query.kind.key(),&query.run,&query.after,&limit]).map_err(backend)?;
+        // Live rows and history in one statement (one snapshot): the commit
+        // that removes an item from the live rows inserts its history row.
+        let rows=tx.query("SELECT item_key,public_value FROM (SELECT item_key,public_value FROM aq_playbooks.inspection_rows WHERE namespace=$1 AND kind=$2 AND ($3::text IS NULL OR run_id=$3) AND ($4::text IS NULL OR item_key>$4) UNION ALL SELECT item_key,public_value FROM aq_playbooks.run_history WHERE namespace=$1 AND kind=$2 AND ($3::text IS NULL OR run_id=$3) AND ($4::text IS NULL OR item_key>$4)) u ORDER BY item_key LIMIT $5",&[&namespace,&query.kind.key(),&query.run,&query.after,&limit]).map_err(backend)?;
         let more = rows.len() > query.limit;
         let selected: Vec<_> = rows.into_iter().take(query.limit).collect();
         let next = if more {
@@ -538,7 +580,6 @@ impl Storage for PostgresStorage {
         expected_revision: u64,
         state: &State,
     ) -> Result<u64, StorageError> {
-        refuse_settled(state)?;
         self.count(|s| s.full_commits += 1);
         self.commit_state(namespace, owner, expected_revision, state, false)
     }
@@ -671,6 +712,11 @@ impl PostgresStorage {
         }
         tx.phase("retention");
         retention::verify_and_record(&mut tx, namespace, &previous, state)?;
+        history::insert(
+            &mut tx,
+            namespace,
+            &aq_playbooks_runner::history_items(&state.settled),
+        )?;
         for (digest, artifact) in &state.artifacts {
             tx.phase("artifact_compare");
             // Previous bytes were freshly read, authenticated and fully verified

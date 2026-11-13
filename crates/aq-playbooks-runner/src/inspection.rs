@@ -102,7 +102,7 @@ pub fn public_receipt(r: &Receipt) -> Value {
     json!({"sequence":r.sequence,"run":r.run,"step":r.step,"at_ms":r.at_ms,"kind":r.kind,"detail":detail})
 }
 
-pub fn run_row(r: &Run) -> InspectionRow {
+pub(crate) fn run_row(r: &Run) -> InspectionRow {
     InspectionRow {
         kind: InspectionKind::Runs,
         key: r.id.clone(),
@@ -111,7 +111,7 @@ pub fn run_row(r: &Run) -> InspectionRow {
         value: public_run(r),
     }
 }
-pub fn intent_row(i: &Intent) -> InspectionRow {
+pub(crate) fn intent_row(i: &Intent) -> InspectionRow {
     InspectionRow {
         kind: InspectionKind::Effects,
         key: i.id.clone(),
@@ -120,7 +120,7 @@ pub fn intent_row(i: &Intent) -> InspectionRow {
         value: public_intent(i),
     }
 }
-pub fn receipt_row(r: &Receipt) -> InspectionRow {
+pub(crate) fn receipt_row(r: &Receipt) -> InspectionRow {
     InspectionRow {
         kind: InspectionKind::Receipts,
         key: format!("{:020}", r.sequence),
