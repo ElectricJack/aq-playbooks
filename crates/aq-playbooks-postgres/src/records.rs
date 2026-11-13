@@ -430,12 +430,7 @@ impl PostgresStorage {
             return Err(StorageError::Ownership.into());
         }
         let row = tx.query_opt("SELECT revision,owner,incarnation,owner_backend_pid=pg_backend_pid(),writer_format,state_header,state_accounting,catalog_projected_revision,catalog_metadata_revision,catalog_definition_count,catalog_activation_count,catalog_actual_definition_count,catalog_actual_activation_count FROM aq_playbooks.namespaces WHERE namespace=$1 FOR UPDATE", &[&namespace]).map_err(backend)?.ok_or(StorageError::Ownership)?;
-        if row.get::<_, Option<String>>(1).as_deref() != Some(owner)
-            || row.get::<_, i64>(2) != incarnation
-            || row.get::<_, Option<bool>>(3) != Some(true)
-        {
-            return Err(StorageError::Ownership.into());
-        }
+        owns_row(&row, owner, incarnation)?;
         if row.get::<_, i32>("writer_format") != FORMAT {
             return Ok(TransitionOutcome::Unsupported);
         }
@@ -479,6 +474,12 @@ impl PostgresStorage {
             if !changed {
                 return Ok(None);
             }
+            // Bound lookups, while the transaction is still lent.
+            aq_playbooks_runner::history::check_not_live(
+                &state,
+                &aq_playbooks_runner::history_items(&state.settled),
+            )?;
+            source.check()?;
             let patch = take_patch(&mut state)?;
             let stripped = stripped_header(&mut state)?;
             source.check()?;
@@ -498,6 +499,7 @@ impl PostgresStorage {
         let mut tx: ObservedTransaction<'_> = lent.reclaim()?;
         let previous = header_state(&header)?;
         let staged = stage(&mut tx, namespace, &accounting, &patch)?;
+        let live_keys = aq_playbooks_runner::history::patch_live_keys(&patch)?;
         (request.validate)(&state, &staged.accounting.counts())?;
         source.check()?;
         let heavy = !fallbacks.is_empty()
@@ -554,6 +556,7 @@ impl PostgresStorage {
             &staged.keys,
             &staged.values,
         )?;
+        crate::history::check_unrecorded(&mut tx, namespace, &live_keys)?;
         crate::history::insert(
             &mut tx,
             namespace,
@@ -588,6 +591,22 @@ impl PostgresStorage {
     pub fn reset_transition_stats(&self) {
         *lock(&self.stats) = TransitionStats::default();
     }
+}
+/// Columns 1..=3 of a namespace row read as
+/// `revision,owner,incarnation,owner_backend_pid=pg_backend_pid(),…`: this
+/// session's lease of `owner` at `incarnation`.
+pub(crate) fn owns_row(
+    row: &postgres::Row,
+    owner: &str,
+    incarnation: i64,
+) -> Result<(), StorageError> {
+    if row.get::<_, Option<String>>(1).as_deref() != Some(owner)
+        || row.get::<_, i64>(2) != incarnation
+        || row.get::<_, Option<bool>>(3) != Some(true)
+    {
+        return Err(StorageError::Ownership);
+    }
+    Ok(())
 }
 pub(crate) fn owns_lock(
     tx: &mut ObservedTransaction<'_>,

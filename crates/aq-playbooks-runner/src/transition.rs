@@ -621,6 +621,11 @@ impl Storage for RecordStorage {
             .ok_or_else(|| StorageError::Backend("revision exhausted".into()))?;
         let items = crate::history_items(&state.settled);
         crate::history::check_new(&ns.history, &items)?;
+        crate::history::check_not_live(state, &items)?;
+        crate::history::check_unrecorded(
+            &ns.history,
+            &crate::history::new_live_keys(&previous, state),
+        )?;
         // `settled` is not part of the stored header (serde skip).
         let (data, accounting) = export(state).map_err(to_storage)?;
         crate::history::insert(&mut ns.history, items);
@@ -731,15 +736,18 @@ impl Storage for RecordStorage {
         if !changed {
             return Ok(TransitionOutcome::Unchanged);
         }
+        let items = crate::history_items(&std::mem::take(&mut state.settled));
+        crate::history::check_not_live(&state, &items)?;
+        source.check()?;
         let patch = take_patch(&mut state)?;
         source.check()?;
+        crate::history::check_unrecorded(&ns.history, &crate::history::patch_live_keys(&patch)?)?;
         let accounting = stage(&ns.data, &ns.accounting, &patch)?;
         (request.validate)(&state, &accounting.counts())?;
         verify_keyed_admissions(&ns.data, &patch)?;
         let previous = header_state(&ns.data.header)?;
         crate::retention::verify_artifact_removals(&previous, &state)?;
         source.check()?;
-        let items = crate::history_items(&std::mem::take(&mut state.settled));
         crate::history::check_new(&ns.history, &items)?;
         drop(state);
         drop(source);

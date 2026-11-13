@@ -124,17 +124,44 @@ fn history_rows(ns: &str) -> i64 {
         .unwrap()
         .get(0)
 }
-/// A format 3 transition that carries `cohort`. `heavy` also changes a header
-/// field that sends the commit through the complete path.
+fn already_recorded<T>(result: std::result::Result<T, StorageError>) -> bool {
+    matches!(result, Err(StorageError::Backend(m)) if m == history::ALREADY_RECORDED)
+}
+fn also_live<T>(result: std::result::Result<T, StorageError>) -> bool {
+    matches!(result, Err(StorageError::Backend(m)) if m == history::ALSO_LIVE)
+}
+fn storage_error<T>(result: Result<T>) -> std::result::Result<T, StorageError> {
+    result.map_err(|error| match error {
+        Error::Storage(error) => error,
+        other => StorageError::Backend(other.to_string()),
+    })
+}
+fn live_receipt(sequence: u64) -> Receipt {
+    Receipt {
+        sequence,
+        run: "live".into(),
+        step: "s".into(),
+        at_ms: 1,
+        kind: "admitted".into(),
+        detail: json!({}),
+    }
+}
+/// A format 3 transition that carries `cohort` (if any) and stores `live` as
+/// a live run (if any). `heavy` also changes a header field that sends the
+/// commit through the complete path.
 fn transition_with(
     store: &PostgresStorage,
     ns: &str,
-    cohort: SettledCohort,
+    cohort: Option<SettledCohort>,
+    live: Option<Run>,
     heavy: bool,
-) -> Result<TransitionOutcome> {
-    let mut cohort = Some(cohort);
+) -> std::result::Result<TransitionOutcome, StorageError> {
+    let (mut cohort, mut live) = (cohort, live);
     let mut plan = |s: &mut State| {
         s.settled.extend(cohort.take());
+        if let Some(run) = live.take() {
+            s.runs.insert(run.id.clone(), run);
+        }
         s.sequence += 1;
         if heavy {
             s.execution_denied.insert(format!("denied-{}", s.sequence));
@@ -142,7 +169,7 @@ fn transition_with(
         Ok(true)
     };
     let validate = |_: &State, _: &QuotaCounts| Ok(());
-    store.transition_v1(
+    storage_error(store.transition_v1(
         ns,
         "w",
         &mut TransitionRequest {
@@ -150,20 +177,33 @@ fn transition_with(
             plan: &mut plan,
             validate: &validate,
         },
-    )
+    ))
+}
+/// A format 3 namespace whose State has initialized runtime indexes, so
+/// `transition_v1` runs.
+fn transition_namespace(label: &str) -> (String, PostgresStorage, u64) {
+    let (ns, store) = (support::namespace(label), support::records());
+    store.acquire(&ns, "w").unwrap();
+    let mut initialized = State::default();
+    initialized.indexes.initialized = true;
+    let revision = store.compare_and_swap(&ns, "w", 0, &initialized).unwrap();
+    (ns, store, revision)
 }
 
 #[test]
 fn protected_history_rows_are_plaintext_public_and_insert_once() {
     let (ns, store) = (support::namespace("history"), support::protected());
     store.acquire(&ns, "w").unwrap();
+    // Protected values that inspection never projects.
+    let mut cohort = synthetic_cohort("run-a", 10, &[1, 2]);
+    let run = &mut cohort.runs[0];
+    run.input = json!({"secret": "PROTECTED_SENTINEL_INPUT"});
+    run.output = Some(json!("PROTECTED_SENTINEL_OUTPUT"));
+    run.variables
+        .insert("v".into(), json!("PROTECTED_SENTINEL_VARIABLE"));
+    cohort.receipts[0].detail["private"] = json!("PROTECTED_SENTINEL_DETAIL");
     let revision = store
-        .compare_and_swap(
-            &ns,
-            "w",
-            0,
-            &history_state(vec![synthetic_cohort("run-a", 10, &[1, 2])]),
-        )
+        .compare_and_swap(&ns, "w", 0, &history_state(vec![cohort]))
         .unwrap();
     let mut c = support::client();
     let rows: i64 = c
@@ -176,6 +216,14 @@ fn protected_history_rows_are_plaintext_public_and_insert_once() {
     assert_eq!(rows, 3);
     let envelope = c.query_one("SELECT snapshot IS NULL, protection_key_id IS NOT NULL FROM aq_playbooks.namespaces WHERE namespace=$1", &[&ns]).unwrap();
     assert!(envelope.get::<_, bool>(0) && envelope.get::<_, bool>(1));
+    let leaked: bool = c
+        .query_one(
+            "SELECT bool_or(public_value::text LIKE '%PROTECTED_SENTINEL%') FROM aq_playbooks.run_history WHERE namespace=$1",
+            &[&ns],
+        )
+        .unwrap()
+        .get(0);
+    assert!(!leaked);
     let mut tx = support::marked(&mut c, &ns);
     let err = tx
         .execute(
@@ -184,16 +232,12 @@ fn protected_history_rows_are_plaintext_public_and_insert_once() {
         )
         .unwrap_err();
     assert!(db_message(&err).contains("run history rows are immutable"));
-    assert!(
-        store
-            .compare_and_swap(
-                &ns,
-                "w",
-                revision,
-                &history_state(vec![synthetic_cohort("run-a", 10, &[1, 2])])
-            )
-            .is_err()
-    );
+    assert!(already_recorded(store.compare_and_swap(
+        &ns,
+        "w",
+        revision,
+        &history_state(vec![synthetic_cohort("run-a", 10, &[1, 2])])
+    )));
 }
 #[test]
 fn history_union_pages_in_item_key_order() {
@@ -299,11 +343,20 @@ fn history_rows_need_the_namespace_writer_and_cannot_be_truncated() {
         )
         .unwrap_err();
     assert!(db_message(&err).contains("writer"), "{err:?}");
-    // `reject_artifact_mutation` refuses every TRUNCATE (as for state_records).
-    assert!(
-        c.batch_execute("TRUNCATE aq_playbooks.run_history")
-            .is_err()
-    );
+    // The writer marker alone does not let a session without the lease delete.
+    let mut tx = support::marked(&mut c, &ns);
+    let err = tx
+        .execute(
+            "DELETE FROM aq_playbooks.run_history WHERE namespace=$1",
+            &[&ns],
+        )
+        .unwrap_err();
+    assert!(db_message(&err).contains("writer"), "{err:?}");
+    drop(tx);
+    let err = c
+        .batch_execute("TRUNCATE aq_playbooks.run_history")
+        .unwrap_err();
+    assert_eq!(db_message(&err), "run_history is insert-only");
     assert_eq!(history_rows(&ns), 2); // run + receipt of "a"
 }
 /// Pins what PostgreSQL does with a commit that carries settled cohorts, on
@@ -323,45 +376,148 @@ fn settled_cohorts_are_written_on_every_commit_path() {
         )
         .unwrap();
     assert_eq!(history_rows(&ns), 3);
-    assert!(
-        store
-            .compare_and_swap(
-                &ns,
-                "w",
-                revision,
-                &history_state(vec![
-                    synthetic_cohort("b", 11, &[3]),
-                    synthetic_cohort("a", 10, &[1, 2])
-                ])
-            )
-            .is_err()
-    );
+    assert!(already_recorded(store.compare_and_swap(
+        &ns,
+        "w",
+        revision,
+        &history_state(vec![
+            synthetic_cohort("b", 11, &[3]),
+            synthetic_cohort("a", 10, &[1, 2])
+        ])
+    )));
     assert_eq!(history_rows(&ns), 3);
     assert_eq!(store.load(&ns).unwrap().revision, revision);
     assert_eq!(run_ids(&store, &ns), vec![json!("a")]);
 
     // Format 3 transitions, incremental and complete.
-    let (ns, store) = (support::namespace("f3_transition"), support::records());
-    store.acquire(&ns, "w").unwrap();
-    let mut initialized = State::default();
-    initialized.indexes.initialized = true;
-    let mut revision = store.compare_and_swap(&ns, "w", 0, &initialized).unwrap();
+    let (ns, store, mut revision) = transition_namespace("f3_transition");
     store.reset_transition_stats();
-    let committed = transition_with(&store, &ns, synthetic_cohort("inc", 10, &[1]), false).unwrap();
+    let committed = transition_with(
+        &store,
+        &ns,
+        Some(synthetic_cohort("inc", 10, &[1])),
+        None,
+        false,
+    )
+    .unwrap();
     assert_eq!(store.transition_stats().incremental, 1);
     revision += 1;
     assert!(matches!(committed, TransitionOutcome::Committed { revision: r } if r == revision));
-    let committed =
-        transition_with(&store, &ns, synthetic_cohort("heavy", 11, &[2]), true).unwrap();
+    let committed = transition_with(
+        &store,
+        &ns,
+        Some(synthetic_cohort("heavy", 11, &[2])),
+        None,
+        true,
+    )
+    .unwrap();
     assert_eq!(store.transition_stats().heavy, 1);
     revision += 1;
     assert!(matches!(committed, TransitionOutcome::Committed { revision: r } if r == revision));
     assert_eq!(history_rows(&ns), 4);
     assert_eq!(run_ids(&store, &ns), vec![json!("heavy"), json!("inc")]);
-    assert!(transition_with(&store, &ns, synthetic_cohort("inc", 10, &[1]), false).is_err());
-    assert!(transition_with(&store, &ns, synthetic_cohort("heavy", 11, &[2]), true).is_err());
+    assert!(already_recorded(transition_with(
+        &store,
+        &ns,
+        Some(synthetic_cohort("inc", 10, &[1])),
+        None,
+        false
+    )));
+    assert!(already_recorded(transition_with(
+        &store,
+        &ns,
+        Some(synthetic_cohort("heavy", 11, &[2])),
+        None,
+        true
+    )));
     let stats = store.transition_stats();
     assert_eq!((stats.incremental, stats.heavy), (1, 1));
     assert_eq!(history_rows(&ns), 4);
     assert_eq!(store.load(&ns).unwrap().revision, revision);
+}
+/// No commit leaves an item key both live and in history, on any path:
+/// neither settling an item the stored State still holds, nor storing a live
+/// item whose key is already in history. Nothing is written by the refusal.
+#[test]
+fn history_that_is_also_live_is_refused_on_every_commit_path() {
+    let stores = [
+        ("f2_protected", support::protected()),
+        ("f2_plain", support::store()),
+        ("f3_cas", support::records()),
+    ];
+    for (label, store) in stores {
+        let ns = support::namespace(label);
+        store.acquire(&ns, "w").unwrap();
+        let cohort = synthetic_cohort("a", 10, &[1]);
+        let mut state = history_state(vec![cohort.clone()]);
+        state.runs.insert("a".into(), cohort.runs[0].clone());
+        assert!(
+            also_live(store.compare_and_swap(&ns, "w", 0, &state)),
+            "{label}"
+        );
+        let mut state = history_state(vec![synthetic_cohort("r", 10, &[7])]);
+        state.receipts.push(live_receipt(7));
+        assert!(
+            also_live(store.compare_and_swap(&ns, "w", 0, &state)),
+            "{label}"
+        );
+        assert_eq!(history_rows(&ns), 0, "{label}");
+        let revision = store
+            .compare_and_swap(
+                &ns,
+                "w",
+                0,
+                &history_state(vec![synthetic_cohort("b", 10, &[2])]),
+            )
+            .unwrap();
+        let mut state = State::default();
+        state
+            .runs
+            .insert("b".into(), synthetic_cohort("b", 10, &[]).runs[0].clone());
+        assert!(
+            also_live(store.compare_and_swap(&ns, "w", revision, &state)),
+            "{label}"
+        );
+        let mut state = State::default();
+        state.receipts.push(live_receipt(2));
+        assert!(
+            also_live(store.compare_and_swap(&ns, "w", revision, &state)),
+            "{label}"
+        );
+        assert_eq!(history_rows(&ns), 2, "{label}");
+        assert_eq!(store.load(&ns).unwrap().revision, revision, "{label}");
+    }
+    for heavy in [false, true] {
+        let (ns, store, revision) = transition_namespace(if heavy { "f3_heavy" } else { "f3_inc" });
+        let c = synthetic_cohort("c", 10, &[]);
+        assert!(
+            also_live(transition_with(
+                &store,
+                &ns,
+                Some(c.clone()),
+                Some(c.runs[0].clone()),
+                heavy
+            )),
+            "{heavy}"
+        );
+        assert_eq!(history_rows(&ns), 0);
+        transition_with(
+            &store,
+            &ns,
+            Some(synthetic_cohort("d", 10, &[])),
+            None,
+            heavy,
+        )
+        .unwrap();
+        let d = synthetic_cohort("d", 10, &[]).runs[0].clone();
+        store.reset_transition_stats();
+        assert!(
+            also_live(transition_with(&store, &ns, None, Some(d), heavy)),
+            "{heavy}"
+        );
+        let stats = store.transition_stats();
+        assert_eq!((stats.incremental, stats.heavy), (0, 0));
+        assert_eq!(history_rows(&ns), 1);
+        assert_eq!(store.load(&ns).unwrap().revision, revision + 1);
+    }
 }

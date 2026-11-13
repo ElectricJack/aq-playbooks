@@ -4,7 +4,9 @@
 //! projections only; it is inserted once, never updated, and deleted by the
 //! host by finish time.
 use crate::inspection::{self, InspectionKind, InspectionQuery, InspectionRow};
-use crate::{Intent, Receipt, Run, StorageError};
+use crate::lazy::{ContainerChange, TreeKey};
+use crate::transition::StatePatch;
+use crate::{Intent, Receipt, Run, State, StorageError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -57,6 +59,105 @@ pub fn history_items(settled: &[SettledCohort]) -> Vec<HistoryItem> {
         .collect()
 }
 
+/// Refusal of a commit that would record an item a second time.
+pub const ALREADY_RECORDED: &str = "run history item already recorded";
+/// Refusal of a commit that would leave an item key both live and in history.
+pub const ALSO_LIVE: &str = "run history item key is also live";
+
+/// An inspection item key: `(kind, key)` as in [`inspection::rows`].
+pub type ItemKey = (InspectionKind, String);
+fn receipt_key(sequence: u64) -> String {
+    format!("{sequence:020}")
+}
+fn also_live() -> StorageError {
+    StorageError::Backend(ALSO_LIVE.into())
+}
+/// Refuse history `items` whose key is live in `state`, the State the commit
+/// stores. Bounded on a bound State: map lookups, and receipts through the
+/// runtime index once it is initialized (a scan of `receipts` otherwise).
+pub fn check_not_live(state: &State, items: &[HistoryItem]) -> Result<(), StorageError> {
+    for item in items {
+        let live = match item.kind {
+            InspectionKind::Runs => state.runs.contains_key(&item.key),
+            InspectionKind::Effects => state.intents.contains_key(&item.key),
+            InspectionKind::Receipts if state.indexes.initialized => state
+                .indexes
+                .all_receipts
+                .get(&item.sequence)
+                .and_then(|&offset| state.receipts.get(offset))
+                .is_some_and(|r| r.sequence == item.sequence),
+            InspectionKind::Receipts => state.receipts.iter().any(|r| r.sequence == item.sequence),
+        };
+        if live {
+            return Err(also_live());
+        }
+    }
+    Ok(())
+}
+/// Item keys live in `next` and not in `previous` (complete States).
+pub fn new_live_keys(previous: &State, next: &State) -> Vec<ItemKey> {
+    let old_receipts: std::collections::BTreeSet<u64> =
+        previous.receipts.iter().map(|r| r.sequence).collect();
+    let runs = next
+        .runs
+        .keys()
+        .filter(|id| !previous.runs.contains_key(*id))
+        .map(|id| (InspectionKind::Runs, id.clone()));
+    let intents = next
+        .intents
+        .keys()
+        .filter(|id| !previous.intents.contains_key(*id))
+        .map(|id| (InspectionKind::Effects, id.clone()));
+    let receipts = next
+        .receipts
+        .iter()
+        .filter(|r| !old_receipts.contains(&r.sequence))
+        .map(|r| (InspectionKind::Receipts, receipt_key(r.sequence)));
+    runs.chain(intents).chain(receipts).collect()
+}
+/// Item keys a transition patch writes as live (bounded by the patch).
+pub fn patch_live_keys(patch: &StatePatch) -> Result<Vec<ItemKey>, StorageError> {
+    let mut keys = vec![];
+    for (path, change) in &patch.changes {
+        let kind = match (path.outer.is_none(), path.field) {
+            (true, "runs") => InspectionKind::Runs,
+            (true, "intents") => InspectionKind::Effects,
+            (true, "receipts") => InspectionKind::Receipts,
+            _ => continue,
+        };
+        let written: Vec<(&TreeKey, &[u8])> = match change {
+            ContainerChange::Entries(rows) => rows
+                .iter()
+                .filter_map(|(k, v)| v.as_deref().map(|v| (k, v)))
+                .collect(),
+            ContainerChange::Replace(rows) => rows.iter().map(|(k, v)| (k, v.as_slice())).collect(),
+        };
+        for (key, value) in written {
+            keys.push(match (kind, key) {
+                (InspectionKind::Receipts, _) => {
+                    let receipt: Receipt = serde_json::from_slice(value).map_err(|e| {
+                        StorageError::Backend(format!("receipt record decode: {e}"))
+                    })?;
+                    (kind, receipt_key(receipt.sequence))
+                }
+                (_, TreeKey::Str(id)) => (kind, id.clone()),
+                _ => return Err(StorageError::Backend("unexpected record key".into())),
+            });
+        }
+    }
+    Ok(keys)
+}
+/// Refuse live `keys` already recorded as history.
+pub(crate) fn check_unrecorded(rows: &HistoryRows, keys: &[ItemKey]) -> Result<(), StorageError> {
+    if keys
+        .iter()
+        .any(|(kind, key)| rows.contains_key(&(kind.key().to_string(), key.clone())))
+    {
+        return Err(also_live());
+    }
+    Ok(())
+}
+
 /// History rows of one namespace in the in-memory backends, by
 /// `(kind.key(), key)`.
 pub(crate) type HistoryRows = BTreeMap<(String, String), HistoryItem>;
@@ -70,9 +171,7 @@ pub(crate) fn check_new(rows: &HistoryRows, items: &[HistoryItem]) -> Result<(),
     for item in items {
         let key = row_key(item);
         if rows.contains_key(&key) || !seen.insert(key) {
-            return Err(StorageError::Backend(
-                "run history item already recorded".into(),
-            ));
+            return Err(StorageError::Backend(ALREADY_RECORDED.into()));
         }
     }
     Ok(())

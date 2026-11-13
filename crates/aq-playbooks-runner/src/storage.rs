@@ -335,6 +335,11 @@ impl Storage for MemoryStorage {
             .ok_or_else(|| StorageError::Backend("revision exhausted".into()))?;
         let items = crate::history_items(&state.settled);
         history::check_new(&entry.history, &items)?;
+        history::check_not_live(state, &items)?;
+        history::check_unrecorded(
+            &entry.history,
+            &history::new_live_keys(&entry.versioned.state, state),
+        )?;
         // An old otherwise admissible State can exceed this new metadata
         // profile. Preserve existing mutations while refusing catalog reads.
         let catalog = crate::catalog_inspection::project(state).ok().map(Arc::new);

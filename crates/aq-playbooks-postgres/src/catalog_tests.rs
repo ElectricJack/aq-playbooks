@@ -8,7 +8,7 @@ use aq_playbooks_runner::{
 use std::{collections::BTreeSet, sync::atomic::Ordering};
 #[path = "../tests/support/mod.rs"]
 #[allow(dead_code)]
-mod support;
+pub(super) mod support; // also used by `history_tests`
 use support::{artifact, boundary, client, database, namespace};
 
 fn keys(active: &str) -> ProtectionKeyring {

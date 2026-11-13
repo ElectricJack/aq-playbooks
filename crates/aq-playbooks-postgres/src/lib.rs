@@ -13,6 +13,8 @@ mod catalog;
 #[cfg(all(test, feature = "postgres-tests"))]
 mod catalog_tests;
 mod history;
+#[cfg(all(test, feature = "postgres-tests"))]
+mod history_tests;
 mod indexes;
 mod profiling;
 mod projection;
@@ -55,6 +57,11 @@ const MIGRATIONS: &[(i32, &str)] = &[
 #[cfg(all(test, feature = "postgres-tests"))]
 const WRITE_MARKER_SQL: &str = "SELECT set_config('aq_playbooks.writer_namespace',$1,true),set_config('aq_playbooks.writer_format','2',true)";
 use records::MARKER_SQL as WRITE_MARKER_FORMAT_SQL;
+/// One format 2 inspection page over live rows and history. Each branch has
+/// its own `ORDER BY item_key LIMIT`, so PostgreSQL merges two ordered index
+/// scans (Merge Append) instead of sorting every matching history row: the
+/// cost of a page does not grow with the number of finished runs.
+pub(crate) const INSPECT_SQL: &str = "SELECT item_key,public_value FROM ((SELECT item_key,public_value FROM aq_playbooks.inspection_rows WHERE namespace=$1 AND kind=$2 AND ($3::text IS NULL OR run_id=$3) AND ($4::text IS NULL OR item_key>$4) ORDER BY item_key LIMIT $5) UNION ALL (SELECT item_key,public_value FROM aq_playbooks.run_history WHERE namespace=$1 AND kind=$2 AND ($3::text IS NULL OR run_id=$3) AND ($4::text IS NULL OR item_key>$4) ORDER BY item_key LIMIT $5)) u ORDER BY item_key LIMIT $5";
 const MIGRATION_LOCK: i64 = 0x4151504c41594d47;
 
 struct Lease {
@@ -339,9 +346,11 @@ impl Storage for PostgresStorage {
         );
         tx.query_one(WRITE_MARKER_FORMAT_SQL, &[&namespace, &format])
             .map_err(backend)?;
-        if !records::owns_lock(&mut tx, namespace)? || tx.query_opt("SELECT 1 FROM aq_playbooks.namespaces WHERE namespace=$1 AND owner=$2 AND incarnation=$3 AND owner_backend_pid=pg_backend_pid()",&[&namespace,&owner,&incarnation]).map_err(backend)?.is_none() {
+        if !records::owns_lock(&mut tx, namespace)? {
             return Err(StorageError::Ownership);
         }
+        let row = tx.query_opt("SELECT revision,owner,incarnation,owner_backend_pid=pg_backend_pid() FROM aq_playbooks.namespaces WHERE namespace=$1", &[&namespace]).map_err(backend)?.ok_or(StorageError::Ownership)?;
+        records::owns_row(&row, owner, incarnation)?;
         let deleted = history::delete_before(&mut tx, namespace, before_ms)?;
         tx.commit().map_err(backend)?;
         Ok(deleted)
@@ -420,9 +429,21 @@ impl Storage for PostgresStorage {
             ));
         }
         let limit = (query.limit + 1) as i64;
-        // Live rows and history in one statement (one snapshot): the commit
-        // that removes an item from the live rows inserts its history row.
-        let rows=tx.query("SELECT item_key,public_value FROM (SELECT item_key,public_value FROM aq_playbooks.inspection_rows WHERE namespace=$1 AND kind=$2 AND ($3::text IS NULL OR run_id=$3) AND ($4::text IS NULL OR item_key>$4) UNION ALL SELECT item_key,public_value FROM aq_playbooks.run_history WHERE namespace=$1 AND kind=$2 AND ($3::text IS NULL OR run_id=$3) AND ($4::text IS NULL OR item_key>$4)) u ORDER BY item_key LIMIT $5",&[&namespace,&query.kind.key(),&query.run,&query.after,&limit]).map_err(backend)?;
+        // Live rows and history in one statement (one snapshot). No commit
+        // leaves a key in both (`check_not_live`, `check_unrecorded`), so the
+        // page needs no de-duplication.
+        let rows = tx
+            .query(
+                INSPECT_SQL,
+                &[
+                    &namespace,
+                    &query.kind.key(),
+                    &query.run,
+                    &query.after,
+                    &limit,
+                ],
+            )
+            .map_err(backend)?;
         let more = rows.len() > query.limit;
         let selected: Vec<_> = rows.into_iter().take(query.limit).collect();
         let next = if more {
@@ -641,12 +662,7 @@ impl PostgresStorage {
             return Err(StorageError::Ownership);
         }
         let row = tx.query_opt("SELECT revision,owner,incarnation,owner_backend_pid=pg_backend_pid(),snapshot,protection_key_id,protection_nonce,encrypted_snapshot,indexes_materialized,catalog_projected_revision,catalog_metadata_revision,catalog_supported,catalog_definition_count,catalog_activation_count,catalog_actual_definition_count,catalog_actual_activation_count,writer_format,state_header FROM aq_playbooks.namespaces WHERE namespace=$1 FOR UPDATE", &[&namespace]).map_err(backend)?.ok_or(StorageError::Ownership)?;
-        if row.get::<_, Option<String>>(1).as_deref() != Some(owner)
-            || row.get::<_, i64>(2) != incarnation
-            || row.get::<_, Option<bool>>(3) != Some(true)
-        {
-            return Err(StorageError::Ownership);
-        }
+        records::owns_row(&row, owner, incarnation)?;
         if row.get::<_, i64>(0) != expected {
             return Err(StorageError::Conflict);
         }
@@ -712,11 +728,14 @@ impl PostgresStorage {
         }
         tx.phase("retention");
         retention::verify_and_record(&mut tx, namespace, &previous, state)?;
-        history::insert(
+        let items = aq_playbooks_runner::history_items(&state.settled);
+        aq_playbooks_runner::history::check_not_live(state, &items)?;
+        history::check_unrecorded(
             &mut tx,
             namespace,
-            &aq_playbooks_runner::history_items(&state.settled),
+            &aq_playbooks_runner::history::new_live_keys(&previous, state),
         )?;
+        history::insert(&mut tx, namespace, &items)?;
         for (digest, artifact) in &state.artifacts {
             tx.phase("artifact_compare");
             // Previous bytes were freshly read, authenticated and fully verified
