@@ -429,6 +429,35 @@ WITH t(tbl, n, bytes, maxrow, logical) AS (
 )
 SELECT tbl, n, bytes::bigint, maxrow::bigint, logical::bigint FROM t";
 
+/// On-disk size and tuple statistics of the `namespaces` table and its
+/// TOAST table (bloat from rewriting the record; whether autovacuum ran).
+fn namespaces_table(monitor: &Mutex<Client>) -> Value {
+    let mut c = monitor.lock().unwrap();
+    let rows = c
+        .query(
+            "SELECT CASE WHEN n.nspname='pg_toast' THEN 'toast' ELSE 'namespaces' END, \
+                    pg_relation_size(c.oid), pg_total_relation_size(c.oid), \
+                    s.n_live_tup, s.n_dead_tup, s.autovacuum_count, s.vacuum_count, \
+                    s.last_autovacuum::text \
+             FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace \
+             JOIN pg_stat_all_tables s ON s.relid=c.oid \
+             WHERE c.oid='aq_playbooks.namespaces'::regclass \
+                OR c.oid=(SELECT reltoastrelid FROM pg_class WHERE oid='aq_playbooks.namespaces'::regclass)",
+            &[],
+        )
+        .unwrap();
+    let mut out = serde_json::Map::new();
+    for row in rows {
+        out.insert(
+            row.get::<_, String>(0),
+            json!({"relation_bytes": row.get::<_, i64>(1), "total_bytes": row.get::<_, i64>(2),
+                   "n_live_tup": row.get::<_, i64>(3), "n_dead_tup": row.get::<_, i64>(4),
+                   "autovacuum_count": row.get::<_, i64>(5), "vacuum_count": row.get::<_, i64>(6),
+                   "last_autovacuum": row.get::<_, Option<String>>(7)}),
+        );
+    }
+    Value::Object(out)
+}
 fn sizes(monitor: &Mutex<Client>) -> Value {
     let mut c = monitor.lock().unwrap();
     let mut tables = serde_json::Map::new();
@@ -755,7 +784,8 @@ fn main() {
                        "gc_last20_us": recent_gc,
                        "stats": format!("{:?}", e.store.inner.transition_stats()),
                        "elapsed_s": started.elapsed().as_secs_f64(),
-                       "sizes": sizes(&e.store.monitor), "state": breakdown(&state)})
+                       "sizes": sizes(&e.store.monitor), "state": breakdown(&state),
+                       "namespaces_table": namespaces_table(&e.store.monitor)})
             );
             eprintln!(
                 "[{config}] run {k}: median {med:.0} us max {max} us, total {} B, elapsed {:.1}s",
