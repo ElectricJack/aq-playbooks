@@ -68,6 +68,19 @@ fn offline_cli_round_trip_and_invalid_input_exit() {
     );
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["complete"], true);
+    // The finished runs have left the engine's State; the report's
+    // inspection reads them from run history.
+    let runs = value["inspection"]["runs"].as_array().unwrap();
+    assert!(!runs.is_empty());
+    assert!(runs.iter().all(|run| {
+        ["completed", "failed", "cancelled"].contains(&run["status"].as_str().unwrap())
+    }));
+    assert!(
+        !value["inspection"]["receipts"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     let mut value: serde_json::Value =
         serde_json::from_slice(&fs::read(&proposal).unwrap()).unwrap();
     value["proposal"]["questions"] = serde_json::json!(["Who may approve publication?"]);

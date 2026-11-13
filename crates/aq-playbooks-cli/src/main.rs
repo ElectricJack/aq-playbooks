@@ -291,6 +291,18 @@ fn engine(args: &StoreArgs) -> Result<Engine<PostgresStorage>> {
         ),
     )?)
 }
+/// Advance `run` until it makes no progress. A run whose cohort settled has
+/// left the State (it is in history), so `NotFound` also ends the loop.
+fn advance_until_settled(e: &Engine<PostgresStorage>, run: &str) -> Result<()> {
+    for _ in 0..1000 {
+        match e.advance(run, time()?) {
+            Ok(true) => {}
+            Ok(false) | Err(aq_playbooks_runner::Error::NotFound(_)) => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
 fn choose<T: Serialize>(
     map: &std::collections::BTreeMap<String, T>,
     action: CatalogAction,
@@ -424,12 +436,8 @@ fn execute(cli: Cli) -> Result<()> {
                 read::<Authority>(&authority)?,
                 time()?,
             )?;
-            for _ in 0..1000 {
-                if !e.advance(&id, time()?)? {
-                    break;
-                }
-            }
-            let view = simulation::inspect(&e.snapshot()?, Some(&id));
+            advance_until_settled(&e, &id)?;
+            let view = simulation::inspect(&e, Some(&id))?;
             e.release()?;
             print(&view)
         }
@@ -593,12 +601,8 @@ fn execute(cli: Cli) -> Result<()> {
         Command::Cancel { run, store } => {
             let e = engine(&store)?;
             e.cancel(&run, time()?)?;
-            for _ in 0..1000 {
-                if !e.advance(&run, time()?)? {
-                    break;
-                }
-            }
-            let view = simulation::inspect(&e.snapshot()?, Some(&run));
+            advance_until_settled(&e, &run)?;
+            let view = simulation::inspect(&e, Some(&run))?;
             e.release()?;
             print(&view)
         }
