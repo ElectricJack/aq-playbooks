@@ -523,14 +523,12 @@ fn record_storage_refuses_live_and_history_conflicts() {
             s.sequence += 1;
             Ok(true)
         };
-        let validate = |_: &State, _: &QuotaCounts, _: &QuotaCounts| Ok(());
         store.transition_v1(
             "t",
             "w",
             &mut TransitionRequest {
                 operation: "history",
                 plan: &mut plan,
-                validate: &validate,
             },
         )
     };
@@ -1623,7 +1621,6 @@ fn record_storage_transitions_hold_the_removal_fences() {
             f(s);
             Ok(true)
         };
-        let validate = |_: &State, _: &QuotaCounts, _: &QuotaCounts| Ok(());
         store
             .transition_v1(
                 ns,
@@ -1631,7 +1628,6 @@ fn record_storage_transitions_hold_the_removal_fences() {
                 &mut TransitionRequest {
                     operation: "fence",
                     plan: &mut plan,
-                    validate: &validate,
                 },
             )
             .map_err(|e| match e {
@@ -4756,78 +4752,6 @@ fn a_driven_join_at_the_pinned_time_is_capped_by_its_declared_deadline() {
 // --- Task 8: quotas count live work
 
 #[test]
-fn max_runs_counts_live_runs_only() {
-    let e = Engine::with_config(
-        MemoryStorage::retaining_settled(),
-        "test",
-        "i-1",
-        EngineConfig {
-            max_runs: 2,
-            ..EngineConfig::default()
-        },
-    )
-    .unwrap();
-    install(
-        &e,
-        artifact(
-            "a",
-            "done",
-            BTreeMap::from([("done".into(), ret("ok"))]),
-            Registry::default(),
-            BTreeMap::new(),
-        ),
-        "a",
-    );
-    for t in 0..5 {
-        let id = e.admit("a", "main", Value::Null, authority(), t).unwrap();
-        e.advance(&id, t).unwrap();
-    }
-    e.admit("a", "main", Value::Null, authority(), 10).unwrap();
-    e.admit("a", "main", Value::Null, authority(), 11).unwrap();
-    assert!(
-        matches!(e.admit("a", "main", Value::Null, authority(), 12), Err(Error::Refused(m)) if m.contains("quota"))
-    );
-}
-#[test]
-fn max_receipts_counts_the_window_and_frees_when_it_passes() {
-    let e = Engine::with_config(
-        MemoryStorage::retaining_settled(),
-        "test",
-        "i-1",
-        EngineConfig {
-            // Deviation from the brief (10): the ten window receipts plus
-            // the receipt of the run each keyed admission starts.
-            max_receipts: 11,
-            ..EngineConfig::default()
-        },
-    )
-    .unwrap();
-    install(
-        &e,
-        artifact(
-            "a",
-            "done",
-            BTreeMap::from([("done".into(), ret("ok"))]),
-            Registry::default(),
-            BTreeMap::new(),
-        ),
-        "a",
-    );
-    e.set_retention_policy(RetentionPolicy {
-        admission_replay_ms: 1_000,
-        ..RetentionPolicy::default()
-    })
-    .unwrap();
-    for i in 0..10 {
-        let d = e.admit_once(keyed(&e, &format!("k{i}")), i).unwrap();
-        e.advance(&d.receipt.run_id, i).unwrap();
-    }
-    assert!(
-        matches!(e.admit_once(keyed(&e, "k10"), 10), Err(Error::Refused(m)) if m.contains("quota"))
-    );
-    assert!(!e.admit_once(keyed(&e, "k10"), 2_000).unwrap().duplicate);
-}
-#[test]
 fn max_tombstones_and_terminal_run_ms_are_accepted_and_ignored() {
     let e = engine();
     e.set_retention_policy(RetentionPolicy {
@@ -4860,84 +4784,6 @@ fn retention_windows_must_be_positive() {
         );
     }
 }
-/// A refusal names the quota that is full, what it counts and its limit, in
-/// the counts the refused commit would have held; it writes nothing.
-#[test]
-fn a_quota_refusal_names_what_is_full() {
-    type Step = dyn Fn(&Engine<MemoryStorage>, i64) -> Result<()>;
-    let refusal = |config: EngineConfig, fill: usize, step: &Step| {
-        let mut e = engine();
-        install(&e, done_artifact(), "a");
-        e.set_retention_policy(RetentionPolicy {
-            admission_replay_ms: 1_000,
-            ..RetentionPolicy::default()
-        })
-        .unwrap();
-        for t in 0..fill {
-            step(&e, t as i64).unwrap();
-        }
-        e.config = config;
-        let before = e.store.load("test").unwrap().revision;
-        let message = match step(&e, fill as i64) {
-            Err(Error::Refused(m)) => m,
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(e.store.load("test").unwrap().revision, before);
-        message
-    };
-    let admit = |e: &Engine<MemoryStorage>, t: i64| {
-        e.admit("a", "main", Value::Null, authority(), t)
-            .map(|_| ())
-    };
-    let admit_keyed = |e: &Engine<MemoryStorage>, t: i64| {
-        let d = e.admit_once(keyed(e, &format!("k{t}")), t)?;
-        e.advance(&d.receipt.run_id, t).map(|_| ())
-    };
-    let runs = refusal(
-        EngineConfig {
-            max_runs: 2,
-            ..EngineConfig::default()
-        },
-        2,
-        &admit,
-    );
-    assert_eq!(
-        runs,
-        "the namespace is full for new work: 3 runs in the record (quota max_runs 2)"
-    );
-    // Two finished keyed runs leave two window receipts; the third
-    // admission holds them, its own receipt and its run's receipt.
-    let receipts = refusal(
-        EngineConfig {
-            max_receipts: 3,
-            ..EngineConfig::default()
-        },
-        2,
-        &admit_keyed,
-    );
-    assert_eq!(
-        receipts,
-        "the namespace is full for new work: 4 receipts in the record (quota max_receipts 3)"
-    );
-    let bytes = refusal(
-        EngineConfig {
-            max_state_bytes: 1,
-            ..EngineConfig::default()
-        },
-        0,
-        &admit,
-    );
-    assert!(
-        bytes.starts_with("the namespace is full for new work: ")
-            && bytes.ends_with(" bytes in the state record (quota max_state_bytes 1)"),
-        "{bytes}"
-    );
-    for message in [runs, receipts, bytes] {
-        for advice in ["GC", "garbage", "epoch", "tombstone"] {
-            assert!(!message.contains(advice), "{message}");
-        }
-    }
-}
 /// Event tombstones written by legacy GC beyond `max_tombstones` neither
 /// stop a later GC nor a policy change: the tombstone quota is ignored.
 #[test]
@@ -4958,14 +4804,13 @@ fn legacy_tombstones_beyond_max_tombstones_stop_neither_gc_nor_policy_changes() 
     assert_eq!(e.snapshot().unwrap().retention.event_tombstones.len(), 3);
     e.set_retention_policy(policy).unwrap();
 }
-/// A namespace written before this change holds finished runs. They count
-/// toward `max_runs` until they leave (the drain of Task 9; here, GC by
-/// `audit_ms`, with `terminal_run_ms` ignored). At its quota such a
-/// namespace refuses new work, saying what is full, and still commits the
-/// work that frees it: a live run finishes and leaves, and GC moves the
-/// finished runs out.
+/// A namespace written before this change holds finished runs (until the
+/// drain of Task 9; here, GC by `audit_ms`, with `terminal_run_ms`
+/// ignored). They never make new work wait, whatever a host's deprecated
+/// `max_runs` says (Task 8b, no limits): new work is admitted, a live run
+/// finishes and leaves, and GC moves the finished runs out.
 #[test]
-fn a_legacy_namespace_at_its_run_quota_still_commits_the_work_that_drains_it() {
+fn a_legacy_namespace_holding_finished_runs_admits_new_work_and_drains() {
     let legacy = 51;
     let e = Engine::with_config(
         MemoryStorage::retaining_settled(),
@@ -4994,139 +4839,14 @@ fn a_legacy_namespace_at_its_run_quota_still_commits_the_work_that_drains_it() {
     }
     s.indexes.initialized = false;
     overwrite(&e.store, "i-1", &s);
-    assert_eq!(quota_counts(&s).unwrap().runs, e.config.max_runs);
-    assert!(matches!(
-        e.admit("a", "main", Value::Null, authority(), 2),
-        Err(Error::Refused(m)) if m.contains("53 runs in the record")
-    ));
-    // The live run finishes and leaves at the quota.
+    let admitted = e.admit("a", "main", Value::Null, authority(), 2).unwrap();
     assert!(e.advance(&live, 3).unwrap());
+    assert!(e.advance(&admitted, 3).unwrap());
     assert_eq!(e.snapshot().unwrap().runs.len(), legacy);
-    // GC moves the finished runs out at the quota, by audit_ms.
     e.admit("a", "main", Value::Null, authority(), 4).unwrap();
     assert_eq!(e.collect_garbage(1_000, 1_000).unwrap().runs, legacy);
     assert_eq!(e.snapshot().unwrap().runs.len(), 1);
-    e.admit("a", "main", Value::Null, authority(), 1_001)
-        .unwrap();
-    assert_eq!(e.snapshot().unwrap().runs.len(), 2);
 }
-
-// --- Task 8 fix round 1: a quota refuses only growth
-
-/// Review I2(a): a pinned clock fills the record with entries that never
-/// drop; the licensed rebase that recovers it lands at a full
-/// `max_state_bytes`, though its licence adds bytes (the stale floor).
-#[test]
-fn a_clock_rebase_lands_at_a_full_state_record() {
-    let now: i64 = 1_763_000_000_000;
-    let pinned = now + 31_536_000_000;
-    let pinned_engine = || {
-        let e = ret_engine();
-        e.set_retention_policy(RetentionPolicy {
-            admission_replay_ms: 1_000,
-            ..RetentionPolicy::default()
-        })
-        .unwrap();
-        // Real epoch milliseconds: the pin has as many digits as `now`, so
-        // the capped expiries do not shrink the record.
-        for i in 0..3 {
-            let d = e.admit_once(keyed(&e, &format!("p{i}")), pinned).unwrap();
-            assert!(e.advance(&d.receipt.run_id, pinned).unwrap());
-        }
-        e
-    };
-    let full = quota_counts(&pinned_engine().snapshot().unwrap())
-        .unwrap()
-        .state_bytes;
-    // At the configured limit, and with the record at its hard ceiling
-    // (where only the licence's exemption lets it land).
-    for limit in [full, full * 8 / 9] {
-        let mut e = pinned_engine();
-        assert_eq!(e.snapshot().unwrap().keyed_admissions.len(), 3);
-        e.config.max_state_bytes = limit;
-        e.rebase_retention_clock(now, now, "operator", "clock pinned a year ahead", now)
-            .unwrap_or_else(|err| panic!("at {limit}: {err}"));
-        let s = e.snapshot().unwrap();
-        assert_eq!(s.retention.clock_ms, Some(now));
-        assert!(quota_counts(&s).unwrap().state_bytes > full);
-        // The record is over its limit by the licence's bytes: new work
-        // that grows it is refused, saying so.
-        assert!(matches!(
-            e.admit("a", "main", Value::Null, authority(), now + 1),
-            Err(Error::Refused(m)) if m.contains("bytes in the state record")
-        ));
-    }
-}
-/// Review I2(b): an operator lowers `max_runs` below the live count. New
-/// work is refused, but every commit that does not add a run lands: runs
-/// finish and leave, a run is cancelled, an event completes a waiting run,
-/// and a window drop goes through.
-#[test]
-fn over_a_lowered_limit_commits_that_do_not_grow_the_count_land() {
-    let mut e = ret_engine();
-    install(&e, wait_artifact(), "waiter");
-    e.set_retention_policy(RetentionPolicy {
-        admission_replay_ms: 1_000,
-        ..RetentionPolicy::default()
-    })
-    .unwrap();
-    for i in 0..2 {
-        let d = e.admit_once(keyed(&e, &format!("k{i}")), i).unwrap();
-        e.advance(&d.receipt.run_id, i).unwrap();
-    }
-    let waiter = e
-        .admit("waiter", "main", Value::Null, authority(), 2)
-        .unwrap();
-    e.advance(&waiter, 2).unwrap();
-    let a1 = e.admit("a", "main", Value::Null, authority(), 3).unwrap();
-    let a2 = e.admit("a", "main", Value::Null, authority(), 4).unwrap();
-    let a3 = e.admit("a", "main", Value::Null, authority(), 5).unwrap();
-    let live = |e: &Engine<MemoryStorage>| quota_counts(&e.snapshot().unwrap()).unwrap();
-    assert_eq!(live(&e).runs, 4);
-    e.config.max_runs = 1;
-    let refused = |e: &Engine<MemoryStorage>, t: i64| {
-        matches!(
-            e.admit("a", "main", Value::Null, authority(), t),
-            Err(Error::Refused(m)) if m.contains("(quota max_runs 1)")
-        )
-    };
-    assert!(refused(&e, 10));
-    // A run finishes and leaves.
-    assert!(e.advance(&a1, 11).unwrap());
-    // A run is cancelled.
-    e.cancel(&a2, 12).unwrap();
-    // An event completes the waiting run.
-    e.admit_event("host", event("done", 2), 13).unwrap();
-    for _ in 0..3 {
-        if e.snapshot().unwrap().runs.contains_key(&waiter) {
-            assert!(e.advance(&waiter, 14).unwrap());
-        }
-    }
-    assert_eq!(runs_page(&e, Some(&waiter))[0]["outcome"], "ok");
-    let s = e.snapshot().unwrap();
-    assert!(!s.runs.contains_key(&waiter) && !s.runs.contains_key(&a1));
-    let counts = live(&e);
-    assert_eq!(counts.runs, 2, "{counts:?}");
-    assert!(refused(&e, 15));
-    // Receipts over a lowered limit too: the commit that finishes a run
-    // and drops the passed keyed window lands (still over, but fewer).
-    e.config.max_receipts = 1;
-    let before = live(&e).receipts;
-    assert!(before > 1, "{before}");
-    assert!(e.advance(&a3, 2_000).unwrap());
-    assert!(live(&e).receipts < before);
-    assert!(!e.snapshot().unwrap().keyed_admissions.contains_key("k0"));
-    // Review M1: the count is of runs in the record, not only in progress.
-    assert!(matches!(
-        e.admit("a", "main", Value::Null, authority(), 2_001),
-        Err(Error::Refused(m)) if m.contains(
-            "the namespace is full for new work: 2 runs in the record (quota max_runs 1)"
-        )
-    ));
-}
-
-// --- Task 8 fix round 2: limits gate admission, not progress
-
 fn ok_host(n: usize) -> FakeHost {
     FakeHost {
         responses: BTreeMap::from([(
@@ -5142,152 +4862,12 @@ fn ok_host(n: usize) -> FakeHost {
         ..Default::default()
     }
 }
-fn full_for_new_work(result: Result<String>, what: &str) -> bool {
-    matches!(result, Err(Error::Refused(m)) if m.starts_with("the namespace is full for new work: ") && m.contains(what))
-}
-/// The review's reproduction: three admitted `invoke` runs and the keyed
-/// window fill `max_receipts` exactly (128; ceiling 144). Dispatching writes
-/// a receipt without finishing a run (an invoke run holds up to 5 receipts
-/// before it leaves, so the three need 12 above the limit), yet every run
-/// drives to completion and leaves; a new admission is refused while the
-/// quota is full. (With the window empty the limit would be 3, whose ceiling
-/// is 3 + 3 / 8 = 3: no room. See the round 2 report.)
+/// A pre-D10 namespace written before the retention clock opens (the
+/// `root_intents` fill grows the record) and takes its first commits under
+/// the smallest deprecated `max_state_bytes` a host could pass: nothing
+/// judges the record's size (Task 8b, no limits).
 #[test]
-fn at_a_full_receipt_quota_admitted_runs_drive_to_completion() {
-    let mut e = engine();
-    install(&e, done_artifact(), "a");
-    install(
-        &e,
-        invoke_artifact(command(Recovery::KeyedIdempotent), None),
-        "invoke",
-    );
-    for i in 0..125 {
-        let d = e.admit_once(keyed(&e, &format!("w{i}")), i).unwrap();
-        assert!(e.advance(&d.receipt.run_id, i).unwrap());
-    }
-    let runs: Vec<String> = (0..3)
-        .map(|t| {
-            e.admit("invoke", "main", Value::Null, authority(), 100 + t)
-                .unwrap()
-        })
-        .collect();
-    let full = quota_counts(&e.snapshot().unwrap()).unwrap().receipts;
-    assert_eq!(full, 128);
-    e.config.max_receipts = full;
-    let admit =
-        |e: &Engine<MemoryStorage>, t| e.admit("invoke", "main", Value::Null, authority(), t);
-    assert!(matches!(admit(&e, 200), Err(Error::Refused(m)) if m.contains("receipts")));
-    let mut host = ok_host(3);
-    e.drive(&mut host, 210, 200).unwrap();
-    let s = e.snapshot().unwrap();
-    assert!(s.runs.is_empty(), "{:?}", s.runs.keys().collect::<Vec<_>>());
-    for id in &runs {
-        assert_eq!(runs_page(&e, Some(id))[0]["outcome"], "ok", "{id}");
-    }
-    assert_eq!(quota_counts(&s).unwrap().receipts, 125);
-}
-/// At a full `max_receipts`, a waiting run can be cancelled and another can
-/// time out (both write receipts before the run finishes); new work is
-/// refused.
-#[test]
-fn at_a_full_receipt_quota_a_waiting_run_can_be_cancelled_and_can_time_out() {
-    let mut e = engine();
-    install(&e, wait_artifact(), "waiter");
-    install(&e, done_artifact(), "a");
-    for t in 0..14 {
-        e.admit("a", "main", Value::Null, authority(), t).unwrap();
-    }
-    let waiters: Vec<String> = (0..2)
-        .map(|_| {
-            let id = e
-                .admit("waiter", "main", Value::Null, authority(), 0)
-                .unwrap();
-            e.advance(&id, 0).unwrap();
-            id
-        })
-        .collect();
-    e.config.max_receipts = quota_counts(&e.snapshot().unwrap()).unwrap().receipts;
-    let admit =
-        |e: &Engine<MemoryStorage>, t| e.admit("waiter", "main", Value::Null, authority(), t);
-    assert!(matches!(admit(&e, 1), Err(Error::Refused(m)) if m.contains("receipts")));
-    e.cancel(&waiters[0], 10).unwrap();
-    e.drive(&mut FakeHost::default(), 10, 20).unwrap();
-    e.drive(&mut FakeHost::default(), 200, 20).unwrap();
-    assert!(e.snapshot().unwrap().runs.is_empty());
-    assert_eq!(runs_page(&e, Some(&waiters[0]))[0]["status"], "cancelled");
-    assert_eq!(runs_page(&e, Some(&waiters[1]))[0]["outcome"], "error");
-}
-/// At a full `max_state_bytes`, registering a wait (which grows the record)
-/// lands; a new admission is refused.
-#[test]
-fn at_a_full_state_record_registering_a_wait_lands() {
-    let mut e = engine();
-    install(&e, wait_artifact(), "waiter");
-    let ids: Vec<String> = (0..3)
-        .map(|t| {
-            e.admit("waiter", "main", Value::Null, authority(), t)
-                .unwrap()
-        })
-        .collect();
-    let id = ids[0].clone();
-    e.config.max_state_bytes = quota_counts(&e.snapshot().unwrap()).unwrap().state_bytes;
-    let admit =
-        |e: &Engine<MemoryStorage>, t| e.admit("waiter", "main", Value::Null, authority(), t);
-    assert!(matches!(admit(&e, 1), Err(Error::Refused(m)) if m.contains("bytes")));
-    assert!(e.advance(&id, 2).unwrap());
-    assert_eq!(e.snapshot().unwrap().runs[&id].status, RunStatus::Waiting);
-    let limit = e.config.max_state_bytes;
-    let bytes = quota_counts(&e.snapshot().unwrap()).unwrap().state_bytes;
-    assert!(bytes > limit);
-    assert!(full_for_new_work(admit(&e, 3), "bytes"));
-    // The two refusals say which: new work at the limit, and the ceiling.
-    e.config.max_receipts = 1;
-    assert!(full_for_new_work(
-        admit(&e, 4),
-        "receipts in the record (quota max_receipts 1)"
-    ));
-}
-/// Work already admitted is bounded too: past `limit + limit / 8` it is
-/// refused with the ceiling message.
-#[test]
-fn work_already_admitted_is_refused_past_the_hard_ceiling() {
-    let mut e = engine();
-    install(
-        &e,
-        invoke_artifact(command(Recovery::KeyedIdempotent), None),
-        "invoke",
-    );
-    let runs: Vec<String> = (0..16)
-        .map(|t| {
-            e.admit("invoke", "main", Value::Null, authority(), t)
-                .unwrap()
-        })
-        .collect();
-    e.config.max_receipts = quota_counts(&e.snapshot().unwrap()).unwrap().receipts;
-    assert_eq!(e.config.max_receipts, 16);
-    // Each first step plans an operation, writes a receipt and leaves its
-    // run live: the third would make 19 > 16 + 2.
-    let mut refusal = None;
-    for id in &runs {
-        if let Err(err) = e.advance(id, 20) {
-            refusal = Some(err);
-            break;
-        }
-    }
-    assert!(
-        matches!(&refusal, Some(Error::Refused(m)) if m == "the namespace is past its hard ceiling: 19 receipts in the record (ceiling 18: quota max_receipts 16 plus one eighth)"),
-        "{refusal:?}"
-    );
-    assert_eq!(quota_counts(&e.snapshot().unwrap()).unwrap().receipts, 18);
-    let _ = runs;
-}
-/// The upgrade's own bookkeeping is never refused by a quota: a pre-D10
-/// namespace written before the retention clock opens (the `root_intents`
-/// fill grows the record) and its first host-time commit, which starts the
-/// clock, lands. Once with the stored record at its configured
-/// `max_state_bytes`, once at its hard ceiling.
-#[test]
-fn a_namespace_at_its_configured_state_bytes_opens_and_takes_its_first_commits() {
+fn a_pre_d10_namespace_opens_and_takes_its_first_commits_whatever_its_configured_limits() {
     let e = Engine::new(MemoryStorage::retaining_settled(), "test", "incarnation-1").unwrap();
     install_on(
         &e,
@@ -5301,79 +4881,217 @@ fn a_namespace_at_its_configured_state_bytes_opens_and_takes_its_first_commits()
     let mut legacy = vendored_shape(&e.snapshot().unwrap());
     legacy.retention.clock_ms = None;
     e.release().unwrap();
-    let full = quota_counts(&legacy).unwrap().state_bytes;
-    for limit in [full, full * 8 / 9] {
-        // Stored by an engine without the retention clock: a fresh store.
-        let store = MemoryStorage::retaining_settled();
-        store.acquire("test", "w").unwrap();
-        store.compare_and_swap("test", "w", 0, &legacy).unwrap();
-        store.release("test", "w").unwrap();
-        assert!(limit == full || quota_ceiling(limit) <= full);
-        let e = Engine::with_config(
-            store,
-            "test",
-            "incarnation-2",
-            EngineConfig {
-                max_state_bytes: limit,
-                ..EngineConfig::default()
-            },
-        )
-        .unwrap_or_else(|err| panic!("open at {limit}: {err}"));
-        let s = e.snapshot().unwrap();
-        assert!(s.indexes.root_intents_complete);
-        assert!(
-            quota_counts(&s).unwrap().state_bytes > full,
-            "the fill grew it"
-        );
-        // The first host-time commit starts the clock (`null` becomes a
-        // seven-digit time): a redelivery inside the event's window, a
-        // duplicate that writes nothing else.
-        let before = quota_counts(&s).unwrap().state_bytes;
-        assert!(
-            e.admit_event("host", event("seen", 1), 1_000_000)
-                .unwrap_or_else(|err| panic!("first commit at {limit}: {err}"))
-                .duplicate
-        );
-        let s = e.snapshot().unwrap();
-        assert_eq!(s.retention.clock_ms, Some(1_000_000));
-        assert!(
-            quota_counts(&s).unwrap().state_bytes > before,
-            "the clock grew it"
-        );
-        assert!(e.advance(&old, 1_000_001).unwrap());
+    let store = MemoryStorage::retaining_settled();
+    store.acquire("test", "w").unwrap();
+    store.compare_and_swap("test", "w", 0, &legacy).unwrap();
+    store.release("test", "w").unwrap();
+    let e = Engine::with_config(store, "test", "incarnation-2", tiny_limits()).unwrap();
+    let s = e.snapshot().unwrap();
+    assert!(s.indexes.root_intents_complete);
+    // The first host-time commit starts the clock: a redelivery inside the
+    // event's window, a duplicate that writes nothing else.
+    assert!(
+        e.admit_event("host", event("seen", 1), 1_000_000)
+            .unwrap()
+            .duplicate
+    );
+    assert_eq!(e.snapshot().unwrap().retention.clock_ms, Some(1_000_000));
+    assert!(e.advance(&old, 1_000_001).unwrap());
+}
+
+// --- Task 8b (owner override): no namespace limits
+
+/// Every deprecated namespace limit at its smallest value: a host may still
+/// pass them, and nothing reads them.
+fn tiny_limits() -> EngineConfig {
+    EngineConfig {
+        max_runs: 1,
+        max_events: 1,
+        max_queued_destinations: 1,
+        max_state_bytes: 1,
+        max_receipts: 1,
     }
 }
-/// A new event, a new artifact and an activation are new work: at a full
-/// quota they are refused against the configured limit, though the ceiling
-/// would have room.
-#[test]
-fn new_events_artifacts_and_activations_are_new_work() {
-    let mut e = engine();
-    install(&e, wait_artifact(), "waiter");
-    for i in 0..8 {
-        e.admit_event("host", event(&format!("e{i}"), 1), 0)
-            .unwrap();
+fn unlimited_engine() -> Engine<MemoryStorage> {
+    Engine::with_config(
+        MemoryStorage::retaining_settled(),
+        "test",
+        "incarnation-1",
+        tiny_limits(),
+    )
+    .unwrap()
+}
+/// A chain of `n` decisions, then `ok`: each decision writes a `branch`
+/// receipt, so a run holds `n + 1` receipts just before it finishes.
+fn chain_artifact(n: usize) -> Artifact {
+    let mut steps = BTreeMap::new();
+    for i in 0..n {
+        let next = if i + 1 == n {
+            "ok".to_string()
+        } else {
+            format!("d{}", i + 1)
+        };
+        steps.insert(
+            format!("d{i}"),
+            Step {
+                op: Operation::Decide {
+                    predicate: Expr::literal(true),
+                },
+                edges: edges(&[("true", next.as_str()), ("false", "ok"), ("unknown", "ok")]),
+                on_error: None,
+            },
+        );
     }
-    e.config.max_events = 8;
-    let refused = e
-        .admit_event("host", event("e8", 1), 1)
-        .map(|_| String::new());
-    assert!(full_for_new_work(
-        refused,
-        "9 events in the record (quota max_events 8)"
-    ));
-    e.config = EngineConfig {
-        max_state_bytes: quota_counts(&e.snapshot().unwrap()).unwrap().state_bytes,
-        ..EngineConfig::default()
+    steps.insert("ok".into(), ret("ok"));
+    artifact("chain", "d0", steps, Registry::default(), BTreeMap::new())
+}
+/// Task 8 re-review round 2's deadlock: two parents waiting on a child,
+/// with a host's `max_runs` at 2. Nothing counts runs, so both start their
+/// children and finish.
+#[test]
+fn calling_parents_complete_whatever_max_runs_says() {
+    let e = Engine::with_config(
+        MemoryStorage::retaining_settled(),
+        "test",
+        "incarnation-1",
+        EngineConfig {
+            max_runs: 2,
+            ..EngineConfig::default()
+        },
+    )
+    .unwrap();
+    let child = done_artifact();
+    e.install(child.clone()).unwrap();
+    install(&e, parent_artifact(&child, CallMode::Wait), "parent");
+    let parents: Vec<String> = (0..2)
+        .map(|t| {
+            e.admit("parent", "main", Value::Null, authority(), t)
+                .unwrap()
+        })
+        .collect();
+    e.drive(&mut FakeHost::default(), 10, 100).unwrap();
+    assert!(e.snapshot().unwrap().runs.is_empty());
+    for parent in &parents {
+        assert_eq!(runs_page(&e, Some(parent))[0]["outcome"], "ok", "{parent}");
+    }
+}
+/// 1,000 root runs admitted and left in progress at once (direct and keyed)
+/// are all accepted, then all finish.
+#[test]
+fn a_thousand_root_runs_in_progress_are_all_accepted_then_all_finish() {
+    let e = unlimited_engine();
+    install(&e, chain_artifact(2), "chain");
+    install(&e, done_artifact(), "a");
+    let mut runs = vec![];
+    for t in 0..500 {
+        runs.push(
+            e.admit("chain", "main", Value::Null, authority(), t)
+                .unwrap(),
+        );
+        let d = e.admit_once(keyed(&e, &format!("k{t:03}")), t).unwrap();
+        assert!(!d.duplicate);
+        runs.push(d.receipt.run_id);
+    }
+    assert_eq!(e.snapshot().unwrap().runs.len(), 1_000);
+    while e.drive(&mut FakeHost::default(), 1_000, 1_000).unwrap() > 0 {}
+    assert!(e.snapshot().unwrap().runs.is_empty());
+    for id in &runs {
+        assert_eq!(runs_page(&e, Some(id))[0]["outcome"], "ok", "{id}");
+    }
+}
+/// No commit is refused for namespace capacity: with every deprecated limit
+/// at its smallest, a direct and a keyed admission, an event with its
+/// fan-out, a child start, a run holding 1,500 receipts, a waiting run's
+/// wait, an install and an activation all land.
+#[test]
+fn nothing_is_refused_for_namespace_capacity() {
+    let e = unlimited_engine();
+    install(&e, done_artifact(), "a");
+    install(&e, trigger_artifact(), "trigger");
+    install(&e, wait_artifact(), "waiter");
+    install(&e, chain_artifact(1_600), "chain");
+    let child = done_artifact();
+    install(&e, parent_artifact(&child, CallMode::Wait), "parent");
+    let direct = e.admit("a", "main", Value::Null, authority(), 0).unwrap();
+    let keyed_run = e.admit_once(keyed(&e, "k"), 0).unwrap().receipt.run_id;
+    let parent = e
+        .admit("parent", "main", Value::Null, authority(), 0)
+        .unwrap();
+    let waiter = e
+        .admit("waiter", "main", Value::Null, authority(), 0)
+        .unwrap();
+    let long = e
+        .admit("chain", "main", Value::Null, authority(), 0)
+        .unwrap();
+    for i in 0..20 {
+        let d = e
+            .admit_event("host", event(&format!("e{i}"), 1), 1)
+            .unwrap();
+        assert_eq!(e.fanout(&d.key, 10, 1).unwrap(), 1);
+    }
+    let mut peak = 0;
+    while e.drive(&mut FakeHost::default(), 2, 16).unwrap() > 0 {
+        peak = peak.max(e.snapshot().unwrap().receipts.len());
+    }
+    assert!(peak > 1_500, "{peak}");
+    for id in [&direct, &keyed_run, &parent, &long] {
+        assert_eq!(runs_page(&e, Some(id))[0]["outcome"], "ok", "{id}");
+    }
+    assert_eq!(
+        e.snapshot().unwrap().runs[&waiter].status,
+        RunStatus::Waiting
+    );
+    let mut other = done_artifact().content;
+    other.playbook.purpose = "another".into();
+    let other = Artifact::seal(other).unwrap();
+    let digest = other.digest.clone();
+    e.install(other).unwrap();
+    e.activate("other", &digest, authority()).unwrap();
+}
+/// A stored policy with the deprecated limit fields decodes and behaves as
+/// one without them, and an engine given a host's limits behaves as one
+/// given none: the same script leaves the same record and history.
+#[test]
+fn deprecated_limit_fields_decode_and_change_nothing() {
+    let without: RetentionPolicy = serde_json::from_value(json!({
+        "event_replay_ms": 1_000, "audit_ms": 604_800_000,
+    }))
+    .unwrap();
+    let with: RetentionPolicy = serde_json::from_value(json!({
+        "event_replay_ms": 1_000, "audit_ms": 604_800_000,
+        "terminal_run_ms": 0, "max_tombstones": 0,
+    }))
+    .unwrap();
+    let config: EngineConfig = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(
+        serde_json::to_value(&config).unwrap(),
+        serde_json::to_value(EngineConfig::default()).unwrap()
+    );
+    let script = |config: EngineConfig, policy: RetentionPolicy| {
+        let e = Engine::with_config(
+            MemoryStorage::retaining_settled(),
+            "test",
+            "incarnation-1",
+            config,
+        )
+        .unwrap();
+        install(&e, done_artifact(), "a");
+        install(&e, trigger_artifact(), "trigger");
+        e.set_retention_policy(policy).unwrap();
+        for t in 0..5 {
+            e.admit("a", "main", Value::Null, authority(), t).unwrap();
+            let d = e
+                .admit_event("host", event(&format!("e{t}"), 1), t)
+                .unwrap();
+            e.fanout(&d.key, 10, t).unwrap();
+        }
+        e.drive(&mut FakeHost::default(), 3_000, 100).unwrap();
+        let mut s = serde_json::to_value(e.snapshot().unwrap()).unwrap();
+        for field in ["terminal_run_ms", "max_tombstones"] {
+            s["retention"]["policy"][field] = Value::Null;
+        }
+        (s, runs_page(&e, None))
     };
-    assert!(full_for_new_work(
-        e.install(done_artifact()).map(|_| String::new()),
-        "bytes in the state record"
-    ));
-    let waiter = e.snapshot().unwrap().bindings["waiter"].artifact.clone();
-    assert!(full_for_new_work(
-        e.activate("other", &waiter, authority())
-            .map(|_| String::new()),
-        "bytes in the state record"
-    ));
+    let reference = script(EngineConfig::default(), without);
+    assert_eq!(script(tiny_limits(), with), reference);
 }

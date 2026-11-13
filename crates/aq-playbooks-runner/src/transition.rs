@@ -2,32 +2,21 @@
 //!
 //! A backend that implements the capability runs the engine's transition plan
 //! against a State whose retained-history containers are bound to the
-//! backend's authoritative records (see [`crate::lazy`]), validates quota from
-//! exact maintained accounting, and commits only the touched records in one
+//! backend's authoritative records (see [`crate::lazy`]), keeps an exact count
+//! of each container's records, and commits only the touched records in one
 //! atomic revision. Backends without the capability return
 //! [`TransitionOutcome::Unsupported`] before running the plan, and the engine
 //! then uses the full `load`/`compare_and_swap` path unchanged.
 use crate::lazy::{
-    Changes, ContainerChange, ContainerPath, LazyField, RecordSource, Shape, TreeKey,
-    container_bytes, header_bytes, record_bytes,
+    Changes, ContainerChange, ContainerPath, LazyField, RecordSource, Shape, TreeKey, header_bytes,
 };
 use crate::storage::{Storage, StorageError, VersionedState};
-use crate::{AcceptedEvent, EngineConfig, Error, Result, State};
+use crate::{Error, Result, State};
 use std::collections::BTreeMap;
 use std::panic::Location;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Exact quota inputs; the full path derives them from the materialized State.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct QuotaCounts {
-    pub runs: usize,
-    pub events: usize,
-    pub queued_destinations: usize,
-    /// Retained receipts plus keyed admission receipts.
-    pub receipts: usize,
-    pub state_bytes: usize,
-}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionOutcome {
     /// Capability unavailable for this namespace; the plan was not run.
@@ -42,145 +31,6 @@ pub struct TransitionRequest<'a> {
     pub operation: &'static str,
     /// Runs the engine transition on the bound State; returns whether it changed.
     pub plan: &'a mut dyn FnMut(&mut State) -> Result<bool>,
-    /// Shared quota validation, given the exact counts of the stored
-    /// revision before the transition, then after it.
-    pub validate: &'a dyn Fn(&State, &QuotaCounts, &QuotaCounts) -> Result<()>,
-}
-
-/// How a commit's quota check judges it, marked by the engine while it
-/// plans the commit (`State::quota_marks`). Never stored.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct QuotaMarks {
-    /// The commit brings new work or new retained items into the namespace
-    /// from outside (a run, an event, an artifact or an activation): it is
-    /// judged against the configured limits ([`QuotaGate::NewWork`]).
-    /// Otherwise it is a step of work already admitted
-    /// ([`QuotaGate::InFlight`]).
-    pub new_work: bool,
-    /// The upgrade's own bookkeeping on open (index rebuild, `root_intents`
-    /// fill): never refused by a quota.
-    pub bookkeeping: bool,
-    /// Bytes the upgrade's bookkeeping added inside an ordinary commit (the
-    /// retention clock's first value): not judged.
-    pub bookkeeping_bytes: usize,
-}
-/// Which limit a commit is judged against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuotaGate {
-    /// New work: the configured limit.
-    NewWork,
-    /// Work already admitted: the hard ceiling, the limit plus one eighth.
-    InFlight,
-}
-/// The hard ceiling for work already admitted: `limit + limit / 8`.
-pub fn quota_ceiling(limit: usize) -> usize {
-    limit.saturating_add(limit / 8)
-}
-fn limits(config: &EngineConfig, gate: QuotaGate) -> [usize; 5] {
-    let limit = |l: usize| match gate {
-        QuotaGate::NewWork => l,
-        QuotaGate::InFlight => quota_ceiling(l),
-    };
-    [
-        limit(config.max_runs),
-        limit(config.max_events),
-        limit(config.max_queued_destinations),
-        limit(config.max_receipts),
-        limit(config.max_state_bytes),
-    ]
-}
-fn values(c: &QuotaCounts) -> [usize; 5] {
-    [
-        c.runs,
-        c.events,
-        c.queued_destinations,
-        c.receipts,
-        c.state_bytes,
-    ]
-}
-/// Whether some count of `next` is over the limit `gate` judges it by
-/// (whatever it was before). A commit for which this is false passes
-/// [`check_quota`] whatever the previous counts.
-pub fn over_quota(config: &EngineConfig, gate: QuotaGate, next: &QuotaCounts) -> bool {
-    values(next)
-        .iter()
-        .zip(limits(config, gate))
-        .any(|(n, l)| *n > l)
-}
-/// Refuse a commit that grows a count past the limit `gate` judges it by: a
-/// count is refused only when it is over that limit after the commit and
-/// higher than before it. Limits gate admission, not progress:
-///
-/// - a commit that brings new work in ([`QuotaGate::NewWork`]) is judged
-///   against the configured limit;
-/// - a step of work already admitted ([`QuotaGate::InFlight`]) against the
-///   hard ceiling `limit + limit / 8`, so in-flight work keeps moving at a
-///   full quota, within a bounded overshoot.
-///
-/// A commit that leaves a count unchanged or lower always passes that
-/// count. The State holds work in progress and the replay windows
-/// (finished runs leave as history, which counts toward nothing). The
-/// refusal says which limit, and names each count the commit would grow
-/// past it.
-pub fn check_quota(
-    config: &EngineConfig,
-    gate: QuotaGate,
-    previous: &QuotaCounts,
-    next: &QuotaCounts,
-) -> Result<()> {
-    const WHAT: [(&str, &str); 5] = [
-        ("runs in the record", "max_runs"),
-        ("events in the record", "max_events"),
-        ("queued event deliveries", "max_queued_destinations"),
-        ("receipts in the record", "max_receipts"),
-        ("bytes in the state record", "max_state_bytes"),
-    ];
-    let configured = limits(config, QuotaGate::NewWork);
-    let judged = limits(config, gate);
-    let (previous, next) = (values(previous), values(next));
-    let full: Vec<String> = (0..5)
-        .filter(|&i| next[i] > judged[i] && next[i] > previous[i])
-        .map(|i| {
-            let (what, name) = WHAT[i];
-            match gate {
-                QuotaGate::NewWork => {
-                    format!("{} {what} (quota {name} {})", next[i], configured[i])
-                }
-                QuotaGate::InFlight => format!(
-                    "{} {what} (ceiling {}: quota {name} {} plus one eighth)",
-                    next[i], judged[i], configured[i]
-                ),
-            }
-        })
-        .collect();
-    if full.is_empty() {
-        return Ok(());
-    }
-    let which = match gate {
-        QuotaGate::NewWork => "the namespace is full for new work",
-        QuotaGate::InFlight => "the namespace is past its hard ceiling",
-    };
-    Err(Error::Refused(format!("{which}: {}", full.join("; "))))
-}
-pub fn queued_destinations(event: &AcceptedEvent) -> usize {
-    event
-        .destinations
-        .iter()
-        .filter(|d| d.run.is_none())
-        .count()
-}
-/// Reference quota counts from a fully materialized State.
-pub fn quota_counts(state: &State) -> Result<QuotaCounts> {
-    Ok(QuotaCounts {
-        runs: state.runs.len(),
-        events: state.events.len(),
-        queued_destinations: state.events.values().map(queued_destinations).sum(),
-        receipts: state
-            .receipts
-            .len()
-            .saturating_add(state.keyed_admissions.len()),
-        state_bytes: aq_playbooks_model::canonical_bytes(state)?.len(),
-    })
 }
 
 impl State {
@@ -327,64 +177,26 @@ pub fn assemble_state(
     serde_json::from_value(value).map_err(|e| backend(format!("state assemble: {e}")))
 }
 
-/// Per-container record sums: `pairs` is Σ record bytes (see [`record_bytes`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ContainerStats {
-    pub count: usize,
-    pub pairs: usize,
-}
-/// Exact maintained accounting for one namespace revision.
+/// The number of records of each container of one namespace revision
+/// (what a bound container's `len` reads), and the header's length.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Accounting {
     pub header_len: usize,
-    pub fields: BTreeMap<&'static str, ContainerStats>,
-    pub queued_destinations: usize,
-}
-fn queued_bytes(bytes: &[u8]) -> Result<usize> {
-    let event: AcceptedEvent = serde_json::from_slice(bytes).map_err(backend)?;
-    Ok(queued_destinations(&event))
+    pub fields: BTreeMap<&'static str, usize>,
 }
 impl Accounting {
-    pub fn counts(&self) -> QuotaCounts {
-        let count = |f: &str| self.fields.get(f).map_or(0, |s| s.count);
-        let state_bytes = self.header_len
-            + self
-                .fields
-                .values()
-                .map(|s| container_bytes(s.pairs, s.count) - 2)
-                .sum::<usize>();
-        QuotaCounts {
-            runs: count("runs"),
-            events: count("events"),
-            queued_destinations: self.queued_destinations,
-            receipts: count("receipts").saturating_add(count("keyed_admissions")),
-            state_bytes,
-        }
+    /// Records of `field`.
+    pub fn count(&self, field: &str) -> usize {
+        self.fields.get(field).copied().unwrap_or(0)
     }
-    /// Account one record write: `old`/`new` are canonical value bytes.
-    pub fn record(
-        &mut self,
-        field: &'static str,
-        key: &TreeKey,
-        old: Option<&[u8]>,
-        new: Option<&[u8]>,
-    ) -> Result<()> {
-        let shape = shape_of(field).ok_or_else(|| backend(format!("unknown field {field}")))?;
-        let stats = self.fields.entry(field).or_default();
-        if let Some(old) = old {
-            stats.count -= 1;
-            stats.pairs -= record_bytes(shape, key, old);
-            if field == "events" {
-                self.queued_destinations -= queued_bytes(old)?;
-            }
-        }
-        if let Some(new) = new {
-            stats.count += 1;
-            stats.pairs += record_bytes(shape, key, new);
-            if field == "events" {
-                self.queued_destinations += queued_bytes(new)?;
-            }
-        }
+    /// Account one record write: whether the record existed before and
+    /// whether it exists after.
+    pub fn record(&mut self, field: &'static str, old: bool, new: bool) -> Result<()> {
+        shape_of(field).ok_or_else(|| backend(format!("unknown field {field}")))?;
+        let count = self.fields.entry(field).or_default();
+        *count = (*count + usize::from(new))
+            .checked_sub(usize::from(old))
+            .ok_or_else(|| backend(format!("{field}: record count underflow")))?;
         Ok(())
     }
 }
@@ -548,16 +360,16 @@ fn stage(data: &RecordData, accounting: &Accounting, patch: &StatePatch) -> Resu
         match change {
             ContainerChange::Entries(rows) => {
                 for (key, new) in rows {
-                    let before = old.and_then(|c| c.get(key)).map(Vec::as_slice);
-                    next.record(field, key, before, new.as_deref())?;
+                    let before = old.is_some_and(|c| c.contains_key(key));
+                    next.record(field, before, new.is_some())?;
                 }
             }
             ContainerChange::Replace(rows) => {
-                for (key, bytes) in old.into_iter().flatten() {
-                    next.record(field, key, Some(bytes), None)?;
+                for _ in old.into_iter().flatten() {
+                    next.record(field, true, false)?;
                 }
-                for (key, bytes) in rows {
-                    next.record(field, key, None, Some(bytes))?;
+                for _ in rows {
+                    next.record(field, false, true)?;
                 }
             }
         }
@@ -885,7 +697,7 @@ fn export(state: &State) -> Result<(RecordData, Accounting)> {
     Ok((data, accounting))
 }
 impl RecordStorage {
-    /// Maintained accounting for `namespace` (for quota proofs).
+    /// Maintained record counts of `namespace`.
     pub fn accounting(&self, namespace: &str) -> Result<Accounting> {
         Ok(self
             .lock()?
@@ -1098,7 +910,6 @@ impl Storage for RecordStorage {
         source.check()?;
         crate::history::check_unrecorded(&ns.history, &crate::history::patch_live_keys(&patch)?)?;
         let accounting = stage(&ns.data, &ns.accounting, &patch)?;
-        (request.validate)(&state, &ns.accounting.counts(), &accounting.counts())?;
         verify_keyed_admissions(&ns.data, &patch)?;
         verify_patch_removals(&ns.data, &patch, &state)?;
         source.check()?;

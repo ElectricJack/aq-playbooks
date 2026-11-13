@@ -127,18 +127,20 @@ fn first_admission_fences_future_revision_and_revoked_authority_but_history_rema
     assert!(matches!(e.admit_once(fresh, 4), Err(Error::Refused(_))));
     assert_eq!(e.snapshot().unwrap().runs.len(), 1);
 }
+/// Task 8b (no limits): a host's deprecated limits refuse nothing; a new
+/// key is admitted and an exact replay is still a read-only lookup.
 #[test]
-fn full_quotas_refuse_new_atomic_admission_without_blocking_exact_lookup() {
+fn deprecated_limits_refuse_no_admission_and_replay_stays_read_only() {
     let (mut e, r) = setup(MemoryStorage::retaining_settled());
     let first = e.admit_once(r.clone(), 1).unwrap();
     let state = e.snapshot().unwrap();
     e.config.max_receipts = state.receipts.len() + state.keyed_admissions.len();
+    e.config.max_state_bytes = 1024;
     let mut new = r.clone();
     new.key = "second".into();
-    assert!(matches!(e.admit_once(new, 2), Err(Error::Refused(_))));
-    assert_eq!(e.snapshot().unwrap().runs.len(), 1);
-    assert_eq!(e.snapshot().unwrap().keyed_admissions.len(), 1);
-    e.config.max_state_bytes = 1024;
+    assert!(!e.admit_once(new, 2).unwrap().duplicate);
+    assert_eq!(e.snapshot().unwrap().runs.len(), 2);
+    assert_eq!(e.snapshot().unwrap().keyed_admissions.len(), 2);
     let before = e.store.load("keyed").unwrap().revision;
     assert_eq!(e.admit_once(r, 3).unwrap().receipt, first.receipt);
     assert_eq!(before, e.store.load("keyed").unwrap().revision);

@@ -380,8 +380,12 @@ fn t13_independent_calls_consume_origin_budget_without_becoming_owned() {
     assert_eq!(child.root, id);
     assert_eq!(child.status, RunStatus::Admitted);
 }
+/// T17, rewritten by Task 8b (no namespace limits): an event past the
+/// deprecated `max_events` is admitted; a refused event (forged producer)
+/// leaves the record byte for byte; the first event's artifacts and
+/// destination remain and fan out.
 #[test]
-fn t17_quota_refusal_retains_prior_event_artifacts_and_destinations() {
+fn t17_refused_event_retains_prior_event_artifacts_and_destinations() {
     let e = Engine::with_config(
         MemoryStorage::retaining_settled(),
         "review",
@@ -396,8 +400,13 @@ fn t17_quota_refusal_retains_prior_event_artifacts_and_destinations() {
     install(&e, &a, "retained");
     let first = e.admit_event("host", envelope("first"), 0).unwrap();
     let before = canonical_bytes(&e.snapshot().unwrap()).unwrap();
-    assert!(e.admit_event("host", envelope("second"), 1).is_err());
+    assert!(e.admit_event("intruder", envelope("forged"), 1).is_err());
     assert_eq!(canonical_bytes(&e.snapshot().unwrap()).unwrap(), before);
+    assert!(
+        !e.admit_event("host", envelope("second"), 1)
+            .unwrap()
+            .duplicate
+    );
     assert!(e.snapshot().unwrap().artifacts.contains_key(&a.digest));
     assert_eq!(e.fanout(&first.key, 1, 2).unwrap(), 1);
 }

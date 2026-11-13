@@ -168,14 +168,12 @@ fn transition_with(
         }
         Ok(true)
     };
-    let validate = |_: &State, _: &QuotaCounts, _: &QuotaCounts| Ok(());
     storage_error(store.transition_v1(
         ns,
         "w",
         &mut TransitionRequest {
             operation: "history",
             plan: &mut plan,
-            validate: &validate,
         },
     ))
 }
@@ -1280,14 +1278,12 @@ fn a_clock_rebase_is_licensed_on_every_commit_path() {
             f(s);
             Ok(true)
         };
-        let validate = |_: &State, _: &QuotaCounts, _: &QuotaCounts| Ok(());
         storage_error(store.transition_v1(
             &ns,
             "w",
             &mut TransitionRequest {
                 operation: "rebase",
                 plan: &mut plan,
-                validate: &validate,
             },
         ))
     };
@@ -1323,14 +1319,12 @@ fn a_clock_rebase_is_licensed_on_every_commit_path() {
         license(s, retention::CLOCK_REBASE, 500, 100);
         Ok(true)
     };
-    let validate = |_: &State, _: &QuotaCounts, _: &QuotaCounts| Ok(());
     storage_error(store.transition_v1(
         &ns,
         "w",
         &mut TransitionRequest {
             operation: "rebase",
             plan: &mut plan,
-            validate: &validate,
         },
     ))
     .unwrap();
@@ -1423,14 +1417,12 @@ fn format_3_transitions_hold_the_removal_fences() {
             f(s);
             Ok(true)
         };
-        let validate = |_: &State, _: &QuotaCounts, _: &QuotaCounts| Ok(());
         storage_error(store.transition_v1(
             ns,
             "w",
             &mut TransitionRequest {
                 operation: "fence",
                 plan: &mut plan,
-                validate: &validate,
             },
         ))
     };
@@ -2281,7 +2273,7 @@ fn a_pinned_clock_is_rebased_on_postgres() {
     }
 }
 
-// --- Task 8: quotas count live work; max_tombstones is ignored -------------
+// --- Task 8: max_tombstones is ignored ------------------------------------
 
 /// Legacy disposal tombstone rows beyond `max_tombstones` refuse no full
 /// commit, and a full commit that does not move the GC clock leaves them in
@@ -2326,78 +2318,28 @@ fn legacy_tombstone_rows_beyond_max_tombstones_refuse_no_commit_and_are_not_scan
         assert_eq!(tombstone_rows(&ns), 0, "{label}");
     }
 }
-// --- Task 8 fix round 1: a quota refuses only growth -----------------------
+// --- Task 8b (owner override): no namespace limits -----------------------
 
-/// On f2 protected and f3: over a lowered `max_runs`, an admission is
-/// refused and runs still finish and leave; a clock rebase lands at a full
-/// `max_state_bytes` (its licence adds the stale floor).
+/// On f2 protected and f3, with every deprecated limit at its smallest:
+/// direct, keyed and `invoke` admissions land, the runs drive to completion
+/// and leave, and a clock rebase lands. Nothing is refused for capacity.
 #[test]
-fn a_quota_refuses_only_growth_on_postgres() {
+fn nothing_is_refused_for_namespace_capacity_on_postgres() {
     for (format, store) in both() {
-        let ns = support::namespace("growth");
-        let mut e = Engine::new(store, &ns, "w").unwrap();
-        let a = support::artifact("a");
-        let digest = a.digest.clone();
-        e.install(a).unwrap();
-        e.activate_at("a", &digest, pg_authority(), 0).unwrap();
-        e.set_retention_policy(RetentionPolicy {
-            admission_replay_ms: 1_000,
-            ..RetentionPolicy::default()
-        })
+        let ns = support::namespace("unlimited");
+        let e = Engine::with_config(
+            store,
+            &ns,
+            "w",
+            EngineConfig {
+                max_runs: 1,
+                max_events: 1,
+                max_queued_destinations: 1,
+                max_state_bytes: 1,
+                max_receipts: 1,
+            },
+        )
         .unwrap();
-        let runs: Vec<String> = (1..4)
-            .map(|t| {
-                e.admit("a", "main", Value::Null, pg_authority(), t)
-                    .unwrap()
-            })
-            .collect();
-        e.config.max_runs = 1;
-        let refused = |e: &Engine<PostgresStorage>, t: i64| {
-            matches!(
-                e.admit("a", "main", Value::Null, pg_authority(), t),
-                Err(Error::Refused(m)) if m.contains("(quota max_runs 1)")
-            )
-        };
-        assert!(refused(&e, 10), "{format}");
-        assert!(e.advance(&runs[0], 11).unwrap(), "{format}");
-        assert!(e.advance(&runs[1], 12).unwrap(), "{format}");
-        assert!(refused(&e, 13), "{format}");
-        assert!(e.advance(&runs[2], 14).unwrap(), "{format}");
-        e.config.max_runs = EngineConfig::default().max_runs;
-        // Pin the clock a year ahead, then rebase at a full record.
-        let now: i64 = 1_763_000_000_000;
-        let pinned = now + 31_536_000_000;
-        for i in 0..3 {
-            let d = e
-                .admit_once(pg_keyed(&e, &format!("p{i}")), pinned)
-                .unwrap();
-            assert!(e.advance(&d.receipt.run_id, pinned).unwrap(), "{format}");
-        }
-        // The record at its hard ceiling: only the licence's exemption lets
-        // the rebase (which adds the stale floor) land.
-        e.config.max_state_bytes =
-            quota_counts(&e.snapshot().unwrap()).unwrap().state_bytes * 8 / 9;
-        e.rebase_retention_clock(now, now, "operator", "clock pinned a year ahead", now)
-            .unwrap_or_else(|err| panic!("{format}: {err}"));
-        assert_eq!(
-            e.snapshot().unwrap().retention.clock_ms,
-            Some(now),
-            "{format}"
-        );
-    }
-}
-
-// --- Task 8 fix round 2: limits gate admission, not progress --------------
-
-/// On f2 protected and f3: three admitted `invoke` runs and the keyed
-/// window fill `max_receipts` exactly (128; ceiling 144). The runs drive to
-/// completion and leave; a new admission is refused; past the ceiling an
-/// admitted run's step is refused with the ceiling message.
-#[test]
-fn limits_gate_admission_not_progress_on_postgres() {
-    for (format, store) in both() {
-        let ns = support::namespace("gate");
-        let mut e = Engine::new(store, &ns, "w").unwrap();
         let a = support::artifact("a");
         e.install(a.clone()).unwrap();
         e.activate_at("a", &a.digest, pg_authority(), 0).unwrap();
@@ -2405,28 +2347,13 @@ fn limits_gate_admission_not_progress_on_postgres() {
         e.install(invoke.clone()).unwrap();
         e.activate_at("invoke", &invoke.digest, pg_authority(), 0)
             .unwrap();
-        for i in 0..125 {
-            let d = e.admit_once(pg_keyed(&e, &format!("w{i}")), i).unwrap();
-            assert!(e.advance(&d.receipt.run_id, i).unwrap(), "{format}");
+        for i in 0..20 {
+            e.admit_once(pg_keyed(&e, &format!("w{i}")), i).unwrap();
         }
-        let admit = |e: &Engine<PostgresStorage>, t| {
-            e.admit("invoke", "main", Value::Null, pg_authority(), t)
-        };
-        let runs: Vec<String> = (0..3).map(|t| admit(&e, 200 + t).unwrap()).collect();
-        let full = quota_counts(&e.snapshot().unwrap()).unwrap().receipts;
-        assert_eq!(full, 128, "{format}");
-        e.config.max_receipts = full;
-        assert!(
-            matches!(admit(&e, 300), Err(Error::Refused(m)) if m == "the namespace is full for new work: 129 receipts in the record (quota max_receipts 128)"),
-            "{format}"
-        );
-        // Past the ceiling, a step of an admitted run is refused.
-        e.config.max_receipts = 1;
-        assert!(
-            matches!(e.advance(&runs[0], 301), Err(Error::Refused(m)) if m.starts_with("the namespace is past its hard ceiling: ")),
-            "{format}"
-        );
-        e.config.max_receipts = full;
+        for t in 0..3 {
+            e.admit("invoke", "main", Value::Null, pg_authority(), 200 + t)
+                .unwrap();
+        }
         let mut host = ok_host();
         host.responses
             .get_mut("test.command")
@@ -2438,5 +2365,21 @@ fn limits_gate_admission_not_progress_on_postgres() {
         e.drive(&mut host, 310, 200)
             .unwrap_or_else(|err| panic!("{format}: {err}"));
         assert!(e.snapshot().unwrap().runs.is_empty(), "{format}");
+        // Pin the clock a year ahead, then rebase it.
+        let now: i64 = 1_763_000_000_000;
+        let pinned = now + 31_536_000_000;
+        for i in 0..3 {
+            let d = e
+                .admit_once(pg_keyed(&e, &format!("p{i}")), pinned)
+                .unwrap();
+            assert!(e.advance(&d.receipt.run_id, pinned).unwrap(), "{format}");
+        }
+        e.rebase_retention_clock(now, now, "operator", "clock pinned a year ahead", now)
+            .unwrap_or_else(|err| panic!("{format}: {err}"));
+        assert_eq!(
+            e.snapshot().unwrap().retention.clock_ms,
+            Some(now),
+            "{format}"
+        );
     }
 }

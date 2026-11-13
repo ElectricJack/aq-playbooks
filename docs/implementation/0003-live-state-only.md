@@ -271,10 +271,10 @@ than the smallest window (up to 1 day with the default event window). Cancel
 
 The commit does nothing else. It carries no host time, so nothing settles
 and nothing is dropped in it. Its cost is one pass over the expiry order
-above the smallest cap, plus one pass over the live runs and operations. It
-is bounded by the namespace quotas (`max_events`, `max_receipts`,
-`max_runs`, `max_state_bytes`): at most one record's worth, the same order
-as any protected format 2 commit.
+above the smallest cap, plus one pass over the live runs and operations.  It
+is at most one record's worth (the remembered window is at most
+`replay_keep` unheld entries plus those live work holds), the same order as
+any protected format 2 commit.
 
 ### The fences
 
@@ -362,109 +362,67 @@ server must:
   and refuse when they disagree beyond the slack;
 - require explicit confirmation, and offer the dry run first.
 
-## Quotas count live work
+## No namespace limits
 
-Spec §4. `EngineConfig`'s quotas count what the namespace record holds.
-Finished runs leave the record as history rows, which count toward no
-quota. So:
+Owner direction (spec 0003, final section): there are no namespace limits.
+The record holds work in progress. Finished work is deleted when it
+finishes. Remembered keys and history are rolling sets of fixed size
+(`replay_keep` and `history_keep`).
 
-| Quota | Counts |
-| --- | --- |
-| `max_runs` | runs in the record: in progress, or finished in a cohort still in progress (a finished child of a live root, a finished root with an unsettled operation); on a namespace written before this change, also the finished runs awaiting the drain |
-| `max_events` | events awaiting delivery, and events inside their replay window (or kept while a live run needs them) |
-| `max_queued_destinations` | event deliveries queued for runs not yet admitted |
-| `max_receipts` | the receipts of the runs in the record, plus keyed admission receipts inside their replay window or kept past it while their run is live. A live keyed run counts twice: its keyed admission receipt and its own receipts |
-| `max_state_bytes` | the canonical State: work in progress plus the window entries |
+Nothing is ever refused because a namespace holds too much: no admission
+(direct, keyed, or an event's fan-out), event, step, child start,
+completion, wait, timer, cancel, settlement or admin commit. What bounds the
+record is deletion alone.
 
-**Limits gate admission, not progress.** Every commit is judged by
-growth: a quota refuses a count only when the count is over the limit the
-commit is judged by *and* higher than before the commit. A commit that
-leaves a count unchanged or lower always passes it. Which limit depends on
-what the commit does:
+Removed in Task 8b (the mechanism Task 8 built, and everything that served
+only it):
 
-- **New work** — a commit that brings new work or new retained items into
-  the namespace from outside: a run (`admit`, `admit_once`, a trigger
-  admission by `fanout`, a child or independent run started by a live run),
-  a new event (`admit_event*`), `install` of a new artifact, `activate`. It
-  is judged against the **configured limit**.
-- **Work already admitted** — every other commit: `advance`, `drive` turns,
-  `dispatch_next`, `record_result`, completions, waits, timers and
-  timeouts, `cancel`, settlement, window drops and deferrals, `recover`,
-  `request_recovery`, and the operator controls. It is judged against a
-  **hard ceiling of `limit + limit / 8`** for each quota.
-- **Licensed admin commits** (`rebase_retention_clock`,
-  `lower_stale_floor`) are judged as work already admitted, and the bytes
-  their licence adds are exempt (they change nothing but what their licence
-  names; the removal fences hold them to that). A rebase therefore lands at
-  a full record.
-- **The upgrade's own bookkeeping** is never refused: the commit
-  `Engine::new`/`with_config` makes on open (index rebuild, the
-  `root_intents` fill) is not judged, and the bytes of starting the
-  retention clock on a namespace written before it (`null` becomes the
-  time) are not judged in the commit that does it. `with_config` applies
-  the host's limits from that open commit on.
+- the quota check (`check_quota`, `over_quota`, `quota_counts`,
+  `QuotaCounts`, `QuotaGate`, `quota_ceiling`), the `limit + limit / 8`
+  ceiling, the commit classes (`QuotaMarks`, `State::quota_marks`) and the
+  quota refusal texts;
+- `TransitionRequest::validate` (the format 3 path's quota callback);
+- the maintained byte and queued-destination sums of the format 3
+  accounting (`Accounting` keeps each container's record count, which a
+  bound container's `len` reads, and the header length). A PostgreSQL
+  format 3 row written before stores `[count, bytes]` per container and a
+  queued-destination count; both decode, and the extra numbers are ignored;
+- the `with_config` refusal of zero or small limits
+  ("invalid namespace resource bounds").
 
-So **quotas are soft by one eighth for work in flight.** A full namespace
-refuses new work, while the runs it already holds keep moving and leave.
-On aq-server (`max_runs` 128, `max_receipts` 4,096, `max_state_bytes`
-8 MiB) work in flight may take the namespace to 144 runs, 4,608 receipts and
-9 MiB. The eighth is headroom for what admitted runs add before they
-finish: an `invoke` run adds up to 4 receipts after its admission receipt
-before it leaves, so 128 such runs in flight need 512 receipts above the
-limit, which is exactly the eighth of 4,096. Size `max_receipts` at no less than 8 × `max_runs` × the
-receipts a run adds in flight. At very small limits the eighth rounds down
-(3 / 8 = 0), and then there is no headroom.
+**Deprecated, accepted and ignored**, so stored states decode and existing
+hosts compile:
 
-**When work in flight reaches the ceiling** its steps are refused (the
-refusal says "past its hard ceiling"), and the runs wait. Runs whose next
-step shrinks the record still finish and leave, and window entries still
-drop as their windows pass; each of those makes room. If the namespace
-stays at the ceiling, the operator raises the limit (on aq-server a
-configuration change and restart) or cancels runs, and investigates why so
-much work is in flight: a playbook that writes many receipts per run, or a
-limit sized below the work it admits.
+- `EngineConfig::{max_runs, max_events, max_queued_destinations,
+  max_state_bytes, max_receipts}`. `EngineConfig` decodes with any of them
+  missing (`#[serde(default)]`), and `Engine::with_config` keeps the value
+  unread;
+- `RetentionPolicy::{max_tombstones, terminal_run_ms}`. A stored policy
+  decodes with or without them (each has a serde default) and behaves the
+  same either way (tested: `deprecated_limit_fields_decode_and_change_nothing`).
 
-The refusal says which limit, and names each count the commit would grow
-past it:
+`set_retention_policy` refuses only a zero window (`event_replay_ms`,
+`admission_replay_ms` or `audit_ms`): "retention windows must be positive".
+GC no longer refuses for the event tombstone or correlation fence count,
+and the age of a finished root it may collect is `audit_ms` alone.
+PostgreSQL does not count `disposal_tombstones` rows on a full commit; its
+cutoff deletes over those rows (`collect`) run only in a commit that moves
+the GC clock. Rows written before this change are drained by Task 9 and
+never refuse a commit.
 
-```text
-the namespace is full for new work: 129 receipts in the record (quota max_receipts 128)
-the namespace is past its hard ceiling: 19 receipts in the record (ceiling 18: quota max_receipts 16 plus one eighth)
-```
-
-The complete path (`quota_counts(&State)`) needs the counts before the
-commit only when a count is over the limit it is judged by; it then loads
-the stored revision once more. The format 3 transition path compares the
-maintained `Accounting` before and after the patch. The engine marks the
-commit's class on the State it plans (`State::quota_marks`, never stored),
-and both paths judge it with the same function, so they cannot disagree:
-`transition_equivalence` compares the maintained counts with
-`quota_counts` at every step (including a clock rebase, a window drop and a
-deferral), and the two paths' results, refusals included, at the quota
-steps of both gates.
-
-Nothing has to be collected to free a quota: runs leave when they finish and
-window entries when their window passes. To make room for new work sooner,
-finish or cancel runs in progress, or raise the limit.
+**What stays, because it is not a namespace limit:** the limits a playbook
+declares for itself in its artifact (step visits, children, depth,
+iterations, duration, concurrent effects and children, payload and history
+bytes), which bound one run and are part of the playbook's meaning; input
+validation bounds (payload sizes, key and text lengths); the bounded amount
+of deletion work per commit (64 window drops, 64 evictions, 50 cohorts, the
+history trim batch); and the removal fences, which are about the
+correctness of deletion, not capacity.
 
 **A namespace written before this change** still holds the runs that
-finished before the upgrade, and counts them, until the drain moves them
-out (Task 9). Such a namespace refuses new work while it is over a quota,
-but still commits the work that frees it (tested:
-`a_legacy_namespace_at_its_run_quota_still_commits_the_work_that_drains_it`).
-
-**`max_tombstones` and `terminal_run_ms`** are accepted in a stored policy
-(any value, `0` included) and never read. `set_retention_policy` refuses
-only a zero window (`event_replay_ms`, `admission_replay_ms` or `audit_ms`):
-"retention windows must be positive". Nothing refuses a commit for the
-number of tombstones it holds:
-
-- GC no longer refuses for the event tombstone or correlation fence count,
-  and the age of a finished root it may collect is `audit_ms` alone;
-- PostgreSQL no longer counts `disposal_tombstones` rows on a full commit.
-  Its cutoff deletes over those rows (`collect`) run only in a commit that
-  moves the GC clock, as on the format 3 bounded path. Rows written before
-  this change are drained by Task 9 and never refuse a commit.
+finished before the upgrade until the drain moves them out (Task 9). They
+never make new work wait (tested:
+`a_legacy_namespace_holding_finished_runs_admits_new_work_and_drains`).
 
 ## PostgreSQL: on-disk size of the namespace table
 

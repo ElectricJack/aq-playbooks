@@ -24,7 +24,8 @@ are excluded. Public metadata inspection intentionally works without decryption
 keys; the host must authorize database roles and control-surface access.
 
 The authoritative snapshot is still serialized for CAS. Namespace size is bounded
-by runner admission/history quotas; native discovery and incremental index writes
+by deletion: finished work leaves at completion, and remembered keys and history
+are rolling sets of fixed size (there are no namespace limits); native discovery and incremental index writes
 do not make snapshot serialization constant-time. A version-one database upgrades
 transactionally; its next exclusive owner initializes materialized indexes before
 scheduling or inspection. Reads refuse an uninitialized index rather than reporting

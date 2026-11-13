@@ -22,10 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 pub use storage::{MemoryStorage, Storage, StorageError, VersionedState};
-pub use transition::{
-    QuotaCounts, QuotaGate, QuotaMarks, RecordStorage, TransitionOutcome, TransitionRequest,
-    check_quota, over_quota, quota_ceiling, quota_counts,
-};
+pub use transition::{RecordStorage, TransitionOutcome, TransitionRequest};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -111,48 +108,6 @@ pub struct DeadlineAdjustment {
 enum Finish {
     Host(Option<i64>),
     Licensed,
-}
-/// The quota check of one commit: the gate it is judged by (see
-/// [`check_quota`]) and the counts it is judged on; `None` when it is not
-/// judged (the upgrade's bookkeeping on open). Bytes the upgrade's
-/// bookkeeping added inside the commit are not judged. A licensed admin
-/// commit (clock rebase, floor lowering) changes nothing but what its
-/// licence names (the removal fences hold it to that), so every byte it adds
-/// is its licence's: it is exempt from `max_state_bytes` for them. It adds
-/// no run, event or receipt.
-fn quota_inputs(
-    mode: Finish,
-    marks: QuotaMarks,
-    previous: &QuotaCounts,
-    next: &QuotaCounts,
-) -> Option<(QuotaGate, QuotaCounts)> {
-    if marks.bookkeeping {
-        return None;
-    }
-    let mut judged = *next;
-    judged.state_bytes = judged.state_bytes.saturating_sub(marks.bookkeeping_bytes);
-    if matches!(mode, Finish::Licensed) {
-        judged.state_bytes = judged.state_bytes.min(previous.state_bytes);
-    }
-    let gate = if marks.new_work {
-        QuotaGate::NewWork
-    } else {
-        QuotaGate::InFlight
-    };
-    Some((gate, judged))
-}
-/// [`check_quota`] for one commit (see [`quota_inputs`]).
-fn judge_quota(
-    config: &EngineConfig,
-    mode: Finish,
-    marks: QuotaMarks,
-    previous: &QuotaCounts,
-    next: &QuotaCounts,
-) -> Result<()> {
-    match quota_inputs(mode, marks, previous, next) {
-        Some((gate, judged)) => check_quota(config, gate, previous, &judged),
-        None => Ok(()),
-    }
 }
 /// Of the windows in `policy`, the smallest (at least 1 ms).
 fn smallest_window(policy: &RetentionPolicy) -> i64 {
@@ -660,10 +615,6 @@ pub struct State {
     /// history in the same commit. Never stored with the State.
     #[serde(skip)]
     pub settled: Vec<SettledCohort>,
-    /// How this commit's quota check judges it, marked while the commit is
-    /// planned. Never stored.
-    #[serde(skip)]
-    pub quota_marks: QuotaMarks,
     #[serde(default)]
     pub indexes: RuntimeIndexes,
     pub artifacts: BTreeMap<String, Artifact>,
@@ -720,7 +671,14 @@ pub fn cancellation_key(intent: &Intent) -> Result<String> {
     Ok(digest(&(&intent.id, "cancel"))?)
 }
 /// A runner incarnation must be unique. Do not share its identifier between processes.
+///
+/// Deprecated: a namespace has no limits (spec 0003, "no limits"). These
+/// fields are accepted, so existing hosts compile and configurations decode,
+/// and ignored: nothing is ever refused because a namespace holds too much.
+/// The record is bounded by deletion alone (finished work at completion,
+/// `replay_keep` remembered keys, `history_keep` finished runs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EngineConfig {
     pub max_runs: usize,
     pub max_events: usize,
@@ -751,8 +709,7 @@ impl<S: Storage> Engine<S> {
         Self::open(store, namespace, owner, EngineConfig::default())
     }
     /// Acquire the namespace and run the upgrade's bookkeeping commit (index
-    /// rebuild, `root_intents` fill) under `config`. That commit is never
-    /// refused by a quota.
+    /// rebuild, `root_intents` fill).
     fn open(
         store: S,
         namespace: impl Into<String>,
@@ -774,7 +731,6 @@ impl<S: Storage> Engine<S> {
         };
         e.store.acquire(&e.namespace, &e.owner)?;
         e.transaction_at(None, |s| {
-            s.quota_marks.bookkeeping = true;
             if !s.indexes.initialized {
                 indexes::rebuild(s)?;
             }
@@ -785,20 +741,13 @@ impl<S: Storage> Engine<S> {
         })?;
         Ok(e)
     }
+    /// [`Self::new`] keeping `config`, whose (deprecated) limits are ignored.
     pub fn with_config(
         store: S,
         namespace: impl Into<String>,
         owner: impl Into<String>,
         config: EngineConfig,
     ) -> Result<Self> {
-        if config.max_runs == 0
-            || config.max_events == 0
-            || config.max_queued_destinations == 0
-            || config.max_state_bytes < 1024
-            || config.max_receipts == 0
-        {
-            return Err(Error::Refused("invalid namespace resource bounds".into()));
-        }
         Self::open(store, namespace, owner, config)
     }
     fn measure_host<T>(&self, f: impl FnOnce() -> T) -> T {
@@ -888,14 +837,12 @@ impl<S: Storage> Engine<S> {
         let mut f = Some(f);
         let mut result = None;
         let mut report = retention::CommitReport::default();
-        let config = &self.config;
         let metrics = &self.metrics;
         let mut plan = |state: &mut State| -> Result<bool> {
             let f = f
                 .take()
                 .ok_or_else(|| Error::Conflict("transition plan ran twice".into()))?;
             state.protection_available = protection;
-            state.quota_marks = QuotaMarks::default();
             let started = std::time::Instant::now();
             let evaluated = f(state);
             metrics.record_time(metrics::Timing::Transition, started.elapsed());
@@ -906,9 +853,6 @@ impl<S: Storage> Engine<S> {
             }
             Ok(changed)
         };
-        let validate = |state: &State, previous: &QuotaCounts, next: &QuotaCounts| {
-            judge_quota(config, now_ms, state.quota_marks, previous, next)
-        };
         let started = std::time::Instant::now();
         let outcome = self.store.transition_v1(
             &self.namespace,
@@ -916,7 +860,6 @@ impl<S: Storage> Engine<S> {
             &mut TransitionRequest {
                 operation: "transaction",
                 plan: &mut plan,
-                validate: &validate,
             },
         );
         let outcome = outcome?;
@@ -937,7 +880,6 @@ impl<S: Storage> Engine<S> {
             indexes::rebuild(&mut v.state)?;
         }
         v.state.protection_available = protection;
-        v.state.quota_marks = QuotaMarks::default();
         let started = std::time::Instant::now();
         let evaluated = f(&mut v.state);
         self.metrics
@@ -947,16 +889,6 @@ impl<S: Storage> Engine<S> {
             return Ok((result, retention::CommitReport::default()));
         }
         let report = finish(&mut v.state, now_ms)?;
-        let next = quota_counts(&v.state)?;
-        let marks = v.state.quota_marks;
-        // Only a commit over a limit needs the counts before it (one more
-        // load and serialization, on this path only).
-        if quota_inputs(now_ms, marks, &next, &next)
-            .is_some_and(|(gate, judged)| over_quota(&self.config, gate, &judged))
-        {
-            let previous = self.stored_counts(v.revision)?;
-            judge_quota(&self.config, now_ms, marks, &previous, &next)?;
-        }
         let started = std::time::Instant::now();
         let committed =
             self.store
@@ -966,19 +898,6 @@ impl<S: Storage> Engine<S> {
         committed?;
         Ok((result, report))
     }
-    /// Quota counts of the stored revision `revision`, as the plan saw it.
-    /// If the namespace has moved on, the zero counts: the strict check,
-    /// and the commit's compare-and-swap would fail anyway.
-    fn stored_counts(&self, revision: u64) -> Result<QuotaCounts> {
-        let mut stored = self.store.load(&self.namespace)?;
-        if stored.revision != revision {
-            return Ok(QuotaCounts::default());
-        }
-        if !stored.state.indexes.initialized {
-            indexes::rebuild(&mut stored.state)?;
-        }
-        quota_counts(&stored.state)
-    }
     pub fn install(&self, artifact: Artifact) -> Result<()> {
         artifact.verify()?;
         self.transaction_at(None, |s| {
@@ -987,7 +906,6 @@ impl<S: Storage> Engine<S> {
             {
                 return Err(Error::Conflict("artifact replacement".into()));
             }
-            s.quota_marks.new_work = true;
             s.artifacts.insert(artifact.digest.clone(), artifact);
             Ok(())
         })
@@ -1030,7 +948,6 @@ impl<S: Storage> Engine<S> {
                 .get(artifact)
                 .ok_or_else(|| Error::NotFound(artifact.into()))?;
             check_authority(a, &authority)?;
-            s.quota_marks.new_work = true;
             s.catalog_revision += 1;
             let controls = s
                 .bindings
@@ -1358,7 +1275,6 @@ impl<S: Storage> Engine<S> {
             }
             s.sequence += 1;
             let sequence = s.sequence;
-            s.quota_marks.new_work = true;
             s.events.insert(
                 key.clone(),
                 AcceptedEvent {
@@ -2038,7 +1954,6 @@ fn admit_run(
     if s.runs.contains_key(&id) {
         return Ok(());
     }
-    s.quota_marks.new_work = true;
     ensure_admission_protection(
         s,
         artifact,
@@ -2660,7 +2575,7 @@ fn advance_inner(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
                 Some(r.id.clone())
             };
             // Independent starts retain the original shared allocation ledger. They
-            // cannot replenish quotas by detaching, even after the origin finishes.
+            // cannot replenish budgets by detaching, even after the origin finishes.
             admit_run(
                 s,
                 id.clone(),
@@ -3799,9 +3714,10 @@ impl<S: Storage> Engine<S> {
             Ok(())
         })
     }
-    /// Store `policy`. Its windows must be positive. `max_tombstones` and
-    /// `terminal_run_ms` are stored as given and never read: finished runs
-    /// leave the State as history, and no tombstone is written for them.
+    /// Store `policy`. Its windows must be positive. The deprecated
+    /// `max_tombstones` and `terminal_run_ms` are stored as given and never
+    /// read: there are no namespace limits, finished runs leave the State as
+    /// history, and no tombstone is written for them.
     pub fn set_retention_policy(&self, policy: RetentionPolicy) -> Result<()> {
         if policy.event_replay_ms == 0 || policy.admission_replay_ms == 0 || policy.audit_ms == 0 {
             return Err(Error::Refused("retention windows must be positive".into()));

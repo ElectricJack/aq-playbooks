@@ -1191,18 +1191,6 @@ impl<T: Record> LazyField for LazySeq<T> {
     }
 }
 
-/// Exact canonical byte length of one container from its record sums:
-/// `pairs` is Σ(child bytes, plus quoted key and colon for objects).
-pub fn container_bytes(pairs: usize, count: usize) -> usize {
-    2 + pairs + count.saturating_sub(1)
-}
-/// Bytes one record contributes to `pairs` for a container of `shape`.
-pub fn record_bytes(shape: Shape, key: &TreeKey, value: &[u8]) -> usize {
-    match shape {
-        Shape::Map(_) | Shape::Nested(..) => key.json_key().len() + 1 + value.len(),
-        Shape::Set(_) | Shape::Seq => value.len(),
-    }
-}
 impl<K: LazyKey, V: Record> IntoIterator for LazyMap<K, V> {
     type Item = (K, V);
     type IntoIter = std::collections::btree_map::IntoIter<K, V>;

@@ -68,19 +68,18 @@ Asynchronous admission follows an explicit `accepted` edge and binds `{handle}`;
 completion matching remains pinned after that step has continued. Invalid results
 block only the affected operation and retain a safe diagnostic.
 
-`EngineConfig` bounds namespace runs, events, queued destinations, receipts and
-bytes. They count what the record holds: work in progress and the replay
-windows (finished runs leave as history, which counts toward no quota).
-Artifacts bound payloads, visits, nested iterations, history, duration,
-children, depth and concurrent work. Execution-budget exhaustion settles owned
-work and fails once. Limits gate admission, not progress: a commit that brings
-new work in is refused when it grows a count past its configured limit; steps of
-work already admitted are judged against a hard ceiling of the limit plus one
-eighth, so they keep moving at a full quota. Quota refusal preserves existing
-obligations and says which limit is reached.
+A namespace has no limits. The record holds work in progress; finished work
+is deleted when it finishes; remembered keys and history are rolling sets of
+fixed size (`replay_keep` and `history_keep` in `RetentionPolicy`). Nothing is
+ever refused because a namespace holds too much. `EngineConfig`'s fields
+(`max_runs`, `max_events`, `max_queued_destinations`, `max_receipts`,
+`max_state_bytes`) are deprecated: accepted and ignored. Artifacts bound their
+own runs: payloads, visits, nested iterations, history, duration, children,
+depth and concurrent work. Execution-budget exhaustion settles owned work and
+fails once.
 
 `RetentionPolicy` declares event replay, keyed admission and audit windows. Its
-`terminal_run_ms` and `max_tombstones` are accepted and ignored. Bounded GC pages persist their scan cursor, preserve
+`terminal_run_ms` and `max_tombstones` are deprecated: accepted and ignored. Bounded GC pages persist their scan cursor, preserve
 unsettled cohorts and transitive artifact closures, and record disposal. Replay
 identities become tombstones rather than reusable IDs. Explicit monotonic producer
 epoch retirement fences old requests and permits bounded tombstone compaction.

@@ -343,12 +343,35 @@ impl Pair {
                 self.steps
             );
         }
-        let counts = quota_counts(&m.state).unwrap();
+        // The maintained record counts (what a bound container's `len`
+        // reads) are those of the complete State.
         if self.r.store.stats.transitions.load(Ordering::Relaxed) > 0 {
+            let mut plain = m.state.clone();
+            let patch = aq_playbooks_runner::transition::take_patch(&mut plain).unwrap();
+            let counts: BTreeMap<&str, usize> = patch
+                .changes
+                .iter()
+                .filter_map(|(path, change)| match change {
+                    aq_playbooks_runner::lazy::ContainerChange::Replace(rows)
+                        if !rows.is_empty() =>
+                    {
+                        Some((path.field, rows.len()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let maintained: BTreeMap<&str, usize> = self
+                .r
+                .store
+                .accounting(NS)
+                .unwrap()
+                .fields
+                .into_iter()
+                .filter(|(_, count)| *count > 0)
+                .collect();
             assert_eq!(
-                self.r.store.accounting(NS).unwrap().counts(),
-                counts,
-                "step {}: maintained quota accounting after {step}",
+                maintained, counts,
+                "step {}: maintained record counts after {step}",
                 self.steps
             );
         }
@@ -517,34 +540,6 @@ fn scenario(p: &mut Pair) {
     both!(p, |e| e.admit_once(request(Value::Null), 300));
     both!(p, |e| e.admit_once(request(Value::Null), 301));
     both!(p, |e| e.admit_once(request(json!(1)), 302));
-    // Quotas count what the record holds: live work plus the window. The
-    // maintained accounting refuses where the complete path does, with the
-    // same counts in the same words (`check` compares the results).
-    let counts = quota_counts(&p.m.snapshot().unwrap()).unwrap();
-    assert!(counts.receipts > 0 && !p.m.snapshot().unwrap().keyed_admissions.is_empty());
-    for (receipts, bytes) in [
-        (counts.receipts + 1, usize::MAX),
-        (usize::MAX, counts.state_bytes),
-    ] {
-        for config in [&mut p.m.config, &mut p.r.config] {
-            config.max_receipts = receipts;
-            config.max_state_bytes = bytes;
-        }
-        let refused = both!(p, |e| e.admit_once(
-            KeyedAdmissionRequest {
-                key: "request-two".into(),
-                ..request(Value::Null)
-            },
-            303
-        ));
-        assert!(
-            refused.contains("the namespace is full for new work"),
-            "{refused}"
-        );
-    }
-    for config in [&mut p.m.config, &mut p.r.config] {
-        *config = EngineConfig::default();
-    }
     // Producer epochs and expiry through retention.
     both!(p, |e| e
         .advance_producer_epoch("d10", 1, "operator", "rotate", 400));
@@ -631,64 +626,44 @@ fn scenario(p: &mut Pair) {
         "dropped"
     );
     assert!(s.keyed_admissions.contains_key("held"), "deferred");
-    // A quota refuses only growth, on both paths: over a lowered run limit
-    // a commit that finishes a run lands, an admission is refused.
-    let live = quota_counts(&s).unwrap().runs;
-    assert!(live >= 2, "{live}");
+    // No namespace limit refuses anything, on either path (spec 0003, "no
+    // limits"): with every deprecated limit at its smallest, root
+    // admissions, keyed admissions, an event, a child start and a cancel
+    // land.
     for config in [&mut p.m.config, &mut p.r.config] {
-        config.max_runs = live - 2;
-    }
-    let refused = both!(p, |e| e.admit(
-        "a",
-        "main",
-        Value::Null,
-        authority("a"),
-        31_600
-    ));
-    assert!(
-        refused.contains("the namespace is full for new work"),
-        "{refused}"
-    );
-    let landed = both!(p, |e| e.drive(&mut host(), 31_700, 64));
-    assert!(landed.starts_with("Ok("), "{landed}");
-    assert!(quota_counts(&p.m.snapshot().unwrap()).unwrap().runs < live);
-    // Both gates on both paths: at a full `max_receipts` new work is judged
-    // by the limit and work already admitted by the ceiling.
-    for config in [&mut p.m.config, &mut p.r.config] {
-        *config = EngineConfig::default();
+        *config = EngineConfig {
+            max_runs: 1,
+            max_events: 1,
+            max_queued_destinations: 1,
+            max_state_bytes: 1,
+            max_receipts: 1,
+        };
     }
     for i in 0..8 {
         let request = keyed("a", &format!("fill-{i}"), p);
-        both!(p, |e| e.admit_once(request.clone(), 31_750));
+        let landed = both!(p, |e| e.admit_once(request.clone(), 31_750));
+        assert!(landed.starts_with("Ok("), "{landed}");
     }
-    both!(p, |e| e.drive(&mut host(), 31_760, 64));
+    let parent = both!(p, |e| e.admit(
+        "parent",
+        "main",
+        Value::Null,
+        authority("a"),
+        31_751
+    ));
+    assert!(parent.starts_with("Ok("), "{parent}");
+    let landed = both!(p, |e| e.admit_event_in_epoch(
+        "d10",
+        event("unlimited", "p"),
+        u64::MAX,
+        31_752
+    ));
+    assert!(landed.starts_with("Ok("), "{landed}");
+    let landed = both!(p, |e| e.drive(&mut host(), 31_760, 64));
+    assert!(landed.starts_with("Ok("), "{landed}");
     let s = p.m.snapshot().unwrap();
     let held_run = s.keyed_admissions["held"].run_id.clone();
     assert!(s.runs.contains_key(&held_run));
-    let receipts = quota_counts(&s).unwrap().receipts;
-    assert!(receipts >= 8, "{receipts}");
-    let limit = |p: &mut Pair, max_receipts: usize| {
-        for config in [&mut p.m.config, &mut p.r.config] {
-            *config = EngineConfig {
-                max_receipts,
-                ..EngineConfig::default()
-            };
-        }
-    };
-    limit(p, receipts);
-    let request = keyed("a", "at-full", p);
-    let refused = both!(p, |e| e.admit_once(request.clone(), 31_800));
-    assert!(
-        refused.contains("the namespace is full for new work"),
-        "{refused}"
-    );
-    limit(p, 1);
-    let refused = both!(p, |e| e.cancel(&held_run, 31_801));
-    assert!(
-        refused.contains("the namespace is past its hard ceiling"),
-        "{refused}"
-    );
-    limit(p, receipts);
     let landed = both!(p, |e| e.cancel(&held_run, 31_802));
     assert!(landed.starts_with("Ok("), "{landed}");
     for config in [&mut p.m.config, &mut p.r.config] {

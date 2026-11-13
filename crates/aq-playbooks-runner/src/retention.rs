@@ -1,5 +1,5 @@
 //! Explicit replay horizons, disposal records and epoch fences. No unresolved
-//! obligation is evicted for quota pressure.
+//! obligation is ever evicted.
 //!
 //! The retention clock (`RetentionState::clock_ms`) is the latest host time a
 //! commit carried. A removal from the State is allowed only when the commit
@@ -21,8 +21,15 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetentionPolicy {
     pub event_replay_ms: u64,
+    /// Deprecated and ignored: a finished run leaves the record when it
+    /// finishes. Accepted (and defaulted when absent) so stored policies
+    /// decode.
+    #[serde(default = "default_terminal_run_ms")]
     pub terminal_run_ms: u64,
     pub audit_ms: u64,
+    /// Deprecated and ignored: there are no namespace limits. Accepted (and
+    /// defaulted when absent) so stored policies decode.
+    #[serde(default = "default_max_tombstones")]
     pub max_tombstones: usize,
     /// Window of a keyed admission receipt, from its acceptance.
     #[serde(default = "default_admission_replay_ms")]
@@ -31,13 +38,19 @@ pub struct RetentionPolicy {
 fn default_admission_replay_ms() -> u64 {
     604_800_000
 }
+fn default_terminal_run_ms() -> u64 {
+    604_800_000
+}
+fn default_max_tombstones() -> usize {
+    100_000
+}
 impl Default for RetentionPolicy {
     fn default() -> Self {
         Self {
             event_replay_ms: 86_400_000,
-            terminal_run_ms: 604_800_000,
+            terminal_run_ms: default_terminal_run_ms(),
             audit_ms: 604_800_000,
-            max_tombstones: 100_000,
+            max_tombstones: default_max_tombstones(),
             admission_replay_ms: default_admission_replay_ms(),
         }
     }
@@ -365,7 +378,6 @@ pub(crate) fn check_licensed_header(
         // Not stored.
         protection_available: _,
         settled: _,
-        quota_marks: _,
         catalog_history,
         catalog_history_at_ms,
         retention,
@@ -500,12 +512,6 @@ pub(crate) fn advance_clock(s: &mut State, now_ms: i64) {
         .retention
         .clock_ms
         .map_or(now_ms, |clock| clock.max(now_ms));
-    if s.retention.clock_ms.is_none() {
-        // Starting the clock on a namespace written before it is upgrade
-        // bookkeeping: its bytes (`null` becomes the time) are not judged by
-        // a quota.
-        s.quota_marks.bookkeeping_bytes += clock.to_string().len().saturating_sub("null".len());
-    }
     s.retention.clock_ms = Some(clock);
 }
 /// Removals that carry a legacy disposal record (written by `gc` before the
@@ -1008,7 +1014,7 @@ pub(crate) fn admission_droppable(s: &State, key: &str, clock: i64) -> bool {
 /// recorded expiry later than its [`rebase_cap`] at that: `to_ms` plus the
 /// entry's own window. An expiry at or below its cap stays. Walks the expiry
 /// order from the smallest possible cap upwards, so the cost is the number
-/// of entries above it (bounded by the namespace quotas). Returns (events,
+/// of entries above it (at most the remembered window). Returns (events,
 /// admissions) capped. The caller writes the [`CLOCK_REBASE`] receipt that
 /// licenses the commit.
 pub(crate) fn rebase_clock(s: &mut State, to_ms: i64) -> (usize, usize) {

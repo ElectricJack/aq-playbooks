@@ -4,7 +4,7 @@
 //! MemoryStorage reference. Since spec 0003 a finished run leaves the State,
 //! so "history" is run history (settled cohorts written as history rows)
 //! next to the events still in their window. Every timed operation runs on
-//! both; the complete canonical State, revision, maintained quota accounting
+//! both; the complete canonical State, revision, maintained record counts
 //! and inspection (live plus history) are compared after each step. The
 //! record backend's work counters must show zero full materialization and
 //! history-flat record work; admission and event ingress also take zero
@@ -217,8 +217,9 @@ struct Work {
 trait Candidate: Storage {
     fn work(&self) -> Work;
     fn fallbacks(&self) -> Vec<String>;
-    /// Maintained accounting and header bytes, where the backend exposes them.
-    fn accounting(&self, namespace: &str) -> Option<(QuotaCounts, usize)>;
+    /// Maintained record counts and header bytes, where the backend exposes
+    /// them.
+    fn accounting(&self, namespace: &str) -> Option<(BTreeMap<&'static str, usize>, usize)>;
     /// Whether removing a settled cohort is a full (heavy) commit here.
     fn settling_commit_is_full(&self) -> bool;
 }
@@ -235,9 +236,10 @@ impl Candidate for RecordStorage {
     fn fallbacks(&self) -> Vec<String> {
         self.stats.fallbacks()
     }
-    fn accounting(&self, namespace: &str) -> Option<(QuotaCounts, usize)> {
+    fn accounting(&self, namespace: &str) -> Option<(BTreeMap<&'static str, usize>, usize)> {
         let a = RecordStorage::accounting(self, namespace).unwrap();
-        Some((a.counts(), a.header_len))
+        let counts = a.fields.into_iter().filter(|(_, n)| *n > 0).collect();
+        Some((counts, a.header_len))
     }
     fn settling_commit_is_full(&self) -> bool {
         false
@@ -253,7 +255,7 @@ struct Cell {
 
 /// Full-State comparison against the reference after every step: revision
 /// and the complete serialized State (every container, record backend fully
-/// assembled). `exact` also checks canonical bytes and quota accounting.
+/// assembled). `exact` also checks canonical bytes and record counts.
 fn compare<C: Candidate>(
     ns: &str,
     m: &Engine<MemoryStorage>,
@@ -298,11 +300,21 @@ fn compare<C: Candidate>(
             "canonical State after {step}"
         );
         if let Some((counts, _)) = r.store.accounting(ns) {
-            assert_eq!(
-                counts,
-                quota_counts(&mv.state).unwrap(),
-                "maintained quota accounting after {step}"
-            );
+            let mut plain = mv.state.clone();
+            let expected: BTreeMap<&'static str, usize> = take_patch(&mut plain)
+                .unwrap()
+                .changes
+                .into_iter()
+                .filter_map(|(path, change)| match change {
+                    aq_playbooks_runner::lazy::ContainerChange::Replace(rows)
+                        if !rows.is_empty() =>
+                    {
+                        Some((path.field, rows.len()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(counts, expected, "maintained record counts after {step}");
         }
     }
 }
@@ -502,7 +514,7 @@ mod postgres {
         fn fallbacks(&self) -> Vec<String> {
             self.transition_stats().fallbacks
         }
-        fn accounting(&self, _: &str) -> Option<(QuotaCounts, usize)> {
+        fn accounting(&self, _: &str) -> Option<(BTreeMap<&'static str, usize>, usize)> {
             None
         }
         fn settling_commit_is_full(&self) -> bool {

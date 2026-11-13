@@ -1,6 +1,7 @@
 //! Writer format 3 (D10, PB-04): bounded `transition_v1` over a record
 //! representation. The namespace row holds the State header (artifacts
-//! stripped; they stay in the artifact tables) and its exact [`Accounting`];
+//! stripped; they stay in the artifact tables) and its exact record counts
+//! ([`Accounting`]);
 //! every retained-history container record is one `state_records` row keyed by
 //! an order-preserving encoding of its typed key. A transition binds the
 //! header's lazy containers to the open row-locked transaction, runs the
@@ -14,8 +15,8 @@ use aq_playbooks_runner::lazy::{
     ContainerChange, ContainerPath, KeyKind, RecordSource, Shape, TreeKey, header_bytes,
 };
 use aq_playbooks_runner::transition::{
-    Accounting, ContainerStats, StatePatch, TransitionOutcome, TransitionRequest, assemble_state,
-    bind_state, header_state, schema, take_patch,
+    Accounting, StatePatch, TransitionOutcome, TransitionRequest, assemble_state, bind_state,
+    header_state, schema, take_patch,
 };
 use aq_playbooks_runner::{Error, State, StorageError};
 use postgres::Statement;
@@ -90,29 +91,29 @@ pub(crate) fn accounting_json(a: &Accounting) -> Value {
     let fields: serde_json::Map<String, Value> = a
         .fields
         .iter()
-        .filter(|(_, s)| s.count > 0)
-        .map(|(f, s)| (f.to_string(), json!([s.count, s.pairs])))
+        .filter(|(_, count)| **count > 0)
+        .map(|(f, count)| (f.to_string(), json!(count)))
         .collect();
-    json!({"header_len":a.header_len,"queued_destinations":a.queued_destinations,"fields":fields})
+    json!({"header_len":a.header_len,"fields":fields})
 }
+/// Record counts from a namespace row. A row written before spec 0003's
+/// "no limits" holds `[count, bytes]` per field and a queued-destination
+/// count, which only served the removed quotas: the bytes and that count
+/// are ignored.
 pub(crate) fn accounting_from(value: &Value) -> Result<Accounting, StorageError> {
     let bad = || backend("invalid record accounting");
     let number = |v: &Value| v.as_u64().map(|n| n as usize).ok_or_else(bad);
     let mut fields = BTreeMap::new();
     for (name, stats) in value["fields"].as_object().ok_or_else(bad)? {
         let (name, _) = field(name).map_err(backend)?;
-        let pair = stats.as_array().filter(|p| p.len() == 2).ok_or_else(bad)?;
-        fields.insert(
-            name,
-            ContainerStats {
-                count: number(&pair[0])?,
-                pairs: number(&pair[1])?,
-            },
-        );
+        let count = match stats {
+            Value::Array(pair) if pair.len() == 2 => number(&pair[0])?,
+            other => number(other)?,
+        };
+        fields.insert(name, count);
     }
     Ok(Accounting {
         header_len: number(&value["header_len"])?,
-        queued_destinations: number(&value["queued_destinations"])?,
         fields,
     })
 }
@@ -148,9 +149,7 @@ pub(crate) fn export(state: &State) -> Result<Export, StorageError> {
             return Err(backend("nested record container"));
         }
         for (key, value) in rows {
-            accounting
-                .record(name, &key, None, Some(&value))
-                .map_err(storage)?;
+            accounting.record(name, false, true).map_err(storage)?;
             out.fields.push(name.to_string());
             out.keys.push(encode_key(&key));
             out.values.push(value);
@@ -456,11 +455,7 @@ impl PostgresStorage {
             })),
             namespace: namespace.to_string(),
             statements,
-            counts: accounting
-                .fields
-                .iter()
-                .map(|(f, s)| (*f, s.count))
-                .collect(),
+            counts: accounting.fields.clone(),
             reads: Mutex::new(0),
             fallbacks: Mutex::new(vec![]),
             poison: Mutex::new(None),
@@ -514,7 +509,6 @@ impl PostgresStorage {
             rebase,
         )?;
         let live_keys = aq_playbooks_runner::history::patch_live_keys(&patch)?;
-        (request.validate)(&state, &accounting.counts(), &staged.accounting.counts())?;
         source.check()?;
         let heavy = !fallbacks.is_empty()
             || rebase
@@ -687,7 +681,7 @@ struct Staged {
     deleted_fields: Vec<String>,
     deleted_keys: Vec<Vec<u8>>,
 }
-/// Exact accounting of the patch against the current records (one read of
+/// Exact record counts of the patch against the current records (one read of
 /// every touched key), plus the keyed admission immutability check. A
 /// keyed admission or event deletion stays bounded only when the same patch
 /// deletes its expiry record with an expiry `clock_ms` has reached (and, for
@@ -764,7 +758,7 @@ fn stage(
                     let before = old.get(&(name.to_string(), encoded.clone()));
                     staged
                         .accounting
-                        .record(name, key, before.map(Vec::as_slice), new.as_deref())
+                        .record(name, before.is_some(), new.is_some())
                         .map_err(storage)?;
                     // Audit receipts are positional: overwriting or deleting
                     // a stored one removes it, which the complete path judges.
@@ -830,16 +824,16 @@ fn stage(
                     replaced_old.insert(name, current);
                 }
                 let current = &replaced_old[name];
-                for (key, bytes) in current {
+                for _ in current {
                     staged
                         .accounting
-                        .record(name, key, Some(bytes), None)
+                        .record(name, true, false)
                         .map_err(storage)?;
                 }
-                for (key, bytes) in rows {
+                for _ in rows {
                     staged
                         .accounting
-                        .record(name, key, None, Some(bytes))
+                        .record(name, false, true)
                         .map_err(storage)?;
                 }
                 // A replaced container takes the complete path, where removals
@@ -968,11 +962,7 @@ impl PostgresStorage {
             })),
             namespace: namespace.to_string(),
             statements,
-            counts: accounting
-                .fields
-                .iter()
-                .map(|(f, s)| (*f, s.count))
-                .collect(),
+            counts: accounting.fields.clone(),
             reads: Mutex::new(0),
             fallbacks: Mutex::new(vec![]),
             poison: Mutex::new(None),
@@ -1050,5 +1040,29 @@ pub(crate) fn inspect(
         },
         items: rows.into_iter().map(|r| r.1).collect(),
         revision,
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// A format 3 row written before the namespace limits were removed
+    /// holds `[count, bytes]` per container and a queued-destination count;
+    /// it decodes to the same record counts as a row written now.
+    #[test]
+    fn record_counts_decode_from_rows_written_before_and_after_no_limits() {
+        let before = json!({"header_len": 120, "queued_destinations": 3,
+            "fields": {"runs": [2, 900], "events": [5, 4000]}});
+        let after = json!({"header_len": 120, "fields": {"runs": 2, "events": 5}});
+        let (a, b) = (
+            accounting_from(&before).unwrap(),
+            accounting_from(&after).unwrap(),
+        );
+        assert_eq!(a, b);
+        assert_eq!(
+            (a.count("runs"), a.count("events"), a.header_len),
+            (2, 5, 120)
+        );
+        assert_eq!(accounting_json(&a), after);
+        assert!(accounting_from(&json!({"header_len": 1, "fields": {"runs": [1]}})).is_err());
     }
 }

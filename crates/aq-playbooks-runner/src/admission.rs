@@ -79,10 +79,9 @@ impl<S: Storage> Engine<S> {
             .get(key)
             .cloned())
     }
-    /// Exact replay performs no write, new resolution, quota consumption, or
-    /// authority grant. First admission creates run+receipt atomically. A key is
-    /// remembered until its window (`admission_replay_ms`) expires; combined
-    /// receipt/state quotas refuse new work.
+    /// Exact replay performs no write, new resolution, or authority grant.
+    /// First admission creates run+receipt atomically. A key is remembered
+    /// until its window (`admission_replay_ms`) expires.
     pub fn admit_once(
         &self,
         request: KeyedAdmissionRequest,

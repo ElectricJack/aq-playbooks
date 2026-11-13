@@ -483,77 +483,6 @@ fn pending(config: &str, n: usize) {
     );
     e.release().unwrap();
 }
-fn quotas(config: &str, state: &State) {
-    for kind in [
-        "runs",
-        "events",
-        "receipts",
-        "state_bytes",
-        "queued_destinations",
-    ] {
-        let (mut e, meter) = pg(config, &format!("quota-{kind}"), state);
-        if kind == "queued_destinations" {
-            let mut a = artifact("triggered", "a", ret());
-            let c = event_contract();
-            a.content.playbook.triggers.push(Trigger {
-                id: "on-signal".into(),
-                event: ContractRef {
-                    name: c.name.clone(),
-                    fingerprint: c.fingerprint().unwrap(),
-                },
-                entry: "main".into(),
-                input: Expr::literal(Value::Null),
-            });
-            a = Artifact::seal(a.content).unwrap();
-            install(&e, "triggered", a);
-            e.config.max_queued_destinations = 1;
-            e.admit_event("pb02", event("first"), NOW).unwrap();
-        } else {
-            match kind {
-                "runs" => e.config.max_runs = 2,
-                "events" => e.config.max_events = 2,
-                "receipts" => e.config.max_receipts = 2,
-                "state_bytes" => {
-                    e.config.max_state_bytes =
-                        canonical_bytes(&e.snapshot().unwrap()).unwrap().len() + 64
-                }
-                _ => unreachable!(),
-            }
-            if kind != "state_bytes" {
-                for i in 0..2 {
-                    if kind == "events" {
-                        e.admit_event("pb02", event(&format!("quota-{i}")), NOW)
-                            .unwrap();
-                    } else {
-                        e.admit("a", "main", Value::Null, authority("a"), NOW + i)
-                            .unwrap();
-                    }
-                }
-            }
-        }
-        let before = e.snapshot().unwrap();
-        clear(&e, &meter);
-        let t = Instant::now();
-        let refusal = if matches!(kind, "events" | "queued_destinations") {
-            e.admit_event("pb02", event("excess"), NOW).map(|_| ())
-        } else {
-            e.admit("a", "main", Value::Null, authority("a"), NOW + 10)
-                .map(|_| ())
-        };
-        let elapsed = t.elapsed().as_micros();
-        let work = work(&e);
-        assert!(refusal.is_err());
-        let after = e.snapshot().unwrap();
-        assert_eq!(
-            canonical_bytes(&before).unwrap(),
-            canonical_bytes(&after).unwrap()
-        );
-        emit(
-            json!({"scenario":"quota_refusal","quota":kind,"limits":e.config,"refused":true,"state_unchanged":true,"refusal_us":elapsed,"transition_work":work,"bounded":bounded(&work,0),"retained":counts(&after),"error":refusal.unwrap_err().to_string()}),
-        );
-        e.release().unwrap();
-    }
-}
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().nth(1).as_deref() == Some("--check-fixtures") {
         let e = base();
@@ -617,7 +546,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for threads in [1, 2, 4] {
         concurrent(&config, &empty, threads);
     }
-    quotas(&config, &empty);
+    // The quota-refusal scenario was removed with the namespace limits
+    // (spec 0003, "no limits").
     emit(json!({"scenario":"complete","rss_kib":rss_kib()}));
     Ok(())
 }

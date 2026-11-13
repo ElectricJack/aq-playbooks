@@ -165,8 +165,8 @@ enum Command {
         #[command(flatten)]
         store: StoreArgs,
     },
-    /// Set explicit retention windows from a JSON policy (`max_tombstones` and
-    /// `terminal_run_ms` are accepted and ignored).
+    /// Set explicit retention windows from a JSON policy (the deprecated
+    /// `max_tombstones` and `terminal_run_ms` are accepted and ignored).
     Retention {
         policy: PathBuf,
         #[command(flatten)]
