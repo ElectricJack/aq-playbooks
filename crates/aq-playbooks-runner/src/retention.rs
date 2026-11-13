@@ -365,6 +365,7 @@ pub(crate) fn check_licensed_header(
         // Not stored.
         protection_available: _,
         settled: _,
+        quota_marks: _,
         catalog_history,
         catalog_history_at_ms,
         retention,
@@ -499,6 +500,12 @@ pub(crate) fn advance_clock(s: &mut State, now_ms: i64) {
         .retention
         .clock_ms
         .map_or(now_ms, |clock| clock.max(now_ms));
+    if s.retention.clock_ms.is_none() {
+        // Starting the clock on a namespace written before it is upgrade
+        // bookkeeping: its bytes (`null` becomes the time) are not judged by
+        // a quota.
+        s.quota_marks.bookkeeping_bytes += clock.to_string().len().saturating_sub("null".len());
+    }
     s.retention.clock_ms = Some(clock);
 }
 /// Removals that carry a legacy disposal record (written by `gc` before the

@@ -2355,7 +2355,7 @@ fn a_quota_refuses_only_growth_on_postgres() {
         let refused = |e: &Engine<PostgresStorage>, t: i64| {
             matches!(
                 e.admit("a", "main", Value::Null, pg_authority(), t),
-                Err(Error::Refused(m)) if m.contains("(limit max_runs 1)")
+                Err(Error::Refused(m)) if m.contains("(quota max_runs 1)")
             )
         };
         assert!(refused(&e, 10), "{format}");
@@ -2373,7 +2373,10 @@ fn a_quota_refuses_only_growth_on_postgres() {
                 .unwrap();
             assert!(e.advance(&d.receipt.run_id, pinned).unwrap(), "{format}");
         }
-        e.config.max_state_bytes = quota_counts(&e.snapshot().unwrap()).unwrap().state_bytes;
+        // The record at its hard ceiling: only the licence's exemption lets
+        // the rebase (which adds the stale floor) land.
+        e.config.max_state_bytes =
+            quota_counts(&e.snapshot().unwrap()).unwrap().state_bytes * 8 / 9;
         e.rebase_retention_clock(now, now, "operator", "clock pinned a year ahead", now)
             .unwrap_or_else(|err| panic!("{format}: {err}"));
         assert_eq!(
@@ -2381,5 +2384,59 @@ fn a_quota_refuses_only_growth_on_postgres() {
             Some(now),
             "{format}"
         );
+    }
+}
+
+// --- Task 8 fix round 2: limits gate admission, not progress --------------
+
+/// On f2 protected and f3: three admitted `invoke` runs and the keyed
+/// window fill `max_receipts` exactly (128; ceiling 144). The runs drive to
+/// completion and leave; a new admission is refused; past the ceiling an
+/// admitted run's step is refused with the ceiling message.
+#[test]
+fn limits_gate_admission_not_progress_on_postgres() {
+    for (format, store) in both() {
+        let ns = support::namespace("gate");
+        let mut e = Engine::new(store, &ns, "w").unwrap();
+        let a = support::artifact("a");
+        e.install(a.clone()).unwrap();
+        e.activate_at("a", &a.digest, pg_authority(), 0).unwrap();
+        let invoke = pg_invoke_artifact();
+        e.install(invoke.clone()).unwrap();
+        e.activate_at("invoke", &invoke.digest, pg_authority(), 0)
+            .unwrap();
+        for i in 0..125 {
+            let d = e.admit_once(pg_keyed(&e, &format!("w{i}")), i).unwrap();
+            assert!(e.advance(&d.receipt.run_id, i).unwrap(), "{format}");
+        }
+        let admit = |e: &Engine<PostgresStorage>, t| {
+            e.admit("invoke", "main", Value::Null, pg_authority(), t)
+        };
+        let runs: Vec<String> = (0..3).map(|t| admit(&e, 200 + t).unwrap()).collect();
+        let full = quota_counts(&e.snapshot().unwrap()).unwrap().receipts;
+        assert_eq!(full, 128, "{format}");
+        e.config.max_receipts = full;
+        assert!(
+            matches!(admit(&e, 300), Err(Error::Refused(m)) if m == "the namespace is full for new work: 129 receipts in the record (quota max_receipts 128)"),
+            "{format}"
+        );
+        // Past the ceiling, a step of an admitted run is refused.
+        e.config.max_receipts = 1;
+        assert!(
+            matches!(e.advance(&runs[0], 301), Err(Error::Refused(m)) if m.starts_with("the namespace is past its hard ceiling: ")),
+            "{format}"
+        );
+        e.config.max_receipts = full;
+        let mut host = ok_host();
+        host.responses
+            .get_mut("test.command")
+            .unwrap()
+            .push(DispatchResult::Completed {
+                outcome: "ok".into(),
+                output: Value::Null,
+            });
+        e.drive(&mut host, 310, 200)
+            .unwrap_or_else(|err| panic!("{format}: {err}"));
+        assert!(e.snapshot().unwrap().runs.is_empty(), "{format}");
     }
 }

@@ -376,43 +376,76 @@ quota. So:
 | `max_receipts` | the receipts of the runs in the record, plus keyed admission receipts inside their replay window or kept past it while their run is live. A live keyed run counts twice: its keyed admission receipt and its own receipts |
 | `max_state_bytes` | the canonical State: work in progress plus the window entries |
 
-**A quota refuses only growth.** A commit is refused for a quota only when
-that count is over its limit after the commit *and* higher than before it.
-A commit that leaves a count unchanged or lower always passes that count,
-even when the namespace is already over the limit: an operator lowered the
-limit, a namespace written before this change still holds finished runs, or
-a pinned clock filled the record with entries that never dropped. So the
-work that frees a full namespace always lands: a run finishes or is
-cancelled and leaves, an event completes a waiting run, a window entry
-drops. New work that adds to a full count is refused. A step of a live run
-that adds a receipt without finishing it is growth too, so it is refused
-while `max_receipts` is over its limit.
+**Limits gate admission, not progress.** Every commit is judged by
+growth: a quota refuses a count only when the count is over the limit the
+commit is judged by *and* higher than before the commit. A commit that
+leaves a count unchanged or lower always passes it. Which limit depends on
+what the commit does:
 
-The two licensed admin commits (`rebase_retention_clock`,
-`lower_stale_floor`) change nothing but what their licence names (the
-removal fences hold them to that), so the bytes they add (the stale floor
-on a first rebase) are exempt from `max_state_bytes`. That is what lets a
-rebase land at a full record (tested:
-`a_clock_rebase_lands_at_a_full_state_record`).
+- **New work** — a commit that brings new work or new retained items into
+  the namespace from outside: a run (`admit`, `admit_once`, a trigger
+  admission by `fanout`, a child or independent run started by a live run),
+  a new event (`admit_event*`), `install` of a new artifact, `activate`. It
+  is judged against the **configured limit**.
+- **Work already admitted** — every other commit: `advance`, `drive` turns,
+  `dispatch_next`, `record_result`, completions, waits, timers and
+  timeouts, `cancel`, settlement, window drops and deferrals, `recover`,
+  `request_recovery`, and the operator controls. It is judged against a
+  **hard ceiling of `limit + limit / 8`** for each quota.
+- **Licensed admin commits** (`rebase_retention_clock`,
+  `lower_stale_floor`) are judged as work already admitted, and the bytes
+  their licence adds are exempt (they change nothing but what their licence
+  names; the removal fences hold them to that). A rebase therefore lands at
+  a full record.
+- **The upgrade's own bookkeeping** is never refused: the commit
+  `Engine::new`/`with_config` makes on open (index rebuild, the
+  `root_intents` fill) is not judged, and the bytes of starting the
+  retention clock on a namespace written before it (`null` becomes the
+  time) are not judged in the commit that does it. `with_config` applies
+  the host's limits from that open commit on.
 
-The complete path (`quota_counts(&State)`) needs the counts before the
-commit only when a count is over its limit after it; it then loads the
-stored revision once more. The format 3 transition path compares the
-maintained `Accounting` before and after the patch. Both count the same:
-`transition_equivalence` compares the maintained counts with `quota_counts`
-at every step (including a clock rebase, a window drop and a deferral), and
-compares the two paths' results, refusals included, at the quota steps.
+So **quotas are soft by one eighth for work in flight.** A full namespace
+refuses new work, while the runs it already holds keep moving and leave.
+On aq-server (`max_runs` 128, `max_receipts` 4,096, `max_state_bytes`
+8 MiB) work in flight may take the namespace to 144 runs, 4,608 receipts and
+9 MiB. The eighth is headroom for what admitted runs add before they
+finish: an `invoke` run adds up to 4 receipts after its admission receipt
+before it leaves, so 128 such runs in flight need 512 receipts above the
+limit, which is exactly the eighth of 4,096. Size `max_receipts` at no less than 8 × `max_runs` × the
+receipts a run adds in flight. At very small limits the eighth rounds down
+(3 / 8 = 0), and then there is no headroom.
 
-A refusal names each quota the commit would grow past its limit, what it
-counts, the count the commit would reach and the limit, for example:
+**When work in flight reaches the ceiling** its steps are refused (the
+refusal says "past its hard ceiling"), and the runs wait. Runs whose next
+step shrinks the record still finish and leave, and window entries still
+drop as their windows pass; each of those makes room. If the namespace
+stays at the ceiling, the operator raises the limit (on aq-server a
+configuration change and restart) or cancels runs, and investigates why so
+much work is in flight: a playbook that writes many receipts per run, or a
+limit sized below the work it admits.
+
+The refusal says which limit, and names each count the commit would grow
+past it:
 
 ```text
-namespace quota exhausted: this commit would hold 3 runs in the record (in progress, or finished and not yet moved to history) (limit max_runs 2)
+the namespace is full for new work: 129 receipts in the record (quota max_receipts 128)
+the namespace is past its hard ceiling: 19 receipts in the record (ceiling 18: quota max_receipts 16 plus one eighth)
 ```
 
+The complete path (`quota_counts(&State)`) needs the counts before the
+commit only when a count is over the limit it is judged by; it then loads
+the stored revision once more. The format 3 transition path compares the
+maintained `Accounting` before and after the patch. The engine marks the
+commit's class on the State it plans (`State::quota_marks`, never stored),
+and both paths judge it with the same function, so they cannot disagree:
+`transition_equivalence` compares the maintained counts with
+`quota_counts` at every step (including a clock rebase, a window drop and a
+deferral), and the two paths' results, refusals included, at the quota
+steps of both gates.
+
 Nothing has to be collected to free a quota: runs leave when they finish and
-window entries when their window passes. To make room sooner, finish or
-cancel runs in progress, or raise the limit.
+window entries when their window passes. To make room for new work sooner,
+finish or cancel runs in progress, or raise the limit.
 
 **A namespace written before this change** still holds the runs that
 finished before the upgrade, and counts them, until the drain moves them

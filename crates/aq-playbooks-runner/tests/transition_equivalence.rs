@@ -537,7 +537,10 @@ fn scenario(p: &mut Pair) {
             },
             303
         ));
-        assert!(refused.contains("namespace quota exhausted"), "{refused}");
+        assert!(
+            refused.contains("the namespace is full for new work"),
+            "{refused}"
+        );
     }
     for config in [&mut p.m.config, &mut p.r.config] {
         *config = EngineConfig::default();
@@ -642,10 +645,52 @@ fn scenario(p: &mut Pair) {
         authority("a"),
         31_600
     ));
-    assert!(refused.contains("namespace quota exhausted"), "{refused}");
+    assert!(
+        refused.contains("the namespace is full for new work"),
+        "{refused}"
+    );
     let landed = both!(p, |e| e.drive(&mut host(), 31_700, 64));
     assert!(landed.starts_with("Ok("), "{landed}");
     assert!(quota_counts(&p.m.snapshot().unwrap()).unwrap().runs < live);
+    // Both gates on both paths: at a full `max_receipts` new work is judged
+    // by the limit and work already admitted by the ceiling.
+    for config in [&mut p.m.config, &mut p.r.config] {
+        *config = EngineConfig::default();
+    }
+    for i in 0..8 {
+        let request = keyed("a", &format!("fill-{i}"), p);
+        both!(p, |e| e.admit_once(request.clone(), 31_750));
+    }
+    both!(p, |e| e.drive(&mut host(), 31_760, 64));
+    let s = p.m.snapshot().unwrap();
+    let held_run = s.keyed_admissions["held"].run_id.clone();
+    assert!(s.runs.contains_key(&held_run));
+    let receipts = quota_counts(&s).unwrap().receipts;
+    assert!(receipts >= 8, "{receipts}");
+    let limit = |p: &mut Pair, max_receipts: usize| {
+        for config in [&mut p.m.config, &mut p.r.config] {
+            *config = EngineConfig {
+                max_receipts,
+                ..EngineConfig::default()
+            };
+        }
+    };
+    limit(p, receipts);
+    let request = keyed("a", "at-full", p);
+    let refused = both!(p, |e| e.admit_once(request.clone(), 31_800));
+    assert!(
+        refused.contains("the namespace is full for new work"),
+        "{refused}"
+    );
+    limit(p, 1);
+    let refused = both!(p, |e| e.cancel(&held_run, 31_801));
+    assert!(
+        refused.contains("the namespace is past its hard ceiling"),
+        "{refused}"
+    );
+    limit(p, receipts);
+    let landed = both!(p, |e| e.cancel(&held_run, 31_802));
+    assert!(landed.starts_with("Ok("), "{landed}");
     for config in [&mut p.m.config, &mut p.r.config] {
         *config = EngineConfig::default();
     }

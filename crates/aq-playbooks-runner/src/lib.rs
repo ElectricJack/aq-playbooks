@@ -23,8 +23,8 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 pub use storage::{MemoryStorage, Storage, StorageError, VersionedState};
 pub use transition::{
-    QuotaCounts, RecordStorage, TransitionOutcome, TransitionRequest, check_quota, over_quota,
-    quota_counts,
+    QuotaCounts, QuotaGate, QuotaMarks, RecordStorage, TransitionOutcome, TransitionRequest,
+    check_quota, over_quota, quota_ceiling, quota_counts,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -112,18 +112,46 @@ enum Finish {
     Host(Option<i64>),
     Licensed,
 }
-/// The counts a commit's quota check judges. A licensed admin commit (clock
-/// rebase, floor lowering) changes nothing but what its licence names (the
-/// removal fences hold it to that), so every byte it adds is its licence's:
-/// it is exempt from `max_state_bytes` for them. It adds no run, event or
-/// receipt.
-fn quota_inputs(mode: Finish, previous: &QuotaCounts, next: &QuotaCounts) -> QuotaCounts {
-    match mode {
-        Finish::Licensed => QuotaCounts {
-            state_bytes: next.state_bytes.min(previous.state_bytes),
-            ..*next
-        },
-        Finish::Host(_) => *next,
+/// The quota check of one commit: the gate it is judged by (see
+/// [`check_quota`]) and the counts it is judged on; `None` when it is not
+/// judged (the upgrade's bookkeeping on open). Bytes the upgrade's
+/// bookkeeping added inside the commit are not judged. A licensed admin
+/// commit (clock rebase, floor lowering) changes nothing but what its
+/// licence names (the removal fences hold it to that), so every byte it adds
+/// is its licence's: it is exempt from `max_state_bytes` for them. It adds
+/// no run, event or receipt.
+fn quota_inputs(
+    mode: Finish,
+    marks: QuotaMarks,
+    previous: &QuotaCounts,
+    next: &QuotaCounts,
+) -> Option<(QuotaGate, QuotaCounts)> {
+    if marks.bookkeeping {
+        return None;
+    }
+    let mut judged = *next;
+    judged.state_bytes = judged.state_bytes.saturating_sub(marks.bookkeeping_bytes);
+    if matches!(mode, Finish::Licensed) {
+        judged.state_bytes = judged.state_bytes.min(previous.state_bytes);
+    }
+    let gate = if marks.new_work {
+        QuotaGate::NewWork
+    } else {
+        QuotaGate::InFlight
+    };
+    Some((gate, judged))
+}
+/// [`check_quota`] for one commit (see [`quota_inputs`]).
+fn judge_quota(
+    config: &EngineConfig,
+    mode: Finish,
+    marks: QuotaMarks,
+    previous: &QuotaCounts,
+    next: &QuotaCounts,
+) -> Result<()> {
+    match quota_inputs(mode, marks, previous, next) {
+        Some((gate, judged)) => check_quota(config, gate, previous, &judged),
+        None => Ok(()),
     }
 }
 /// Of the windows in `policy`, the smallest (at least 1 ms).
@@ -632,6 +660,10 @@ pub struct State {
     /// history in the same commit. Never stored with the State.
     #[serde(skip)]
     pub settled: Vec<SettledCohort>,
+    /// How this commit's quota check judges it, marked while the commit is
+    /// planned. Never stored.
+    #[serde(skip)]
+    pub quota_marks: QuotaMarks,
     #[serde(default)]
     pub indexes: RuntimeIndexes,
     pub artifacts: BTreeMap<String, Artifact>,
@@ -716,6 +748,17 @@ pub struct Engine<S: Storage> {
 }
 impl<S: Storage> Engine<S> {
     pub fn new(store: S, namespace: impl Into<String>, owner: impl Into<String>) -> Result<Self> {
+        Self::open(store, namespace, owner, EngineConfig::default())
+    }
+    /// Acquire the namespace and run the upgrade's bookkeeping commit (index
+    /// rebuild, `root_intents` fill) under `config`. That commit is never
+    /// refused by a quota.
+    fn open(
+        store: S,
+        namespace: impl Into<String>,
+        owner: impl Into<String>,
+        config: EngineConfig,
+    ) -> Result<Self> {
         // A backend (or wrapper) that would drop history fails closed.
         if !store.persists_history() {
             return Err(Error::Refused(
@@ -726,11 +769,12 @@ impl<S: Storage> Engine<S> {
             store,
             namespace: namespace.into(),
             owner: owner.into(),
-            config: EngineConfig::default(),
+            config,
             metrics: metrics::Metrics::default(),
         };
         e.store.acquire(&e.namespace, &e.owner)?;
         e.transaction_at(None, |s| {
+            s.quota_marks.bookkeeping = true;
             if !s.indexes.initialized {
                 indexes::rebuild(s)?;
             }
@@ -755,9 +799,7 @@ impl<S: Storage> Engine<S> {
         {
             return Err(Error::Refused("invalid namespace resource bounds".into()));
         }
-        let mut e = Self::new(store, namespace, owner)?;
-        e.config = config;
-        Ok(e)
+        Self::open(store, namespace, owner, config)
     }
     fn measure_host<T>(&self, f: impl FnOnce() -> T) -> T {
         let started = std::time::Instant::now();
@@ -853,6 +895,7 @@ impl<S: Storage> Engine<S> {
                 .take()
                 .ok_or_else(|| Error::Conflict("transition plan ran twice".into()))?;
             state.protection_available = protection;
+            state.quota_marks = QuotaMarks::default();
             let started = std::time::Instant::now();
             let evaluated = f(state);
             metrics.record_time(metrics::Timing::Transition, started.elapsed());
@@ -863,8 +906,8 @@ impl<S: Storage> Engine<S> {
             }
             Ok(changed)
         };
-        let validate = |_: &State, previous: &QuotaCounts, next: &QuotaCounts| {
-            check_quota(config, previous, &quota_inputs(now_ms, previous, next))
+        let validate = |state: &State, previous: &QuotaCounts, next: &QuotaCounts| {
+            judge_quota(config, now_ms, state.quota_marks, previous, next)
         };
         let started = std::time::Instant::now();
         let outcome = self.store.transition_v1(
@@ -894,6 +937,7 @@ impl<S: Storage> Engine<S> {
             indexes::rebuild(&mut v.state)?;
         }
         v.state.protection_available = protection;
+        v.state.quota_marks = QuotaMarks::default();
         let started = std::time::Instant::now();
         let evaluated = f(&mut v.state);
         self.metrics
@@ -904,15 +948,14 @@ impl<S: Storage> Engine<S> {
         }
         let report = finish(&mut v.state, now_ms)?;
         let next = quota_counts(&v.state)?;
-        if over_quota(&self.config, &next) {
-            // Only a commit over a limit needs the counts before it (one
-            // more load and serialization, on this path only).
+        let marks = v.state.quota_marks;
+        // Only a commit over a limit needs the counts before it (one more
+        // load and serialization, on this path only).
+        if quota_inputs(now_ms, marks, &next, &next)
+            .is_some_and(|(gate, judged)| over_quota(&self.config, gate, &judged))
+        {
             let previous = self.stored_counts(v.revision)?;
-            check_quota(
-                &self.config,
-                &previous,
-                &quota_inputs(now_ms, &previous, &next),
-            )?;
+            judge_quota(&self.config, now_ms, marks, &previous, &next)?;
         }
         let started = std::time::Instant::now();
         let committed =
@@ -944,6 +987,7 @@ impl<S: Storage> Engine<S> {
             {
                 return Err(Error::Conflict("artifact replacement".into()));
             }
+            s.quota_marks.new_work = true;
             s.artifacts.insert(artifact.digest.clone(), artifact);
             Ok(())
         })
@@ -986,6 +1030,7 @@ impl<S: Storage> Engine<S> {
                 .get(artifact)
                 .ok_or_else(|| Error::NotFound(artifact.into()))?;
             check_authority(a, &authority)?;
+            s.quota_marks.new_work = true;
             s.catalog_revision += 1;
             let controls = s
                 .bindings
@@ -1313,6 +1358,7 @@ impl<S: Storage> Engine<S> {
             }
             s.sequence += 1;
             let sequence = s.sequence;
+            s.quota_marks.new_work = true;
             s.events.insert(
                 key.clone(),
                 AcceptedEvent {
@@ -1992,6 +2038,7 @@ fn admit_run(
     if s.runs.contains_key(&id) {
         return Ok(());
     }
+    s.quota_marks.new_work = true;
     ensure_admission_protection(
         s,
         artifact,

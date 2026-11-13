@@ -73,9 +73,11 @@ bytes. They count what the record holds: work in progress and the replay
 windows (finished runs leave as history, which counts toward no quota).
 Artifacts bound payloads, visits, nested iterations, history, duration,
 children, depth and concurrent work. Execution-budget exhaustion settles owned
-work and fails once. A quota refuses only a commit that grows its count past the
-limit, so the work that frees a full namespace always lands. Quota refusal
-preserves existing obligations and names the quota that is full.
+work and fails once. Limits gate admission, not progress: a commit that brings
+new work in is refused when it grows a count past its configured limit; steps of
+work already admitted are judged against a hard ceiling of the limit plus one
+eighth, so they keep moving at a full quota. Quota refusal preserves existing
+obligations and says which limit is reached.
 
 `RetentionPolicy` declares event replay, keyed admission and audit windows. Its
 `terminal_run_ms` and `max_tombstones` are accepted and ignored. Bounded GC pages persist their scan cursor, preserve
