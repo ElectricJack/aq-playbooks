@@ -22,7 +22,10 @@ Expressions have no side effects and deterministic ordered arrays. References
 traverse named roots using object keys or zero-based array-index strings. Missing,
 null, and unknown are distinct; even boolean short circuits preserve unresolved
 required inputs. Exists maps Missing to false and Known(null) to true; Unknown
-stays Unknown. Filter preserves order; map preserves length/order; difference
+stays Unknown. Filter preserves order; map preserves length/order; an item whose
+body is Unknown makes either one Unknown at once, and an item whose body is
+Missing makes it Missing only once every item is evaluated and none was
+Unknown, so a Missing item never hides an Unknown one; difference
 preserves left order and rejects missing/duplicate identities in either input.
 Collection lexical roots cannot shadow existing roots. Every evaluation has
 explicit depth, cumulative node/element work and serialized-byte limits.
@@ -79,7 +82,9 @@ once per item. Validation refuses an expression that uses `lookup` or `let`
 when, on its worst path (every map or filter at its `max_items`, the costliest
 lookup branch), it could exceed either limit, so such an expression never fails
 on them at run time. A 256-case lookup on a plain key, inside a map, therefore
-fits a `max_items` of at most 38.
+fits a `max_items` of at most 38. The compiler also holds every expression of a new draft
+to the depth limit; verifying a stored artifact does not, so artifacts stored
+before these rules keep loading.
 
 Diagnostics for both name the place inside the step, for example
 `steps.route.input.level.lookup.cases[0].when`: object fields by name, array

@@ -142,7 +142,9 @@ pub fn validate(input: &CompileInput) -> Vec<Diagnostic> {
     }
     if let Some(header) = header {
         let c = content(input, header);
-        for issue in c.validate_structure() {
+        let mut found = c.validate_structure();
+        draft_depth_issues(&c.playbook, &mut found);
+        for issue in found {
             let mut d = Diagnostic::error(&issue.code, &issue.path, issue.message);
             if let Some(loc) = c.source_map.get(&issue.path) {
                 d.line = Some(loc.line);
@@ -152,6 +154,115 @@ pub fn validate(input: &CompileInput) -> Vec<Diagnostic> {
         }
     }
     issues
+}
+/// Every expression of an operation, with its location inside the step.
+fn step_exprs(op: &Operation) -> Vec<(String, &Expr)> {
+    match op {
+        Operation::Invoke { input, .. } | Operation::Call { input, .. } => {
+            vec![("input".into(), input)]
+        }
+        Operation::Decide { predicate } => vec![("predicate".into(), predicate)],
+        Operation::Wait {
+            correlation,
+            minimum_revision,
+            ..
+        } => correlation
+            .iter()
+            .map(|(k, e)| (format!("correlation.{k}"), e))
+            .chain(
+                minimum_revision
+                    .iter()
+                    .map(|e| ("minimum_revision".into(), e)),
+            )
+            .collect(),
+        Operation::ForEach { collection, .. } => vec![("collection".into(), collection)],
+        Operation::Join { members, .. } => members
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (format!("members[{i}]"), e))
+            .collect(),
+        Operation::Return { output, .. } => vec![("output".into(), output)],
+    }
+}
+/// Nesting depth as evaluation counts it (the root is 0), and whether the
+/// expression uses lookup or let (the model already bounds those).
+fn depth(expr: &Expr) -> (usize, bool) {
+    let children: Vec<&Expr> = match expr {
+        Expr::Literal { .. } | Expr::Ref { .. } => vec![],
+        Expr::Object { fields } => fields.values().collect(),
+        Expr::Array { items: values } | Expr::And { values } | Expr::Or { values } => {
+            values.iter().collect()
+        }
+        Expr::Exists { value } | Expr::Not { value } => vec![value],
+        Expr::Eq { left, right }
+        | Expr::Lt { left, right }
+        | Expr::Difference { left, right, .. }
+        | Expr::Contains {
+            collection: left,
+            value: right,
+        }
+        | Expr::Map {
+            collection: left,
+            value: right,
+            ..
+        }
+        | Expr::Filter {
+            collection: left,
+            predicate: right,
+            ..
+        } => vec![left, right],
+        Expr::Lookup {
+            key,
+            cases,
+            default,
+        } => [&**key, &**default]
+            .into_iter()
+            .chain(cases.iter().map(|c| &c.then))
+            .collect(),
+        Expr::Let { bindings, body } => {
+            bindings.iter().map(|b| &b.value).chain([&**body]).collect()
+        }
+    };
+    let own = matches!(expr, Expr::Lookup { .. } | Expr::Let { .. });
+    children
+        .into_iter()
+        .map(depth)
+        .fold((0, own), |(d, l), (cd, cl)| (d.max(cd + 1), l || cl))
+}
+/// A new draft is held to the evaluator's depth limit in every expression.
+/// The model checks this only for lookup and let, because it also verifies
+/// stored artifacts, which must keep loading; an expression past the limit
+/// fails on every evaluation, so refusing it in a draft costs nothing.
+fn draft_depth_issues(playbook: &Playbook, issues: &mut Vec<ValidationIssue>) {
+    let limit = EvalLimits::default().max_depth;
+    let steps = playbook.steps.iter().flat_map(|(name, step)| {
+        step_exprs(&step.op)
+            .into_iter()
+            .map(move |(at, e)| (format!("steps.{name}"), at, e))
+    });
+    let triggers = playbook
+        .triggers
+        .iter()
+        .map(|t| (format!("triggers.{}", t.id), "input".to_string(), &t.input));
+    for (path, at, expr) in steps.chain(triggers).collect::<Vec<_>>() {
+        let (levels, bounded_by_model) = depth(expr);
+        let place = format!("{path}.{at}");
+        // Typing already refuses most deep expressions; say it once.
+        let reported = issues.iter().any(|i| {
+            i.path == path
+                && i.message.starts_with(&place)
+                && i.message.contains("expression nesting exceeds 32")
+        });
+        if levels > limit && !bounded_by_model && !reported {
+            issues.push(ValidationIssue {
+                code: "expression_limit".into(),
+                path,
+                message: format!(
+                    "{place}: nests {levels} levels deep; evaluation stops past depth {limit}. Flatten it: move part of the work to an earlier step, or bind shared parts once."
+                ),
+            });
+        }
+    }
 }
 pub fn compile(input: &CompileInput) -> Result<Artifact, Vec<Diagnostic>> {
     let diagnostics = validate(input);
@@ -903,5 +1014,76 @@ mod tests {
             .insert("not_in_schema".into());
         f.registry.events.insert(event.name.clone(), event);
         assert!(codes(&f).contains("sensitive_field"));
+    }
+    /// `objects` nested objects around `not(true)`, and the matching schema.
+    fn nested(objects: usize) -> (Expr, Schema) {
+        let mut expr = Expr::Not {
+            value: Box::new(Expr::literal(true)),
+        };
+        let mut schema = Schema::Boolean;
+        for _ in 0..objects {
+            expr = Expr::Object {
+                fields: BTreeMap::from([("a".into(), expr)]),
+            };
+            schema = Schema::object(BTreeMap::from([("a".into(), schema)]));
+        }
+        (expr, schema)
+    }
+    fn returning(output: Expr, done: Schema) -> CompileInput {
+        let mut f = fixture();
+        f.proposal
+            .playbook
+            .entries
+            .get_mut("main")
+            .unwrap()
+            .outcomes = BTreeMap::from([("done".into(), done)]);
+        if let Operation::Return { output: o, .. } =
+            &mut f.proposal.playbook.steps.get_mut("finish").unwrap().op
+        {
+            *o = output;
+        }
+        f
+    }
+    #[test]
+    fn a_new_draft_is_held_to_the_evaluation_depth_everywhere() {
+        // 31 objects around not(true) nest 32 deep: evaluation's limit.
+        let (expr, schema) = nested(31);
+        assert!(compile(&returning(expr, schema)).is_ok());
+        // 32 objects nest 33 deep. The model accepts it (object descent does
+        // not count depth, and stored artifacts must keep verifying), but every
+        // evaluation fails, so a new draft is refused.
+        let (expr, schema) = nested(32);
+        let f = returning(expr.clone(), schema);
+        let diagnostics = validate(&f);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].code, "expression_limit");
+        assert_eq!(diagnostics[0].path, "steps.finish");
+        assert!(
+            diagnostics[0].message.starts_with(
+                "steps.finish.output: nests 33 levels deep; evaluation stops past depth 32"
+            ),
+            "{diagnostics:?}"
+        );
+        let header = parse_source_header(&f.source).unwrap();
+        let stored = Artifact::seal(content(&f, header)).unwrap();
+        assert!(stored.verify().is_ok());
+        assert!(
+            eval(&expr, &BTreeMap::new(), &EvalLimits::default()).is_err(),
+            "evaluation refuses it"
+        );
+        // A fault the model already reports for depth is not reported twice.
+        let mut deep = Expr::literal(true);
+        for _ in 0..40 {
+            deep = Expr::Not {
+                value: Box::new(deep),
+            };
+        }
+        let diagnostics = validate(&returning(deep, Schema::Boolean));
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("expression nesting exceeds 32")
+        );
     }
 }

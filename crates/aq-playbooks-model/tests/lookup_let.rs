@@ -914,6 +914,113 @@ fn diagnostics_name_the_place_the_key_type_and_the_branch_once() {
     );
 }
 
+/// `map` or `filter` over `[0, 1]` whose body is Missing for item `missing`
+/// and Unknown for item `unknown`.
+fn collection_over(filter: bool, missing: i64, unknown: i64) -> Expr {
+    let body = lookup(
+        r("i", &[]),
+        vec![
+            case(json!(missing), r("input", &["absent"])),
+            case(json!(unknown), r("stale", &[])),
+        ],
+        lit(json!(true)),
+    );
+    let collection = Box::new(lit(json!([0, 1])));
+    if filter {
+        Expr::Filter {
+            collection,
+            item: "i".into(),
+            predicate: Box::new(body),
+            max_items: 2,
+        }
+    } else {
+        Expr::Map {
+            collection,
+            item: "i".into(),
+            value: Box::new(body),
+            max_items: 2,
+        }
+    }
+}
+
+#[test]
+fn map_and_filter_never_let_a_missing_item_hide_an_unknown_one() {
+    let ctx = BTreeMap::from([
+        ("input".into(), known(json!({}))),
+        ("stale".into(), EvalValue::Unknown("revision".into())),
+    ]);
+    let stale = EvalValue::Unknown("revision".into());
+    for filter in [false, true] {
+        // Missing then Unknown, and Unknown then Missing: Unknown either way.
+        assert_eq!(ev(&collection_over(filter, 0, 1), &ctx), stale, "{filter}");
+        assert_eq!(ev(&collection_over(filter, 1, 0), &ctx), stale, "{filter}");
+        // The reviewer's probe: a lookup keyed on it never takes its default.
+        let keyed = lookup(
+            collection_over(filter, 0, 1),
+            vec![case(json!([]), lit(json!("EMPTY")))],
+            lit(json!("DEFAULT")),
+        );
+        assert_eq!(ev(&keyed, &ctx), stale, "{filter}");
+        // Missing alone is still Missing (and so takes a lookup's default).
+        let only_missing = collection_over(filter, 0, 7);
+        assert_eq!(ev(&only_missing, &ctx), EvalValue::Missing, "{filter}");
+        let keyed = lookup(only_missing, vec![], lit(json!("DEFAULT")));
+        assert_eq!(ev(&keyed, &ctx), known(json!("DEFAULT")), "{filter}");
+        // Known items are unchanged.
+        let all_known = collection_over(filter, 7, 8);
+        let expected = if filter {
+            json!([0, 1])
+        } else {
+            json!([true, true])
+        };
+        assert_eq!(ev(&all_known, &ctx), known(expected), "{filter}");
+    }
+}
+
+#[test]
+fn an_empty_collection_item_satisfies_a_boolean_position() {
+    let none = || lit(json!([]));
+    let item = || r("h", &[]);
+    let filtered = |predicate: Expr| Expr::Filter {
+        collection: Box::new(none()),
+        item: "h".into(),
+        predicate: Box::new(predicate),
+        max_items: 4,
+    };
+    let strings = Schema::Array {
+        items: Box::new(Schema::string(16)),
+        max_items: 4,
+    };
+    for predicate in [
+        item(),
+        Expr::Not {
+            value: Box::new(item()),
+        },
+        Expr::And {
+            values: vec![item(), lit(json!(true))],
+        },
+        Expr::Or {
+            values: vec![item(), lit(json!(false))],
+        },
+    ] {
+        let issues = returning(filtered(predicate.clone()), strings.clone());
+        assert!(issues.is_empty(), "{predicate:?}: {issues:?}");
+    }
+    // A non-boolean item is still refused.
+    let numbers = Expr::Filter {
+        collection: Box::new(lit(json!([1]))),
+        item: "h".into(),
+        predicate: Box::new(item()),
+        max_items: 4,
+    };
+    assert!(has_issue(
+        &returning(numbers, strings),
+        "expression_type",
+        "steps.finish",
+        "filter predicate requires boolean"
+    ));
+}
+
 /// Canonical bytes of pilot artifacts written by `aq-playbooks examples` at
 /// 92fcc42, before `lookup` and `let` existed. Adding expression variants must
 /// not change the bytes, digest or executable fingerprint of an artifact that

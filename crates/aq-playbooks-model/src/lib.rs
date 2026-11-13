@@ -999,6 +999,9 @@ fn eval_inner(
                 ));
             }
             let mut result = vec![];
+            // An Unknown item is the result at once. A Missing item does not
+            // stop the loop, so a later Unknown is never hidden behind it.
+            let mut missing = false;
             for v in source {
                 let mut local = context.clone();
                 local.insert(item.clone(), EvalValue::Known(v.clone()));
@@ -1016,8 +1019,12 @@ fn eval_inner(
                             result.push(m);
                         }
                     }
-                    unknown => return Ok(unknown),
+                    EvalValue::Missing => missing = true,
+                    unknown @ EvalValue::Unknown(_) => return Ok(unknown),
                 }
+            }
+            if missing {
+                return Ok(EvalValue::Missing);
             }
             known(Value::Array(result))
         }
@@ -2638,6 +2645,10 @@ fn no_type() -> Schema {
 fn is_no_type(schema: &Schema) -> bool {
     matches!(schema, Schema::Union { variants } if variants.is_empty())
 }
+/// A boolean position also accepts a value of no type (an item of `[]`).
+fn is_boolean(schema: &Schema) -> bool {
+    *schema == Schema::Boolean || is_no_type(schema)
+}
 fn literal_schema(value: &Value) -> Result<Schema, String> {
     match value {
         Value::Null => Ok(Schema::Null),
@@ -2949,14 +2960,14 @@ fn infer_node(
             Ok(Schema::Boolean)
         }
         Expr::Not { value } => {
-            if sub(value, ".value")? != Schema::Boolean {
+            if !is_boolean(&sub(value, ".value")?) {
                 return Err("not requires boolean expression".into());
             }
             Ok(Schema::Boolean)
         }
         Expr::And { values } | Expr::Or { values } => {
             for (i, e) in values.iter().enumerate() {
-                if sub(e, &format!(".values[{i}]"))? != Schema::Boolean {
+                if !is_boolean(&sub(e, &format!(".values[{i}]"))?) {
                     return Err("boolean logic requires booleans".into());
                 }
             }
@@ -3022,7 +3033,7 @@ fn infer_node(
             let field = if filter { ".predicate" } else { ".value" };
             let result = infer_expr(value, &local, depth + 1, &operand(at, expr, field))?;
             if filter {
-                if result != Schema::Boolean {
+                if !is_boolean(&result) {
                     return Err("filter predicate requires boolean".into());
                 }
                 Ok(Schema::Array {
