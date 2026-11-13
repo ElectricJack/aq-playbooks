@@ -1,58 +1,1930 @@
 //! Checks a new draft is held to that `Artifact::verify` does not run, so an
-//! artifact stored before them keeps loading:
+//! artifact stored before them keeps loading (FORMAT.md, "What a draft is
+//! held to"):
 //! - a join member that is an operation handle is named by its binding alone;
-//! - a read through a field that some way of reaching the step lacks (an
-//!   outcome without it, a join member that has not answered, a wait that
-//!   timed out) is refused, except inside `exists`;
-//! - so is a read of a binding on some way to the step that never bound it:
-//!   around the step that binds it, or through that step's `on_error`.
+//! - strict reads: a read through a field that some outcome lacks is refused;
+//! - bound reads: so is a read of a binding some way to the step never bound;
+//! - aliasing does not launder: so is a read through any expression that
+//!   carries such a value;
+//! - bounded cost: an expression may expand to a bounded number of nodes.
+//!
+//! All of it rests on ONE derivation, `Pass::derive`: what every expression
+//! carries (`Carried`: the forms its value can have on each way of reaching
+//! the step, the ways it is Missing, and its expanded size). It is one match
+//! over every `Expr` variant; `ArtifactContent::parts` is one match over every
+//! `Operation` and says how each step puts a value in scope (`Held`); and
+//! `Pass::reserved` is one match over the reserved roots. None has a wildcard
+//! arm, and the lints below refuse one, so a new variant does not compile
+//! until it is decided here. A read is refused where a Missing value is
+//! consumed (`Pass::sink`): there is no second walk over expressions.
 //!
 //! Ordinary typing merges the outcomes a binding can hold into one object, in
 //! which a field only one outcome has is merely optional, and an optional
 //! field types as present. Here each binding keeps its outcomes apart.
+#![deny(
+    clippy::wildcard_enum_match_arm,
+    clippy::match_wildcard_for_single_variants
+)]
 use super::*;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 
-/// One shape a binding can have on one way of reaching a step.
-#[derive(Clone, PartialEq)]
-enum Variant {
-    /// Reads follow this schema; a field optional in it is readable.
-    Shape(Schema),
-    /// Not there at all on this way.
-    Absent,
-    /// Bound, in a shape this check does not follow.
-    Bound,
-    /// Missing, for the reason given (an alias of a field some way lacks).
-    Lacks(String),
-    /// A named join's result, or an object or array an expression builds:
-    /// each key's (or position's) own variants.
-    Keys(BTreeMap<String, Variants>),
-    /// `variant`, read from the reference written as the string: reasons
-    /// name it as a direct read would.
-    Origin(String, Box<Variant>),
+/// The most nodes one expression of a new draft may expand to, and all of
+/// its expressions together. A reference to a `let` name or a `map` or
+/// `filter` item counts what the name stands for; a reference to anything
+/// else (`input`, `event`, `definitions`, `vars`, a step's binding, a
+/// `for_each` item) counts the nodes of the type it reads.
+pub const MAX_DRAFT_EXPANSION: u64 = 200_000;
+pub const MAX_DRAFT_EXPANSION_TOTAL: u64 = 1_000_000;
+/// The most type nodes all the steps of a draft may have in scope together:
+/// for each step, the types of its entry's `input`, of the definitions and of
+/// every binding and item of the playbook. Ordinary typing copies them for
+/// every step, several times, when a draft is checked and on every load.
+pub const MAX_DRAFT_SCOPE: u64 = 250_000;
+/// The most times the flow over the steps may revisit them before the draft
+/// is refused as too entangled to check.
+const MAX_FLOW_VISITS_PER_STEP: usize = 64;
+/// The deepest a `for_each` item's derived value may nest.
+const MAX_ITEM_DEPTH: u32 = 256;
+
+// ---------------------------------------------------------------------------
+// What a value is.
+// ---------------------------------------------------------------------------
+
+/// What a value can be, over every way of reaching the step that reads it.
+#[derive(Clone)]
+struct Carried<'a> {
+    /// Ways on which the value is not there, not yet read by any reference:
+    /// only the values steps put in scope have these.
+    lacks: Vec<Rc<str>>,
+    /// Ways on which the value is Missing because a reference inside the
+    /// expression that computed it read something that was not there.
+    gaps: Gaps,
+    /// What it is where it is there: one form per way.
+    forms: Rc<[Form<'a>]>,
+    /// Nodes of its type, as ordinary typing would build it.
+    nodes: u64,
+    /// How deep its built forms nest.
+    depth: u32,
 }
-/// Variants with the way each one arises, for diagnostics.
-type Variants = Vec<(Variant, String)>;
-type Context = BTreeMap<String, Variants>;
+/// One form a present value has.
+#[derive(Clone)]
+enum Form<'a> {
+    /// A value of this schema, arising on `way`; `name` is how a direct
+    /// reference writes it. A field optional in the schema is readable.
+    Shape {
+        schema: &'a Schema,
+        way: Rc<str>,
+        name: Rc<str>,
+    },
+    /// A present value whose inside this check does not follow (a literal, a
+    /// boolean, a scalar, a result ordinary typing gives no shape); the
+    /// number is the node count of its type.
+    Opaque(u64),
+    /// An object or array an expression builds, a named join's result, or
+    /// `vars`: each key or position with what it carries.
+    Built(Rc<Built<'a>>),
+    /// An array whose every item is this (the result of `map`, `filter` or
+    /// `difference`).
+    Items(Rc<Carried<'a>>),
+}
+struct Built<'a> {
+    parts: BTreeMap<String, Carried<'a>>,
+    array: bool,
+    nodes: u64,
+    depth: u32,
+}
+/// A set of gaps, shared: joining two sets never copies either.
+type Gaps = Option<Rc<GapNode>>;
+enum GapNode {
+    /// `read` found the value missing for `reason`.
+    Leaf {
+        reason: Rc<str>,
+        read: Rc<Read>,
+    },
+    All(Vec<Rc<GapNode>>),
+    /// The gaps of the value a lexical name holds, used through that name.
+    Via(Rc<str>, Rc<GapNode>),
+}
+/// A reference, as written, that read a value some way lacks.
+struct Read {
+    at: String,
+    written: String,
+    note: Option<String>,
+    /// Read as the identity of a `difference` item: `exists` cannot test it.
+    identity: bool,
+}
+fn join_gaps(parts: impl IntoIterator<Item = Gaps>) -> Gaps {
+    let mut nodes: Vec<Rc<GapNode>> = parts.into_iter().flatten().collect();
+    if nodes.len() > 1 {
+        Some(Rc::new(GapNode::All(nodes)))
+    } else {
+        nodes.pop()
+    }
+}
 
-fn add_all(into: &mut Variants, from: &Variants) -> bool {
+/// Identity of a form, for keeping each once.
+#[derive(PartialEq, Eq, Hash)]
+enum FormKey {
+    Shape(*const Schema, Rc<str>),
+    Opaque(u64),
+    Built(*const ()),
+    Items(*const ()),
+}
+impl Form<'_> {
+    fn key(&self) -> FormKey {
+        match self {
+            Form::Shape { schema, way, .. } => {
+                FormKey::Shape(std::ptr::from_ref(*schema), way.clone())
+            }
+            Form::Opaque(nodes) => FormKey::Opaque(*nodes),
+            Form::Built(built) => FormKey::Built(Rc::as_ptr(built).cast()),
+            Form::Items(items) => FormKey::Items(Rc::as_ptr(items).cast()),
+        }
+    }
+}
+/// Identity of a built value: equal ones are built once and shared, so that
+/// deriving the same value again gives the very same form.
+#[derive(PartialEq, Eq, Hash)]
+enum BuiltKey {
+    Parts(bool, Vec<(String, PartKey)>),
+    Items(PartKey),
+}
+type PartKey = (Vec<Rc<str>>, Vec<FormKey>);
+/// `None` where the part has gaps of its own: such a value is not shared.
+fn part_key(part: &Carried<'_>) -> Option<PartKey> {
+    part.gaps.is_none().then(|| {
+        (
+            part.lacks.clone(),
+            part.forms.iter().map(Form::key).collect(),
+        )
+    })
+}
+/// Collects what a value carries, each form and lack once.
+#[derive(Default)]
+struct Build<'a> {
+    lacks: Vec<Rc<str>>,
+    gaps: Vec<Gaps>,
+    forms: Vec<Form<'a>>,
+    seen: HashSet<FormKey>,
+}
+impl<'a> Build<'a> {
+    fn form(&mut self, form: Form<'a>) {
+        if self.seen.insert(form.key()) {
+            self.forms.push(form);
+        }
+    }
+    fn lack(&mut self, text: &str) {
+        if !self.lacks.iter().any(|l| **l == *text) {
+            self.lacks.push(text.into());
+        }
+    }
+    /// Everything `other` carries.
+    fn all(&mut self, other: &Carried<'a>) {
+        for lack in &other.lacks {
+            self.lack(lack);
+        }
+        self.gaps.push(other.gaps.clone());
+        for form in other.forms.iter() {
+            self.form(form.clone());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// How a value enters scope.
+// ---------------------------------------------------------------------------
+
+/// What a step leaves in its binding (or a `for_each` in its item) on one
+/// exit. Every kind of step binding is one of these.
+enum Held<'a> {
+    /// A value of this schema: an invoke or call outcome, a received event.
+    Shape(&'a Schema),
+    /// Nothing: the name is not bound on this exit.
+    Unbound,
+    /// A value ordinary typing gives no shape, so no read of it types.
+    Unfollowed,
+    /// A named join's result: what each key holds.
+    Members(BTreeMap<&'a str, Vec<Member<'a>>>),
+    /// An item of this collection, evaluated where the step runs.
+    ItemOf(&'a Expr),
+}
+/// What one key of a named join's result holds on one edge.
+enum Member<'a> {
+    /// The member answered with this outcome and output.
+    Answer(&'a str, &'a Schema),
+    /// The member's answer, any outcome, perhaps without outcome and output.
+    Loose(&'a Schema),
+    /// The key is not in the result, for this reason.
+    Absent(&'static str),
+}
+/// One way out of a step: where it leads, and what it leaves bound.
+struct Exit<'a> {
+    to: &'a str,
+    /// Names the way, for a diagnostic.
+    way: String,
+    holds: Option<(&'a str, Held<'a>)>,
+}
+/// Everything about one step this check uses: the expressions it evaluates
+/// and its exits.
+struct Parts<'a> {
+    exprs: Vec<(String, &'a Expr)>,
+    exits: Vec<Exit<'a>>,
+}
+/// A reserved root.
+#[derive(Clone, Copy)]
+enum Reserved {
+    Input,
+    Event,
+    Definitions,
+    Vars,
+}
+impl Reserved {
+    /// In the order of `RESERVED_ROOTS`.
+    const ALL: [Reserved; 4] = [
+        Reserved::Input,
+        Reserved::Event,
+        Reserved::Definitions,
+        Reserved::Vars,
+    ];
+    fn name(self) -> &'static str {
+        match self {
+            Reserved::Input => "input",
+            Reserved::Event => "event",
+            Reserved::Definitions => "definitions",
+            Reserved::Vars => "vars",
+        }
+    }
+    fn named(root: &str) -> Option<Reserved> {
+        Self::ALL.into_iter().find(|r| r.name() == root)
+    }
+}
+/// Where an expression is evaluated.
+#[derive(Clone, Copy)]
+enum Place<'a, 'c> {
+    /// In a step of `entry`, with these bindings.
+    Step {
+        entry_name: &'a str,
+        entry: &'a EntryPoint,
+        context: &'c Context<'a>,
+    },
+    /// In a trigger's `input`, with this event payload.
+    Trigger { payload: Option<&'a Schema> },
+}
+/// Every binding and `for_each` item of the playbook at one step.
+type Context<'a> = BTreeMap<&'a str, Rc<Carried<'a>>>;
+
+/// Schemas this check reads that the artifact does not hold as such.
+struct Sources {
+    definitions: Option<Schema>,
+    child: Schema,
+    /// Per named join step: each key's answer of any outcome.
+    loose: BTreeMap<String, BTreeMap<String, Schema>>,
+    /// Per named join step: each member's outcomes.
+    outcomes: BTreeMap<String, Vec<BTreeMap<String, Schema>>>,
+}
+impl Sources {
+    fn new(content: &ArtifactContent) -> Self {
+        let definitions = literal_schema(&Value::Object(
+            content
+                .definitions
+                .iter()
+                .map(|(k, d)| (k.clone(), d.value.clone()))
+                .collect(),
+        ))
+        .ok();
+        let mut loose = BTreeMap::new();
+        let mut outcomes = BTreeMap::new();
+        for (name, step) in &content.playbook.steps {
+            let Operation::Join {
+                members,
+                member_keys,
+                ..
+            } = &step.op
+            else {
+                continue;
+            };
+            if member_keys.is_empty() || member_keys.len() != members.len() {
+                continue;
+            }
+            let Ok(Some(Schema::Object { properties, .. })) = content.join_schema(step, false)
+            else {
+                continue;
+            };
+            let Ok(each) = members
+                .iter()
+                .map(|m| content.member_outcomes(m))
+                .collect::<Result<Vec<_>, _>>()
+            else {
+                continue;
+            };
+            loose.insert(name.clone(), properties);
+            outcomes.insert(name.clone(), each);
+        }
+        Self {
+            definitions,
+            child: Schema::object(BTreeMap::from([("child".into(), Schema::string(128))])),
+            loose,
+            outcomes,
+        }
+    }
+}
+
+impl ArtifactContent {
+    /// The expressions and exits of the step `name`: the one place that says,
+    /// for every kind of operation, how it puts a value in scope.
+    fn parts<'a>(&'a self, sources: &'a Sources, name: &'a str, step: &'a Step) -> Parts<'a> {
+        let edges = |holds: &dyn Fn(&'a str) -> (String, Option<(&'a str, Held<'a>)>)| {
+            step.edges
+                .iter()
+                .map(|(edge, to)| {
+                    let (way, holds) = holds(edge);
+                    Exit { to, way, holds }
+                })
+                .collect::<Vec<_>>()
+        };
+        let failed = |bind: Option<&'a str>| {
+            step.on_error.as_deref().map(|to| Exit {
+                to,
+                way: format!("the `on_error` exit of step `{name}`"),
+                holds: bind.map(|b| (b, Held::Unbound)),
+            })
+        };
+        let outcome = |edge: &str| format!("outcome `{edge}` of step `{name}`");
+        let (exprs, mut exits, bind): (Vec<(String, &Expr)>, Vec<Exit>, Option<&str>) = match &step
+            .op
+        {
+            Operation::Invoke {
+                command,
+                input,
+                bind,
+                retry: _,
+            } => {
+                let outcomes = self.registry.commands.get(&command.name);
+                let exits = edges(&|edge| {
+                    let held = match outcomes.and_then(|c| c.outcomes.get(edge)) {
+                        Some(schema) => Held::Shape(schema),
+                        None => Held::Unfollowed,
+                    };
+                    (outcome(edge), Some((bind.as_str(), held)))
+                });
+                (vec![("input".into(), input)], exits, Some(bind))
+            }
+            Operation::Decide { predicate } => (
+                vec![("predicate".into(), predicate)],
+                edges(&|edge| (format!("edge `{edge}` of step `{name}`"), None)),
+                None,
+            ),
+            Operation::Wait {
+                event,
+                correlation,
+                minimum_revision,
+                deadline_ms: _,
+                bind,
+            } => {
+                let payload = event
+                    .as_ref()
+                    .and_then(|e| self.registry.events.get(&e.name))
+                    .map(|e| &e.payload);
+                // Only a received event binds; a timeout, and a timer,
+                // bind nothing.
+                let exits = edges(&|edge| {
+                    let held = match (event, edge) {
+                        (Some(_), "received") => match payload {
+                            Some(schema) => Held::Shape(schema),
+                            None => Held::Unfollowed,
+                        },
+                        (Some(_) | None, _) => Held::Unbound,
+                    };
+                    (
+                        format!("edge `{edge}` of wait `{name}`"),
+                        Some((bind.as_str(), held)),
+                    )
+                });
+                let exprs = correlation
+                    .iter()
+                    .map(|(k, e)| (format!("correlation.{k}"), e))
+                    .chain(
+                        minimum_revision
+                            .iter()
+                            .map(|e| ("minimum_revision".into(), e)),
+                    )
+                    .collect();
+                (exprs, exits, Some(bind))
+            }
+            Operation::ForEach {
+                collection,
+                item,
+                body,
+                next,
+                max_items: _,
+                concurrency: _,
+                on_failure: _,
+            } => {
+                // The item is bound for the body only: the runner removes
+                // it when the loop ends or fails.
+                let mut exits = vec![
+                    Exit {
+                        to: body,
+                        way: format!("the body of for_each `{name}`"),
+                        holds: Some((item, Held::ItemOf(collection))),
+                    },
+                    Exit {
+                        to: next,
+                        way: format!("the `next` exit of for_each `{name}`"),
+                        holds: Some((item, Held::Unbound)),
+                    },
+                ];
+                exits.extend(edges(&|edge| {
+                    (
+                        format!("edge `{edge}` of for_each `{name}`"),
+                        Some((item.as_str(), Held::Unbound)),
+                    )
+                }));
+                (vec![("collection".into(), collection)], exits, Some(item))
+            }
+            Operation::Call {
+                dependency,
+                entry,
+                input,
+                mode,
+                bind,
+            } => {
+                let interface = self
+                    .dependencies
+                    .get(dependency)
+                    .and_then(|d| d.interfaces.get(entry));
+                let exits = edges(&|edge| {
+                    let held = match mode {
+                        CallMode::Wait => match interface.and_then(|i| i.outcomes.get(edge)) {
+                            Some(schema) => Held::Shape(schema),
+                            None => Held::Unfollowed,
+                        },
+                        // The child's identity: `{child}`.
+                        CallMode::OwnedAsync | CallMode::Independent => Held::Shape(&sources.child),
+                    };
+                    (outcome(edge), Some((bind.as_str(), held)))
+                });
+                (vec![("input".into(), input)], exits, Some(bind))
+            }
+            Operation::Join {
+                members,
+                member_keys,
+                mode,
+                accepted_outcomes,
+                deadline_ms: _,
+                remaining: _,
+                bind,
+            } => {
+                let exits = edges(&|edge| {
+                    let held = match (sources.loose.get(name), sources.outcomes.get(name)) {
+                        (Some(loose), Some(outcomes)) => join_members(
+                            edge,
+                            mode,
+                            accepted_outcomes,
+                            member_keys,
+                            loose,
+                            outcomes,
+                        ),
+                        // Without keys the result is keyed by run-time
+                        // identities, and has no type.
+                        (Some(_) | None, Some(_) | None) => Held::Unfollowed,
+                    };
+                    (
+                        format!("edge `{edge}` of join `{name}`"),
+                        Some((bind.as_str(), held)),
+                    )
+                });
+                let exprs = members
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| (format!("members[{i}]"), e))
+                    .collect();
+                (exprs, exits, Some(bind))
+            }
+            Operation::Return { outcome: _, output } => (
+                vec![("output".into(), output)],
+                edges(&|edge| (format!("edge `{edge}` of step `{name}`"), None)),
+                None,
+            ),
+        };
+        exits.extend(failed(bind));
+        Parts { exprs, exits }
+    }
+}
+/// What each key of a named join's result holds on `edge`: one answer per
+/// outcome the member can have there, and `Absent` where the key can be
+/// missing.
+fn join_members<'a>(
+    edge: &str,
+    mode: &JoinMode,
+    accepted: &BTreeSet<String>,
+    keys: &'a [String],
+    loose: &'a BTreeMap<String, Schema>,
+    outcomes: &'a [BTreeMap<String, Schema>],
+) -> Held<'a> {
+    let several = keys.len() > 1;
+    let mut held = BTreeMap::new();
+    for (key, outcomes) in keys.iter().zip(outcomes) {
+        let Some(any) = loose.get(key) else {
+            return Held::Unfollowed;
+        };
+        let qualified = || {
+            outcomes
+                .iter()
+                .filter(|(o, _)| accepted.is_empty() || accepted.contains(*o))
+                .map(|(o, schema)| Member::Answer(o, schema))
+                .collect::<Vec<_>>()
+        };
+        let unanswered = Member::Absent("when that member has not answered");
+        let none = vec![Member::Absent("where no member is kept")];
+        let members = match (mode, edge) {
+            (JoinMode::All, "completed") => qualified(),
+            (JoinMode::All, "no_match") => vec![Member::Loose(any)],
+            (JoinMode::AnyAccepted, "completed") => {
+                let mut members = qualified();
+                // With one member, that member is the one that qualified.
+                if several {
+                    members.push(Member::Absent("when another member qualified first"));
+                }
+                members
+            }
+            (JoinMode::AnyCompletion, "completed") => {
+                let mut members = vec![Member::Loose(any)];
+                // With one member, that member is the one that completed.
+                if several {
+                    members.push(Member::Absent("when another member completed first"));
+                }
+                members
+            }
+            (JoinMode::All | JoinMode::AnyAccepted | JoinMode::AnyCompletion, "timeout") => {
+                vec![Member::Loose(any), unanswered]
+            }
+            (JoinMode::All | JoinMode::AnyAccepted | JoinMode::AnyCompletion, _) => none,
+        };
+        held.insert(key.as_str(), members);
+    }
+    Held::Members(held)
+}
+
+// ---------------------------------------------------------------------------
+// The derivation.
+// ---------------------------------------------------------------------------
+
+/// A lexical name: a `let` name or a `map` or `filter` item.
+#[derive(Clone)]
+struct Named<'a> {
+    carried: Carried<'a>,
+    /// The expanded size of what it stands for, counted at every reference.
+    size: u64,
+    /// The reference it stands for, as a direct read writes it.
+    origin: Option<Rc<str>>,
+    /// What it is, for a diagnostic: "is `work`", "is an item of …".
+    note: Rc<str>,
+}
+type Scope<'a> = BTreeMap<&'a str, Named<'a>>;
+/// What `derive` says of one expression.
+struct Out<'a> {
+    carried: Carried<'a>,
+    /// Its size with every name replaced by what it stands for. Saturating.
+    size: u64,
+    /// Set for a reference: what it reads, as a direct read writes it.
+    origin: Option<Rc<str>>,
+}
+/// A read some way cannot satisfy, consumed where its value is needed.
+struct Refusal {
+    read: Rc<Read>,
+    reasons: Vec<Rc<str>>,
+    /// Consumed as a lookup key.
+    key: bool,
+    /// The lexical names its value was used through.
+    through: Vec<Rc<str>>,
+}
+/// What one name contributes to an expression's expanded size.
+#[derive(Clone, Default)]
+struct Charge {
+    each: u64,
+    times: u64,
+    total: u64,
+    lexical: bool,
+}
+/// The size of one expression of the draft.
+struct ExprSize {
+    path: String,
+    at: String,
+    size: u64,
+    /// The name that contributes most.
+    most: Option<(String, Charge)>,
+}
+
+/// What stays the same over the whole draft.
+struct Check<'a> {
+    content: &'a ArtifactContent,
+    sources: &'a Sources,
+    /// Nodes of each schema, by address.
+    schema_nodes: RefCell<HashMap<*const Schema, u64>>,
+    /// Every built value, by what it is made of.
+    built: RefCell<HashMap<BuiltKey, Form<'a>>>,
+    /// What each `for_each` item is, for a diagnostic.
+    item_notes: BTreeMap<&'a str, Rc<str>>,
+}
+/// Evaluates expressions, collecting the reads it refuses.
+struct Pass<'a, 'k> {
+    check: &'k Check<'a>,
+    refusals: Vec<Refusal>,
+    by_read: HashMap<*const Read, usize>,
+    /// Gap sets already consumed, kept alive so an address is never reused.
+    sunk: HashSet<(*const GapNode, bool)>,
+    kept: Vec<Rc<GapNode>>,
+    charges: BTreeMap<String, Charge>,
+}
+
+fn value_nodes(value: &Value) -> u64 {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => 1,
+        Value::Array(items) => items
+            .iter()
+            .fold(1u64, |n, v| n.saturating_add(value_nodes(v))),
+        Value::Object(map) => map
+            .values()
+            .fold(1u64, |n, v| n.saturating_add(value_nodes(v))),
+    }
+}
+/// "<way> has no `key` in `at` (it has a, b)", or "(it has no fields)".
+fn no_field(way: &str, key: &str, at: &str, properties: &BTreeMap<String, Schema>) -> String {
+    let has = if properties.is_empty() {
+        "no fields".to_string()
+    } else {
+        properties.keys().cloned().collect::<Vec<_>>().join(", ")
+    };
+    format!("{way} has no `{key}` in `{at}` (it has {has})")
+}
+
+impl<'a> Check<'a> {
+    fn nodes(&self, schema: &Schema) -> u64 {
+        if let Some(n) = self.schema_nodes.borrow().get(&std::ptr::from_ref(schema)) {
+            return *n;
+        }
+        let sum = |parts: &mut dyn Iterator<Item = &Schema>| {
+            parts.fold(1u64, |n, s| n.saturating_add(self.nodes(s)))
+        };
+        let n = match schema {
+            Schema::Null | Schema::Boolean | Schema::Integer { .. } | Schema::String { .. } => 1,
+            Schema::Array {
+                items,
+                max_items: _,
+            } => sum(&mut [&**items].into_iter()),
+            Schema::Object {
+                properties,
+                required: _,
+            } => sum(&mut properties.values()),
+            Schema::Nullable { inner } => sum(&mut [&**inner].into_iter()),
+            Schema::Union { variants } => sum(&mut variants.iter()),
+        };
+        self.schema_nodes
+            .borrow_mut()
+            .insert(std::ptr::from_ref(schema), n);
+        n
+    }
+    fn finish(&self, build: Build<'a>) -> Carried<'a> {
+        let mut nodes = 0u64;
+        let mut depth = 0;
+        for form in &build.forms {
+            let (n, d) = match form {
+                Form::Shape { schema, .. } => (self.nodes(schema), 0),
+                Form::Opaque(n) => (*n, 0),
+                Form::Built(built) => (built.nodes, built.depth),
+                Form::Items(items) => (items.nodes.saturating_add(1), items.depth + 1),
+            };
+            nodes = nodes.saturating_add(n);
+            depth = depth.max(d);
+        }
+        Carried {
+            lacks: build.lacks,
+            gaps: join_gaps(build.gaps),
+            forms: build.forms.into(),
+            nodes,
+            depth,
+        }
+    }
+    fn of(&self, form: Form<'a>) -> Carried<'a> {
+        let mut build = Build::default();
+        build.form(form);
+        self.finish(build)
+    }
+    fn opaque(&self, nodes: u64) -> Carried<'a> {
+        self.of(Form::Opaque(nodes.max(1)))
+    }
+    fn shape(&self, schema: &'a Schema, way: &str, name: &str) -> Carried<'a> {
+        self.of(Form::Shape {
+            schema,
+            way: way.into(),
+            name: name.into(),
+        })
+    }
+    fn lacking(&self, text: &str) -> Carried<'a> {
+        let mut build = Build::default();
+        build.lack(text);
+        self.finish(build)
+    }
+    /// An object (or array) of `parts`.
+    fn built(&self, parts: BTreeMap<String, Carried<'a>>, array: bool) -> Carried<'a> {
+        let nodes = parts
+            .values()
+            .fold(1u64, |n, c| n.saturating_add(c.nodes.max(1)));
+        let depth = parts.values().map(|c| c.depth).max().unwrap_or(0) + 1;
+        let key = parts
+            .iter()
+            .map(|(k, part)| Some((k.clone(), part_key(part)?)))
+            .collect::<Option<Vec<_>>>()
+            .map(|parts| BuiltKey::Parts(array, parts));
+        self.shared(key, || {
+            Form::Built(Rc::new(Built {
+                parts,
+                array,
+                nodes,
+                depth,
+            }))
+        })
+    }
+    /// An array whose every item is `item`.
+    fn items(&self, item: Carried<'a>) -> Carried<'a> {
+        let key = part_key(&item).map(BuiltKey::Items);
+        self.shared(key, || Form::Items(Rc::new(item)))
+    }
+    /// The form `make` builds, or the equal one built before.
+    fn shared(&self, key: Option<BuiltKey>, make: impl FnOnce() -> Form<'a>) -> Carried<'a> {
+        let Some(key) = key else {
+            return self.of(make());
+        };
+        if let Some(form) = self.built.borrow().get(&key) {
+            return self.of(form.clone());
+        }
+        let form = make();
+        self.built.borrow_mut().insert(key, form.clone());
+        self.of(form)
+    }
+    /// What a step's exit leaves in `bind`. `item` derives an item's value.
+    fn held(
+        &self,
+        bind: &str,
+        way: &str,
+        held: &Held<'a>,
+        item: &mut dyn FnMut(&'a Expr) -> Carried<'a>,
+    ) -> Carried<'a> {
+        match held {
+            Held::Shape(schema) => self.shape(schema, way, bind),
+            Held::Unbound => self.lacking(&format!("on {way}, `{bind}` is not bound")),
+            Held::Unfollowed => self.opaque(1),
+            Held::Members(keys) => {
+                let mut parts = BTreeMap::new();
+                for (key, members) in keys {
+                    let mut build = Build::default();
+                    for member in members {
+                        match member {
+                            Member::Answer(outcome, output) => {
+                                let answered =
+                                    format!("outcome `{outcome}` of member `{key}` on {way}");
+                                let output =
+                                    self.shape(output, &answered, &format!("{bind}.{key}.output"));
+                                build.all(&self.built(
+                                    BTreeMap::from([
+                                        ("participant".to_string(), self.opaque(1)),
+                                        ("outcome".to_string(), self.opaque(1)),
+                                        ("output".to_string(), output),
+                                    ]),
+                                    false,
+                                ));
+                            }
+                            Member::Loose(schema) => build.form(Form::Shape {
+                                schema,
+                                way: way.into(),
+                                name: format!("{bind}.{key}").into(),
+                            }),
+                            Member::Absent(why) => {
+                                build.lack(&format!("on {way}, {why}, `{bind}.{key}` is absent"));
+                            }
+                        }
+                    }
+                    parts.insert((*key).to_string(), self.finish(build));
+                }
+                self.built(parts, false)
+            }
+            Held::ItemOf(collection) => item(collection),
+        }
+    }
+    /// `from`, followed along `path[depth..]`, into `out`. `written` is the
+    /// root as the reference writes it, to name a part of a built value.
+    fn follow(
+        &self,
+        from: &Carried<'a>,
+        written: &str,
+        path: &[String],
+        depth: usize,
+        out: &mut Build<'a>,
+    ) {
+        let Some(key) = path.get(depth) else {
+            out.all(from);
+            return;
+        };
+        for lack in &from.lacks {
+            out.lack(lack);
+        }
+        out.gaps.push(from.gaps.clone());
+        for form in from.forms.iter() {
+            match form {
+                Form::Shape { schema, way, name } => {
+                    self.follow_schema(schema, way, name, &path[depth..], 0, out);
+                }
+                Form::Opaque(nodes) => out.form(Form::Opaque(*nodes)),
+                Form::Built(built) => {
+                    let part = if built.array {
+                        key.parse::<usize>().ok().map(|i| i.to_string())
+                    } else {
+                        Some(key.clone())
+                    };
+                    match part.and_then(|k| built.parts.get(&k)) {
+                        Some(part) => self.follow(part, written, path, depth + 1, out),
+                        None => {
+                            let at = dotted(written, &path[..depth]);
+                            out.lack(&if built.array {
+                                format!(
+                                    "`{at}` is an array of {} items, which has no position `{key}`",
+                                    built.parts.len()
+                                )
+                            } else if built.parts.is_empty() {
+                                format!("`{at}` has no `{key}` (it has no fields)")
+                            } else {
+                                let has = built.parts.keys().cloned().collect::<Vec<_>>();
+                                format!("`{at}` has no `{key}` (it has {})", has.join(", "))
+                            });
+                        }
+                    }
+                }
+                Form::Items(item) => {
+                    if key.parse::<usize>().is_ok() {
+                        self.follow(item, written, path, depth + 1, out);
+                    } else {
+                        out.form(Form::Opaque(1));
+                    }
+                }
+            }
+        }
+    }
+    fn follow_schema(
+        &self,
+        schema: &'a Schema,
+        way: &Rc<str>,
+        name: &Rc<str>,
+        path: &[String],
+        depth: usize,
+        out: &mut Build<'a>,
+    ) {
+        let Some(key) = path.get(depth) else {
+            out.form(Form::Shape {
+                schema,
+                way: way.clone(),
+                name: dotted(name, path).into(),
+            });
+            return;
+        };
+        match schema {
+            Schema::Union { variants } => {
+                for v in variants {
+                    self.follow_schema(v, way, name, path, depth, out);
+                }
+            }
+            Schema::Object {
+                properties,
+                required: _,
+            } => match properties.get(key) {
+                // A field merely optional in one schema is readable.
+                Some(next) => self.follow_schema(next, way, name, path, depth + 1, out),
+                None => out.lack(&no_field(
+                    way,
+                    key,
+                    &dotted(name, &path[..depth]),
+                    properties,
+                )),
+            },
+            Schema::Array {
+                items,
+                max_items: _,
+            } => self.follow_schema(items, way, name, path, depth + 1, out),
+            // Ordinary typing refuses to read inside these.
+            Schema::Nullable { inner: _ }
+            | Schema::Null
+            | Schema::Boolean
+            | Schema::Integer { .. }
+            | Schema::String { .. } => out.form(Form::Opaque(1)),
+        }
+    }
+    /// What an item of the array `collection` is.
+    fn items_of(&self, collection: &Carried<'a>) -> Carried<'a> {
+        let mut out = Build::default();
+        for form in collection.forms.iter() {
+            match form {
+                Form::Shape { schema, way, name } => {
+                    self.items_of_schema(schema, way, &format!("{name}[]"), &mut out);
+                }
+                Form::Opaque(nodes) => out.form(Form::Opaque(*nodes)),
+                Form::Built(built) => {
+                    if built.array {
+                        for part in built.parts.values() {
+                            out.all(part);
+                        }
+                    } else {
+                        out.form(Form::Opaque(1));
+                    }
+                }
+                Form::Items(item) => out.all(item),
+            }
+        }
+        // Where the collection is Missing nothing has an item; its own read
+        // carries that.
+        out.gaps.clear();
+        self.finish(out)
+    }
+    fn items_of_schema(&self, schema: &'a Schema, way: &Rc<str>, name: &str, out: &mut Build<'a>) {
+        match schema {
+            Schema::Array {
+                items,
+                max_items: _,
+            } => out.form(Form::Shape {
+                schema: items,
+                way: way.clone(),
+                name: name.into(),
+            }),
+            Schema::Union { variants } => {
+                for v in variants {
+                    self.items_of_schema(v, way, name, out);
+                }
+            }
+            Schema::Object { .. }
+            | Schema::Nullable { .. }
+            | Schema::Null
+            | Schema::Boolean
+            | Schema::Integer { .. }
+            | Schema::String { .. } => out.form(Form::Opaque(1)),
+        }
+    }
+}
+
+impl<'a, 'k> Pass<'a, 'k> {
+    fn new(check: &'k Check<'a>) -> Self {
+        Self {
+            check,
+            refusals: vec![],
+            by_read: HashMap::new(),
+            sunk: HashSet::new(),
+            kept: vec![],
+            charges: BTreeMap::new(),
+        }
+    }
+    /// What `expr`, at location `at`, carries: the one derivation.
+    fn derive(
+        &mut self,
+        expr: &'a Expr,
+        at: &str,
+        scope: &Scope<'a>,
+        place: Place<'a, '_>,
+    ) -> Out<'a> {
+        let check = self.check;
+        let under = |field: &str| operand(at, expr, field);
+        // A test of its operands: a boolean, Missing where any operand is.
+        let test = |parts: Vec<Out<'a>>| {
+            let mut carried = check.opaque(1);
+            carried.gaps = join_gaps(parts.iter().map(|o| o.carried.gaps.clone()));
+            Out {
+                carried,
+                size: parts.iter().fold(1u64, |n, o| n.saturating_add(o.size)),
+                origin: None,
+            }
+        };
+        // A value built from parts: Missing where any part is.
+        let build = |parts: Vec<(String, Out<'a>)>, array: bool| {
+            let size = parts
+                .iter()
+                .fold(1u64, |n, (_, o)| n.saturating_add(o.size));
+            let gaps = join_gaps(parts.iter().map(|(_, o)| o.carried.gaps.clone()));
+            let mut carried = check.built(
+                parts
+                    .into_iter()
+                    .map(|(k, o)| {
+                        let mut part = o.carried;
+                        part.gaps = None;
+                        (k, part)
+                    })
+                    .collect(),
+                array,
+            );
+            carried.gaps = gaps;
+            Out {
+                carried,
+                size,
+                origin: None,
+            }
+        };
+        match expr {
+            Expr::Literal { value } => {
+                let nodes = value_nodes(value);
+                Out {
+                    carried: check.opaque(nodes),
+                    size: nodes,
+                    origin: None,
+                }
+            }
+            Expr::Ref { root, path } => self.read(root, path, at, scope, place),
+            Expr::Object { fields } => {
+                let parts = fields
+                    .iter()
+                    .map(|(k, e)| {
+                        (
+                            k.clone(),
+                            self.derive(e, &under(&format!(".{k}")), scope, place),
+                        )
+                    })
+                    .collect();
+                build(parts, false)
+            }
+            Expr::Array { items } => {
+                let parts = items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| {
+                        (
+                            i.to_string(),
+                            self.derive(e, &under(&format!("[{i}]")), scope, place),
+                        )
+                    })
+                    .collect();
+                build(parts, true)
+            }
+            // The one place a Missing value stops: `exists` makes it `false`.
+            Expr::Exists { value } => {
+                let tested = self.derive(value, &under(".value"), scope, place);
+                Out {
+                    carried: check.opaque(1),
+                    size: tested.size.saturating_add(1),
+                    origin: None,
+                }
+            }
+            Expr::Not { value } => test(vec![self.derive(value, &under(".value"), scope, place)]),
+            Expr::And { values } | Expr::Or { values } => test(
+                values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| self.derive(e, &under(&format!(".values[{i}]")), scope, place))
+                    .collect(),
+            ),
+            Expr::Eq { left, right } | Expr::Lt { left, right } => test(vec![
+                self.derive(left, &under(".left"), scope, place),
+                self.derive(right, &under(".right"), scope, place),
+            ]),
+            Expr::Contains { collection, value } => test(vec![
+                self.derive(collection, &under(".collection"), scope, place),
+                self.derive(value, &under(".value"), scope, place),
+            ]),
+            Expr::Map {
+                collection,
+                item,
+                value,
+                max_items: _,
+            } => {
+                let over = self.derive(collection, &under(".collection"), scope, place);
+                let inner = self.with_item(scope, item, &over);
+                let each = self.derive(value, &under(".value"), &inner, place);
+                // Missing where the collection is, or where the body is for
+                // any item; otherwise every item is what the body carries.
+                let gaps = join_gaps([over.carried.gaps.clone(), each.carried.gaps.clone()]);
+                let mut mapped = each.carried;
+                mapped.gaps = None;
+                let mut carried = check.items(mapped);
+                carried.gaps = gaps;
+                Out {
+                    carried,
+                    size: over.size.saturating_add(each.size).saturating_add(1),
+                    origin: None,
+                }
+            }
+            Expr::Filter {
+                collection,
+                item,
+                predicate,
+                max_items: _,
+            } => {
+                let over = self.derive(collection, &under(".collection"), scope, place);
+                let inner = self.with_item(scope, item, &over);
+                let kept = self.derive(predicate, &under(".predicate"), &inner, place);
+                // The items it keeps are items of the collection.
+                let mut carried = check.items(check.items_of(&over.carried));
+                carried.gaps = join_gaps([over.carried.gaps.clone(), kept.carried.gaps.clone()]);
+                Out {
+                    carried,
+                    size: over.size.saturating_add(kept.size).saturating_add(1),
+                    origin: None,
+                }
+            }
+            Expr::Difference {
+                left,
+                right,
+                identity,
+                max_items: _,
+            } => {
+                let sides = [
+                    ("left", self.derive(left, &under(".left"), scope, place)),
+                    ("right", self.derive(right, &under(".right"), scope, place)),
+                ];
+                // The identity is read in every item of both sides, and an
+                // item without it stops the run: no `exists` can test it.
+                for (side, out) in &sides {
+                    let mut found = Build::default();
+                    check.follow(&check.items_of(&out.carried), side, identity, 0, &mut found);
+                    if !found.lacks.is_empty() {
+                        let read = Rc::new(Read {
+                            at: under(".identity"),
+                            written: dotted(side, identity),
+                            note: Some(format!(
+                                "`{side}` is an item of the {side} collection, and `difference` \
+                                 needs the identity of every item"
+                            )),
+                            identity: true,
+                        });
+                        for reason in found.lacks {
+                            self.refuse(&read, &reason, false, None);
+                        }
+                    }
+                }
+                let [(_, kept), (_, removed)] = sides;
+                // The items it keeps are items of `left`.
+                let mut carried = check.items(check.items_of(&kept.carried));
+                carried.gaps = join_gaps([kept.carried.gaps.clone(), removed.carried.gaps.clone()]);
+                Out {
+                    carried,
+                    size: kept.size.saturating_add(removed.size).saturating_add(1),
+                    origin: None,
+                }
+            }
+            Expr::Lookup {
+                key,
+                cases,
+                default,
+            } => {
+                // A Missing key takes the default without a trace, so the
+                // key is consumed here, inside `exists` or not.
+                let keyed = self.derive(key, &under(".key"), scope, place);
+                self.sink(&keyed.carried.gaps, true);
+                let mut size = keyed.size.saturating_add(1);
+                let mut result = Build::default();
+                let branches = cases
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (format!(".cases[{i}].then"), &c.then, value_nodes(&c.when)))
+                    .chain([(".default".to_string(), &**default, 0)]);
+                // It is whichever branch is chosen.
+                for (field, branch, when) in branches {
+                    let out = self.derive(branch, &under(&field), scope, place);
+                    size = size.saturating_add(when).saturating_add(out.size);
+                    result.all(&out.carried);
+                }
+                Out {
+                    carried: check.finish(result),
+                    size,
+                    origin: None,
+                }
+            }
+            Expr::Let { bindings, body } => {
+                let mut inner = scope.clone();
+                let mut size = 1u64;
+                for (i, b) in bindings.iter().enumerate() {
+                    let at = under(&format!(".bindings[{i}].value"));
+                    let value = self.derive(&b.value, &at, &inner, place);
+                    size = size.saturating_add(value.size);
+                    // A Missing value is bound as it is: it is refused where
+                    // the name is consumed, and `exists` may test the name.
+                    let note = match &value.origin {
+                        Some(origin) => format!("is `{origin}`"),
+                        None => "is computed from other values".to_string(),
+                    };
+                    inner.insert(
+                        &b.name,
+                        Named {
+                            carried: value.carried,
+                            size: value.size,
+                            origin: value.origin,
+                            note: note.into(),
+                        },
+                    );
+                }
+                let out = self.derive(body, &under(".body"), &inner, place);
+                Out {
+                    carried: out.carried,
+                    size: size.saturating_add(out.size),
+                    origin: out.origin,
+                }
+            }
+        }
+    }
+    /// `scope` with the item of a `map` or `filter` over `collection`.
+    fn with_item(&self, scope: &Scope<'a>, item: &'a str, collection: &Out<'a>) -> Scope<'a> {
+        let note = match &collection.origin {
+            Some(origin) => format!("is an item of `{origin}`"),
+            None => "is an item of its collection".to_string(),
+        };
+        let mut inner = scope.clone();
+        // The item shadows any binding of the same name.
+        inner.insert(
+            item,
+            Named {
+                carried: self.check.items_of(&collection.carried),
+                size: collection.size,
+                origin: collection.origin.as_ref().map(|o| format!("{o}[]").into()),
+                note: note.into(),
+            },
+        );
+        inner
+    }
+    /// What the reserved root `root` holds at `place`.
+    fn reserved(&self, root: Reserved, place: Place<'a, '_>) -> Carried<'a> {
+        let check = self.check;
+        let elsewhere =
+            |only: &str| check.lacking(&format!("`{}` is there only in {only}", root.name()));
+        match (root, place) {
+            (
+                Reserved::Input,
+                Place::Step {
+                    entry_name, entry, ..
+                },
+            ) => check.shape(
+                &entry.input,
+                &format!("the input of entry `{entry_name}`"),
+                root.name(),
+            ),
+            (Reserved::Input, Place::Trigger { .. }) => elsewhere("a step"),
+            (Reserved::Event, Place::Trigger { payload }) => match payload {
+                Some(schema) => check.shape(schema, "the trigger's event", root.name()),
+                None => check.opaque(1),
+            },
+            (Reserved::Event, Place::Step { .. }) => elsewhere("a trigger's `input`"),
+            (Reserved::Definitions, Place::Step { .. } | Place::Trigger { .. }) => {
+                match &check.sources.definitions {
+                    Some(schema) => check.shape(schema, "the captured definitions", root.name()),
+                    None => check.opaque(1),
+                }
+            }
+            // Every binding and item, each as it is at this step.
+            (Reserved::Vars, Place::Step { context, .. }) => check.built(
+                context
+                    .iter()
+                    .map(|(name, carried)| ((*name).to_string(), (**carried).clone()))
+                    .collect(),
+                false,
+            ),
+            (Reserved::Vars, Place::Trigger { .. }) => elsewhere("a step"),
+        }
+    }
+    /// A reference: what `root.path` reads.
+    fn read(
+        &mut self,
+        root: &'a str,
+        path: &'a [String],
+        at: &str,
+        scope: &Scope<'a>,
+        place: Place<'a, '_>,
+    ) -> Out<'a> {
+        let check = self.check;
+        let written = dotted(root, path);
+        let mut found = Build::default();
+        // A lexical name first: it shadows; then a reserved root; then a
+        // binding or item of the step's context.
+        let lexical = scope.get(root);
+        let (note, origin): (Option<String>, Option<Rc<str>>) = match lexical {
+            Some(named) => {
+                check.follow(&named.carried, root, path, 0, &mut found);
+                (
+                    Some(format!("`{root}` {}", named.note)),
+                    named.origin.as_ref().map(|o| dotted(o, path).into()),
+                )
+            }
+            None => {
+                let (source, shown) = match (Reserved::named(root), place) {
+                    (Some(reserved), _) => (Some(self.reserved(reserved, place)), None),
+                    (None, Place::Step { context, .. }) => (
+                        context.get(root).map(|c| (**c).clone()),
+                        check.item_notes.get(root),
+                    ),
+                    (None, Place::Trigger { .. }) => (None, None),
+                };
+                match source {
+                    Some(source) => check.follow(&source, root, path, 0, &mut found),
+                    // No such root: ordinary typing says so.
+                    None => found.form(Form::Opaque(1)),
+                }
+                let origin = match (root, path.split_first()) {
+                    ("vars", Some((binding, rest))) => dotted(binding, rest),
+                    _ => written.clone(),
+                };
+                (shown.map(|n| format!("`{root}` {n}")), Some(origin.into()))
+            }
+        };
+        let mut carried = check.finish(found);
+        if lexical.is_some()
+            && let Some(gaps) = carried.gaps.take()
+        {
+            carried.gaps = Some(Rc::new(GapNode::Via(root.into(), gaps)));
+        }
+        // What is not there on some way is Missing here, read by this
+        // reference: from now on it travels with the value.
+        if !carried.lacks.is_empty() {
+            let read = Rc::new(Read {
+                at: at.to_string(),
+                written: written.clone(),
+                note,
+                identity: false,
+            });
+            let leaves = std::mem::take(&mut carried.lacks)
+                .into_iter()
+                .map(|reason| {
+                    Some(Rc::new(GapNode::Leaf {
+                        reason,
+                        read: read.clone(),
+                    }))
+                })
+                .collect::<Vec<_>>();
+            carried.gaps = join_gaps(std::iter::once(carried.gaps.take()).chain(leaves));
+        }
+        // A name that stands for a computed value counts all of it; a
+        // reference, or a name that stands for one, counts the type it reads.
+        let size = match lexical {
+            Some(named) if named.origin.is_none() => named.size,
+            Some(_) | None => carried.nodes,
+        }
+        .max(1);
+        let charge = self.charges.entry(root.to_string()).or_default();
+        charge.each = charge.each.max(size);
+        charge.times += 1;
+        charge.total = charge.total.saturating_add(size);
+        charge.lexical = lexical.is_some();
+        Out {
+            carried,
+            size,
+            origin,
+        }
+    }
+    /// The value with these gaps is needed here: every read behind them is
+    /// refused. `key`: needed as a lookup key.
+    fn sink(&mut self, gaps: &Gaps, key: bool) {
+        let Some(top) = gaps else {
+            return;
+        };
+        let mut pending: Vec<(Rc<GapNode>, Option<Rc<str>>)> = vec![(top.clone(), None)];
+        while let Some((node, through)) = pending.pop() {
+            if !self.sunk.insert((Rc::as_ptr(&node), key)) {
+                continue;
+            }
+            self.kept.push(node.clone());
+            match &*node {
+                GapNode::Leaf { reason, read } => {
+                    self.refuse(read, reason, key, through);
+                }
+                GapNode::All(parts) => {
+                    pending.extend(parts.iter().map(|p| (p.clone(), through.clone())));
+                }
+                GapNode::Via(name, inner) => pending.push((inner.clone(), Some(name.clone()))),
+            }
+        }
+    }
+    fn refuse(&mut self, read: &Rc<Read>, reason: &Rc<str>, key: bool, through: Option<Rc<str>>) {
+        let index = *self.by_read.entry(Rc::as_ptr(read)).or_insert_with(|| {
+            self.refusals.push(Refusal {
+                read: read.clone(),
+                reasons: vec![],
+                key: false,
+                through: vec![],
+            });
+            self.refusals.len() - 1
+        });
+        let refusal = &mut self.refusals[index];
+        if !refusal.reasons.contains(reason) {
+            refusal.reasons.push(reason.clone());
+        }
+        refusal.key |= key;
+        if let Some(name) = through
+            && !refusal.through.contains(&name)
+        {
+            refusal.through.push(name);
+        }
+    }
+    /// One expression a step (or trigger) evaluates and needs the value of:
+    /// its refused reads as (location, message), and its size.
+    fn evaluate(
+        &mut self,
+        path: &str,
+        at: &str,
+        expr: &'a Expr,
+        place: Place<'a, '_>,
+    ) -> (Vec<(String, String)>, ExprSize) {
+        self.charges.clear();
+        let out = self.derive(expr, at, &Scope::new(), place);
+        self.sink(&out.carried.gaps, false);
+        let reads = std::mem::take(&mut self.refusals)
+            .into_iter()
+            .map(|refusal| (refusal.read.at.clone(), refusal.message()))
+            .collect();
+        self.by_read.clear();
+        self.sunk.clear();
+        self.kept.clear();
+        let most = self
+            .charges
+            .iter()
+            .max_by_key(|(_, c)| c.total)
+            .map(|(name, c)| (name.clone(), c.clone()));
+        let sized = ExprSize {
+            path: path.to_string(),
+            at: at.to_string(),
+            size: out.size,
+            most,
+        };
+        (reads, sized)
+    }
+}
+impl Refusal {
+    fn message(&self) -> String {
+        let read = &self.read;
+        let mut notes: Vec<String> = read.note.iter().cloned().collect();
+        if !self.through.is_empty() {
+            let names: Vec<_> = self.through.iter().map(|n| format!("`{n}`")).collect();
+            notes.push(format!(
+                "its value is used through {}, outside any `exists`",
+                names.join(", ")
+            ));
+        }
+        let note = if notes.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", notes.join("; "))
+        };
+        let reasons: Vec<&str> = self.reasons.iter().map(|r| &**r).collect();
+        let remedy = if read.identity {
+            "Build both collections only from values that always have it: an item without its \
+             identity stops the run, and `exists` cannot test it"
+        } else {
+            "Read it only where it is always present: after the outcome edge of the step that \
+             returns it, or on the `completed` edge of a join whose `accepted_outcomes` lists \
+             only outcomes that have it (a `decide` on `outcome` does not narrow it). Or test \
+             it first with `exists`"
+        };
+        let mut message = format!(
+            "`{}`{note} is not there on every way to this step: {}. {remedy}",
+            read.written,
+            reasons.join("; ")
+        );
+        if self.key {
+            message.push_str(
+                ". A lookup whose key is missing takes its default without a trace, so a \
+                 lookup key is held to this too",
+            );
+        }
+        message
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The flow over the steps, and the whole draft.
+// ---------------------------------------------------------------------------
+
+/// Per step inside a `for_each` body, where a failure there leads: the target,
+/// the item that is unbound there, and the name of the way.
+type LoopFailures<'a> = BTreeMap<&'a str, Vec<(&'a str, Option<&'a str>, String)>>;
+/// What the derivation says of the whole draft.
+#[derive(Default)]
+struct Derived {
+    /// Refused reads: (step or trigger path, location, message).
+    reads: Vec<(String, String, String)>,
+    sizes: Vec<ExprSize>,
+    /// Per entry: the steps it reaches and the type nodes in scope at each.
+    scope: Vec<(String, u64, u64)>,
+    /// The expanded size of every expression, once for each entry that
+    /// reaches its step: ordinary typing types it once for each.
+    total: u64,
+    /// Faults that stop the check itself.
+    limits: Vec<ValidationIssue>,
+}
+
+fn merge<'a>(check: &Check<'a>, into: &mut Context<'a>, from: &Context<'a>) -> bool {
     let mut changed = false;
-    for v in from {
-        if !into.contains(v) {
-            into.push(v.clone());
-            changed = true;
+    for (name, carried) in from {
+        match into.get_mut(name) {
+            None => {
+                into.insert(name, carried.clone());
+                changed = true;
+            }
+            Some(existing) => {
+                if Rc::ptr_eq(existing, carried) {
+                    continue;
+                }
+                let mut both = Build::default();
+                both.all(existing);
+                both.all(carried);
+                if both.forms.len() > existing.forms.len()
+                    || both.lacks.len() > existing.lacks.len()
+                {
+                    *existing = Rc::new(check.finish(both));
+                    changed = true;
+                }
+            }
         }
     }
     changed
 }
-fn merge(into: &mut Context, from: &Context) -> bool {
-    let mut changed = false;
-    for (root, variants) in from {
-        changed |= add_all(into.entry(root.clone()).or_default(), variants);
+
+impl<'a> Check<'a> {
+    fn new(content: &'a ArtifactContent, sources: &'a Sources) -> Self {
+        let item_notes = content
+            .playbook
+            .steps
+            .iter()
+            .filter_map(|(name, step)| match &step.op {
+                Operation::ForEach { item, .. } => Some((
+                    item.as_str(),
+                    format!("is an item of the collection of for_each `{name}`").into(),
+                )),
+                Operation::Invoke { .. }
+                | Operation::Decide { .. }
+                | Operation::Wait { .. }
+                | Operation::Call { .. }
+                | Operation::Join { .. }
+                | Operation::Return { .. } => None,
+            })
+            .collect();
+        Self {
+            content,
+            sources,
+            schema_nodes: RefCell::new(HashMap::new()),
+            built: RefCell::new(HashMap::new()),
+            item_notes,
+        }
     }
-    changed
+    /// For each step inside a `for_each` body, where a failure there leads:
+    /// the runner hands it to the innermost loop, not to the step's own
+    /// `on_error`. `(target, item unbound there, way)`.
+    fn loop_failures(&self, parts: &BTreeMap<&'a str, Parts<'a>>) -> LoopFailures<'a> {
+        let mut failures: BTreeMap<&str, Vec<_>> = BTreeMap::new();
+        for (site, step) in &self.content.playbook.steps {
+            let Operation::ForEach {
+                item,
+                body,
+                on_failure,
+                ..
+            } = &step.op
+            else {
+                continue;
+            };
+            let target = match on_failure {
+                // The next item, or the end of the loop.
+                IterationFailure::Continue => Some((site.as_str(), None)),
+                IterationFailure::Stop => {
+                    step.on_error.as_deref().map(|to| (to, Some(item.as_str())))
+                }
+            };
+            let Some((to, unbinds)) = target else {
+                continue;
+            };
+            let mut inside = BTreeSet::new();
+            let mut pending = vec![body.as_str()];
+            while let Some(name) = pending.pop() {
+                if name == site || !inside.insert(name) {
+                    continue;
+                }
+                if let Some(p) = parts.get(name) {
+                    pending.extend(p.exits.iter().map(|e| e.to));
+                }
+            }
+            for name in inside {
+                failures.entry(name).or_default().push((
+                    to,
+                    unbinds,
+                    format!("a failure in the body of for_each `{site}`"),
+                ));
+            }
+        }
+        failures
+    }
+    /// What every binding and item is at every step reachable from `entry`.
+    /// Each is in every context: not bound on a way that never bound it.
+    fn contexts(
+        &self,
+        entry_name: &'a str,
+        entry: &'a EntryPoint,
+        parts: &BTreeMap<&'a str, Parts<'a>>,
+        failures: &LoopFailures<'a>,
+        limits: &mut Vec<ValidationIssue>,
+    ) -> BTreeMap<&'a str, Context<'a>> {
+        let mut start = Context::new();
+        for (name, p) in parts {
+            for exit in &p.exits {
+                if let Some((bind, _)) = &exit.holds {
+                    let way = format!(
+                        "the way from the start of entry `{entry_name}` that does not pass step `{name}`"
+                    );
+                    start.insert(
+                        bind,
+                        Rc::new(self.lacking(&format!("on {way}, `{bind}` is not bound"))),
+                    );
+                }
+            }
+        }
+        let mut contexts = BTreeMap::from([(entry.start.as_str(), start)]);
+        let mut pending = VecDeque::from([entry.start.as_str()]);
+        let mut queued = BTreeSet::from([entry.start.as_str()]);
+        let mut visits = 0usize;
+        let budget = MAX_FLOW_VISITS_PER_STEP * parts.len().max(1);
+        let mut frozen = BTreeSet::new();
+        while let Some(name) = pending.pop_front() {
+            queued.remove(name);
+            let Some(p) = parts.get(name) else {
+                continue;
+            };
+            visits += 1;
+            if visits > budget {
+                issue(
+                    limits,
+                    "draft_limit",
+                    "playbook",
+                    format!(
+                        "the steps of entry `{entry_name}` reach each other in too many ways to \
+                         check (more than {budget} visits for {} steps). Shorten the draft: fewer \
+                         steps that lead back to earlier ones.",
+                        parts.len()
+                    ),
+                );
+                break;
+            }
+            let current = contexts[name].clone();
+            let mut targets = vec![];
+            for exit in &p.exits {
+                let mut next = current.clone();
+                if let Some((bind, held)) = &exit.holds {
+                    let mut item = |collection: &'a Expr| {
+                        if frozen.contains(name) {
+                            return self.opaque(1);
+                        }
+                        let mut pass = Pass::new(self);
+                        let place = Place::Step {
+                            entry_name,
+                            entry,
+                            context: &current,
+                        };
+                        let out = pass.derive(collection, "collection", &Scope::new(), place);
+                        let item = self.items_of(&out.carried);
+                        if item.depth > MAX_ITEM_DEPTH {
+                            frozen.insert(name);
+                            issue(
+                                limits,
+                                "draft_limit",
+                                &format!("steps.{name}"),
+                                format!(
+                                    "steps.{name}.collection: the items nest more than \
+                                     {MAX_ITEM_DEPTH} levels deep. A `for_each` collection may \
+                                     not be built from the items of a loop that is itself built \
+                                     from this one's."
+                                ),
+                            );
+                            return self.opaque(1);
+                        }
+                        item
+                    };
+                    next.insert(bind, Rc::new(self.held(bind, &exit.way, held, &mut item)));
+                }
+                targets.push((exit.to, next));
+            }
+            for (to, unbinds, way) in failures.get(name).into_iter().flatten() {
+                let mut next = current.clone();
+                if let Some(item) = unbinds {
+                    next.insert(
+                        item,
+                        Rc::new(self.lacking(&format!("on {way}, `{item}` is not bound"))),
+                    );
+                }
+                targets.push((to, next));
+            }
+            for (target, next) in targets {
+                let changed = match contexts.get_mut(target) {
+                    Some(existing) => merge(self, existing, &next),
+                    None => {
+                        contexts.insert(target, next);
+                        true
+                    }
+                };
+                if changed && queued.insert(target) {
+                    pending.push_back(target);
+                }
+            }
+        }
+        contexts
+    }
+    /// The derivation over the whole draft.
+    fn derived(&self) -> Derived {
+        let playbook = &self.content.playbook;
+        let parts: BTreeMap<&str, Parts> = playbook
+            .steps
+            .iter()
+            .map(|(name, step)| (name.as_str(), self.content.parts(self.sources, name, step)))
+            .collect();
+        let failures = self.loop_failures(&parts);
+        let mut derived = Derived::default();
+        let mut sizes: BTreeMap<(String, String), ExprSize> = BTreeMap::new();
+        let mut pass = Pass::new(self);
+        for (entry_name, entry) in &playbook.entries {
+            let contexts = self.contexts(entry_name, entry, &parts, &failures, &mut derived.limits);
+            // Ordinary typing holds, at every step, the type of `input`, of
+            // the definitions and of every binding and item, in every form
+            // it has anywhere.
+            let mut anywhere: BTreeMap<&str, Build> = BTreeMap::new();
+            for context in contexts.values() {
+                for (name, carried) in context {
+                    anywhere.entry(name).or_default().all(carried);
+                }
+            }
+            let fixed = self.nodes(&entry.input).saturating_add(
+                self.sources
+                    .definitions
+                    .as_ref()
+                    .map_or(0, |d| self.nodes(d)),
+            );
+            let in_scope = anywhere
+                .into_values()
+                .fold(fixed, |n, forms| n.saturating_add(self.finish(forms).nodes));
+            let reached = contexts
+                .keys()
+                .filter(|name| parts.contains_key(*name))
+                .count();
+            derived
+                .scope
+                .push((entry_name.clone(), reached as u64, in_scope));
+            for (name, context) in &contexts {
+                let Some(p) = parts.get(name) else {
+                    continue;
+                };
+                let path = format!("steps.{name}");
+                let place = Place::Step {
+                    entry_name,
+                    entry,
+                    context,
+                };
+                for (at, expr) in &p.exprs {
+                    let (reads, sized) = pass.evaluate(&path, at, expr, place);
+                    derived
+                        .reads
+                        .extend(reads.into_iter().map(|(at, m)| (path.clone(), at, m)));
+                    derived.total = derived.total.saturating_add(sized.size);
+                    let key = (path.clone(), at.clone());
+                    if sizes.get(&key).is_none_or(|old| old.size < sized.size) {
+                        sizes.insert(key, sized);
+                    }
+                }
+            }
+        }
+        for t in &playbook.triggers {
+            let path = format!("triggers.{}", t.id);
+            let payload = self
+                .content
+                .registry
+                .events
+                .get(&t.event.name)
+                .map(|e| &e.payload);
+            let (reads, sized) =
+                pass.evaluate(&path, "input", &t.input, Place::Trigger { payload });
+            derived
+                .reads
+                .extend(reads.into_iter().map(|(at, m)| (path.clone(), at, m)));
+            derived.total = derived.total.saturating_add(sized.size);
+            sizes.insert((path, "input".into()), sized);
+        }
+        derived.sizes = sizes.into_values().collect();
+        derived
+    }
+}
+
+fn count(size: u64) -> String {
+    if size == u64::MAX {
+        "too many".into()
+    } else {
+        size.to_string()
+    }
+}
+impl ExprSize {
+    /// "`R` stands for 4100 nodes and is read 40 times".
+    fn most(&self) -> String {
+        let Some((name, charge)) = &self.most else {
+            return String::new();
+        };
+        let what = if charge.lexical {
+            "a `let` name or item, counted at the size of what it stands for"
+        } else {
+            "counted at the size of the type it reads"
+        };
+        format!(
+            " Most of it is `{name}` ({what}): up to {} nodes, read {} time{}, {} in all.",
+            count(charge.each),
+            charge.times,
+            if charge.times == 1 { "" } else { "s" },
+            count(charge.total)
+        )
+    }
 }
 
 impl ArtifactContent {
+    /// Bounds a new draft is held to before anything costly runs on it: the
+    /// expanded size of each expression and of all together, and the types
+    /// in scope over all steps. Typing and the read check follow every copy
+    /// of a value, so such a draft is refused before either runs.
+    pub fn draft_expansion_issues(&self) -> Vec<ValidationIssue> {
+        let sources = Sources::new(self);
+        let derived = Check::new(self, &sources).derived();
+        let mut issues = derived.limits;
+        if !issues.is_empty() {
+            return issues;
+        }
+        const COUNTED: &str = "with every `let` name and `map` or `filter` item replaced by what \
+                               it stands for, and every other reference counted at the size of \
+                               the type it reads";
+        let total = derived.total;
+        for sized in &derived.sizes {
+            if sized.size > MAX_DRAFT_EXPANSION {
+                issue(
+                    &mut issues,
+                    "expression_limit",
+                    &sized.path,
+                    format!(
+                        "{}.{}: expands to {} nodes {COUNTED}; an expression may expand to at \
+                         most {MAX_DRAFT_EXPANSION}.{} Build each value from a name once, not \
+                         twice at every level; bind the result of a table once rather than the \
+                         table; read the one field you need rather than a whole binding.",
+                        sized.path,
+                        sized.at,
+                        count(sized.size),
+                        sized.most()
+                    ),
+                );
+            }
+        }
+        if issues.is_empty() && total > MAX_DRAFT_EXPANSION_TOTAL {
+            let largest = derived.sizes.iter().max_by_key(|s| s.size);
+            let largest = largest
+                .map(|s| {
+                    format!(
+                        " The largest is {}.{}, {} nodes.{}",
+                        s.path,
+                        s.at,
+                        count(s.size),
+                        s.most()
+                    )
+                })
+                .unwrap_or_default();
+            issue(
+                &mut issues,
+                "expression_limit",
+                "playbook",
+                format!(
+                    "the draft's expressions expand to {} nodes in all {COUNTED} (an expression \
+                     counts once for each entry that reaches its step); a draft may expand to at \
+                     most {MAX_DRAFT_EXPANSION_TOTAL}.{largest} Build each value from a name \
+                     once, or shorten the draft.",
+                    count(total)
+                ),
+            );
+        }
+        let in_scope = derived.scope.iter().fold(0u64, |n, (_, steps, each)| {
+            n.saturating_add(steps.saturating_mul(*each))
+        });
+        if issues.is_empty() && in_scope > MAX_DRAFT_SCOPE {
+            let entries: Vec<String> = derived
+                .scope
+                .iter()
+                .map(|(entry, steps, each)| {
+                    format!("entry `{entry}` reaches {steps} steps with {each} at each")
+                })
+                .take(8)
+                .collect();
+            issue(
+                &mut issues,
+                "expression_limit",
+                "playbook",
+                format!(
+                    "the draft's steps have {} type nodes in scope in all (for each step an \
+                     entry reaches: the type of the entry's `input`, the captured definitions, \
+                     and the result type of every step that binds one); a draft may have at most \
+                     {MAX_DRAFT_SCOPE}: {}. Use fewer steps, fewer steps that bind a result, a \
+                     smaller `input` type, or fewer entries over the same steps.",
+                    count(in_scope),
+                    entries.join("; ")
+                ),
+            );
+        }
+        issues
+    }
     /// Issues only a new draft is held to. `reported` are the issues
     /// `validate_structure` already found; a read it already refused is not
     /// reported again.
@@ -82,712 +1954,37 @@ impl ArtifactContent {
                 }
             }
         }
-        for (entry_name, entry) in &self.playbook.entries {
-            for (name, context) in self.variant_contexts(entry_name, entry) {
-                let Some(step) = self.playbook.steps.get(&name) else {
-                    continue;
-                };
-                let path = format!("steps.{name}");
-                for (at, expr) in step_exprs(&step.op) {
-                    let mut reads = vec![];
-                    strict_reads(expr, &at, false, false, &context, &Scope::new(), &mut reads);
-                    for (place, message) in reads {
-                        let refused = reported.iter().chain(&issues).any(|i| {
-                            i.path == path && i.message.starts_with(&format!("{path}.{place}:"))
-                        });
-                        if !refused {
-                            issue(
-                                &mut issues,
-                                "expression_type",
-                                &path,
-                                format!("{path}.{place}: {message}"),
-                            );
-                        }
-                    }
-                }
+        let sources = Sources::new(self);
+        let derived = Check::new(self, &sources).derived();
+        issues.extend(derived.limits);
+        for (path, place, message) in derived.reads {
+            let refused = reported
+                .iter()
+                .chain(&issues)
+                .any(|i| i.path == path && i.message.starts_with(&format!("{path}.{place}:")));
+            if !refused {
+                issue(
+                    &mut issues,
+                    "expression_type",
+                    &path,
+                    format!("{path}.{place}: {message}"),
+                );
             }
         }
         issues
     }
-    /// The variants of every binding at every step reachable from `entry`,
-    /// along the same edges as `outcome_contexts`. Every step binding is
-    /// present in every context: `Absent` on a way that never bound it.
-    fn variant_contexts(&self, entry_name: &str, entry: &EntryPoint) -> BTreeMap<String, Context> {
-        let start: Context = self
-            .playbook
-            .steps
-            .iter()
-            .filter_map(|(name, step)| {
-                let way = format!(
-                    "the way from the start of entry `{entry_name}` that does not pass step `{name}`"
-                );
-                Some((binding_of(step)?.to_string(), vec![(Variant::Absent, way)]))
-            })
-            .collect();
-        let mut contexts = BTreeMap::from([(entry.start.clone(), start)]);
-        let mut pending = std::collections::VecDeque::from([entry.start.clone()]);
-        let mut queued = BTreeSet::from([entry.start.clone()]);
-        while let Some(name) = pending.pop_front() {
-            queued.remove(&name);
-            let Some(step) = self.playbook.steps.get(&name) else {
-                continue;
-            };
-            let current = contexts[&name].clone();
-            let mut targets = vec![];
-            for (edge, target) in &step.edges {
-                let mut next = current.clone();
-                if let Some((bind, variants)) = self.bound_on(&name, step, edge) {
-                    next.insert(bind, variants);
-                } else if let Some(bind) = binding_of(step) {
-                    let way = format!("edge `{edge}` of step `{name}`");
-                    next.insert(bind.to_string(), vec![(Variant::Bound, way)]);
-                }
-                targets.push((target.clone(), next));
-            }
-            if let Some(target) = &step.on_error {
-                let mut next = current.clone();
-                if let Some(bind) = binding_of(step) {
-                    let way = format!("the `on_error` exit of step `{name}`");
-                    next.insert(bind.to_string(), vec![(Variant::Absent, way)]);
-                }
-                targets.push((target.clone(), next));
-            }
-            if let Operation::ForEach { body, next, .. } = &step.op {
-                targets.push((body.clone(), current.clone()));
-                targets.push((next.clone(), current.clone()));
-            }
-            for (target, next) in targets {
-                let changed = match contexts.get_mut(&target) {
-                    Some(existing) => merge(existing, &next),
-                    None => {
-                        contexts.insert(target.clone(), next);
-                        true
-                    }
-                };
-                if changed && queued.insert(target.clone()) {
-                    pending.push_back(target);
-                }
-            }
-        }
-        contexts
-    }
-    /// What the step at `name` binds when it leaves by `edge`.
-    fn bound_on(&self, name: &str, step: &Step, edge: &str) -> Option<(String, Variants)> {
-        let outcome = |schema: &Schema| {
-            vec![(
-                Variant::Shape(schema.clone()),
-                format!("outcome `{edge}` of step `{name}`"),
-            )]
-        };
-        match &step.op {
-            Operation::Invoke { command, bind, .. } => {
-                let schema = self
-                    .registry
-                    .commands
-                    .get(&command.name)?
-                    .outcomes
-                    .get(edge)?;
-                Some((bind.clone(), outcome(schema)))
-            }
-            Operation::Call {
-                dependency,
-                entry,
-                mode: CallMode::Wait,
-                bind,
-                ..
-            } => {
-                let schema = self
-                    .dependencies
-                    .get(dependency)?
-                    .interfaces
-                    .get(entry)?
-                    .outcomes
-                    .get(edge)?;
-                Some((bind.clone(), outcome(schema)))
-            }
-            Operation::Wait {
-                event: Some(event),
-                bind,
-                ..
-            } => {
-                let variant = match edge {
-                    "received" => {
-                        Variant::Shape(self.registry.events.get(&event.name)?.payload.clone())
-                    }
-                    _ => Variant::Absent,
-                };
-                Some((
-                    bind.clone(),
-                    vec![(variant, format!("edge `{edge}` of wait `{name}`"))],
-                ))
-            }
-            Operation::Join {
-                member_keys, bind, ..
-            } if !member_keys.is_empty() => Some((
-                bind.clone(),
-                vec![(
-                    Variant::Keys(self.join_keys(name, step, edge)?),
-                    format!("edge `{edge}` of join `{name}`"),
-                )],
-            )),
-            _ => None,
-        }
-    }
-    /// Each key of a named join's result on `edge`: one variant per outcome
-    /// the member can have there, and `Absent` where the key can be missing.
-    fn join_keys(&self, name: &str, step: &Step, edge: &str) -> Option<BTreeMap<String, Variants>> {
-        let Operation::Join {
-            members,
-            member_keys,
-            mode,
-            accepted_outcomes,
-            ..
-        } = &step.op
-        else {
-            return None;
-        };
-        let Ok(Some(Schema::Object {
-            properties: loose, ..
-        })) = self.join_schema(step, false)
-        else {
-            return None;
-        };
-        let on_edge = format!("edge `{edge}` of join `{name}`");
-        let mut keys = BTreeMap::new();
-        for (key, member) in member_keys.iter().zip(members) {
-            let outcomes = self.member_outcomes(member).ok()?;
-            let absent = |why: &str| (Variant::Absent, format!("{on_edge}, {why}"));
-            let mut variants = vec![];
-            match (edge, mode) {
-                ("completed", JoinMode::All | JoinMode::AnyAccepted) => {
-                    for (o, schema) in outcomes.iter().filter(|(o, _)| {
-                        accepted_outcomes.is_empty() || accepted_outcomes.contains(*o)
-                    }) {
-                        let answer = Schema::object(BTreeMap::from([
-                            ("participant".into(), Schema::string(128)),
-                            (
-                                "outcome".into(),
-                                Schema::String {
-                                    max_length: o.len().max(1),
-                                    values: BTreeSet::from([o.clone()]),
-                                },
-                            ),
-                            ("output".into(), schema.clone()),
-                        ]));
-                        variants.push((
-                            Variant::Shape(answer),
-                            format!("outcome `{o}` of member `{key}` on {on_edge}"),
-                        ));
-                    }
-                    // With one member, that member is the one that qualified.
-                    if *mode == JoinMode::AnyAccepted && members.len() > 1 {
-                        variants.push(absent("when another member qualified first"));
-                    }
-                }
-                ("no_match", JoinMode::All) => {
-                    variants.push((Variant::Shape(loose.get(key)?.clone()), on_edge.clone()));
-                }
-                ("completed", JoinMode::AnyCompletion) | ("timeout", _) => {
-                    variants.push((Variant::Shape(loose.get(key)?.clone()), on_edge.clone()));
-                    if edge == "timeout" {
-                        variants.push(absent("when that member has not answered"));
-                    } else if members.len() > 1 {
-                        // With one member, that member is the one that completed.
-                        variants.push(absent("when another member completed first"));
-                    }
-                }
-                _ => variants.push(absent("where no member is kept")),
-            }
-            keys.insert(key.clone(), variants);
-        }
-        Some(keys)
-    }
 }
 
-/// The name a step binds, if it binds one.
-fn binding_of(step: &Step) -> Option<&str> {
-    match &step.op {
-        Operation::Invoke { bind, .. }
-        | Operation::Wait { bind, .. }
-        | Operation::Call { bind, .. }
-        | Operation::Join { bind, .. } => Some(bind),
-        _ => None,
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// A lexical name (`let` alias, `map` or `filter` item): the variants of what
-/// it was derived from; the name reasons use for it (an alias reads as its
-/// origin, so its reasons are worded as the direct read's); and a note for
-/// the message.
-#[derive(Clone)]
-struct Lexical {
-    variants: Variants,
-    shown: Option<String>,
-    note: Option<String>,
-}
-type Scope = BTreeMap<String, Lexical>;
-
-/// A root as a reference names it: the binding, and the path inside it.
-fn split_ref<'a>(root: &'a str, path: &'a [String]) -> (&'a str, &'a [String]) {
-    match (root, path.split_first()) {
-        ("vars", Some((binding, rest))) => (binding.as_str(), rest),
-        _ => (root, path),
-    }
-}
-fn push_unique(into: &mut Variants, items: Variants) {
-    for v in items {
-        if !into.contains(&v) {
-            into.push(v);
+    #[test]
+    fn every_reserved_root_is_decided() {
+        let named: Vec<_> = Reserved::ALL.iter().map(|r| r.name()).collect();
+        assert_eq!(named, RESERVED_ROOTS);
+        for root in RESERVED_ROOTS {
+            assert!(Reserved::named(root).is_some(), "{root}");
         }
-    }
-}
-/// What a reference to a tracked binding or alias holds on each way, with the
-/// origin it reads, as written; `None` for an untracked root.
-fn alias(value: &Expr, context: &Context, scope: &Scope) -> Option<(Variants, String)> {
-    let Expr::Ref { root, path } = value else {
-        return None;
-    };
-    let (binding, rest) = split_ref(root, path);
-    let (variants, origin) = match scope.get(binding) {
-        Some(name) => (
-            &name.variants,
-            name.shown.clone().unwrap_or_else(|| binding.to_string()),
-        ),
-        None => (context.get(binding)?, binding.to_string()),
-    };
-    let mut projected = vec![];
-    for (variant, way) in variants {
-        push_unique(&mut projected, project(variant, way, &origin, rest, 0));
-    }
-    Some((projected, dotted(&origin, rest)))
-}
-/// `variant` (arising `way`) followed along `path[depth..]`. Wherever the
-/// value is missing it becomes `Lacks`, worded as a direct read says it.
-fn project(variant: &Variant, way: &str, binding: &str, path: &[String], depth: usize) -> Variants {
-    let lacks = |text: String| vec![(Variant::Lacks(text), way.to_string())];
-    match variant {
-        Variant::Absent => lacks(format!("on {way}, `{binding}` is not bound")),
-        Variant::Lacks(_) | Variant::Bound => vec![(variant.clone(), way.to_string())],
-        Variant::Keys(keys) => {
-            let Some(key) = path.get(depth) else {
-                return vec![(variant.clone(), way.to_string())];
-            };
-            let Some(alternatives) = keys.get(key) else {
-                return vec![(Variant::Bound, way.to_string())];
-            };
-            let mut out = vec![];
-            for (v, w) in alternatives {
-                let items = if *v == Variant::Absent {
-                    vec![(
-                        Variant::Lacks(format!(
-                            "on {w}, `{}` is absent",
-                            dotted(binding, &path[..=depth])
-                        )),
-                        w.clone(),
-                    )]
-                } else {
-                    project(v, w, binding, path, depth + 1)
-                };
-                push_unique(&mut out, items);
-            }
-            out
-        }
-        Variant::Shape(schema) => project_schema(schema, way, binding, path, depth),
-        Variant::Origin(origin, inner) => {
-            let rest = &path[depth..];
-            project(inner, way, origin, rest, 0)
-                .into_iter()
-                .map(|(v, w)| match v {
-                    Variant::Lacks(_) | Variant::Bound => (v, w),
-                    other => (Variant::Origin(dotted(origin, rest), Box::new(other)), w),
-                })
-                .collect()
-        }
-    }
-}
-fn project_schema(
-    schema: &Schema,
-    way: &str,
-    binding: &str,
-    path: &[String],
-    depth: usize,
-) -> Variants {
-    let Some(key) = path.get(depth) else {
-        return vec![(Variant::Shape(schema.clone()), way.to_string())];
-    };
-    match schema {
-        Schema::Union { variants } => {
-            let mut out = vec![];
-            for v in variants {
-                push_unique(&mut out, project_schema(v, way, binding, path, depth));
-            }
-            out
-        }
-        Schema::Object { properties, .. } => match properties.get(key) {
-            Some(next) => project_schema(next, way, binding, path, depth + 1),
-            None => vec![(
-                Variant::Lacks(no_field(
-                    way,
-                    key,
-                    &dotted(binding, &path[..depth]),
-                    properties,
-                )),
-                way.to_string(),
-            )],
-        },
-        Schema::Array { items, .. } => project_schema(items, way, binding, path, depth + 1),
-        _ => vec![(Variant::Bound, way.to_string())],
-    }
-}
-/// What `expr` evaluates to on each way, derived from its structure: a
-/// reference projects its binding or alias; an object or array maps each
-/// field or position to what its expression carries; a `lookup` carries
-/// every case and its default; a `let` carries its body. `None` when it
-/// carries nothing tracked. A reference inside is also read where it is
-/// written, so a part missing there is taken as bound here.
-fn carried(expr: &Expr, context: &Context, scope: &Scope) -> Option<Variants> {
-    let part = |e: &Expr| {
-        carried(e, context, scope).unwrap_or_else(|| vec![(Variant::Bound, String::new())])
-    };
-    match expr {
-        Expr::Ref { .. } => {
-            let (variants, origin) = alias(expr, context, scope)?;
-            Some(
-                variants
-                    .into_iter()
-                    .map(|(v, w)| match v {
-                        Variant::Lacks(_) | Variant::Absent | Variant::Bound => (Variant::Bound, w),
-                        other => (Variant::Origin(origin.clone(), Box::new(other)), w),
-                    })
-                    .collect(),
-            )
-        }
-        Expr::Object { fields } => Some(vec![(
-            Variant::Keys(fields.iter().map(|(k, e)| (k.clone(), part(e))).collect()),
-            String::new(),
-        )]),
-        Expr::Array { items } => Some(vec![(
-            Variant::Keys(
-                items
-                    .iter()
-                    .enumerate()
-                    .map(|(i, e)| (i.to_string(), part(e)))
-                    .collect(),
-            ),
-            String::new(),
-        )]),
-        Expr::Lookup { cases, default, .. } => {
-            let mut out = vec![];
-            for e in cases.iter().map(|c| &c.then).chain([&**default]) {
-                push_unique(&mut out, part(e));
-            }
-            Some(out)
-        }
-        Expr::Let { bindings, body } => {
-            let mut inner = scope.clone();
-            for b in bindings {
-                let name = let_name(&b.value, context, &inner);
-                inner.insert(b.name.clone(), name);
-            }
-            carried(body, context, &inner)
-        }
-        _ => None,
-    }
-}
-/// What a `let` name holds: an alias of a reference reads as its origin; a
-/// computed value carries what its expression carries.
-fn let_name(value: &Expr, context: &Context, scope: &Scope) -> Lexical {
-    if let Some((variants, origin)) = alias(value, context, scope) {
-        return Lexical {
-            variants,
-            note: Some(format!("is `{origin}`")),
-            shown: Some(origin),
-        };
-    }
-    match carried(value, context, scope) {
-        Some(variants) => Lexical {
-            variants,
-            shown: None,
-            note: Some("is computed from other values".into()),
-        },
-        None => bound_name(),
-    }
-}
-/// The items of each array in `variants`; an array an expression builds
-/// gives its items as they are.
-fn items_of(variants: Variants) -> Variants {
-    let mut out = vec![];
-    for (variant, way) in variants {
-        let items = match variant {
-            Variant::Origin(_, inner) => items_of(vec![(*inner, way)]),
-            Variant::Shape(Schema::Array { items, .. }) => vec![(Variant::Shape(*items), way)],
-            Variant::Shape(Schema::Union { variants }) => variants
-                .into_iter()
-                .map(|v| match v {
-                    Schema::Array { items, .. } => (Variant::Shape(*items), way.clone()),
-                    _ => (Variant::Bound, way.clone()),
-                })
-                .collect(),
-            Variant::Keys(keys) => keys.into_values().flatten().collect(),
-            _ => vec![(Variant::Bound, way)],
-        };
-        push_unique(&mut out, items);
-    }
-    out
-}
-/// The variants of an item of `collection`. Where the collection itself is
-/// missing its own read is refused, so the item is taken as bound there.
-fn item_variants(collection: &Expr, context: &Context, scope: &Scope) -> Lexical {
-    let Some(variants) = carried(collection, context, scope) else {
-        return bound_name();
-    };
-    let note = match alias(collection, context, scope) {
-        Some((_, origin)) => format!("is an item of `{origin}`"),
-        None => "is an item of its collection".into(),
-    };
-    Lexical {
-        variants: items_of(variants),
-        shown: None,
-        note: Some(note),
-    }
-}
-fn bound_name() -> Lexical {
-    Lexical {
-        variants: vec![(Variant::Bound, String::new())],
-        shown: None,
-        note: None,
-    }
-}
-
-/// Every reference in `expr` (at location `at`) that some variant of its
-/// binding, or of the binding an alias or item was derived from, cannot
-/// satisfy, as (location, message). `exempt` holds inside `exists`; `key`
-/// inside a lookup key, which is never exempt.
-fn strict_reads(
-    expr: &Expr,
-    at: &str,
-    exempt: bool,
-    key: bool,
-    context: &Context,
-    scope: &Scope,
-    out: &mut Vec<(String, String)>,
-) {
-    let mut sub = |e: &Expr, field: &str, exempt: bool, key: bool, scope: &Scope| {
-        strict_reads(
-            e,
-            &operand(at, expr, field),
-            exempt,
-            key,
-            context,
-            scope,
-            out,
-        )
-    };
-    match expr {
-        Expr::Literal { .. } => {}
-        Expr::Ref { root, path } => {
-            if exempt {
-                return;
-            }
-            let (binding, rest) = split_ref(root, path);
-            let (variants, shown, note) = match scope.get(binding) {
-                Some(name) => (
-                    &name.variants,
-                    name.shown.clone().unwrap_or_else(|| binding.to_string()),
-                    name.note.clone(),
-                ),
-                None => match context.get(binding) {
-                    Some(variants) => (variants, binding.to_string(), None),
-                    None => return,
-                },
-            };
-            let mut lacks = vec![];
-            for (variant, way) in variants {
-                lacking(variant, way, &shown, rest, 0, &mut lacks);
-            }
-            if lacks.is_empty() {
-                return;
-            }
-            let note = note
-                .map(|n| format!(" (`{binding}` {n})"))
-                .unwrap_or_default();
-            let mut message = format!(
-                "`{}`{note} is not there on every way to this step: {}. Read it only where it is \
-                 always present: after the outcome edge of the step that returns it, or on the \
-                 `completed` edge of a join whose `accepted_outcomes` lists only outcomes that \
-                 have it (a `decide` on `outcome` does not narrow it). Or test it first with \
-                 `exists`",
-                dotted(root, path),
-                lacks.join("; ")
-            );
-            if key {
-                message.push_str(
-                    ". A lookup whose key is missing takes its default without a trace, so a \
-                     lookup key is held to this too",
-                );
-            }
-            out.push((at.to_string(), message));
-        }
-        Expr::Object { fields } => {
-            for (k, e) in fields {
-                sub(e, &format!(".{k}"), exempt, key, scope);
-            }
-        }
-        Expr::Array { items } => {
-            for (i, e) in items.iter().enumerate() {
-                sub(e, &format!("[{i}]"), exempt, key, scope);
-            }
-        }
-        // Missing becomes `false` here; everything else inside propagates it
-        // to here, except a lookup key, which is checked regardless.
-        Expr::Exists { value } => sub(value, ".value", true, key, scope),
-        Expr::Not { value } => sub(value, ".value", exempt, key, scope),
-        Expr::And { values } | Expr::Or { values } => {
-            for (i, e) in values.iter().enumerate() {
-                sub(e, &format!(".values[{i}]"), exempt, key, scope);
-            }
-        }
-        Expr::Eq { left, right }
-        | Expr::Lt { left, right }
-        | Expr::Difference { left, right, .. } => {
-            sub(left, ".left", exempt, key, scope);
-            sub(right, ".right", exempt, key, scope);
-        }
-        Expr::Contains { collection, value } => {
-            sub(collection, ".collection", exempt, key, scope);
-            sub(value, ".value", exempt, key, scope);
-        }
-        Expr::Map {
-            collection,
-            item,
-            value: body,
-            ..
-        }
-        | Expr::Filter {
-            collection,
-            item,
-            predicate: body,
-            ..
-        } => {
-            sub(collection, ".collection", exempt, key, scope);
-            // The item shadows any binding of the same name.
-            let mut inner = scope.clone();
-            inner.insert(item.clone(), item_variants(collection, context, scope));
-            let field = if matches!(expr, Expr::Map { .. }) {
-                ".value"
-            } else {
-                ".predicate"
-            };
-            sub(body, field, exempt, key, &inner);
-        }
-        Expr::Lookup {
-            key: k,
-            cases,
-            default,
-        } => {
-            sub(k, ".key", false, true, scope);
-            for (i, c) in cases.iter().enumerate() {
-                sub(&c.then, &format!(".cases[{i}].then"), exempt, key, scope);
-            }
-            sub(default, ".default", exempt, key, scope);
-        }
-        Expr::Let { bindings, body } => {
-            let mut inner = scope.clone();
-            for (i, b) in bindings.iter().enumerate() {
-                // An alias of a binding is checked where it is used, as the
-                // binding would be: binding a missing value has no effect
-                // until it is read. A computed value is checked where it is
-                // written too, since a missing part spoils it there.
-                if alias(&b.value, context, &inner).is_none() {
-                    sub(
-                        &b.value,
-                        &format!(".bindings[{i}].value"),
-                        exempt,
-                        key,
-                        &inner,
-                    );
-                }
-                let name = let_name(&b.value, context, &inner);
-                inner.insert(b.name.clone(), name);
-            }
-            sub(body, ".body", exempt, key, &inner);
-        }
-    }
-}
-/// Pushes, for `variant` (arising `way`), why `binding.path[depth..]` is
-/// absent in it. Nullable and scalar stops are left to ordinary typing.
-fn lacking(
-    variant: &Variant,
-    way: &str,
-    binding: &str,
-    path: &[String],
-    depth: usize,
-    lacks: &mut Vec<String>,
-) {
-    let push = |lacks: &mut Vec<String>, text: String| {
-        if !lacks.contains(&text) {
-            lacks.push(text);
-        }
-    };
-    match variant {
-        Variant::Absent => push(lacks, format!("on {way}, `{binding}` is not bound")),
-        Variant::Lacks(text) => push(lacks, text.clone()),
-        Variant::Keys(keys) => {
-            let Some(alternatives) = path.get(depth).and_then(|k| keys.get(k)) else {
-                return;
-            };
-            for (v, w) in alternatives {
-                if *v == Variant::Absent {
-                    push(
-                        lacks,
-                        format!("on {w}, `{}` is absent", dotted(binding, &path[..=depth])),
-                    );
-                } else {
-                    lacking(v, w, binding, path, depth + 1, lacks);
-                }
-            }
-        }
-        Variant::Shape(schema) => lacking_in(schema, way, binding, path, depth, lacks),
-        Variant::Origin(origin, inner) => lacking(inner, way, origin, &path[depth..], 0, lacks),
-        Variant::Bound => {}
-    }
-}
-/// "<way> has no `key` in `at` (it has a, b)", or "(it has no fields)".
-fn no_field(way: &str, key: &str, at: &str, properties: &BTreeMap<String, Schema>) -> String {
-    let has = if properties.is_empty() {
-        "no fields".to_string()
-    } else {
-        properties.keys().cloned().collect::<Vec<_>>().join(", ")
-    };
-    format!("{way} has no `{key}` in `{at}` (it has {has})")
-}
-fn lacking_in(
-    schema: &Schema,
-    way: &str,
-    binding: &str,
-    path: &[String],
-    depth: usize,
-    lacks: &mut Vec<String>,
-) {
-    let Some(key) = path.get(depth) else {
-        return;
-    };
-    match schema {
-        Schema::Union { variants } => {
-            for v in variants {
-                lacking_in(v, way, binding, path, depth, lacks);
-            }
-        }
-        Schema::Object { properties, .. } => match properties.get(key) {
-            Some(next) => lacking_in(next, way, binding, path, depth + 1, lacks),
-            None => {
-                let text = no_field(way, key, &dotted(binding, &path[..depth]), properties);
-                if !lacks.contains(&text) {
-                    lacks.push(text);
-                }
-            }
-        },
-        Schema::Array { items, .. } => lacking_in(items, way, binding, path, depth + 1, lacks),
-        _ => {}
     }
 }

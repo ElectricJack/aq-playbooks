@@ -84,11 +84,8 @@ lookup branch), it could exceed either limit, so such an expression never fails
 on them at run time. A 256-case lookup on a plain key, inside a map, therefore
 fits a `max_items` of at most 38. The compiler also holds every expression of a new draft
 to the depth limit; verifying a stored artifact does not, so artifacts stored
-before these rules keep loading. It also bounds a new draft's expressions by
-their size with every `let` name and `map` or `filter` item replaced by what it
-stands for: at most 200 000 nodes for one expression and 1 000 000 for all of
-them. A value built from the same name twice at every level doubles each time,
-and typing follows every copy.
+before these rules keep loading. It also bounds a new draft's size (see "What a
+draft is held to", rule 4).
 
 Diagnostics for both name the place inside the step, for example
 `steps.route.input.level.lookup.cases[0].when`: object fields by name, array
@@ -131,42 +128,96 @@ joins with or without `member_keys`. The runner refuses that member when the run
 reaches the join. Verifying a stored artifact still accepts it, so an artifact
 stored before this rule keeps loading.
 
-Reading a field that is not there on every way to a step. Ordinary typing merges
-the outcomes a binding can hold into one object. In that object, a field only one
-outcome has becomes optional, and an optional field types as present. Compiling a
-draft is stricter: each binding keeps its outcomes apart. A reference is refused
-with `expression_type` when it reads through a field that some way of reaching
-its step lacks:
-- an invoke or call outcome without the field, where several outcome edges meet
-  at one step;
-- an outcome without the field among a join's accepted outcomes. This includes
-  every outcome when `accepted_outcomes` is empty;
-- a join key that can be absent: on `timeout`, a member that has not answered.
-  The same holds for a member that was not selected in modes `any_accepted` and
-  `any_completion`;
-- a wait's binding on its `timeout` edge, where nothing is bound;
-- any binding on a way to the step that never bound it: through the binding
-  step's `on_error` (the operation failed, so nothing was bound), or around the
-  binding step altogether, for example from a branch that skips it or from the
-  start of a loop that has not yet run it.
+What a draft is held to. Compiling a new draft applies four rules that
+verifying a stored artifact does not, so an artifact stored before them keeps
+loading. They follow from how a value that is not there behaves. A reference to
+it evaluates to Missing, and Missing travels: an object, an array, a `map`, a
+`filter`, a comparison or a `let` body with a Missing part is Missing itself.
+Only `exists` stops it, by answering `false`. A step that needs a Missing value
+stops the run ("expression input missing"), a `decide` takes `unknown`, and a
+`lookup` whose key is Missing takes its default. Ordinary typing does not see
+any of this: it merges the outcomes a binding can hold into one object, in which
+a field only one outcome has is merely optional, and an optional field types as
+present. The draft check keeps each binding's outcomes apart, on every way of
+reaching each step.
 
-A `let` alias of a binding (`let out = answer.c.output`), an alias of an alias,
-a value computed from bindings (an object or array holding them, a `lookup` or
-`let` that can return them), and a `map` or `filter` item of a collection
-derived from any of these are held to the same check where they are read, with
-the same reasons as the direct read.
-Binding a missing value has no effect until it is read, so an alias used only
-inside `exists` is fine.
+1. Strict reads. A reference is refused with `expression_type` when it reads
+   through a field that some outcome lacks:
+   - an invoke or call outcome without the field, where several outcome edges
+     meet at one step;
+   - an outcome without the field among a join's accepted outcomes, which is
+     every outcome when `accepted_outcomes` is empty;
+   - a join key that can be absent: on `timeout`, a member that has not
+     answered, and in modes `any_accepted` and `any_completion` with several
+     members, a member that was not the one selected.
 
-The diagnostic names the step, the reference and the ways that lack the field.
-Read the field only where it is always present: after the outcome edge that
-returns it, or on the `completed` edge of a join whose `accepted_outcomes` lists
-only outcomes that have it. A `decide` on `outcome` does not narrow anything.
-The operand of `exists` is exempt, because `exists` turns a missing value into
-`false`. A `lookup` key is never exempt, even inside `exists`. A lookup with a
-missing key takes its default without a trace. A field that is merely optional
-in its one schema stays readable, also as a lookup key. Verifying a stored
-artifact does not apply this check.
+   A field that is merely optional in its one schema stays readable.
+
+2. Bound reads. A reference to a binding is refused at a step that some way
+   reaches without binding it:
+   - through the binding step's `on_error` (the operation failed, so nothing
+     was bound), or a wait's `timeout` edge;
+   - around the binding step: from a branch that skips it, on the first pass of
+     a loop that binds it later, after a `for_each` whose body binds it (the
+     collection may be empty), or at an entry step reached again by a back edge;
+   - a `for_each` item outside the loop's body: it is bound for the body only,
+     and not on the loop's `next` or `on_error`.
+
+   Inside a `for_each` body a failing step is handled by the loop, not by the
+   step's own `on_error`: with `on_failure: continue` the loop goes on to the
+   next item, with `stop` it leaves by its own `on_error`. The check follows
+   both.
+
+3. Aliasing does not launder. Whatever holds such a value carries it, and a
+   read through it is refused exactly as the direct read would be, with the
+   same reasons: a `let` name, a name for a name, an object or array that holds
+   it, a `lookup` that can return it (as a case or as the default), the result
+   of a `map`, `filter` or `difference` over it and the items of that result, a
+   `map` or `filter` item, and a `for_each` item in the loop's body. A Missing
+   value bound to a `let` name does nothing until the name's value is needed,
+   so a name used only inside `exists` is fine; where it is needed, the
+   diagnostic points at the reference that was Missing and names the name it
+   was used through.
+
+   The one exemption from rules 1 to 3 is the operand of `exists`. A `lookup`
+   key is not exempt, even inside `exists`: a Missing key takes the lookup's
+   default, so an exemption would let a playbook route on a default without a
+   trace. A field merely optional in its one schema may be a lookup key (that
+   is what the default is for). The identity of a `difference` is not exempt
+   either: it is read in every item, and an item without it stops the run.
+
+4. Bounded cost. A draft is refused, before anything costly runs on it, when
+   it has more than 256 steps, a `draft.json` over 262 144 bytes, an
+   expression that expands to more than 200 000 nodes, expressions that expand
+   to more than 1 000 000 nodes in all, or more than 250 000 type nodes in
+   scope over all its steps. The purpose: nothing a draft within the bounds
+   seals into is expensive to check or to verify on every load.
+   - The expanded size of an expression counts every `let` name and `map` or
+     `filter` item that stands for a computed value as that whole value, at
+     every reference. A reference to `input`, `event`, `definitions`, `vars`, a
+     step's binding or a `for_each` item, or to a name that only stands for
+     such a reference, counts the nodes of the type it reads: `task.facts.kind`
+     counts one node, `task` its whole result type.
+   - So bind a table's result once. Every read of a `let`-bound table counts
+     the whole table: write `let level = lookup(...)` and read `level`, rather
+     than binding the table and looking it up in several places. Read the one
+     field you need rather than a whole binding, and build a value from a name
+     once, not twice at every level (it doubles each time).
+   - The scope count is, for each step an entry reaches, the type of that
+     entry's `input`, the captured definitions, and the result type of every
+     step that binds one. Ordinary typing copies these for every step, on every
+     load. With several entries over the same steps, the steps and their
+     expressions count once for each entry.
+   - The diagnostic (`expression_limit` or `draft_limit`) gives the number that
+     exceeded and names the `let` name or root that contributes most, with its
+     size and how often it is read.
+
+A read diagnostic names the step and the place inside it, the reference as
+written, what a name in it stands for, every way that lacks the field or the
+binding, and the remedy. Read the value only where it is always present: after
+the outcome edge that returns it, or on the `completed` edge of a join whose
+`accepted_outcomes` lists only outcomes that have it. A `decide` on `outcome`
+does not narrow anything. Or test it first with `exists`.
 
 Ask, then read the answer. A wait on an asynchronous command's completion event
 binds the event's whole payload, which a wait does not narrow per outcome. To read

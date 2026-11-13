@@ -1164,9 +1164,9 @@ fn deciding(predicates: Vec<Value>) -> Workspace {
 
 #[test]
 fn an_expression_that_expands_past_the_bound_is_refused_before_it_is_typed() {
-    // Depth 15 expands to about 147 000 nodes: accepted, and it checks.
+    // Depth 15 expands to about 197 000 nodes: accepted, and it checks.
     assert!(check(&deciding(vec![doubling(15)])).is_empty());
-    // Depth 16, about 295 000: refused, alone, before typing and the read
+    // Depth 16, about 393 000: refused, alone, before typing and the read
     // check run (either would follow every copy).
     let diagnostics = check(&deciding(vec![doubling(16)]));
     assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
@@ -1192,9 +1192,11 @@ fn an_expression_that_expands_past_the_bound_is_refused_before_it_is_typed() {
         diagnostics[0].message.contains("expands to too many nodes"),
         "{diagnostics:#?}"
     );
-    // Six such expressions fit the whole draft's bound; seven do not.
-    assert!(check(&deciding(vec![doubling(15); 6])).is_empty());
-    let diagnostics = check(&deciding(vec![doubling(15); 7]));
+    // Five such expressions fit the whole draft's bound; six do not. (Six fit
+    // while a reference to `input` counted as one node; it now counts the two
+    // nodes of its type, so each expression is about 197 000.)
+    assert!(check(&deciding(vec![doubling(15); 5])).is_empty());
+    let diagnostics = check(&deciding(vec![doubling(15); 6]));
     assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
     assert_eq!(
         (diagnostics[0].code.as_str(), diagnostics[0].path.as_str()),
@@ -1205,4 +1207,194 @@ fn an_expression_that_expands_past_the_bound_is_refused_before_it_is_typed() {
             .message
             .contains("a draft may expand to at most 1000000")
     );
+}
+
+// Values that come out of `map`, `filter` and `difference`, and `for_each`
+// items (A2 re-review round 3, I1; probes 25, 26, 28 and 30). The generated
+// test in the model crate covers every composition; these pin what the
+// author is told.
+#[test]
+fn what_comes_out_of_map_filter_and_difference_is_held_to_the_same_check() {
+    let w = |p: &[&str]| reference("work", p);
+    let (_, reasons) = at_peek(eqx(w(&["kind"]), "chore"));
+    let over = |collection: Value, item: &str, value: Value| json!({"op": "map", "item": item, "max_items": 1, "collection": collection, "value": value});
+    let one = |e: Value| json!({"op": "array", "items": [e]});
+    let kept = json!({"op": "filter", "item": "x", "max_items": 1, "collection": one(w(&[])),
+        "predicate": {"op": "literal", "value": true}});
+    let has_chore = |collection: Value| {
+        json!({"op": "contains", "collection": collection,
+               "value": {"op": "literal", "value": "chore"}})
+    };
+    let copied = over(one(w(&[])), "x", reference("x", &[]));
+    for (predicate, at, written) in [
+        // Probe 25: an item of what `filter` keeps.
+        (
+            has_chore(over(kept, "y", reference("y", &["kind"]))),
+            "steps.peek.predicate.contains.collection.map.value",
+            "`y.kind` (`y` is an item of its collection)",
+        ),
+        // Probe 26: an item of a `map` result bound to a name.
+        (
+            let1(
+                "m",
+                copied.clone(),
+                has_chore(over(reference("m", &[]), "y", reference("y", &["kind"]))),
+            ),
+            "steps.peek.predicate.let.body.contains.collection.map.value",
+            "`y.kind` (`y` is an item of its collection)",
+        ),
+        // Probe 28: a position of a `map` result as a lookup key, which
+        // would take the default silently.
+        (
+            let1("m", copied, keyed_by(reference("m", &["0", "kind"]))),
+            "steps.peek.predicate.let.body.lookup.key",
+            "`m.0.kind` (`m` is computed from other values)",
+        ),
+    ] {
+        let (diagnostics, found) = at_peek(predicate);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        let message = &diagnostics[0].message;
+        assert!(
+            message.starts_with(&format!("{at}: {written} is not there")),
+            "{message}"
+        );
+        assert_eq!(found, reasons, "{message}");
+    }
+    // A value read where it is bound and used through its name outside
+    // `exists` is refused where it is read, and the name is given.
+    let (diagnostics, found) = at_peek(let1(
+        "k",
+        w(&["kind"]),
+        json!({"op": "and", "values": [
+            {"op": "exists", "value": reference("k", &[])},
+            eqx(reference("k", &[]), "chore")]}),
+    ));
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert!(
+        diagnostics[0].message.starts_with(
+            "steps.peek.predicate.let.bindings[0].value: `work.kind` (its value is used \
+             through `k`, outside any `exists`) is not there"
+        ),
+        "{diagnostics:#?}"
+    );
+    assert_eq!(found, reasons);
+    // The identity of a `difference` is read in every item, and no `exists`
+    // makes up for an item without it.
+    let (diagnostics, found) = at_peek(json!({"op": "exists", "value": {
+        "op": "difference", "max_items": 1, "identity": ["kind"],
+        "left": one(w(&[])), "right": {"op": "literal", "value": []}}}));
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    let message = &diagnostics[0].message;
+    assert!(
+        message.starts_with("steps.peek.predicate.exists.value.difference.identity: `left.kind`"),
+        "{message}"
+    );
+    assert!(message.contains("`exists` cannot test it"), "{message}");
+    assert_eq!(found, "");
+    assert!(message.contains(&reasons), "{message}");
+}
+
+#[test]
+fn a_for_each_item_carries_what_its_collection_holds_and_only_in_the_body() {
+    // Probe 30: a loop over `[work]` whose body keys a lookup on `t.kind`.
+    let w = |p: &[&str]| reference("work", p);
+    let (_, reasons) = at_peek(eqx(w(&["kind"]), "chore"));
+    let mut ws = partial(json!({"op": "literal", "value": true}));
+    ws.draft["steps"]["peek"] = json!({"op": {"kind": "for_each",
+        "collection": {"op": "array", "items": [w(&[])]}, "item": "t", "body": "note",
+        "next": "after", "max_items": 1, "concurrency": 1, "on_failure": "stop"},
+        "edges": {}, "on_error": "failed"});
+    ws.draft["steps"]["note"] = decide(keyed_by(reference("t", &["kind"])), "peek");
+    ws.draft["steps"]["after"] = decide(json!({"op": "literal", "value": true}), "route");
+    let diagnostics = check(&ws);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    let d = &diagnostics[0];
+    assert_eq!(
+        (d.code.as_str(), d.path.as_str()),
+        ("expression_type", "draft.json:steps.note")
+    );
+    assert!(
+        d.message.starts_with(
+            "steps.note.predicate.lookup.key: `t.kind` (`t` is an item of the collection of \
+             for_each `peek`) is not there on every way to this step: "
+        ),
+        "{}",
+        d.message
+    );
+    assert!(d.message.contains(&reasons), "{}", d.message);
+    assert!(
+        d.message.contains("a lookup key is held to this too"),
+        "{}",
+        d.message
+    );
+    // A field every outcome has is read through the item without complaint.
+    ws.draft["steps"]["note"] = decide(keyed_by(reference("t", &["kinds", "0"])), "peek");
+    ws.catalog
+        .commands
+        .get_mut("work.read")
+        .unwrap()
+        .outcomes
+        .insert("missing".into(), kinds());
+    assert!(check(&ws).is_empty(), "{:#?}", check(&ws));
+    // The item is bound in the body only: after the loop it is not there.
+    ws.draft["steps"]["after"] = decide(eqx(reference("t", &["kind"]), "chore"), "route");
+    let diagnostics = check(&ws);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert!(
+        diagnostics[0].message.starts_with(
+            "steps.after.predicate.eq.left: `t.kind` (`t` is an item of the collection of \
+             for_each `peek`) is not there on every way to this step: on the `next` exit of \
+             for_each `peek`, `t` is not bound."
+        ),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn a_failure_in_a_loop_body_is_followed_to_where_the_loop_takes_it() {
+    // `read` runs before the loop and again in its body. Its `missing`
+    // outcome leaves the loop by `noted`, so on ordinary edges `after` sees
+    // only the `read` outcome, which has `kind`. But a failure of `noted`
+    // inside the loop is the loop's to handle: with `on_failure: continue`
+    // it goes on to the next item, or to `after`, with `work` as `missing`
+    // left it.
+    let looped = |on_failure: &str| {
+        let mut ws = partial(json!({"op": "literal", "value": true}));
+        let steps = ws.draft["steps"].as_object_mut().unwrap();
+        steps.remove("peek");
+        let mut noted = steps.remove("route").unwrap();
+        noted["edges"] = json!({"routed": "done", "stale": "failed"});
+        steps.insert("noted".into(), noted);
+        steps.insert(
+            "each".into(),
+            json!({"op": {"kind": "for_each",
+                "collection": {"op": "literal", "value": ["a"]}, "item": "t", "body": "again",
+                "next": "after", "max_items": 1, "concurrency": 1, "on_failure": on_failure},
+                "edges": {}, "on_error": "failed"}),
+        );
+        steps.insert(
+            "again".into(),
+            decide(json!({"op": "literal", "value": true}), "read"),
+        );
+        steps.insert("after".into(), decide(kind_is("chore"), "done"));
+        ws.draft["steps"]["read"]["edges"] = json!({"read": "each", "missing": "noted"});
+        ws
+    };
+    let diagnostics = check(&looped("continue"));
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    let d = &diagnostics[0];
+    assert_eq!(
+        (d.code.as_str(), d.path.as_str()),
+        ("expression_type", "draft.json:steps.after")
+    );
+    assert!(
+        d.message
+            .contains("outcome `missing` of step `read` has no `kind` in `work`"),
+        "{}",
+        d.message
+    );
+    // With `stop` the failure leaves by the loop's `on_error`, and `after`
+    // is reached only with the outcome that has the field.
+    let diagnostics = check(&looped("stop"));
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
 }
