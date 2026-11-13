@@ -17,7 +17,9 @@
 //! tool writes them from `record.json` and the commands used, and refuses a
 //! value that differs); `purpose` defaults to the record's; `limits` defaults
 //! to [`Limits::default`]; and `source_map` maps a step name to a line of
-//! `source.md`. Any other unknown field is refused where it is written.
+//! `source.md`. Any other unknown field is refused where it is written. A
+//! draft has at most [`MAX_DRAFT_STEPS`] steps and [`MAX_DRAFT_JSON_BYTES`]
+//! bytes.
 //!
 //! [`fill`] resolves the names against the catalog, restricted to the names
 //! the record allows, adds each asynchronous command's reconciliation command
@@ -50,6 +52,12 @@ const MAX_RECORD_BYTES: u64 = 65_536;
 const MAX_CATALOG_BYTES: u64 = 16_777_216;
 const MAX_FACTS_BYTES: u64 = 1_048_576;
 const MAX_DRAFT_BYTES: u64 = 4_194_304;
+/// A draft may have at most this many steps. Checking a draft costs time and
+/// memory that grow faster than its size, and it runs on the host at save.
+pub const MAX_DRAFT_STEPS: usize = 256;
+/// A draft (the `draft.json` file, or the draft serialized) may be at most
+/// this many bytes.
+pub const MAX_DRAFT_JSON_BYTES: usize = 262_144;
 
 /// What the host keeps about a source; the owner writes only the Markdown.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -278,48 +286,58 @@ fn at_path<'a>(value: &'a Value, path: &[Seg]) -> Option<&'a Value> {
         Seg::Index(i) => v.get(i),
     })
 }
-/// Whether `value` is a tagged object (an operation, expression or schema)
-/// that does not parse as one; `None` when it is not tagged.
-fn tagged_fault(value: &Value) -> Option<bool> {
+/// For a tagged object (an operation, expression or schema): `Some(None)`
+/// when it parses as one, `Some(Some(error))` when it does not. `None` when
+/// `value` is not tagged.
+fn tagged_error(value: &Value) -> Option<Option<String>> {
     let tag = |key: &str| value.get(key).is_some_and(Value::is_string);
-    let fails = if tag("op") {
-        serde_json::from_value::<Expr>(value.clone()).is_err()
+    let error = if tag("op") {
+        serde_json::from_value::<Expr>(value.clone()).err()
     } else if tag("kind") {
-        serde_json::from_value::<DraftOperation>(value.clone()).is_err()
+        serde_json::from_value::<DraftOperation>(value.clone()).err()
     } else if tag("type") {
-        serde_json::from_value::<Schema>(value.clone()).is_err()
+        serde_json::from_value::<Schema>(value.clone()).err()
     } else {
         return None;
     };
-    Some(fails)
+    Some(error.map(|e| e.to_string()))
 }
-/// Extends `path` to the deepest tagged object under `value` that does not
-/// parse, which is where serde's fault is.
-fn deepest_fault(value: &Value, path: &mut Vec<Seg>) {
+/// Extends `path` to the deepest tagged object under `value` whose own parse
+/// error is `reason`, serde's message, and returns whether it found one.
+/// Data is never entered: a literal's `value` and a lookup case's `when`
+/// hold the owner's values, which may look like anything.
+fn deepest_fault(value: &Value, reason: &str, path: &mut Vec<Seg>) -> bool {
+    let literal = value.get("op").and_then(Value::as_str) == Some("literal");
+    let case = value.get("when").is_some() && value.get("then").is_some();
     let children: Vec<(Seg, &Value)> = match value {
-        Value::Object(map) => map.iter().map(|(k, v)| (Seg::Key(k.clone()), v)).collect(),
+        Value::Object(map) => map
+            .iter()
+            .filter(|(k, _)| {
+                let data = (literal && *k == "value") || (case && *k == "when");
+                !data
+            })
+            .map(|(k, v)| (Seg::Key(k.clone()), v))
+            .collect(),
         Value::Array(items) => items
             .iter()
             .enumerate()
             .map(|(i, v)| (Seg::Index(i), v))
             .collect(),
-        _ => return,
+        _ => return false,
     };
     for (seg, child) in children {
         path.push(seg);
-        let depth = path.len();
-        match tagged_fault(child) {
-            Some(true) => return deepest_fault(child, path),
-            Some(false) => {}
-            None => {
-                deepest_fault(child, path);
-                if path.len() > depth {
-                    return;
-                }
-            }
+        let own = tagged_error(child);
+        // A tagged object that parses holds no fault.
+        if own != Some(None) && deepest_fault(child, reason, path) {
+            return true;
+        }
+        if matches!(&own, Some(Some(error)) if error == reason) {
+            return true;
         }
         path.pop();
     }
+    false
 }
 /// 1-based line and column of byte `offset`.
 fn line_column(text: &str, offset: usize) -> (usize, usize) {
@@ -395,21 +413,18 @@ fn parse<T: DeserializeOwned>(
             .map(str::len)
             .sum::<usize>()
             + column;
-        let mut path = scan(text, offset, None).0;
-        if let Some(inner) = parsed.and_then(|v| at_path(v, &path)) {
-            let reported = path.len();
-            deepest_fault(inner, &mut path);
-            if path.len() > reported
-                && let (_, Some(start)) = scan(text, text.len(), Some(&path))
-            {
-                (line, column) = line_column(text, start);
-            }
-        }
-        let path = render(&path);
         let full = e.to_string();
         let reason = full
             .rsplit_once(" at line ")
             .map_or(full.as_str(), |(reason, _)| reason);
+        let mut path = scan(text, offset, None).0;
+        if let Some(inner) = parsed.and_then(|v| at_path(v, &path))
+            && deepest_fault(inner, reason, &mut path)
+            && let (_, Some(start)) = scan(text, text.len(), Some(&path))
+        {
+            (line, column) = line_column(text, start);
+        }
+        let path = render(&path);
         let place = match (positions, path.is_empty()) {
             (true, true) => format!("{file} line {line} column {column}"),
             (true, false) => format!("{file} line {line} column {column} ({path})"),
@@ -517,6 +532,11 @@ impl Workspace {
             )
         });
         let draft = keep(read_file(dir, DRAFT_FILE, MAX_DRAFT_BYTES), f).and_then(|t| {
+            let limits = draft_limits(0, t.len());
+            if !limits.is_empty() {
+                f.extend(limits);
+                return None;
+            }
             let value = keep(parse::<Value>(DRAFT_FILE, &t, true, None), f)?;
             let names = contract_positions(&value);
             if !names.is_empty() {
@@ -662,9 +682,45 @@ fn list(names: &BTreeSet<String>) -> String {
     }
 }
 
+/// A draft past the step or byte bound, refused before any other work.
+fn draft_limits(steps: usize, bytes: usize) -> Vec<Diagnostic> {
+    let advice = "Split the work into sub-workflows, or shorten it: one step per decision, with `lookup` and `let` for tables instead of chains of steps.";
+    let mut faults = vec![];
+    if steps > MAX_DRAFT_STEPS {
+        faults.push(Diagnostic::error(
+            "draft_limit",
+            &at(DRAFT_FILE, "steps"),
+            format!(
+                "steps: the draft has {steps} steps; a draft may have at most {MAX_DRAFT_STEPS}. {advice}"
+            ),
+        ));
+    }
+    if bytes > MAX_DRAFT_JSON_BYTES {
+        faults.push(Diagnostic::error(
+            "draft_limit",
+            DRAFT_FILE,
+            format!(
+                "{DRAFT_FILE} is {bytes} bytes; a draft may be at most {MAX_DRAFT_JSON_BYTES} bytes. {advice}"
+            ),
+        ));
+    }
+    faults
+}
+
 /// Builds the compile input: identities from the catalog, the header and
 /// definitions from the record and facts.
 pub fn fill(ws: &Workspace) -> Result<CompileInput, Vec<Diagnostic>> {
+    // Bounded first: everything after this grows faster than the draft.
+    let steps = ws
+        .draft
+        .get("steps")
+        .and_then(Value::as_object)
+        .map_or(0, |m| m.len());
+    let bytes = serde_json::to_string(&ws.draft).map_or(usize::MAX, |t| t.len());
+    let limits = draft_limits(steps, bytes);
+    if !limits.is_empty() {
+        return Err(limits);
+    }
     let names = contract_positions(&ws.draft);
     if !names.is_empty() {
         return Err(names);
@@ -1237,7 +1293,11 @@ mod tests {
         assert_eq!((d.line, d.column), (Some(2), Some(13)), "{d:#?}");
         assert!(d.message.contains("unknown field `valu`"), "{d:#?}");
         let mut path = vec![];
-        deepest_fault(&value, &mut path);
+        assert!(deepest_fault(
+            &value,
+            "unknown field `valu`, expected `value`",
+            &mut path
+        ));
         assert_eq!(render(&path), "steps.a.op.output");
         assert_eq!(
             scan(text, text.len(), Some(&path)).1,

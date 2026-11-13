@@ -635,3 +635,333 @@ fn unfill_then_fill_round_trips() {
     );
     assert_eq!(unfill(&resealed), draft);
 }
+
+// A binding read on a way that never bound it (A2 re-review R1-I2). Every
+// outcome of these commands has the field, so ordinary typing accepts each
+// read and only the draft check can refuse it.
+fn kinds() -> Schema {
+    Schema::object(BTreeMap::from([
+        ("kind".into(), Schema::string(32)),
+        (
+            "kinds".into(),
+            Schema::Array {
+                items: Box::new(Schema::string(32)),
+                max_items: 2,
+            },
+        ),
+    ]))
+}
+fn object_outcomes() -> Workspace {
+    let mut ws = workspace();
+    let read = ws.catalog.commands.get_mut("work.read").unwrap();
+    read.outcomes = BTreeMap::from([("read".into(), kinds()), ("missing".into(), kinds())]);
+    let level = Schema::object(BTreeMap::from([("level".into(), Schema::string(32))]));
+    let route = ws.catalog.commands.get_mut("work.route").unwrap();
+    route.outcomes = BTreeMap::from([("routed".into(), level.clone()), ("stale".into(), level)]);
+    ws.draft["source_map"] = json!({});
+    ws
+}
+fn decide(predicate: Value, next: &str) -> Value {
+    json!({"op": {"kind": "decide", "predicate": predicate},
+           "edges": {"true": next, "false": next, "unknown": next}, "on_error": null})
+}
+fn kind_is(value: &str) -> Value {
+    json!({"op": "eq", "left": reference("work", &["kind"]), "right": {"op": "literal", "value": value}})
+}
+fn unbound(ws: &Workspace, step: &str, texts: &[&str]) {
+    let diagnostics = check(ws);
+    let d = diagnostics
+        .iter()
+        .find(|d| d.path == format!("draft.json:steps.{step}"))
+        .unwrap_or_else(|| panic!("{diagnostics:#?}"));
+    assert_eq!(d.code, "expression_type", "{diagnostics:#?}");
+    for text in texts {
+        assert!(d.message.contains(text), "{text}: {}", d.message);
+    }
+    // The stored form of the same draft still verifies.
+    let mut input = fill(ws).unwrap();
+    input.proposal.source_map.clear();
+    let header = aq_playbooks_compiler::parse_source_header(&input.source).unwrap();
+    let content = ArtifactContent {
+        format_version: FORMAT_VERSION,
+        compiler: input.compiler.clone(),
+        source: SourceBinding {
+            digest: hash_bytes(input.source.as_bytes()),
+            header,
+        },
+        playbook: input.proposal.playbook,
+        registry: input.registry,
+        dependencies: input.dependencies,
+        definitions: input.definitions,
+        source_map: BTreeMap::new(),
+    };
+    assert!(Artifact::seal(content).unwrap().verify().is_ok());
+}
+
+#[test]
+fn a_shared_step_after_branches_cannot_read_what_only_one_branch_bound() {
+    // The routing draft's natural single final step: `done` returns
+    // `routed.level`, but the `missing` way goes through `assume`, which binds
+    // `assumed`, never `routed`.
+    let mut ws = object_outcomes();
+    ws.draft["entries"]["main"]["outcomes"]["routed"] =
+        serde_json::to_value(Schema::string(32)).unwrap();
+    ws.draft["steps"]["read"]["edges"]["missing"] = json!("assume");
+    let mut assume = route_step();
+    assume["op"]["bind"] = json!("assumed");
+    ws.draft["steps"]["assume"] = assume;
+    ws.draft["steps"]["done"]["op"]["output"] = reference("routed", &["level"]);
+    unbound(
+        &ws,
+        "done",
+        &[
+            "`routed.level` is not there on every way to this step",
+            "the way from the start of entry `main` that does not pass step `route`, `routed` is not bound",
+        ],
+    );
+    // Written as one return per route, it checks.
+    ws.draft["steps"]["assume"]["edges"]["routed"] = json!("assumed_done");
+    ws.draft["steps"]["assumed_done"] = json!({"op": {"kind": "return", "outcome": "routed",
+        "output": reference("assumed", &["level"])}, "edges": {}, "on_error": null});
+    assert!(check(&ws).is_empty(), "{:#?}", check(&ws));
+}
+
+#[test]
+fn a_loop_cannot_read_on_its_first_pass_what_a_later_step_of_its_body_binds() {
+    let mut ws = object_outcomes();
+    ws.draft["entries"]["main"]["start"] = json!("each");
+    ws.draft["steps"]["each"] = json!({"op": {"kind": "for_each",
+        "collection": {"op": "literal", "value": ["a", "b"]}, "item": "t", "body": "note",
+        "next": "done", "max_items": 2, "concurrency": 1, "on_failure": "stop"},
+        "edges": {}, "on_error": "failed"});
+    ws.draft["steps"]["note"] = decide(kind_is("chore"), "read");
+    ws.draft["steps"]["read"]["edges"] = json!({"read": "each", "missing": "each"});
+    ws.draft["steps"].as_object_mut().unwrap().remove("route");
+    unbound(
+        &ws,
+        "note",
+        &[
+            "`work.kind`",
+            "that does not pass step `read`, `work` is not bound",
+        ],
+    );
+    // Tested with `exists` first, it checks.
+    ws.draft["steps"]["note"] = decide(
+        json!({"op": "exists", "value": reference("work", &["kind"])}),
+        "read",
+    );
+    assert!(check(&ws).is_empty(), "{:#?}", check(&ws));
+}
+
+#[test]
+fn after_a_for_each_that_may_not_run_its_body_bindings_are_not_bound() {
+    // Over an empty collection the body never runs, so `after` is reached
+    // with `work` never bound.
+    let mut ws = object_outcomes();
+    ws.draft["entries"]["main"]["start"] = json!("each");
+    ws.draft["steps"]["each"] = json!({"op": {"kind": "for_each",
+        "collection": {"op": "literal", "value": []}, "item": "t", "body": "read",
+        "next": "after", "max_items": 1, "concurrency": 1, "on_failure": "stop"},
+        "edges": {}, "on_error": "failed"});
+    ws.draft["steps"]["read"]["edges"] = json!({"read": "each", "missing": "each"});
+    ws.draft["steps"]["after"] = decide(kind_is("chore"), "done");
+    ws.draft["steps"].as_object_mut().unwrap().remove("route");
+    unbound(
+        &ws,
+        "after",
+        &[
+            "`work.kind`",
+            "that does not pass step `read`, `work` is not bound",
+        ],
+    );
+}
+
+#[test]
+fn the_entry_step_reached_again_by_a_back_edge_cannot_read_what_the_loop_binds() {
+    // `each` is the entry's start and the anchor its body returns to; its
+    // collection reads `work`, which only the body binds.
+    let mut ws = object_outcomes();
+    ws.draft["entries"]["main"]["start"] = json!("each");
+    ws.draft["steps"]["each"] = json!({"op": {"kind": "for_each",
+        "collection": reference("work", &["kinds"]), "item": "t", "body": "read",
+        "next": "done", "max_items": 2, "concurrency": 1, "on_failure": "stop"},
+        "edges": {}, "on_error": "failed"});
+    ws.draft["steps"]["read"]["edges"] = json!({"read": "each", "missing": "each"});
+    ws.draft["steps"].as_object_mut().unwrap().remove("route");
+    unbound(
+        &ws,
+        "each",
+        &[
+            "`work.kinds`",
+            "that does not pass step `read`, `work` is not bound",
+        ],
+    );
+}
+
+#[test]
+fn a_refined_path_names_only_the_object_serde_complained_about() {
+    // A3 re-review I2, probe 1: two faulty expressions in one operation, the
+    // one serde reports (`zz`, first in the file) after the other in key order.
+    let dir = std::env::temp_dir().join(format!("aq-draft-{}-refined", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ws = workspace();
+    std::fs::write(dir.join("source.md"), &ws.markdown).unwrap();
+    std::fs::write(
+        dir.join("record.json"),
+        serde_json::to_vec(&ws.record).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("catalog.json"),
+        serde_json::to_vec(&ws.catalog).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("facts.json"),
+        serde_json::to_vec(&ws.facts).unwrap(),
+    )
+    .unwrap();
+    let text = serde_json::to_string_pretty(&ws.draft).unwrap().replacen(
+        "\"fields\": {",
+        "\"fields\": {\"zz\": {\"op\": \"literal\", \"valu\": 1},\n \"aa\": {\"op\": \"ref\", \"rooot\": \"input\"},",
+        1,
+    );
+    std::fs::write(dir.join("draft.json"), &text).unwrap();
+    let diagnostics = Workspace::read(&dir).unwrap_err();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    let d = &diagnostics[0];
+    assert!(d.message.contains("unknown field `valu`"), "{d:#?}");
+    assert_eq!(d.path, "draft.json:steps.read.op.input.fields.zz", "{d:#?}");
+    let line = text.lines().position(|l| l.contains("\"zz\"")).unwrap() as u32 + 1;
+    assert_eq!(d.line, Some(line), "{d:#?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+    // Probe 2: literal data that has a `type` key is data, never a schema.
+    let mut ws = workspace();
+    ws.draft["steps"]["done"]["op"]["output"] =
+        json!({"extra": 1, "op": "literal", "value": {"type": "user"}});
+    let diagnostics = check(&ws);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        diagnostics[0].path, "draft.json:steps.done.op.output",
+        "{diagnostics:#?}"
+    );
+    assert!(
+        diagnostics[0].message.contains("unknown field `extra`"),
+        "{diagnostics:#?}"
+    );
+    // A lookup case's `when` is data too.
+    let mut ws = workspace();
+    ws.draft["steps"]["route"]["op"]["input"]["fields"]["level"]["cases"][0]["when"] =
+        json!({"op": "nonsense"});
+    ws.draft["steps"]["route"]["op"]["input"]["fields"]["level"]["cases"][0]["thn"] = json!(1);
+    let diagnostics = check(&ws);
+    assert_eq!(
+        diagnostics[0].path, "draft.json:steps.route.op.input.fields.level",
+        "{diagnostics:#?}"
+    );
+}
+
+/// The fixture with `extra` decide steps chained in front of `read`.
+fn chained(extra: usize) -> Workspace {
+    let mut ws = workspace();
+    let steps = ws.draft["steps"].as_object_mut().unwrap();
+    for i in 0..extra {
+        let next = if i + 1 == extra {
+            "read".to_string()
+        } else {
+            format!("d{}", i + 1)
+        };
+        steps.insert(
+            format!("d{i}"),
+            decide(json!({"op": "literal", "value": true}), &next),
+        );
+    }
+    ws.draft["entries"]["main"]["start"] = json!("d0");
+    ws
+}
+
+#[test]
+fn a_draft_is_bounded_in_steps_and_bytes_before_it_is_checked() {
+    // 252 + the fixture's 4 steps = 256: accepted, and it checks.
+    let ws = chained(252);
+    assert_eq!(
+        ws.draft["steps"].as_object().unwrap().len(),
+        MAX_DRAFT_STEPS
+    );
+    assert!(check(&ws).is_empty(), "{:#?}", check(&ws));
+    // 257: refused, with the limit and what to do.
+    let diagnostics = check(&chained(253));
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    let d = &diagnostics[0];
+    assert_eq!(
+        (d.code.as_str(), d.path.as_str()),
+        ("draft_limit", "draft.json:steps")
+    );
+    assert!(
+        d.message
+            .contains("has 257 steps; a draft may have at most 256"),
+        "{}",
+        d.message
+    );
+    assert!(d.message.contains("sub-workflows"), "{}", d.message);
+    // Bytes: the serialized draft, and the file.
+    let mut big = workspace();
+    let padding = "x".repeat(MAX_DRAFT_JSON_BYTES);
+    big.draft["steps"]["done"]["op"]["output"] = json!({"op": "literal", "value": padding});
+    let diagnostics = check(&big);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        (diagnostics[0].code.as_str(), diagnostics[0].path.as_str()),
+        ("draft_limit", "draft.json")
+    );
+    assert!(
+        diagnostics[0]
+            .message
+            .contains("a draft may be at most 262144 bytes")
+    );
+    let dir = std::env::temp_dir().join(format!("aq-draft-{}-big", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("source.md"), &big.markdown).unwrap();
+    std::fs::write(
+        dir.join("record.json"),
+        serde_json::to_vec(&big.record).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("catalog.json"),
+        serde_json::to_vec(&big.catalog).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("facts.json"),
+        serde_json::to_vec(&big.facts).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("draft.json"),
+        serde_json::to_vec(&big.draft).unwrap(),
+    )
+    .unwrap();
+    let diagnostics = Workspace::read(&dir).unwrap_err();
+    assert_eq!(diagnostics[0].code, "draft_limit", "{diagnostics:#?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_reused_binding_name_is_reported_without_the_costly_read_check() {
+    let mut ws = workspace();
+    ws.draft["steps"]["route"]["op"]["bind"] = json!("work");
+    let diagnostics = check(&ws);
+    assert!(
+        diagnostics.iter().any(|d| d.code == "binding"),
+        "{diagnostics:#?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|d| !d.message.contains("is not there on every way")),
+        "{diagnostics:#?}"
+    );
+}

@@ -146,6 +146,12 @@ its step lacks:
   binding step altogether, for example from a branch that skips it or from the
   start of a loop that has not yet run it.
 
+A `let` alias of a binding (`let out = answer.c.output`), an alias of an alias,
+and a `map` or `filter` item of a collection derived from a binding are held to
+the same check where they are read, with the same reasons as the direct read.
+Binding a missing value has no effect until it is read, so an alias used only
+inside `exists` is fine.
+
 The diagnostic names the step, the reference and the ways that lack the field.
 Read the field only where it is always present: after the outcome edge that
 returns it, or on the `completed` edge of a join whose `accepted_outcomes` lists

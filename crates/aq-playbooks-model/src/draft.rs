@@ -21,6 +21,8 @@ enum Variant {
     Absent,
     /// Bound, in a shape this check does not follow.
     Bound,
+    /// Missing, for the reason given (an alias of a field some way lacks).
+    Lacks(String),
     /// A named join's result: each key's own variants.
     Keys(BTreeMap<String, Variants>),
 }
@@ -84,7 +86,7 @@ impl ArtifactContent {
                 let path = format!("steps.{name}");
                 for (at, expr) in step_exprs(&step.op) {
                     let mut reads = vec![];
-                    strict_reads(expr, &at, false, false, &context, &mut reads);
+                    strict_reads(expr, &at, false, false, &context, &Scope::new(), &mut reads);
                     for (place, message) in reads {
                         let refused = reported.iter().chain(&issues).any(|i| {
                             i.path == path && i.message.starts_with(&format!("{path}.{place}:"))
@@ -307,19 +309,203 @@ fn binding_of(step: &Step) -> Option<&str> {
     }
 }
 
+/// A lexical name (`let` alias, `map` or `filter` item): the variants of what
+/// it was derived from; the name reasons use for it (an alias reads as its
+/// origin, so its reasons are worded as the direct read's); and a note for
+/// the message.
+#[derive(Clone)]
+struct Lexical {
+    variants: Variants,
+    shown: Option<String>,
+    note: Option<String>,
+}
+type Scope = BTreeMap<String, Lexical>;
+
+/// A root as a reference names it: the binding, and the path inside it.
+fn split_ref<'a>(root: &'a str, path: &'a [String]) -> (&'a str, &'a [String]) {
+    match (root, path.split_first()) {
+        ("vars", Some((binding, rest))) => (binding.as_str(), rest),
+        _ => (root, path),
+    }
+}
+fn push_unique(into: &mut Variants, items: Variants) {
+    for v in items {
+        if !into.contains(&v) {
+            into.push(v);
+        }
+    }
+}
+/// What a reference to a tracked binding or alias holds on each way, with the
+/// origin it reads, as written; `None` for an untracked root.
+fn alias(value: &Expr, context: &Context, scope: &Scope) -> Option<(Variants, String)> {
+    let Expr::Ref { root, path } = value else {
+        return None;
+    };
+    let (binding, rest) = split_ref(root, path);
+    let (variants, origin) = match scope.get(binding) {
+        Some(name) => (
+            &name.variants,
+            name.shown.clone().unwrap_or_else(|| binding.to_string()),
+        ),
+        None => (context.get(binding)?, binding.to_string()),
+    };
+    let mut projected = vec![];
+    for (variant, way) in variants {
+        push_unique(&mut projected, project(variant, way, &origin, rest, 0));
+    }
+    Some((projected, dotted(&origin, rest)))
+}
+/// `variant` (arising `way`) followed along `path[depth..]`. Wherever the
+/// value is missing it becomes `Lacks`, worded as a direct read says it.
+fn project(variant: &Variant, way: &str, binding: &str, path: &[String], depth: usize) -> Variants {
+    let lacks = |text: String| vec![(Variant::Lacks(text), way.to_string())];
+    match variant {
+        Variant::Absent => lacks(format!("on {way}, `{binding}` is not bound")),
+        Variant::Lacks(_) | Variant::Bound => vec![(variant.clone(), way.to_string())],
+        Variant::Keys(keys) => {
+            let Some(key) = path.get(depth) else {
+                return vec![(variant.clone(), way.to_string())];
+            };
+            let Some(alternatives) = keys.get(key) else {
+                return vec![(Variant::Bound, way.to_string())];
+            };
+            let mut out = vec![];
+            for (v, w) in alternatives {
+                let items = if *v == Variant::Absent {
+                    vec![(
+                        Variant::Lacks(format!(
+                            "on {w}, `{}` is absent",
+                            dotted(binding, &path[..=depth])
+                        )),
+                        w.clone(),
+                    )]
+                } else {
+                    project(v, w, binding, path, depth + 1)
+                };
+                push_unique(&mut out, items);
+            }
+            out
+        }
+        Variant::Shape(schema) => project_schema(schema, way, binding, path, depth),
+    }
+}
+fn project_schema(
+    schema: &Schema,
+    way: &str,
+    binding: &str,
+    path: &[String],
+    depth: usize,
+) -> Variants {
+    let Some(key) = path.get(depth) else {
+        return vec![(Variant::Shape(schema.clone()), way.to_string())];
+    };
+    match schema {
+        Schema::Union { variants } => {
+            let mut out = vec![];
+            for v in variants {
+                push_unique(&mut out, project_schema(v, way, binding, path, depth));
+            }
+            out
+        }
+        Schema::Object { properties, .. } => match properties.get(key) {
+            Some(next) => project_schema(next, way, binding, path, depth + 1),
+            None => vec![(
+                Variant::Lacks(format!(
+                    "{way} has no `{key}` in `{}` (it has {})",
+                    dotted(binding, &path[..depth]),
+                    properties.keys().cloned().collect::<Vec<_>>().join(", ")
+                )),
+                way.to_string(),
+            )],
+        },
+        Schema::Array { items, .. } => project_schema(items, way, binding, path, depth + 1),
+        _ => vec![(Variant::Bound, way.to_string())],
+    }
+}
+/// The variants of an item of `collection`: the items of each array it can
+/// be. Where the collection itself is missing its own read is refused, so
+/// the item is taken as bound there.
+fn item_variants(collection: &Expr, context: &Context, scope: &Scope) -> Lexical {
+    let mut out = vec![];
+    let mut add = |variants: Variants, of_array: bool| {
+        for (variant, way) in variants {
+            let items = match (&variant, of_array) {
+                (Variant::Shape(Schema::Array { items, .. }), true) => {
+                    vec![(Variant::Shape((**items).clone()), way)]
+                }
+                (Variant::Shape(Schema::Union { variants }), true) => variants
+                    .iter()
+                    .map(|v| match v {
+                        Schema::Array { items, .. } => {
+                            (Variant::Shape((**items).clone()), way.clone())
+                        }
+                        _ => (Variant::Bound, way.clone()),
+                    })
+                    .collect(),
+                (Variant::Shape(_) | Variant::Keys(_), false) => vec![(variant, way)],
+                _ => vec![(Variant::Bound, way)],
+            };
+            push_unique(&mut out, items);
+        }
+    };
+    match collection {
+        Expr::Array { items } => {
+            for item in items {
+                match alias(item, context, scope) {
+                    Some((variants, _)) => add(variants, false),
+                    None => add(vec![(Variant::Bound, String::new())], false),
+                }
+            }
+            Lexical {
+                variants: out,
+                shown: None,
+                note: Some("is an item of its collection".into()),
+            }
+        }
+        _ => match alias(collection, context, scope) {
+            Some((variants, origin)) => {
+                add(variants, true);
+                Lexical {
+                    variants: out,
+                    shown: None,
+                    note: Some(format!("is an item of `{origin}`")),
+                }
+            }
+            None => bound_name(),
+        },
+    }
+}
+fn bound_name() -> Lexical {
+    Lexical {
+        variants: vec![(Variant::Bound, String::new())],
+        shown: None,
+        note: None,
+    }
+}
+
 /// Every reference in `expr` (at location `at`) that some variant of its
-/// binding cannot satisfy, as (location, message). `exempt` holds inside
-/// `exists`; `key` inside a lookup key, which is never exempt.
+/// binding, or of the binding an alias or item was derived from, cannot
+/// satisfy, as (location, message). `exempt` holds inside `exists`; `key`
+/// inside a lookup key, which is never exempt.
 fn strict_reads(
     expr: &Expr,
     at: &str,
     exempt: bool,
     key: bool,
     context: &Context,
+    scope: &Scope,
     out: &mut Vec<(String, String)>,
 ) {
-    let mut sub = |e: &Expr, field: &str, exempt: bool, key: bool| {
-        strict_reads(e, &operand(at, expr, field), exempt, key, context, out)
+    let mut sub = |e: &Expr, field: &str, exempt: bool, key: bool, scope: &Scope| {
+        strict_reads(
+            e,
+            &operand(at, expr, field),
+            exempt,
+            key,
+            context,
+            scope,
+            out,
+        )
     };
     match expr {
         Expr::Literal { .. } => {}
@@ -327,22 +513,30 @@ fn strict_reads(
             if exempt {
                 return;
             }
-            let (binding, rest) = match (root.as_str(), path.split_first()) {
-                ("vars", Some((binding, rest))) => (binding.as_str(), rest),
-                _ => (root.as_str(), path.as_slice()),
-            };
-            let Some(variants) = context.get(binding) else {
-                return;
+            let (binding, rest) = split_ref(root, path);
+            let (variants, shown, note) = match scope.get(binding) {
+                Some(name) => (
+                    &name.variants,
+                    name.shown.clone().unwrap_or_else(|| binding.to_string()),
+                    name.note.clone(),
+                ),
+                None => match context.get(binding) {
+                    Some(variants) => (variants, binding.to_string(), None),
+                    None => return,
+                },
             };
             let mut lacks = vec![];
             for (variant, way) in variants {
-                lacking(variant, way, binding, rest, 0, &mut lacks);
+                lacking(variant, way, &shown, rest, 0, &mut lacks);
             }
             if lacks.is_empty() {
                 return;
             }
+            let note = note
+                .map(|n| format!(" (`{binding}` {n})"))
+                .unwrap_or_default();
             let mut message = format!(
-                "`{}` is not there on every way to this step: {}. Read it only where it is \
+                "`{}`{note} is not there on every way to this step: {}. Read it only where it is \
                  always present: after the outcome edge of the step that returns it, or on the \
                  `completed` edge of a join whose `accepted_outcomes` lists only outcomes that \
                  have it (a `decide` on `outcome` does not narrow it). Or test it first with \
@@ -360,63 +554,99 @@ fn strict_reads(
         }
         Expr::Object { fields } => {
             for (k, e) in fields {
-                sub(e, &format!(".{k}"), exempt, key);
+                sub(e, &format!(".{k}"), exempt, key, scope);
             }
         }
         Expr::Array { items } => {
             for (i, e) in items.iter().enumerate() {
-                sub(e, &format!("[{i}]"), exempt, key);
+                sub(e, &format!("[{i}]"), exempt, key, scope);
             }
         }
         // Missing becomes `false` here; everything else inside propagates it
         // to here, except a lookup key, which is checked regardless.
-        Expr::Exists { value } => sub(value, ".value", true, key),
-        Expr::Not { value } => sub(value, ".value", exempt, key),
+        Expr::Exists { value } => sub(value, ".value", true, key, scope),
+        Expr::Not { value } => sub(value, ".value", exempt, key, scope),
         Expr::And { values } | Expr::Or { values } => {
             for (i, e) in values.iter().enumerate() {
-                sub(e, &format!(".values[{i}]"), exempt, key);
+                sub(e, &format!(".values[{i}]"), exempt, key, scope);
             }
         }
         Expr::Eq { left, right }
         | Expr::Lt { left, right }
         | Expr::Difference { left, right, .. } => {
-            sub(left, ".left", exempt, key);
-            sub(right, ".right", exempt, key);
+            sub(left, ".left", exempt, key, scope);
+            sub(right, ".right", exempt, key, scope);
         }
         Expr::Contains { collection, value } => {
-            sub(collection, ".collection", exempt, key);
-            sub(value, ".value", exempt, key);
+            sub(collection, ".collection", exempt, key, scope);
+            sub(value, ".value", exempt, key, scope);
         }
         Expr::Map {
-            collection, value, ..
-        } => {
-            sub(collection, ".collection", exempt, key);
-            sub(value, ".value", exempt, key);
-        }
-        Expr::Filter {
             collection,
-            predicate,
+            item,
+            value: body,
+            ..
+        }
+        | Expr::Filter {
+            collection,
+            item,
+            predicate: body,
             ..
         } => {
-            sub(collection, ".collection", exempt, key);
-            sub(predicate, ".predicate", exempt, key);
+            sub(collection, ".collection", exempt, key, scope);
+            // The item shadows any binding of the same name.
+            let mut inner = scope.clone();
+            inner.insert(item.clone(), item_variants(collection, context, scope));
+            let field = if matches!(expr, Expr::Map { .. }) {
+                ".value"
+            } else {
+                ".predicate"
+            };
+            sub(body, field, exempt, key, &inner);
         }
         Expr::Lookup {
             key: k,
             cases,
             default,
         } => {
-            sub(k, ".key", false, true);
+            sub(k, ".key", false, true, scope);
             for (i, c) in cases.iter().enumerate() {
-                sub(&c.then, &format!(".cases[{i}].then"), exempt, key);
+                sub(&c.then, &format!(".cases[{i}].then"), exempt, key, scope);
             }
-            sub(default, ".default", exempt, key);
+            sub(default, ".default", exempt, key, scope);
         }
         Expr::Let { bindings, body } => {
+            let mut inner = scope.clone();
             for (i, b) in bindings.iter().enumerate() {
-                sub(&b.value, &format!(".bindings[{i}].value"), exempt, key);
+                // An alias of a binding is checked where it is used, as the
+                // binding would be: binding a missing value has no effect
+                // until it is read.
+                match alias(&b.value, context, &inner) {
+                    Some((variants, origin)) => {
+                        let note = Some(format!("is `{origin}`"));
+                        let shown = Some(origin);
+                        inner.insert(
+                            b.name.clone(),
+                            Lexical {
+                                variants,
+                                shown,
+                                note,
+                            },
+                        );
+                    }
+                    None => {
+                        sub(
+                            &b.value,
+                            &format!(".bindings[{i}].value"),
+                            exempt,
+                            key,
+                            &inner,
+                        );
+                        inner.insert(b.name.clone(), bound_name());
+                    }
+                }
             }
-            sub(body, ".body", exempt, key);
+            sub(body, ".body", exempt, key, &inner);
         }
     }
 }
@@ -437,6 +667,7 @@ fn lacking(
     };
     match variant {
         Variant::Absent => push(lacks, format!("on {way}, `{binding}` is not bound")),
+        Variant::Lacks(text) => push(lacks, text.clone()),
         Variant::Keys(keys) => {
             let Some(alternatives) = path.get(depth).and_then(|k| keys.get(k)) else {
                 return;
