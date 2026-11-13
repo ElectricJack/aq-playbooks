@@ -672,7 +672,7 @@ type Case = (&'static str, &'static str, Box<dyn Fn(&mut State)>);
 fn refusal_cases() -> Vec<Case> {
     let early = retention::REFUSE_EARLY_REMOVAL;
     let shortened = retention::REFUSE_EXPIRY;
-    vec![
+    let mut cases: Vec<Case> = vec![
         (
             "run",
             retention::REFUSE_RUN_REMOVAL,
@@ -800,7 +800,235 @@ fn refusal_cases() -> Vec<Case> {
                 n.retention.clock_ms = Some(499);
             }),
         ),
+    ];
+    cases.extend(rebase_refusal_cases());
+    cases
+}
+/// The admin receipt of a clock rebase from `from_ms` to `to_ms`.
+fn rebase_receipt(sequence: u64, from_ms: i64, to_ms: i64) -> Receipt {
+    Receipt {
+        sequence,
+        run: "admin".into(),
+        step: "retention".into(),
+        at_ms: to_ms,
+        kind: retention::CLOCK_REBASE.into(),
+        detail: json!({"from_ms": from_ms, "to_ms": to_ms}),
+    }
+}
+/// That receipt as history written by the commit (the licence).
+fn rebase_cohort(sequence: u64, from_ms: i64, to_ms: i64) -> SettledCohort {
+    SettledCohort {
+        root: "admin".into(),
+        finished_at_ms: to_ms,
+        runs: vec![],
+        intents: vec![],
+        receipts: vec![rebase_receipt(sequence, from_ms, to_ms)],
+    }
+}
+/// Ruling 3: the clock and expiry fences open only for a commit that writes
+/// a clock rebase receipt to history, for exactly that rebase (changes of
+/// `fence_state()`: clock 500, windows 2_000 and 3_000).
+fn rebase_refusal_cases() -> Vec<Case> {
+    let shortened = retention::REFUSE_EXPIRY;
+    vec![
+        (
+            "clock lowered without a rebase",
+            retention::REFUSE_CLOCK,
+            Box::new(|n| n.retention.clock_ms = Some(100)),
+        ),
+        (
+            "clock lowered, rebase receipt left live",
+            retention::REFUSE_CLOCK,
+            Box::new(|n| {
+                n.retention.clock_ms = Some(100);
+                n.receipts.push(rebase_receipt(99, 500, 100));
+            }),
+        ),
+        (
+            "clock lowered, rebase from another clock",
+            retention::REFUSE_CLOCK,
+            Box::new(|n| {
+                n.retention.clock_ms = Some(100);
+                n.settled.push(rebase_cohort(99, 600, 100));
+            }),
+        ),
+        (
+            "clock lowered, rebase to another clock",
+            retention::REFUSE_CLOCK,
+            Box::new(|n| {
+                n.retention.clock_ms = Some(100);
+                n.settled.push(rebase_cohort(99, 500, 200));
+            }),
+        ),
+        (
+            "expiry lowered with a rebase the clock did not take",
+            shortened,
+            Box::new(|n| {
+                n.settled.push(rebase_cohort(99, 500, 100));
+                n.retention
+                    .admission_expires_at_ms
+                    .insert("k".into(), 2_100);
+            }),
+        ),
+        (
+            "expiry capped below the rebased window",
+            shortened,
+            Box::new(|n| {
+                n.retention.clock_ms = Some(100);
+                n.settled.push(rebase_cohort(99, 500, 100));
+                n.retention
+                    .admission_expires_at_ms
+                    .insert("k".into(), 2_099);
+            }),
+        ),
+        (
+            "event expiry capped below the rebased window",
+            shortened,
+            Box::new(|n| {
+                n.retention.clock_ms = Some(100);
+                n.settled.push(rebase_cohort(99, 500, 100));
+                n.retention.event_expires_at_ms.insert("ev".into(), 3_099);
+            }),
+        ),
     ]
+}
+/// The commit a rebase from 500 to 100 makes on `fence_state()`.
+fn rebased(n: &mut State) {
+    n.retention.clock_ms = Some(100);
+    n.retention
+        .admission_expires_at_ms
+        .insert("k".into(), 2_100);
+    n.retention.event_expires_at_ms.insert("ev".into(), 3_100);
+    n.retention.stale_floor_ms = Some(50);
+    n.settled.push(rebase_cohort(99, 500, 100));
+}
+/// After that commit the licence is spent, and the floor never decreases.
+fn after_rebase_refusal_cases() -> Vec<Case> {
+    vec![
+        (
+            "clock lowered again",
+            retention::REFUSE_CLOCK,
+            Box::new(|n| {
+                n.settled.clear();
+                n.retention.clock_ms = Some(90);
+            }),
+        ),
+        (
+            "stale floor lowered",
+            retention::REFUSE_STALE_FLOOR,
+            Box::new(|n| {
+                n.settled.clear();
+                n.retention.stale_floor_ms = Some(40);
+            }),
+        ),
+        (
+            "stale floor removed",
+            retention::REFUSE_STALE_FLOOR,
+            Box::new(|n| {
+                n.settled.clear();
+                n.retention.stale_floor_ms = None;
+            }),
+        ),
+    ]
+}
+/// A licensed rebase commits on every full path (protected and plain
+/// format 2, format 3 compare-and-swap) and through a format 3 transition
+/// (on the complete path); after it the fences are closed again.
+#[test]
+fn a_clock_rebase_is_licensed_on_every_commit_path() {
+    let stores = [
+        ("f2_protected", support::protected()),
+        ("f2_plain", support::store()),
+        ("f3_cas", support::records()),
+    ];
+    for (label, store) in stores {
+        for (case, text, f) in after_rebase_refusal_cases() {
+            let ns = support::namespace(label);
+            store.acquire(&ns, "w").unwrap();
+            let base = store.compare_and_swap(&ns, "w", 0, &fence_state()).unwrap();
+            let mut next = fence_state();
+            rebased(&mut next);
+            let r = store.compare_and_swap(&ns, "w", base, &next).unwrap();
+            let s = store.load(&ns).unwrap().state;
+            assert_eq!(
+                (
+                    s.retention.clock_ms,
+                    s.retention.stale_floor_ms,
+                    s.retention.admission_expires_at_ms.get("k").copied()
+                ),
+                (Some(100), Some(50), Some(2_100)),
+                "{label}"
+            );
+            assert_eq!(history_rows(&ns), 1, "{label}: the rebase receipt");
+            let mut later = s.clone();
+            f(&mut later);
+            let result = store.compare_and_swap(&ns, "w", r, &later);
+            assert!(
+                refused_with(result.clone(), text),
+                "{label} {case}: {result:?}"
+            );
+            assert_eq!(store.load(&ns).unwrap().revision, r, "{label} {case}");
+        }
+    }
+    let store = support::records();
+    let ns = support::namespace("f3_rebase");
+    store.acquire(&ns, "w").unwrap();
+    let mut s = fence_state();
+    s.indexes.initialized = true;
+    store.compare_and_swap(&ns, "w", 0, &s).unwrap();
+    let transition = |f: &dyn Fn(&mut State)| {
+        let mut plan = |s: &mut State| {
+            f(s);
+            Ok(true)
+        };
+        let validate = |_: &State, _: &QuotaCounts| Ok(());
+        storage_error(store.transition_v1(
+            &ns,
+            "w",
+            &mut TransitionRequest {
+                operation: "rebase",
+                plan: &mut plan,
+                validate: &validate,
+            },
+        ))
+    };
+    store.reset_transition_stats();
+    transition(&rebased).unwrap();
+    assert_eq!(store.transition_stats().heavy, 1);
+    let r = store.load(&ns).unwrap().state.retention;
+    assert_eq!(
+        (
+            r.clock_ms,
+            r.stale_floor_ms,
+            r.event_expires_at_ms.get("ev").copied()
+        ),
+        (Some(100), Some(50), Some(3_100))
+    );
+    for (case, text, f) in after_rebase_refusal_cases() {
+        let result = transition(f.as_ref());
+        assert!(refused_with(result.clone(), text), "{case}: {result:?}");
+    }
+    // A rebase that lowers only the clock also takes the complete path.
+    let ns = support::namespace("f3_rebase_clock_only");
+    store.acquire(&ns, "w").unwrap();
+    store.compare_and_swap(&ns, "w", 0, &s).unwrap();
+    let mut plan = |s: &mut State| {
+        s.retention.clock_ms = Some(100);
+        s.settled.push(rebase_cohort(99, 500, 100));
+        Ok(true)
+    };
+    let validate = |_: &State, _: &QuotaCounts| Ok(());
+    storage_error(store.transition_v1(
+        &ns,
+        "w",
+        &mut TransitionRequest {
+            operation: "rebase",
+            plan: &mut plan,
+            validate: &validate,
+        },
+    ))
+    .unwrap();
+    assert_eq!(store.load(&ns).unwrap().state.retention.clock_ms, Some(100));
 }
 fn tombstone_rows(ns: &str) -> i64 {
     support::client()
@@ -1559,5 +1787,190 @@ fn window_drop_on_postgres_is_incremental_on_f3_and_fenced_on_f2() {
             assert_eq!(records, 23, "k-064, k-new, the event and 20 burst entries");
             assert!(largest <= 8, "{largest} bytes");
         }
+    }
+}
+
+/// A waiter on `test.signal` with correlation `invocation = "held"`: it
+/// holds the event `pg_event("held")` while it waits (it is never driven
+/// here, so its deadline never fires).
+fn pg_waiter_artifact() -> aq_playbooks_model::Artifact {
+    use aq_playbooks_model::*;
+    let c = pg_event_contract();
+    let mut content = support::artifact("waiter").content;
+    content.playbook.entries.get_mut("main").unwrap().start = "wait".into();
+    content.playbook.steps = BTreeMap::from([
+        (
+            "wait".to_string(),
+            Step {
+                op: Operation::Wait {
+                    event: Some(ContractRef {
+                        name: c.name.clone(),
+                        fingerprint: c.fingerprint().unwrap(),
+                    }),
+                    correlation: BTreeMap::from([("invocation".into(), Expr::literal("held"))]),
+                    minimum_revision: None,
+                    deadline_ms: 100,
+                    bind: "completion".into(),
+                },
+                edges: BTreeMap::from([
+                    ("received".into(), "return".into()),
+                    ("timeout".into(), "return".into()),
+                ]),
+                on_error: Some("return".into()),
+            },
+        ),
+        ("return".to_string(), ret_ok()),
+    ]);
+    content.registry.events.insert(c.name.clone(), c);
+    Artifact::seal(content).unwrap()
+}
+/// Ruling 3, the full scenario on PostgreSQL protected format 2 and format
+/// 3: normal operation, one far-future host time, stale refusals that write
+/// nothing and entries that do not expire, the rebase, then normal
+/// operation with held events, live runs and duplicates intact and the
+/// record no longer growing.
+#[test]
+fn a_pinned_clock_is_rebased_on_postgres() {
+    for (format, store) in both() {
+        let ns = support::namespace("rebase");
+        let e = Engine::new(store, &ns, "w").unwrap();
+        let mut content = support::artifact("a").content;
+        content
+            .registry
+            .events
+            .insert("test.signal".into(), pg_event_contract());
+        let a = aq_playbooks_model::Artifact::seal(content).unwrap();
+        let digest = a.digest.clone();
+        e.install(a).unwrap();
+        e.activate_at("a", &digest, pg_authority(), 0).unwrap();
+        let w = pg_waiter_artifact();
+        let waiter_digest = w.digest.clone();
+        e.install(w).unwrap();
+        e.activate_at("waiter", &waiter_digest, pg_authority(), 0)
+            .unwrap();
+        e.set_retention_policy(RetentionPolicy {
+            admission_replay_ms: 1_000,
+            event_replay_ms: 1,
+            ..RetentionPolicy::default()
+        })
+        .unwrap();
+        let t0: i64 = 10_000;
+        let pinned = t0 + 1_000_000_000;
+        let done = e.admit_once_at(pg_keyed(&e, "done"), Some(t0), t0).unwrap();
+        e.advance(&done.receipt.run_id, t0).unwrap();
+        let live = e.admit_once_at(pg_keyed(&e, "live"), Some(t0), t0).unwrap();
+        let waiter = e
+            .admit("waiter", "main", Value::Null, pg_authority(), t0)
+            .unwrap();
+        e.advance(&waiter, t0).unwrap();
+        let held = e
+            .admit_event_at("host", pg_event("held"), 0, Some(t0), t0)
+            .unwrap();
+        e.admit("a", "main", Value::Null, pg_authority(), pinned)
+            .unwrap();
+        let s = e.snapshot().unwrap();
+        assert!(!s.keyed_admissions.contains_key("done"), "{format}");
+        assert!(s.events.contains_key(&held.key), "{format}");
+        // Real time again: stale, and nothing written (M5).
+        let t1 = t0 + 200;
+        let revision = e.store.load(&ns).unwrap().revision;
+        assert!(matches!(
+            e.admit_once_at(pg_keyed(&e, "during"), Some(t1), t1),
+            Err(Error::Stale { .. })
+        ));
+        assert!(matches!(
+            e.admit_event_at("host", pg_event("during-e"), 0, Some(t1), t1),
+            Err(Error::Stale { .. })
+        ));
+        assert_eq!(e.store.load(&ns).unwrap().revision, revision, "{format}");
+        for i in 0..3 {
+            let d = e
+                .admit_once(pg_keyed(&e, &format!("pin-{i}")), t1 + i)
+                .unwrap();
+            e.advance(&d.receipt.run_id, t1 + i).unwrap();
+        }
+        e.admit("a", "main", Value::Null, pg_authority(), t1 + 5_000)
+            .unwrap();
+        assert_eq!(e.snapshot().unwrap().keyed_admissions.len(), 4, "{format}");
+        // The rebase.
+        let t2 = t0 + 500;
+        let report = e
+            .rebase_retention_clock(t2, t0, "ops", "pinned clock", t2)
+            .unwrap();
+        assert_eq!(
+            (
+                report.from_ms,
+                report.capped_admissions,
+                report.capped_events
+            ),
+            (pinned, 4, 1),
+            "{format}"
+        );
+        let s = e.snapshot().unwrap();
+        assert_eq!(
+            (s.retention.clock_ms, s.retention.stale_floor_ms),
+            (Some(t2), Some(t0)),
+            "{format}"
+        );
+        assert_eq!(
+            s.retention.event_expires_at_ms.get(&held.key).copied(),
+            Some(t2 + 1_000),
+            "{format}"
+        );
+        let rows: i64 = support::client()
+            .query_one(
+                "SELECT count(*) FROM aq_playbooks.run_history WHERE namespace=$1 AND kind='receipts' AND public_value->>'kind'='retention_clock_rebased'",
+                &[&ns],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(rows, 1, "{format}: the rebase receipt is history");
+        // Normal operation resumes.
+        let during = e
+            .admit_once_at(pg_keyed(&e, "during"), Some(t1), t2)
+            .unwrap();
+        assert!(!during.duplicate, "{format}");
+        assert!(
+            e.admit_once_at(pg_keyed(&e, "during"), Some(t1), t2 + 10)
+                .unwrap()
+                .duplicate
+        );
+        assert!(
+            e.admit_once_at(pg_keyed(&e, "live"), Some(t0), t2 + 10)
+                .unwrap()
+                .duplicate
+        );
+        assert!(
+            e.admit_event_at("host", pg_event("held"), 0, Some(t0), t2 + 10)
+                .unwrap()
+                .duplicate
+        );
+        let s = e.snapshot().unwrap();
+        assert!(s.runs.contains_key(&waiter), "{format}");
+        assert!(s.runs.contains_key(&live.receipt.run_id), "{format}");
+        // The floor refuses a retry of the early-forgotten key.
+        assert!(matches!(
+            e.admit_once_at(pg_keyed(&e, "done"), Some(t0), t2 + 10),
+            Err(Error::Stale { floor_ms: Some(f), .. }) if f == t0
+        ));
+        // The record stops growing.
+        for run in [&live.receipt.run_id, &during.receipt.run_id] {
+            e.advance(run, t2 + 20).unwrap();
+        }
+        for i in 0..10 {
+            let at = t2 + 1_001 + i * 200;
+            let d = e
+                .admit_once_at(pg_keyed(&e, &format!("after-{i}")), Some(at), at)
+                .unwrap();
+            e.advance(&d.receipt.run_id, at).unwrap();
+        }
+        let s = e.snapshot().unwrap();
+        let mut keys: Vec<String> = s.keyed_admissions.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            (5..10).map(|i| format!("after-{i}")).collect::<Vec<_>>(),
+            "{format}"
+        );
     }
 }

@@ -501,6 +501,9 @@ impl PostgresStorage {
         };
         let mut tx: ObservedTransaction<'_> = lent.reclaim()?;
         let previous = header_state(&header)?;
+        // A clock rebase lowers the clock and caps expiries; only the
+        // complete path's `verify_removals` can license that.
+        let rebase = aq_playbooks_runner::retention::clock_rebase(&state).is_some();
         let staged = stage(
             &mut tx,
             namespace,
@@ -508,11 +511,13 @@ impl PostgresStorage {
             &patch,
             state.retention.clock_ms,
             &state.retention.policy,
+            rebase,
         )?;
         let live_keys = aq_playbooks_runner::history::patch_live_keys(&patch)?;
         (request.validate)(&state, &staged.accounting.counts())?;
         source.check()?;
         let heavy = !fallbacks.is_empty()
+            || rebase
             || staged.replaced
             || staged.history_removed
             || state.artifacts != artifacts
@@ -642,6 +647,7 @@ fn verify_header(previous: &State, next: &State) -> Result<(), StorageError> {
     {
         return Err(backend(aq_playbooks_runner::retention::REFUSE_CLOCK));
     }
+    aq_playbooks_runner::retention::check_stale_floor(previous, next)?;
     if next.sequence < previous.sequence {
         return Err(backend("namespace invocation sequence cannot decrease"));
     }
@@ -686,7 +692,9 @@ struct Staged {
 /// keyed admission or event deletion stays bounded only when the same patch
 /// deletes its expiry record with an expiry `clock_ms` has reached (and, for
 /// an event, writes no legacy tombstone for it); otherwise it sets
-/// `history_removed`, so the complete path runs `verify_removals`.
+/// `history_removed`, so the complete path runs `verify_removals`. In a
+/// commit that carries a clock `rebase`, a lowered expiry is left to that
+/// path too (it is refused here otherwise).
 fn stage(
     tx: &mut ObservedTransaction<'_>,
     namespace: &str,
@@ -694,6 +702,7 @@ fn stage(
     patch: &StatePatch,
     clock_ms: Option<i64>,
     policy: &aq_playbooks_runner::RetentionPolicy,
+    rebase: bool,
 ) -> Result<Staged, StorageError> {
     let mut staged = Staged {
         full_header: patch.header.clone(),
@@ -866,6 +875,9 @@ fn stage(
         };
         let (old, new) = (at(&before)?, at(&after)?);
         match (old, new) {
+            (Some(before), Some(after)) if rebase && after < before => {
+                staged.history_removed = true
+            }
             (Some(_), Some(_)) => {
                 aq_playbooks_runner::retention::check_expiry_change(old, new, true, None)?
             }

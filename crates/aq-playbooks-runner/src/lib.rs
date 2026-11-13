@@ -68,6 +68,15 @@ pub(crate) fn invariant(what: String) -> Error {
 fn is_invariant(error: &Error) -> bool {
     matches!(error, Error::Conflict(m) if m.starts_with(INVARIANT))
 }
+/// What [`Engine::rebase_retention_clock`] changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClockRebaseReport {
+    pub from_ms: i64,
+    pub to_ms: i64,
+    pub stale_floor_ms: i64,
+    pub capped_events: usize,
+    pub capped_admissions: usize,
+}
 /// The start of the text of every [`Error::Stale`]: a request whose producer
 /// (request) time is older than its window.
 pub const STALE_REQUEST: &str = "stale request: producer time is older than the replay window";
@@ -3460,6 +3469,76 @@ impl<S: Storage> Engine<S> {
             }
             s.retention.policy = policy;
             Ok(())
+        })
+    }
+    /// Recover from a retention clock that a far-future host time pinned
+    /// (see `docs/implementation/0003-live-state-only.md`, "If the clock was
+    /// pinned"). One commit, refused unless `now_ms <= to_ms < clock` and
+    /// `stale_floor_ms <= to_ms`:
+    ///
+    /// - the clock becomes `to_ms` (the corrected real time);
+    /// - every recorded expiry later than `to_ms` plus its own window is
+    ///   capped there, so what the pin wrote expires in real time again and
+    ///   no entry is remembered for less than its window from `to_ms`;
+    /// - the stale floor becomes the later of the old floor and
+    ///   `stale_floor_ms`: a request for a key the engine does not remember
+    ///   whose request time is at or before it is stale. Pass the last
+    ///   correct host time before the pin, so retries of keys the pin made
+    ///   the engine forget early cannot come back as new;
+    /// - an admin receipt (history) records the old and new clock, the
+    ///   floor, the counts, `actor` and `reason`. Every backend lowers the
+    ///   clock or an expiry only in a commit that carries this receipt.
+    pub fn rebase_retention_clock(
+        &self,
+        to_ms: i64,
+        stale_floor_ms: i64,
+        actor: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<ClockRebaseReport> {
+        if actor.is_empty() || reason.is_empty() || actor.len() > 512 || reason.len() > 4096 {
+            return Err(Error::Refused(
+                "clock rebase requires bounded actor and reason".into(),
+            ));
+        }
+        self.transaction_at(Some(now_ms), |s| {
+            let Some(from_ms) = s.retention.clock_ms else {
+                return Err(Error::Refused("no retention clock to rebase".into()));
+            };
+            if !(now_ms <= to_ms && to_ms < from_ms) {
+                return Err(Error::Refused(format!(
+                    "clock rebase requires host time ({now_ms} ms) <= target ({to_ms} ms) < \
+                     retention clock ({from_ms} ms)"
+                )));
+            }
+            if stale_floor_ms > to_ms {
+                return Err(Error::Refused(format!(
+                    "stale floor ({stale_floor_ms} ms) must not be later than the target \
+                     ({to_ms} ms)"
+                )));
+            }
+            let floor_ms = s
+                .retention
+                .stale_floor_ms
+                .map_or(stale_floor_ms, |old| old.max(stale_floor_ms));
+            let (capped_events, capped_admissions) = retention::rebase_clock(s, to_ms);
+            s.retention.stale_floor_ms = Some(floor_ms);
+            let report = ClockRebaseReport {
+                from_ms,
+                to_ms,
+                stale_floor_ms: floor_ms,
+                capped_events,
+                capped_admissions,
+            };
+            receipt(
+                s,
+                "admin",
+                "retention",
+                now_ms,
+                retention::CLOCK_REBASE,
+                json!({"from_ms":from_ms,"to_ms":to_ms,"stale_floor_ms":floor_ms,"capped_events":capped_events,"capped_admissions":capped_admissions,"actor":actor,"reason":reason}),
+            );
+            Ok(report)
         })
     }
     pub fn collect_garbage(&self, now_ms: i64, limit: usize) -> Result<GcReport> {

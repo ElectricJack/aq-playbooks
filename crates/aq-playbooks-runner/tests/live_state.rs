@@ -852,6 +852,216 @@ fn tombstone(digest: &str) -> retention::EventTombstone {
         disposed_at_ms: 5,
     }
 }
+/// The admin receipt of a clock rebase from `from_ms` to `to_ms`.
+fn rebase_receipt(sequence: u64, from_ms: i64, to_ms: i64) -> Receipt {
+    Receipt {
+        sequence,
+        run: "admin".into(),
+        step: "retention".into(),
+        at_ms: to_ms,
+        kind: retention::CLOCK_REBASE.into(),
+        detail: json!({"from_ms": from_ms, "to_ms": to_ms}),
+    }
+}
+/// That receipt as history written by the commit (the licence).
+fn rebase_cohort(sequence: u64, from_ms: i64, to_ms: i64) -> SettledCohort {
+    SettledCohort {
+        root: "admin".into(),
+        finished_at_ms: to_ms,
+        runs: vec![],
+        intents: vec![],
+        receipts: vec![rebase_receipt(sequence, from_ms, to_ms)],
+    }
+}
+/// Ruling 3: the clock and expiry fences open only for a commit that writes
+/// a clock rebase receipt to history, for exactly that rebase. Cases on
+/// `fence_state()` (clock 500; windows 2_000 and 3_000; "k" 3_000, "ev"
+/// 4_000), each (label, refusal, change).
+fn rebase_refusal_cases() -> Vec<Case> {
+    let shortened = retention::REFUSE_EXPIRY;
+    vec![
+        (
+            "clock lowered without a rebase",
+            retention::REFUSE_CLOCK,
+            Box::new(|n| n.retention.clock_ms = Some(100)),
+        ),
+        (
+            "clock lowered, rebase receipt left live",
+            retention::REFUSE_CLOCK,
+            Box::new(|n| {
+                n.retention.clock_ms = Some(100);
+                n.receipts.push(rebase_receipt(99, 500, 100));
+            }),
+        ),
+        (
+            "clock lowered, rebase from another clock",
+            retention::REFUSE_CLOCK,
+            Box::new(|n| {
+                n.retention.clock_ms = Some(100);
+                n.settled.push(rebase_cohort(99, 600, 100));
+            }),
+        ),
+        (
+            "clock lowered, rebase to another clock",
+            retention::REFUSE_CLOCK,
+            Box::new(|n| {
+                n.retention.clock_ms = Some(100);
+                n.settled.push(rebase_cohort(99, 500, 200));
+            }),
+        ),
+        (
+            "expiry lowered without a rebase",
+            shortened,
+            Box::new(|n| {
+                n.retention
+                    .admission_expires_at_ms
+                    .insert("k".into(), 2_100);
+            }),
+        ),
+        (
+            "expiry lowered with a rebase the clock did not take",
+            shortened,
+            Box::new(|n| {
+                n.settled.push(rebase_cohort(99, 500, 100));
+                n.retention
+                    .admission_expires_at_ms
+                    .insert("k".into(), 2_100);
+            }),
+        ),
+        (
+            "expiry capped below the rebased window",
+            shortened,
+            Box::new(|n| {
+                n.retention.clock_ms = Some(100);
+                n.settled.push(rebase_cohort(99, 500, 100));
+                n.retention
+                    .admission_expires_at_ms
+                    .insert("k".into(), 2_099);
+            }),
+        ),
+        (
+            "event expiry capped below the rebased window",
+            shortened,
+            Box::new(|n| {
+                n.retention.clock_ms = Some(100);
+                n.settled.push(rebase_cohort(99, 500, 100));
+                n.retention.event_expires_at_ms.insert("ev".into(), 3_099);
+            }),
+        ),
+    ]
+}
+/// The commit a rebase from 500 to 100 makes on `fence_state()`: clock
+/// 100, each expiry capped at 100 plus its window, a stale floor.
+fn rebased(n: &mut State) {
+    n.retention.clock_ms = Some(100);
+    n.retention
+        .admission_expires_at_ms
+        .insert("k".into(), 2_100);
+    n.retention.event_expires_at_ms.insert("ev".into(), 3_100);
+    n.retention.stale_floor_ms = Some(50);
+    n.settled.push(rebase_cohort(99, 500, 100));
+}
+/// After that commit the licence is spent, and the floor never decreases.
+fn after_rebase_refusal_cases() -> Vec<Case> {
+    vec![
+        (
+            "clock lowered again",
+            retention::REFUSE_CLOCK,
+            Box::new(|n| {
+                n.settled.clear();
+                n.retention.clock_ms = Some(90);
+            }),
+        ),
+        (
+            "stale floor lowered",
+            retention::REFUSE_STALE_FLOOR,
+            Box::new(|n| {
+                n.settled.clear();
+                n.retention.stale_floor_ms = Some(40);
+            }),
+        ),
+        (
+            "stale floor removed",
+            retention::REFUSE_STALE_FLOOR,
+            Box::new(|n| {
+                n.settled.clear();
+                n.retention.stale_floor_ms = None;
+            }),
+        ),
+    ]
+}
+fn rebase_fences_hold_on_cas(store: &dyn Storage) {
+    let s = fence_state();
+    let count = std::cell::Cell::new(0);
+    let fresh = |state: &State| {
+        count.set(count.get() + 1);
+        let ns = format!("rebase-{}", count.get());
+        store.acquire(&ns, "w").unwrap();
+        let base = store.compare_and_swap(&ns, "w", 0, state).unwrap();
+        (ns, base)
+    };
+    let mut failures = vec![];
+    for (label, text, f) in rebase_refusal_cases() {
+        let (ns, base) = fresh(&s);
+        let mut next = s.clone();
+        f(&mut next);
+        let result = store.compare_and_swap(&ns, "w", base, &next);
+        if !refused_with(result.clone(), text) {
+            failures.push(format!("{label}: {result:?}"));
+        } else {
+            assert_eq!(store.load(&ns).unwrap().revision, base, "{label}");
+        }
+    }
+    let mut next = s.clone();
+    rebased(&mut next);
+    for (label, text, f) in after_rebase_refusal_cases() {
+        let (ns, base) = fresh(&s);
+        let r = store.compare_and_swap(&ns, "w", base, &next).unwrap();
+        let mut later = store.load(&ns).unwrap().state;
+        later.settled.clear();
+        f(&mut later);
+        let result = store.compare_and_swap(&ns, "w", r, &later);
+        if !refused_with(result.clone(), text) {
+            failures.push(format!("{label}: {result:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+#[test]
+fn memory_storage_opens_the_clock_fences_only_for_a_rebase() {
+    rebase_fences_hold_on_cas(&MemoryStorage::default());
+    let store = MemoryStorage::default();
+    store.acquire("ok", "w").unwrap();
+    let s = fence_state();
+    let base = store.compare_and_swap("ok", "w", 0, &s).unwrap();
+    let mut next = s.clone();
+    rebased(&mut next);
+    store.compare_and_swap("ok", "w", base, &next).unwrap();
+    let r = store.load("ok").unwrap().state.retention;
+    assert_eq!(
+        (
+            r.clock_ms,
+            r.stale_floor_ms,
+            r.admission_expires_at_ms.get("k").copied()
+        ),
+        (Some(100), Some(50), Some(2_100))
+    );
+}
+#[test]
+fn record_storage_opens_the_clock_fences_only_for_a_rebase() {
+    rebase_fences_hold_on_cas(&RecordStorage::new());
+    let store = RecordStorage::new();
+    store.acquire("ok", "w").unwrap();
+    let s = fence_state();
+    let base = store.compare_and_swap("ok", "w", 0, &s).unwrap();
+    let mut next = s.clone();
+    rebased(&mut next);
+    store.compare_and_swap("ok", "w", base, &next).unwrap();
+    assert_eq!(
+        store.load("ok").unwrap().state.retention.clock_ms,
+        Some(100)
+    );
+}
 /// The fence stays closed for every removal the rule does not allow: no
 /// history record in the commit, no expired window entry; and an expiry
 /// record never moves earlier.
@@ -1243,6 +1453,8 @@ fn record_storage_transitions_hold_the_removal_fences() {
             }),
         ),
     ];
+    let mut cases = cases;
+    cases.extend(rebase_refusal_cases());
     let failures: Vec<String> = cases
         .iter()
         .filter_map(|(label, text, f)| {
@@ -1255,6 +1467,23 @@ fn record_storage_transitions_hold_the_removal_fences() {
         })
         .collect();
     assert!(failures.is_empty(), "{failures:#?}");
+    // Ruling 3: a licensed rebase commits through the bounded transition,
+    // and the licence is that commit's own.
+    let (ns, _) = fresh();
+    transition_in(&ns, &rebased).unwrap();
+    let r = store.load(&ns).unwrap().state.retention;
+    assert_eq!(
+        (
+            r.clock_ms,
+            r.stale_floor_ms,
+            r.event_expires_at_ms.get("ev").copied()
+        ),
+        (Some(100), Some(50), Some(3_100))
+    );
+    for (label, text, f) in after_rebase_refusal_cases() {
+        let result = transition_in(&ns, f.as_ref());
+        assert!(refused_with(result.clone(), text), "{label}: {result:?}");
+    }
     let (ns, _) = fresh();
     let transition = |f: &dyn Fn(&mut State)| transition_in(&ns, f);
     // Expired: both entries leave in one bounded transition.
@@ -3479,4 +3708,268 @@ fn a_stale_refusal_is_typed_and_names_its_times() {
         assert!(message.contains(part), "{part}: {message}");
     }
     assert!(!matches!(error, Error::Refused(_)));
+}
+
+// --- Task 7 round 1, ruling 3: rebasing a pinned retention clock ----------
+
+/// The pinned-clock scenario (ruling 3) on any backend. Windows: keyed
+/// 1_000, events max(1, contract 1_000). Real time starts at `t0`.
+fn pinned_clock_is_rebased_and_normal_operation_resumes<S: Storage>(e: &Engine<S>) {
+    install_on(e, wait_artifact(), "waiter");
+    e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 1_000,
+        event_replay_ms: 1,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    let t0: i64 = 10_000;
+    let pinned: i64 = t0 + 1_000_000_000;
+    // Normal operation: a finished keyed run, a keyed run still live, a
+    // waiter holding an event, and an unheld event.
+    let done = e.admit_once_at(keyed_on(e, "done"), Some(t0), t0).unwrap();
+    assert!(e.advance(&done.receipt.run_id, t0).unwrap());
+    let live = e.admit_once_at(keyed_on(e, "live"), Some(t0), t0).unwrap();
+    let waiter = e
+        .admit("waiter", "main", Value::Null, authority(), t0)
+        .unwrap();
+    e.advance(&waiter, t0).unwrap();
+    let held = e
+        .admit_event_at("host", event("held", 1), 0, Some(t0), t0)
+        .unwrap();
+    e.admit_event_at(
+        "host",
+        correlated_event("free", "inv-free"),
+        0,
+        Some(t0),
+        t0,
+    )
+    .unwrap();
+    // One far-future host time pins the clock. Its drop forgets "done" and
+    // "free" a whole window early; "live" and "held" are deferred from the
+    // pin.
+    e.admit("a", "main", Value::Null, authority(), pinned)
+        .unwrap();
+    let s = e.snapshot().unwrap();
+    assert_eq!(s.retention.clock_ms, Some(pinned));
+    assert!(!s.keyed_admissions.contains_key("done"));
+    assert_eq!(s.events.len(), 1);
+    assert_eq!(
+        s.retention.admission_expires_at_ms.get("live").copied(),
+        Some(pinned + 1_000)
+    );
+    // Back in real time: every request that carries a request time is
+    // stale, and the refusal writes nothing.
+    let t1 = t0 + 200;
+    let before = e.snapshot().unwrap();
+    let refused = e
+        .admit_once_at(keyed_on(e, "during"), Some(t1), t1)
+        .unwrap_err();
+    assert!(
+        matches!(refused, Error::Stale { clock_ms: Some(c), now_ms, .. } if c == pinned && now_ms == t1)
+    );
+    assert!(refused.to_string().contains("ahead of host time"));
+    assert!(stale(e.admit_event_at(
+        "host",
+        correlated_event("during-e", "inv-during"),
+        0,
+        Some(t1),
+        t1
+    )));
+    let json = |s: &State| serde_json::to_value(s).unwrap();
+    assert_eq!(json(&e.snapshot().unwrap()), json(&before));
+    // Requests without a request time go through, and what they write
+    // expires from the pin: the record only grows.
+    for i in 0..5 {
+        let d = e
+            .admit_once(keyed_on(e, &format!("pin-{i}")), t1 + i)
+            .unwrap();
+        e.advance(&d.receipt.run_id, t1 + i).unwrap();
+    }
+    e.admit("a", "main", Value::Null, authority(), t1 + 5_000)
+        .unwrap();
+    let s = e.snapshot().unwrap();
+    assert_eq!(
+        s.keyed_admissions.len(),
+        6,
+        "pin-0..4 and live never expire"
+    );
+    assert!(
+        s.retention
+            .admission_expires_at_ms
+            .get("pin-0")
+            .is_some_and(|at| *at > pinned)
+    );
+    // The rebase: refused unless now <= to < clock, and the floor <= to.
+    let t2 = t0 + 500;
+    for (to, floor, now) in [
+        (pinned, t0, t2),
+        (pinned + 1, t0, t2),
+        (t2 - 1, t0, t2),
+        (t2, t2 + 1, t2),
+    ] {
+        assert!(
+            matches!(
+                e.rebase_retention_clock(to, floor, "ops", "pinned clock", now),
+                Err(Error::Refused(_))
+            ),
+            "to {to} floor {floor} now {now}"
+        );
+    }
+    assert!(
+        e.rebase_retention_clock(t2, t0, "", "pinned clock", t2)
+            .is_err()
+    );
+    assert_eq!(json(&e.snapshot().unwrap()), json(&s));
+    let report = e
+        .rebase_retention_clock(t2, t0, "ops", "pinned clock", t2)
+        .unwrap();
+    assert_eq!(
+        (report.from_ms, report.to_ms, report.stale_floor_ms),
+        (pinned, t2, t0)
+    );
+    assert_eq!((report.capped_admissions, report.capped_events), (6, 1));
+    let s = e.snapshot().unwrap();
+    assert_eq!(s.retention.clock_ms, Some(t2));
+    assert_eq!(s.retention.stale_floor_ms, Some(t0));
+    for key in ["live", "pin-0", "pin-4"] {
+        assert_eq!(
+            s.retention.admission_expires_at_ms.get(key).copied(),
+            Some(t2 + 1_000),
+            "{key}"
+        );
+    }
+    assert_eq!(
+        s.retention.event_expires_at_ms.get(&held.key).copied(),
+        Some(t2 + 1_000)
+    );
+    assert!(window_entries(&s).iter().all(|(at, _)| *at <= t2 + 1_000));
+    // The receipt is history: who, when, the old and new clock.
+    let receipts = inspect_all(e, InspectionKind::Receipts, Some("admin"));
+    let rebase = receipts
+        .iter()
+        .find(|r| r["kind"] == retention::CLOCK_REBASE)
+        .expect("rebase receipt in history");
+    assert_eq!(rebase["at_ms"], t2);
+    assert!(s.receipts.iter().all(|r| r.kind != retention::CLOCK_REBASE));
+    // Normal operation resumes. A request time is judged against real time
+    // again: one created during the pin is new now.
+    let during = e
+        .admit_once_at(keyed_on(e, "during"), Some(t1), t2)
+        .unwrap();
+    assert!(!during.duplicate);
+    assert!(
+        !e.admit_event_at(
+            "host",
+            correlated_event("during-e", "inv-during"),
+            0,
+            Some(t1),
+            t2
+        )
+        .unwrap()
+        .duplicate
+    );
+    // Duplicates inside their window are still recognised.
+    assert!(
+        e.admit_once_at(keyed_on(e, "during"), Some(t1), t2 + 10)
+            .unwrap()
+            .duplicate
+    );
+    assert!(
+        e.admit_once_at(keyed_on(e, "pin-0"), Some(t1), t2 + 10)
+            .unwrap()
+            .duplicate
+    );
+    // Held events and live runs are intact.
+    assert!(
+        e.admit_event_at("host", event("held", 1), 0, Some(t0), t2 + 10)
+            .unwrap()
+            .duplicate
+    );
+    let s = e.snapshot().unwrap();
+    assert_eq!(s.runs[&waiter].status, RunStatus::Waiting);
+    assert!(s.runs.contains_key(&live.receipt.run_id));
+    assert!(
+        e.admit_once_at(keyed_on(e, "live"), Some(t0), t2 + 10)
+            .unwrap()
+            .duplicate
+    );
+    // The floor: "done" was forgotten a window early by the pin. A retry
+    // with its original request time is stale, not a second run. Without a
+    // request time it is new, as for any key the engine has forgotten.
+    let floor = e
+        .admit_once_at(keyed_on(e, "done"), Some(t0), t2 + 10)
+        .unwrap_err();
+    assert!(
+        matches!(floor, Error::Stale { floor_ms: Some(f), cutoff_ms, .. } if f == t0 && cutoff_ms == t0)
+    );
+    assert!(stale(e.admit_event_at(
+        "host",
+        correlated_event("free", "inv-free"),
+        0,
+        Some(t0),
+        t2 + 10
+    )));
+    let again = e.admit_once(keyed_on(e, "done"), t2 + 10).unwrap();
+    assert!(!again.duplicate);
+    assert_ne!(again.receipt.run_id, done.receipt.run_id);
+    // The record stops growing: what the pin wrote expires in real time.
+    for run in [
+        &live.receipt.run_id,
+        &during.receipt.run_id,
+        &again.receipt.run_id,
+    ] {
+        assert!(e.advance(run, t2 + 20).unwrap());
+    }
+    for i in 0..10 {
+        let at = t2 + 1_001 + i * 200;
+        let d = e
+            .admit_once_at(keyed_on(e, &format!("after-{i}")), Some(at), at)
+            .unwrap();
+        e.advance(&d.receipt.run_id, at).unwrap();
+    }
+    let s = e.snapshot().unwrap();
+    let mut keys: Vec<String> = s.keyed_admissions.keys().cloned().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        (5..10).map(|i| format!("after-{i}")).collect::<Vec<_>>(),
+        "only the last window's keys stay"
+    );
+    assert!(window_entries(&s).len() <= 7, "{:?}", window_entries(&s));
+}
+#[test]
+fn memory_storage_pinned_clock_is_rebased_and_normal_operation_resumes() {
+    pinned_clock_is_rebased_and_normal_operation_resumes(&ret_engine());
+}
+#[test]
+fn record_storage_pinned_clock_is_rebased_and_normal_operation_resumes() {
+    let r = Engine::new(RecordStorage::new(), "test", "incarnation-1").unwrap();
+    install_on(&r, done_artifact(), "a");
+    pinned_clock_is_rebased_and_normal_operation_resumes(&r);
+}
+/// A rebase needs a clock, an actor and a reason, and a second rebase
+/// never lowers the floor.
+#[test]
+fn rebase_preconditions_and_the_floor_never_decreases() {
+    let e = ret_engine();
+    assert!(matches!(
+        e.rebase_retention_clock(10, 5, "ops", "r", 10),
+        Err(Error::Refused(_))
+    ));
+    e.admit("a", "main", Value::Null, authority(), 1_000_000)
+        .unwrap();
+    assert!(e.rebase_retention_clock(100, 50, "ops", "", 100).is_err());
+    e.rebase_retention_clock(500_000, 400_000, "ops", "r", 100)
+        .unwrap();
+    e.admit("a", "main", Value::Null, authority(), 900_000)
+        .unwrap();
+    let report = e
+        .rebase_retention_clock(600_000, 300_000, "ops", "r", 600_000)
+        .unwrap();
+    assert_eq!(report.stale_floor_ms, 400_000);
+    let s = e.snapshot().unwrap();
+    assert_eq!(
+        (s.retention.clock_ms, s.retention.stale_floor_ms),
+        (Some(600_000), Some(400_000))
+    );
 }

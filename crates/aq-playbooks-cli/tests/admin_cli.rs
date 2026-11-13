@@ -338,3 +338,87 @@ fn key_file_permissions_and_invalid_configuration_fail_closed() {
         assert!(read_keyring(&key).is_err());
     }
 }
+/// Ruling 3: the clock rebase needs explicit confirmation, refuses a
+/// target at or past the retention clock, and lowers a pinned clock with
+/// an admin receipt in history.
+#[test]
+fn rebase_retention_clock_requires_confirmation_and_lowers_a_pinned_clock() {
+    let f = Fixture::new();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let pinned = now + 10 * 365 * 86_400_000;
+    let e = Engine::new(
+        PostgresStorage::connect(&f.database).unwrap(),
+        &f.namespace,
+        "test-host",
+    )
+    .unwrap();
+    // One far-future host time pins the clock.
+    e.advance_producer_epoch("producer", 1, "operator", "pin", pinned)
+        .unwrap();
+    e.release().unwrap();
+    drop(e);
+    let to = (now + 60_000).to_string();
+    let floor = (now - 1_000).to_string();
+    let args = |confirm: bool, to: &str| {
+        let mut args = vec![
+            "rebase-retention-clock",
+            "--to-ms",
+            to,
+            "--stale-floor-ms",
+            &floor,
+            "--actor",
+            "operator",
+            "--reason",
+            "host clock jumped",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+        if confirm {
+            args.push("--confirm-clock-rebase".into());
+        }
+        args
+    };
+    let call = |args: Vec<String>| {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        f.call(&args, None)
+    };
+    assert!(!call(args(false, &to)).status.success());
+    let past = (pinned + 1).to_string();
+    let refused = call(args(true, &past));
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("retention clock"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let output = call(args(true, &to));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["from_ms"], pinned);
+    assert_eq!(report["to_ms"], now + 60_000);
+    assert_eq!(report["stale_floor_ms"], now - 1_000);
+    let state = PostgresStorage::connect(&f.database)
+        .unwrap()
+        .load(&f.namespace)
+        .unwrap()
+        .state;
+    assert_eq!(state.retention.clock_ms, Some(now + 60_000));
+    assert_eq!(state.retention.stale_floor_ms, Some(now - 1_000));
+    let receipts = f.ok(&["inspect", "admin", "--kind", "receipts"], None);
+    assert!(
+        receipts["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["kind"] == "retention_clock_rebased"),
+        "{receipts}"
+    );
+}

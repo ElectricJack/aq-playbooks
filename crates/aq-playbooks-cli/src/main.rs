@@ -182,6 +182,28 @@ enum Command {
         #[command(flatten)]
         store: StoreArgs,
     },
+    /// Lower a retention clock that a far-future host time pinned (every
+    /// request with a request time is refused as stale while it is ahead).
+    /// Caps expiries written from the pin, records a stale floor and an
+    /// admin receipt. Needs --confirm-clock-rebase.
+    RebaseRetentionClock {
+        /// The corrected real time (ms): at or after now, before the clock.
+        #[arg(long)]
+        to_ms: i64,
+        /// The last correct host time before the pin (ms): a retry of a key
+        /// the engine no longer remembers with a request time at or before
+        /// it is refused as stale. At most --to-ms.
+        #[arg(long)]
+        stale_floor_ms: i64,
+        #[arg(long)]
+        actor: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, required = true)]
+        confirm_clock_rebase: bool,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
     /// Re-encrypt the namespace with the active key from --protection-keys.
     RotateKeys {
         #[command(flatten)]
@@ -587,6 +609,20 @@ fn execute(cli: Cli) -> Result<()> {
             e.advance_producer_epoch(&producer, epoch, &actor, &reason, time()?)?;
             e.release()?;
             print(&json!({"producer":producer,"epoch":epoch}))
+        }
+        Command::RebaseRetentionClock {
+            to_ms,
+            stale_floor_ms,
+            actor,
+            reason,
+            confirm_clock_rebase,
+            store,
+        } => {
+            anyhow::ensure!(confirm_clock_rebase, "--confirm-clock-rebase required");
+            let e = engine(&store)?;
+            let report = e.rebase_retention_clock(to_ms, stale_floor_ms, &actor, &reason, time()?);
+            e.release()?;
+            print(&report?)
         }
         Command::RotateKeys { store } => {
             anyhow::ensure!(
