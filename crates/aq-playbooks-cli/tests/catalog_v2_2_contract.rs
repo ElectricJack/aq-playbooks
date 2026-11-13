@@ -1991,3 +1991,22 @@ fn a_document_rule_that_allows_nobody_uses_work_unroutable() {
         "{diagnostics:#?}"
     );
 }
+
+/// The routing draft against the draft cost bounds (A2 re-review round 4,
+/// I2): a reference counts the type it reads, so a table bound once and its
+/// result read many times stays far below the bounds.
+#[test]
+fn the_routing_draft_uses_a_small_part_of_the_cost_bounds() {
+    let sealed = seal(&routing_workspace()).unwrap_or_else(|d| panic!("{d:#?}"));
+    let size = sealed.content.draft_size();
+    println!("routing draft: {size:?}");
+    assert!(
+        size.largest_expression * 10 < MAX_DRAFT_EXPANSION,
+        "{size:?}"
+    );
+    assert!(
+        size.expressions * 10 < MAX_DRAFT_EXPANSION_TOTAL,
+        "{size:?}"
+    );
+    assert!(size.scope * 10 < MAX_DRAFT_SCOPE, "{size:?}");
+}

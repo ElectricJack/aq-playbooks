@@ -151,7 +151,16 @@ reaching each step.
      answered, and in modes `any_accepted` and `any_completion` with several
      members, a member that was not the one selected.
 
-   A field that is merely optional in its one schema stays readable.
+   A field that is merely optional in its one schema stays readable. So does
+   a position of an array a schema describes: no schema states a length, so
+   the read relies on the contract that returns the array.
+
+   A literal is read as the value it is, exactly as the same value written
+   with `object` and `array` expressions: each row of a literal table keeps
+   its own fields, and a literal array its own length. A read of a field in a
+   row that lacks it, or of a position past the end, is refused; so is a
+   `map`, `filter` or `lookup` key that reads the field in every row when one
+   row lacks it. Give every row of a table the same fields.
 
 2. Bound reads. A reference to a binding is refused at a step that some way
    reaches without binding it:
@@ -161,7 +170,8 @@ reaching each step.
      a loop that binds it later, after a `for_each` whose body binds it (the
      collection may be empty), or at an entry step reached again by a back edge;
    - a `for_each` item outside the loop's body: it is bound for the body only,
-     and not on the loop's `next` or `on_error`.
+     and not on the loop's `next` or `on_error`, nor in the loop's own
+     `collection`.
 
    Inside a `for_each` body a failing step is handled by the loop, not by the
    step's own `on_error`: with `on_failure: continue` the loop goes on to the
@@ -187,22 +197,32 @@ reaching each step.
    either: it is read in every item, and an item without it stops the run.
 
 4. Bounded cost. A draft is refused, before anything costly runs on it, when
-   it has more than 256 steps, a `draft.json` over 262 144 bytes, an
-   expression that expands to more than 200 000 nodes, expressions that expand
-   to more than 1 000 000 nodes in all, or more than 250 000 type nodes in
-   scope over all its steps. The purpose: nothing a draft within the bounds
-   seals into is expensive to check or to verify on every load.
-   - The expanded size of an expression counts every `let` name and `map` or
-     `filter` item that stands for a computed value as that whole value, at
-     every reference. A reference to `input`, `event`, `definitions`, `vars`, a
-     step's binding or a `for_each` item, or to a name that only stands for
-     such a reference, counts the nodes of the type it reads: `task.facts.kind`
-     counts one node, `task` its whole result type.
-   - So bind a table's result once. Every read of a `let`-bound table counts
-     the whole table: write `let level = lookup(...)` and read `level`, rather
-     than binding the table and looking it up in several places. Read the one
-     field you need rather than a whole binding, and build a value from a name
-     once, not twice at every level (it doubles each time).
+   it has more than 256 steps, a `draft.json` over 786 432 bytes (pretty-printed
+   JSON is fine), an expression that counts more than 200 000 nodes,
+   expressions that count more than 1 000 000 nodes in all, or more than
+   250 000 type nodes in scope over all its steps. The purpose: nothing a draft
+   within the bounds seals into is expensive to check or to verify on every
+   load (in a release build: at most 2 s and 256 MB to check, 1.5 s and 256 MB
+   to verify).
+   - The size of an expression is its own nodes, with a literal counted by
+     the nodes of its value, and every reference counted by the nodes of the
+     type it reads: `task.facts.kind` counts one node, `task` its whole result
+     type. That holds for a reference to `input`, `event`, `definitions`,
+     `vars`, a step's binding or a `for_each` item, and equally for a `let`
+     name and a `map` or `filter` item. What a name stands for is counted
+     once, where it is written.
+   - So a table costs what it is written with, once: bind it or its result to
+     a `let` name and read the name as often as needed. Reading a name whose
+     value is small (a level, a flag) counts one node each time; reading a
+     whole table or a whole binding counts all of it each time, so read the one
+     field you need. A value built from the same name twice at every level
+     doubles its type each time: fifteen levels are about 200 000 nodes,
+     and sixteen are refused.
+   - A value that can have many shapes (literal rows with differing fields, a
+     lookup with many differently shaped results) costs one step to follow
+     for each shape at every read. A read counts at least that, and a draft
+     that follows more than 1 000 000 shapes in all is refused with
+     `draft_limit`.
    - The scope count is, for each step an entry reaches, the type of that
      entry's `input`, the captured definitions, and the result type of every
      step that binds one. Ordinary typing copies these for every step, on every
@@ -211,13 +231,22 @@ reaching each step.
    - The diagnostic (`expression_limit` or `draft_limit`) gives the number that
      exceeded and names the `let` name or root that contributes most, with its
      size and how often it is read.
+   - The byte bound is not 1 048 576: verifying an artifact that holds a
+     literal of very many one-field rows costs about 2 KB a row, and at
+     786 432 bytes the worst such draft stays inside the memory budget.
 
 A read diagnostic names the step and the place inside it, the reference as
 written, what a name in it stands for, every way that lacks the field or the
 binding, and the remedy. Read the value only where it is always present: after
 the outcome edge that returns it, or on the `completed` edge of a join whose
 `accepted_outcomes` lists only outcomes that have it. A `decide` on `outcome`
-does not narrow anything. Or test it first with `exists`.
+does not narrow anything. `exists` only tells you whether the value is there:
+testing it does not make a read of the value allowed, in the same expression
+(`lookup(exists(x), [{when: true, then: x}], ...)` is refused at `x`) or in a
+later step, because the check does not narrow by a test. Use `exists` on its
+own, as the whole test of a `decide` or a lookup key, to route to a step that
+does not read the value; to use the value, branch on the edge first and read
+it in the step that edge leads to. At most twelve ways are listed.
 
 Ask, then read the answer. A wait on an asynchronous command's completion event
 binds the event's whole payload, which a wait does not narrow per outcome. To read

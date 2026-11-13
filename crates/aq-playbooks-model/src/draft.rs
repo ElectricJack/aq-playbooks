@@ -6,7 +6,8 @@
 //! - bound reads: so is a read of a binding some way to the step never bound;
 //! - aliasing does not launder: so is a read through any expression that
 //!   carries such a value;
-//! - bounded cost: an expression may expand to a bounded number of nodes.
+//! - bounded cost: the types an expression reads, and the types in scope
+//!   over the steps, are bounded in size.
 //!
 //! All of it rests on ONE derivation, `Pass::derive`: what every expression
 //! carries (`Carried`: the forms its value can have on each way of reaching
@@ -26,15 +27,16 @@
     clippy::match_wildcard_for_single_variants
 )]
 use super::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
-/// The most nodes one expression of a new draft may expand to, and all of
-/// its expressions together. A reference to a `let` name or a `map` or
-/// `filter` item counts what the name stands for; a reference to anything
-/// else (`input`, `event`, `definitions`, `vars`, a step's binding, a
-/// `for_each` item) counts the nodes of the type it reads.
+/// The most nodes one expression of a new draft may count, and all of its
+/// expressions together. An expression counts its own nodes, a literal the
+/// nodes of its value, and every reference the nodes of the type it reads
+/// (whatever it refers to: a root, a binding, a `let` name, an item). What a
+/// name stands for is counted once, where it is written; a name whose type
+/// doubles at every level still counts double at every level.
 pub const MAX_DRAFT_EXPANSION: u64 = 200_000;
 pub const MAX_DRAFT_EXPANSION_TOTAL: u64 = 1_000_000;
 /// The most type nodes all the steps of a draft may have in scope together:
@@ -45,6 +47,12 @@ pub const MAX_DRAFT_SCOPE: u64 = 250_000;
 /// The most times the flow over the steps may revisit them before the draft
 /// is refused as too entangled to check.
 const MAX_FLOW_VISITS_PER_STEP: usize = 64;
+/// A value with more shapes than this counts toward the work of following
+/// values of many shapes, which is bounded over the whole draft.
+const MANY_SHAPES: u64 = 16;
+const MAX_SHAPE_WORK: u64 = 1_000_000;
+/// The most reasons one diagnostic lists.
+const MAX_REASONS: usize = 12;
 /// The deepest a `for_each` item's derived value may nest.
 const MAX_ITEM_DEPTH: u32 = 256;
 
@@ -90,10 +98,23 @@ enum Form<'a> {
     Items(Rc<Carried<'a>>),
 }
 struct Built<'a> {
-    parts: BTreeMap<String, Carried<'a>>,
+    /// The field names of an object, sorted; none for an array.
+    fields: Vec<String>,
+    /// What each field, or each position, carries.
+    values: Vec<Carried<'a>>,
     array: bool,
     nodes: u64,
     depth: u32,
+}
+impl<'a> Built<'a> {
+    fn get(&self, key: &str) -> Option<&Carried<'a>> {
+        let at = if self.array {
+            key.parse::<usize>().ok()?
+        } else {
+            self.fields.binary_search_by(|f| f.as_str().cmp(key)).ok()?
+        };
+        self.values.get(at)
+    }
 }
 /// A set of gaps, shared: joining two sets never copies either.
 type Gaps = Option<Rc<GapNode>>;
@@ -165,6 +186,7 @@ fn part_key(part: &Carried<'_>) -> Option<PartKey> {
 #[derive(Default)]
 struct Build<'a> {
     lacks: Vec<Rc<str>>,
+    lacking: HashSet<Rc<str>>,
     gaps: Vec<Gaps>,
     forms: Vec<Form<'a>>,
     seen: HashSet<FormKey>,
@@ -176,8 +198,10 @@ impl<'a> Build<'a> {
         }
     }
     fn lack(&mut self, text: &str) {
-        if !self.lacks.iter().any(|l| **l == *text) {
-            self.lacks.push(text.into());
+        if !self.lacking.contains(text) {
+            let text: Rc<str> = text.into();
+            self.lacking.insert(text.clone());
+            self.lacks.push(text);
         }
     }
     /// Everything `other` carries.
@@ -231,6 +255,9 @@ struct Exit<'a> {
 struct Parts<'a> {
     exprs: Vec<(String, &'a Expr)>,
     exits: Vec<Exit<'a>>,
+    /// A `for_each`'s own item: not bound while the step's own expression is
+    /// evaluated, which is when the loop is entered.
+    own_item: Option<&'a str>,
 }
 /// A reserved root.
 #[derive(Clone, Copy)]
@@ -510,7 +537,20 @@ impl ArtifactContent {
             ),
         };
         exits.extend(failed(bind));
-        Parts { exprs, exits }
+        let own_item = match &step.op {
+            Operation::ForEach { item, .. } => Some(item.as_str()),
+            Operation::Invoke { .. }
+            | Operation::Decide { .. }
+            | Operation::Wait { .. }
+            | Operation::Call { .. }
+            | Operation::Join { .. }
+            | Operation::Return { .. } => None,
+        };
+        Parts {
+            exprs,
+            exits,
+            own_item,
+        }
     }
 }
 /// What each key of a named join's result holds on `edge`: one answer per
@@ -576,8 +616,6 @@ fn join_members<'a>(
 #[derive(Clone)]
 struct Named<'a> {
     carried: Carried<'a>,
-    /// The expanded size of what it stands for, counted at every reference.
-    size: u64,
     /// The reference it stands for, as a direct read writes it.
     origin: Option<Rc<str>>,
     /// What it is, for a diagnostic: "is `work`", "is an item of …".
@@ -596,6 +634,8 @@ struct Out<'a> {
 struct Refusal {
     read: Rc<Read>,
     reasons: Vec<Rc<str>>,
+    /// Reasons beyond the ones listed.
+    more: usize,
     /// Consumed as a lookup key.
     key: bool,
     /// The lexical names its value was used through.
@@ -607,7 +647,6 @@ struct Charge {
     each: u64,
     times: u64,
     total: u64,
-    lexical: bool,
 }
 /// The size of one expression of the draft.
 struct ExprSize {
@@ -626,6 +665,12 @@ struct Check<'a> {
     schema_nodes: RefCell<HashMap<*const Schema, u64>>,
     /// Every built value, by what it is made of.
     built: RefCell<HashMap<BuiltKey, Form<'a>>>,
+    /// What each literal is, by where it is written.
+    literals: RefCell<HashMap<*const Value, Carried<'a>>>,
+    /// A present scalar.
+    scalar: Carried<'a>,
+    /// Shapes followed so far, of values with many.
+    work: Cell<u64>,
     /// What each `for_each` item is, for a diagnostic.
     item_notes: BTreeMap<&'a str, Rc<str>>,
 }
@@ -728,25 +773,39 @@ impl<'a> Check<'a> {
         build.lack(text);
         self.finish(build)
     }
-    /// An object (or array) of `parts`.
-    fn built(&self, parts: BTreeMap<String, Carried<'a>>, array: bool) -> Carried<'a> {
-        let nodes = parts
-            .values()
-            .fold(1u64, |n, c| n.saturating_add(c.nodes.max(1)));
-        let depth = parts.values().map(|c| c.depth).max().unwrap_or(0) + 1;
+    /// An object of `parts` by field, or an array of them in their order.
+    fn built(&self, parts: Vec<(String, Carried<'a>)>, array: bool) -> Carried<'a> {
         let key = parts
             .iter()
             .map(|(k, part)| Some((k.clone(), part_key(part)?)))
             .collect::<Option<Vec<_>>>()
             .map(|parts| BuiltKey::Parts(array, parts));
-        self.shared(key, || {
-            Form::Built(Rc::new(Built {
-                parts,
-                array,
-                nodes,
-                depth,
-            }))
-        })
+        match key {
+            Some(key) => self.shared(Some(key), || self.assembled_form(parts, array)),
+            None => self.assembled(parts, array),
+        }
+    }
+    /// An object (or array) of `parts`, not looked up among those built
+    /// before (a literal is found again by where it is written).
+    fn assembled(&self, parts: Vec<(String, Carried<'a>)>, array: bool) -> Carried<'a> {
+        self.of(self.assembled_form(parts, array))
+    }
+    fn assembled_form(&self, mut parts: Vec<(String, Carried<'a>)>, array: bool) -> Form<'a> {
+        if !array {
+            parts.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        let nodes = parts
+            .iter()
+            .fold(1u64, |n, (_, c)| n.saturating_add(c.nodes.max(1)));
+        let depth = parts.iter().map(|(_, c)| c.depth).max().unwrap_or(0) + 1;
+        let (fields, values): (Vec<String>, Vec<Carried>) = parts.into_iter().unzip();
+        Form::Built(Rc::new(Built {
+            fields: if array { vec![] } else { fields },
+            values,
+            array,
+            nodes,
+            depth,
+        }))
     }
     /// An array whose every item is `item`.
     fn items(&self, item: Carried<'a>) -> Carried<'a> {
@@ -765,6 +824,39 @@ impl<'a> Check<'a> {
         self.built.borrow_mut().insert(key, form.clone());
         self.of(form)
     }
+    /// What a literal value is: an object or array as it is written, a
+    /// scalar as a present value. The same literal gives the same forms
+    /// every time it is derived.
+    fn literal(&self, value: &'a Value) -> Carried<'a> {
+        if let Some(known) = self.literals.borrow().get(&std::ptr::from_ref(value)) {
+            return known.clone();
+        }
+        let carried = self.literal_value(value);
+        self.literals
+            .borrow_mut()
+            .insert(std::ptr::from_ref(value), carried.clone());
+        carried
+    }
+    fn literal_value(&self, value: &Value) -> Carried<'a> {
+        match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+                self.scalar.clone()
+            }
+            Value::Array(items) => self.assembled(
+                items
+                    .iter()
+                    .map(|v| (String::new(), self.literal_value(v)))
+                    .collect(),
+                true,
+            ),
+            Value::Object(map) => self.assembled(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), self.literal_value(v)))
+                    .collect(),
+                false,
+            ),
+        }
+    }
     /// What a step's exit leaves in `bind`. `item` derives an item's value.
     fn held(
         &self,
@@ -778,7 +870,7 @@ impl<'a> Check<'a> {
             Held::Unbound => self.lacking(&format!("on {way}, `{bind}` is not bound")),
             Held::Unfollowed => self.opaque(1),
             Held::Members(keys) => {
-                let mut parts = BTreeMap::new();
+                let mut parts = vec![];
                 for (key, members) in keys {
                     let mut build = Build::default();
                     for member in members {
@@ -789,11 +881,11 @@ impl<'a> Check<'a> {
                                 let output =
                                     self.shape(output, &answered, &format!("{bind}.{key}.output"));
                                 build.all(&self.built(
-                                    BTreeMap::from([
+                                    vec![
                                         ("participant".to_string(), self.opaque(1)),
                                         ("outcome".to_string(), self.opaque(1)),
                                         ("output".to_string(), output),
-                                    ]),
+                                    ],
                                     false,
                                 ));
                             }
@@ -807,23 +899,15 @@ impl<'a> Check<'a> {
                             }
                         }
                     }
-                    parts.insert((*key).to_string(), self.finish(build));
+                    parts.push(((*key).to_string(), self.finish(build)));
                 }
                 self.built(parts, false)
             }
             Held::ItemOf(collection) => item(collection),
         }
     }
-    /// `from`, followed along `path[depth..]`, into `out`. `written` is the
-    /// root as the reference writes it, to name a part of a built value.
-    fn follow(
-        &self,
-        from: &Carried<'a>,
-        written: &str,
-        path: &[String],
-        depth: usize,
-        out: &mut Build<'a>,
-    ) {
+    /// `from`, followed along `path[depth..]`, into `out`.
+    fn follow(&self, from: &Carried<'a>, path: &[String], depth: usize, out: &mut Build<'a>) {
         let Some(key) = path.get(depth) else {
             out.all(from);
             return;
@@ -839,32 +923,30 @@ impl<'a> Check<'a> {
                 }
                 Form::Opaque(nodes) => out.form(Form::Opaque(*nodes)),
                 Form::Built(built) => {
-                    let part = if built.array {
-                        key.parse::<usize>().ok().map(|i| i.to_string())
-                    } else {
-                        Some(key.clone())
-                    };
-                    match part.and_then(|k| built.parts.get(&k)) {
-                        Some(part) => self.follow(part, written, path, depth + 1, out),
-                        None => {
-                            let at = dotted(written, &path[..depth]);
-                            out.lack(&if built.array {
-                                format!(
-                                    "`{at}` is an array of {} items, which has no position `{key}`",
-                                    built.parts.len()
-                                )
-                            } else if built.parts.is_empty() {
-                                format!("`{at}` has no `{key}` (it has no fields)")
-                            } else {
-                                let has = built.parts.keys().cloned().collect::<Vec<_>>();
-                                format!("`{at}` has no `{key}` (it has {})", has.join(", "))
-                            });
-                        }
+                    match built.get(key) {
+                        Some(part) => self.follow(part, path, depth + 1, out),
+                        // Said without the name it is read through, so that
+                        // a read through another name gives the same reason.
+                        None => out.lack(&if built.array {
+                            format!(
+                                "position `{key}` is past the end of an array written with {} \
+                                 item{}",
+                                built.values.len(),
+                                if built.values.len() == 1 { "" } else { "s" }
+                            )
+                        } else if built.fields.is_empty() {
+                            format!("`{key}` is not in an object written with no fields")
+                        } else {
+                            format!(
+                                "`{key}` is not in an object written with the fields {}",
+                                built.fields.join(", ")
+                            )
+                        }),
                     }
                 }
                 Form::Items(item) => {
                     if key.parse::<usize>().is_ok() {
-                        self.follow(item, written, path, depth + 1, out);
+                        self.follow(item, path, depth + 1, out);
                     } else {
                         out.form(Form::Opaque(1));
                     }
@@ -931,7 +1013,7 @@ impl<'a> Check<'a> {
                 Form::Opaque(nodes) => out.form(Form::Opaque(*nodes)),
                 Form::Built(built) => {
                     if built.array {
-                        for part in built.parts.values() {
+                        for part in &built.values {
                             out.all(part);
                         }
                     } else {
@@ -1027,11 +1109,14 @@ impl<'a, 'k> Pass<'a, 'k> {
             }
         };
         match expr {
+            // A literal is the value an `object` or `array` expression of the
+            // same shape would build: each row keeps its own fields, and an
+            // array its own length.
             Expr::Literal { value } => {
-                let nodes = value_nodes(value);
+                let carried = check.literal(value);
                 Out {
-                    carried: check.opaque(nodes),
-                    size: nodes,
+                    size: carried.nodes.max(1),
+                    carried,
                     origin: None,
                 }
             }
@@ -1140,7 +1225,7 @@ impl<'a, 'k> Pass<'a, 'k> {
                 // item without it stops the run: no `exists` can test it.
                 for (side, out) in &sides {
                     let mut found = Build::default();
-                    check.follow(&check.items_of(&out.carried), side, identity, 0, &mut found);
+                    check.follow(&check.items_of(&out.carried), identity, 0, &mut found);
                     if !found.lacks.is_empty() {
                         let read = Rc::new(Read {
                             at: under(".identity"),
@@ -1211,7 +1296,6 @@ impl<'a, 'k> Pass<'a, 'k> {
                         &b.name,
                         Named {
                             carried: value.carried,
-                            size: value.size,
                             origin: value.origin,
                             note: note.into(),
                         },
@@ -1238,7 +1322,6 @@ impl<'a, 'k> Pass<'a, 'k> {
             item,
             Named {
                 carried: self.check.items_of(&collection.carried),
-                size: collection.size,
                 origin: collection.origin.as_ref().map(|o| format!("{o}[]").into()),
                 note: note.into(),
             },
@@ -1299,35 +1382,53 @@ impl<'a, 'k> Pass<'a, 'k> {
         // A lexical name first: it shadows; then a reserved root; then a
         // binding or item of the step's context.
         let lexical = scope.get(root);
-        let (note, origin): (Option<String>, Option<Rc<str>>) = match lexical {
-            Some(named) => {
-                check.follow(&named.carried, root, path, 0, &mut found);
-                (
+        let (source, note, origin): (Option<Carried>, Option<String>, Option<Rc<str>>) =
+            match lexical {
+                Some(named) => (
+                    Some(named.carried.clone()),
                     Some(format!("`{root}` {}", named.note)),
                     named.origin.as_ref().map(|o| dotted(o, path).into()),
-                )
-            }
-            None => {
-                let (source, shown) = match (Reserved::named(root), place) {
-                    (Some(reserved), _) => (Some(self.reserved(reserved, place)), None),
-                    (None, Place::Step { context, .. }) => (
-                        context.get(root).map(|c| (**c).clone()),
-                        check.item_notes.get(root),
-                    ),
-                    (None, Place::Trigger { .. }) => (None, None),
-                };
-                match source {
-                    Some(source) => check.follow(&source, root, path, 0, &mut found),
-                    // No such root: ordinary typing says so.
-                    None => found.form(Form::Opaque(1)),
+                ),
+                None => {
+                    let (source, shown) = match (Reserved::named(root), place) {
+                        (Some(reserved), _) => (Some(self.reserved(reserved, place)), None),
+                        (None, Place::Step { context, .. }) => (
+                            context.get(root).map(|c| (**c).clone()),
+                            check.item_notes.get(root),
+                        ),
+                        (None, Place::Trigger { .. }) => (None, None),
+                    };
+                    let origin = match (root, path.split_first()) {
+                        ("vars", Some((binding, rest))) => dotted(binding, rest),
+                        _ => written.clone(),
+                    };
+                    (
+                        source,
+                        shown.map(|n| format!("`{root}` {n}")),
+                        Some(origin.into()),
+                    )
                 }
-                let origin = match (root, path.split_first()) {
-                    ("vars", Some((binding, rest))) => dotted(binding, rest),
-                    _ => written.clone(),
-                };
-                (shown.map(|n| format!("`{root}` {n}")), Some(origin.into()))
-            }
-        };
+            };
+        // Following a value that can have many shapes costs one step for
+        // each: that work is counted, and past a bound the draft is refused
+        // without doing it.
+        let shapes = source.as_ref().map_or(1, |s| s.forms.len()) as u64;
+        if shapes > MANY_SHAPES {
+            check.work.set(check.work.get().saturating_add(shapes));
+        }
+        if check.work.get() > MAX_SHAPE_WORK {
+            self.charge(root, shapes);
+            return Out {
+                carried: check.scalar.clone(),
+                size: shapes,
+                origin: None,
+            };
+        }
+        match &source {
+            Some(source) => check.follow(source, path, 0, &mut found),
+            // No such root: ordinary typing says so.
+            None => found.form(Form::Opaque(1)),
+        }
         let mut carried = check.finish(found);
         if lexical.is_some()
             && let Some(gaps) = carried.gaps.take()
@@ -1354,23 +1455,22 @@ impl<'a, 'k> Pass<'a, 'k> {
                 .collect::<Vec<_>>();
             carried.gaps = join_gaps(std::iter::once(carried.gaps.take()).chain(leaves));
         }
-        // A name that stands for a computed value counts all of it; a
-        // reference, or a name that stands for one, counts the type it reads.
-        let size = match lexical {
-            Some(named) if named.origin.is_none() => named.size,
-            Some(_) | None => carried.nodes,
-        }
-        .max(1);
-        let charge = self.charges.entry(root.to_string()).or_default();
-        charge.each = charge.each.max(size);
-        charge.times += 1;
-        charge.total = charge.total.saturating_add(size);
-        charge.lexical = lexical.is_some();
+        // Every reference counts the type it reads (and no less than the
+        // shapes it had to follow): what a name stands for is counted once,
+        // where it is written.
+        let size = carried.nodes.max(shapes).max(1);
+        self.charge(root, size);
         Out {
             carried,
             size,
             origin,
         }
+    }
+    fn charge(&mut self, root: &str, size: u64) {
+        let charge = self.charges.entry(root.to_string()).or_default();
+        charge.each = charge.each.max(size);
+        charge.times += 1;
+        charge.total = charge.total.saturating_add(size);
     }
     /// The value with these gaps is needed here: every read behind them is
     /// refused. `key`: needed as a lookup key.
@@ -1400,13 +1500,17 @@ impl<'a, 'k> Pass<'a, 'k> {
             self.refusals.push(Refusal {
                 read: read.clone(),
                 reasons: vec![],
+                more: 0,
                 key: false,
                 through: vec![],
             });
             self.refusals.len() - 1
         });
         let refusal = &mut self.refusals[index];
-        if !refusal.reasons.contains(reason) {
+        if refusal.reasons.contains(reason) {
+        } else if refusal.reasons.len() >= MAX_REASONS {
+            refusal.more += 1;
+        } else {
             refusal.reasons.push(reason.clone());
         }
         refusal.key |= key;
@@ -1465,15 +1569,21 @@ impl Refusal {
         } else {
             format!(" ({})", notes.join("; "))
         };
-        let reasons: Vec<&str> = self.reasons.iter().map(|r| &**r).collect();
+        let mut reasons: Vec<String> = self.reasons.iter().map(|r| r.to_string()).collect();
+        if self.more > 0 {
+            reasons.push(format!("and {} more ways", self.more));
+        }
         let remedy = if read.identity {
             "Build both collections only from values that always have it: an item without its \
              identity stops the run, and `exists` cannot test it"
         } else {
             "Read it only where it is always present: after the outcome edge of the step that \
              returns it, or on the `completed` edge of a join whose `accepted_outcomes` lists \
-             only outcomes that have it (a `decide` on `outcome` does not narrow it). Or test \
-             it first with `exists`"
+             only outcomes that have it (a `decide` on `outcome` does not narrow it). `exists` \
+             only tells you whether it is there: testing it does not make a read of it allowed, \
+             in the same expression or in a later step. So branch on the edge first and read \
+             the value in the step that edge leads to; use `exists` on its own, as a test \
+             that routes to a step that does not read the value"
         };
         let mut message = format!(
             "`{}`{note} is not there on every way to this step: {}. {remedy}",
@@ -1495,8 +1605,8 @@ impl Refusal {
 // ---------------------------------------------------------------------------
 
 /// Per step inside a `for_each` body, where a failure there leads: the target,
-/// the item that is unbound there, and the name of the way.
-type LoopFailures<'a> = BTreeMap<&'a str, Vec<(&'a str, Option<&'a str>, String)>>;
+/// the items that are unbound there, and the name of the way.
+type LoopFailures<'a> = BTreeMap<&'a str, Vec<(&'a str, Vec<&'a str>, String)>>;
 /// What the derivation says of the whole draft.
 #[derive(Default)]
 struct Derived {
@@ -1563,8 +1673,24 @@ impl<'a> Check<'a> {
             sources,
             schema_nodes: RefCell::new(HashMap::new()),
             built: RefCell::new(HashMap::new()),
+            literals: RefCell::new(HashMap::new()),
+            work: Cell::new(0),
+            scalar: Carried {
+                lacks: vec![],
+                gaps: None,
+                forms: vec![Form::Opaque(1)].into(),
+                nodes: 1,
+                depth: 0,
+            },
             item_notes,
         }
+    }
+    /// A `for_each`'s own item where the loop is entered: its collection is
+    /// evaluated then, before any item is bound.
+    fn entering(&self, site: &str, item: &str) -> Carried<'a> {
+        self.lacking(&format!(
+            "where for_each `{site}` is entered, `{item}` is not bound yet"
+        ))
     }
     /// For each step inside a `for_each` body, where a failure there leads:
     /// the runner hands it to the innermost loop, not to the step's own
@@ -1588,7 +1714,7 @@ impl<'a> Check<'a> {
                     step.on_error.as_deref().map(|to| (to, Some(item.as_str())))
                 }
             };
-            let Some((to, unbinds)) = target else {
+            let Some((to, own)) = target else {
                 continue;
             };
             let mut inside = BTreeSet::new();
@@ -1601,10 +1727,17 @@ impl<'a> Check<'a> {
                     pending.extend(p.exits.iter().map(|e| e.to));
                 }
             }
+            // The failure is this loop's when no loop inside it is running,
+            // so the items of those loops are not bound either.
+            let unbinds: Vec<&str> = inside
+                .iter()
+                .filter_map(|name| parts.get(name)?.own_item)
+                .chain(own)
+                .collect();
             for name in inside {
                 failures.entry(name).or_default().push((
                     to,
-                    unbinds,
+                    unbinds.clone(),
                     format!("a failure in the body of for_each `{site}`"),
                 ));
             }
@@ -1661,7 +1794,10 @@ impl<'a> Check<'a> {
                 );
                 break;
             }
-            let current = contexts[name].clone();
+            let mut current = contexts[name].clone();
+            if let Some(item) = p.own_item {
+                current.insert(item, Rc::new(self.entering(name, item)));
+            }
             let mut targets = vec![];
             for exit in &p.exits {
                 let mut next = current.clone();
@@ -1701,7 +1837,7 @@ impl<'a> Check<'a> {
             }
             for (to, unbinds, way) in failures.get(name).into_iter().flatten() {
                 let mut next = current.clone();
-                if let Some(item) = unbinds {
+                for item in unbinds {
                     next.insert(
                         item,
                         Rc::new(self.lacking(&format!("on {way}, `{item}` is not bound"))),
@@ -1768,6 +1904,15 @@ impl<'a> Check<'a> {
                     continue;
                 };
                 let path = format!("steps.{name}");
+                let mut entered;
+                let context = match p.own_item {
+                    Some(item) => {
+                        entered = context.clone();
+                        entered.insert(item, Rc::new(self.entering(name, item)));
+                        &entered
+                    }
+                    None => context,
+                };
                 let place = Place::Step {
                     entry_name,
                     entry,
@@ -1803,6 +1948,20 @@ impl<'a> Check<'a> {
             sizes.insert((path, "input".into()), sized);
         }
         derived.sizes = sizes.into_values().collect();
+        if self.work.get() > MAX_SHAPE_WORK {
+            issue(
+                &mut derived.limits,
+                "draft_limit",
+                "playbook",
+                format!(
+                    "the draft reads values that can have many different shapes too often to \
+                     check: more than {MAX_SHAPE_WORK} shapes to follow in all. This comes from \
+                     literal rows with differing fields, or a lookup with many differently \
+                     shaped results, read many times through a name or an item. Give the rows \
+                     the same fields, or read the value in fewer places."
+                ),
+            );
+        }
         derived
     }
 }
@@ -1820,13 +1979,9 @@ impl ExprSize {
         let Some((name, charge)) = &self.most else {
             return String::new();
         };
-        let what = if charge.lexical {
-            "a `let` name or item, counted at the size of what it stands for"
-        } else {
-            "counted at the size of the type it reads"
-        };
         format!(
-            " Most of it is `{name}` ({what}): up to {} nodes, read {} time{}, {} in all.",
+            " Most of it is `{name}` (counted at the size of the type it reads): up to {} nodes, \
+             read {} time{}, {} in all.",
             count(charge.each),
             charge.times,
             if charge.times == 1 { "" } else { "s" },
@@ -1835,7 +1990,39 @@ impl ExprSize {
     }
 }
 
+/// How much of the cost bounds a draft uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftSize {
+    /// The largest expression's count, against `MAX_DRAFT_EXPANSION`.
+    pub largest_expression: u64,
+    /// Where that expression is, as a diagnostic names it.
+    pub largest_at: String,
+    /// All expressions together, against `MAX_DRAFT_EXPANSION_TOTAL`.
+    pub expressions: u64,
+    /// Type nodes in scope over all steps, against `MAX_DRAFT_SCOPE`.
+    pub scope: u64,
+}
+fn scope_total(derived: &Derived) -> u64 {
+    derived.scope.iter().fold(0u64, |n, (_, steps, each)| {
+        n.saturating_add(steps.saturating_mul(*each))
+    })
+}
+
 impl ArtifactContent {
+    /// What the draft counts against each cost bound.
+    pub fn draft_size(&self) -> DraftSize {
+        let sources = Sources::new(self);
+        let derived = Check::new(self, &sources).derived();
+        let largest = derived.sizes.iter().max_by_key(|s| s.size);
+        DraftSize {
+            largest_expression: largest.map_or(0, |s| s.size),
+            largest_at: largest
+                .map(|s| format!("{}.{}", s.path, s.at))
+                .unwrap_or_default(),
+            expressions: derived.total,
+            scope: scope_total(&derived),
+        }
+    }
     /// Bounds a new draft is held to before anything costly runs on it: the
     /// expanded size of each expression and of all together, and the types
     /// in scope over all steps. Typing and the read check follow every copy
@@ -1843,13 +2030,11 @@ impl ArtifactContent {
     pub fn draft_expansion_issues(&self) -> Vec<ValidationIssue> {
         let sources = Sources::new(self);
         let derived = Check::new(self, &sources).derived();
-        let mut issues = derived.limits;
+        let mut issues = derived.limits.clone();
         if !issues.is_empty() {
             return issues;
         }
-        const COUNTED: &str = "with every `let` name and `map` or `filter` item replaced by what \
-                               it stands for, and every other reference counted at the size of \
-                               the type it reads";
+        const COUNTED: &str = "with every reference counted at the size of the type it reads";
         let total = derived.total;
         for sized in &derived.sizes {
             if sized.size > MAX_DRAFT_EXPANSION {
@@ -1860,8 +2045,8 @@ impl ArtifactContent {
                     format!(
                         "{}.{}: expands to {} nodes {COUNTED}; an expression may expand to at \
                          most {MAX_DRAFT_EXPANSION}.{} Build each value from a name once, not \
-                         twice at every level; bind the result of a table once rather than the \
-                         table; read the one field you need rather than a whole binding.",
+                         twice at every level, and read the one field you need rather than a \
+                         whole binding or table.",
                         sized.path,
                         sized.at,
                         count(sized.size),
@@ -1896,9 +2081,7 @@ impl ArtifactContent {
                 ),
             );
         }
-        let in_scope = derived.scope.iter().fold(0u64, |n, (_, steps, each)| {
-            n.saturating_add(steps.saturating_mul(*each))
-        });
+        let in_scope = scope_total(&derived);
         if issues.is_empty() && in_scope > MAX_DRAFT_SCOPE {
             let entries: Vec<String> = derived
                 .scope

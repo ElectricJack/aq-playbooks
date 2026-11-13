@@ -56,8 +56,10 @@ const MAX_DRAFT_BYTES: u64 = 4_194_304;
 /// memory that grow faster than its size, and it runs on the host at save.
 pub const MAX_DRAFT_STEPS: usize = 256;
 /// A draft (the `draft.json` file, or the draft serialized) may be at most
-/// this many bytes.
-pub const MAX_DRAFT_JSON_BYTES: usize = 262_144;
+/// this many bytes: room for pretty-printed JSON, and the most at which the
+/// worst draft found (a literal of one-field rows, about 2 KB a row to
+/// verify) stays inside the 256 MB budget.
+pub const MAX_DRAFT_JSON_BYTES: usize = 786_432;
 
 /// What the host keeps about a source; the owner writes only the Markdown.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

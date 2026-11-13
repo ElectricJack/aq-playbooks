@@ -448,6 +448,54 @@ fn at_the_bounds() -> Vec<(&'static str, Workspace)> {
             chain(wide(70, 70), vec![kept("input", 40)]),
         ),
         (
+            // Near the byte cap: two literal arrays of 190 000 numbers, each
+            // just under the expression bound.
+            "the byte cap, long literal arrays",
+            chain(
+                wide(1, 1),
+                vec![json!({"op": "literal", "value": vec![1; 190_000]}); 2],
+            ),
+        ),
+        (
+            // Near the byte cap: literal tables of 23 500 rows, each row an
+            // object, 70 501 nodes a table, read through a name.
+            "the byte cap, literal tables of rows",
+            chain(
+                wide(1, 1),
+                vec![
+                    json!({"op": "let",
+                        "bindings": [{"name": "t", "value": {"op": "literal",
+                            "value": vec![json!({"k": 1, "v": "x"}); 23_500]}}],
+                        "body": {"op": "ref", "root": "t", "path": ["0", "k"]}});
+                    2
+                ],
+            ),
+        ),
+        (
+            // Near the byte cap: an input type of 32 582 nodes, in scope at
+            // three steps and read whole twice.
+            "the byte cap, a large input type",
+            chain(wide(180, 180), vec![reference("input"); 2]),
+        ),
+        (
+            // Near the byte cap: two literal arrays of 54 500 one-field rows,
+            // the most rows with a field that fit. Serializing the artifact
+            // to verify it costs about 2 KB a row.
+            "the byte cap, one-field rows",
+            chain(
+                wide(1, 1),
+                vec![json!({"op": "literal", "value": vec![json!({"": 1}); 54_500]}); 2],
+            ),
+        ),
+        (
+            // Near the byte cap: two literal arrays of 127 000 empty rows.
+            "the byte cap, empty rows",
+            chain(
+                wide(1, 1),
+                vec![json!({"op": "literal", "value": vec![json!({}); 127_000]}); 2],
+            ),
+        ),
+        (
             // Forty entries over the same 100 steps, each with a 52-node
             // input in scope: 208 000.
             "the scope bound, many entries",
@@ -466,6 +514,46 @@ fn at_the_bounds() -> Vec<(&'static str, Workspace)> {
             chain(wide(1, 1), vec![doubling(14); 6]),
         ),
     ]
+}
+
+/// Literal rows that each have a different field, read through a `map` item
+/// in many places: every read has to follow every row's shape.
+fn many_shapes(rows: usize, reads: usize) -> Workspace {
+    let table: Vec<Value> = (0..rows).map(|i| json!({format!("a{i}"): 1})).collect();
+    let read = json!({"op": "exists", "value": {"op": "ref", "root": "r", "path": ["a0"]}});
+    let mut ws = draft(&mut Rng(7));
+    ws.draft["steps"] = json!({
+        "s0": decide(json!({"op": "map", "item": "r", "max_items": rows,
+            "collection": {"op": "literal", "value": table},
+            "value": {"op": "array", "items": vec![read; reads]}}), "done"),
+        "done": ret("done"),
+    });
+    ws
+}
+
+#[test]
+fn reading_a_value_of_many_shapes_many_times_is_refused_before_the_work_is_done() {
+    let _alone = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
+    // 30 000 shapes read 6 000 times would be 180 million steps.
+    let ws = many_shapes(30_000, 6_000);
+    let bytes = serde_json::to_string(&ws.draft).unwrap().len();
+    assert!(bytes < MAX_DRAFT_JSON_BYTES, "{bytes}");
+    let (diagnostics, cost) = measured(|| check(&ws));
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].code, "draft_limit", "{diagnostics:#?}");
+    assert!(
+        diagnostics[0].message.contains("many different shapes"),
+        "{diagnostics:#?}"
+    );
+    println!("the many-shapes draft ({bytes} bytes) is refused in {cost:?}");
+    assert!(cost.bytes < CHECK_BUDGET.bytes, "{cost:?}");
+    if !cfg!(debug_assertions) {
+        assert!(cost.time < CHECK_BUDGET.time, "{cost:?}");
+    }
+    // A table of a thousand such rows read in a hundred places is checked
+    // as usual (the reads here only test with `exists`, so it checks clean).
+    let diagnostics = check(&many_shapes(1_000, 100));
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
 }
 
 #[test]

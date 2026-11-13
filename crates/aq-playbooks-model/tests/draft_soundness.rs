@@ -159,8 +159,11 @@ fn registry() -> Registry {
     };
     let look = command("work.look", &[("found", found), ("none", fields(&["id"]))]);
     let get = command("ask.get", &[("known", fields(&["status"]))]);
+    // A command whose input a generated read can be written into.
+    let mut flag = command("work.flag", &[("done", fields(&[]))]);
+    flag.input = Schema::object(BTreeMap::from([("flag".into(), Schema::Boolean)]));
     Registry {
-        commands: [judge, look, get]
+        commands: [judge, look, get, flag]
             .into_iter()
             .map(|c| (c.name.clone(), c))
             .collect(),
@@ -184,18 +187,48 @@ fn decide(predicate: Expr, next: &str) -> Step {
 /// The step every generated chain starts at.
 const SLOT: &str = "slot";
 
-/// A read: the binding that carries the value, and the path read in it.
+/// A read: the expression that carries the value, and the path read in it.
 struct Base {
     name: &'static str,
-    carrier: &'static str,
+    carrier: Expr,
     path: &'static [&'static str],
     /// The read is there on every way to `SLOT`.
     sound: bool,
-    /// The carrier itself is not bound on some way (rule R-B); otherwise the
-    /// carrier is there and the path leads through a field some way lacks.
+    /// The carrier itself is Missing on some way (rule R-B, or a read given
+    /// whole that is Missing); otherwise the carrier is there and the path
+    /// leads through a field some way lacks.
     carrier_missing: bool,
+    /// The value is needed inside the carrier itself (as a lookup key), so
+    /// nothing around it, not even `exists`, makes the draft sound.
+    needed_inside: bool,
+    /// Ordinary typing gives a `for_each` item the type its collection has
+    /// anywhere in the playbook, not at the loop, and for this carrier that
+    /// type cannot be read: typing itself refuses the read through an item.
+    loose_item: bool,
+    /// The carrier may be Missing and, where it is there, may lack the
+    /// field: a wrapped read is refused for some of the direct read's
+    /// reasons, not always all (`exists` can absorb one kind).
+    two_causes: bool,
+    /// How deep the combinators are composed around it.
+    depth: usize,
+    /// Where the read can be consumed.
+    sites: &'static [Site],
     content: ArtifactContent,
 }
+/// Where the value of the generated expression is needed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Site {
+    /// A `decide` predicate.
+    Decide,
+    /// A command's input.
+    Input,
+    /// A `return` output.
+    Output,
+    /// A trigger's `input`, where only `event` is in scope.
+    Trigger,
+}
+const IN_STEPS: &[Site] = &[Site::Decide, Site::Input, Site::Output];
+const ANYWHERE: &[Site] = &[Site::Decide, Site::Input, Site::Output, Site::Trigger];
 
 fn playbook(registry: &Registry, start: &str, steps: Vec<(&str, Step)>) -> ArtifactContent {
     let mut steps: BTreeMap<String, Step> =
@@ -221,7 +254,7 @@ fn playbook(registry: &Registry, start: &str, steps: Vec<(&str, Step)>) -> Artif
                 id: "generated".into(),
                 scope: "project".into(),
                 interfaces: strings(&["main"]),
-                definitions: BTreeSet::new(),
+                definitions: strings(&["levels"]),
             },
         },
         playbook: Playbook {
@@ -231,19 +264,35 @@ fn playbook(registry: &Registry, start: &str, steps: Vec<(&str, Step)>) -> Artif
             entries: BTreeMap::from([(
                 "main".into(),
                 EntryPoint {
-                    input: Schema::object(BTreeMap::from([("task".into(), Schema::string(64))])),
-                    outcomes: BTreeMap::from([("done".into(), Schema::Null)]),
+                    input: Schema::Object {
+                        properties: BTreeMap::from([
+                            ("task".into(), Schema::string(64)),
+                            ("flag".into(), Schema::Boolean),
+                        ]),
+                        required: strings(&["task"]),
+                    },
+                    outcomes: BTreeMap::from([
+                        ("done".into(), Schema::Null),
+                        ("told".into(), Schema::Boolean),
+                    ]),
                     start: start.into(),
                 },
             )]),
             steps,
             triggers: vec![],
             limits: Limits::default(),
-            required_capabilities: strings(&["ask.judge", "work.look"]),
+            required_capabilities: strings(&["ask.judge", "work.look", "work.flag"]),
         },
         registry: registry.clone(),
         dependencies: BTreeMap::new(),
-        definitions: BTreeMap::new(),
+        definitions: BTreeMap::from([(
+            "levels".to_string(),
+            CapturedDefinition {
+                version: "1".into(),
+                digest: digest(&json!(["low", "high"])).unwrap(),
+                value: json!(["low", "high"]),
+            },
+        )]),
         source_map: BTreeMap::new(),
     }
 }
@@ -278,6 +327,34 @@ fn bases() -> Vec<Base> {
         edges: edges(to),
         on_error: Some("end".into()),
     };
+    let ask_as = |bind: &str, to: &[(&str, &str)]| Step {
+        op: Operation::Invoke {
+            command: command_ref("ask.judge"),
+            input: Expr::Object {
+                fields: BTreeMap::new(),
+            },
+            bind: bind.into(),
+            retry: None,
+        },
+        edges: edges(to),
+        on_error: Some("end".into()),
+    };
+    let join_of = |members: &[&str], mode: JoinMode, accepted: &[&str], to: &[(&str, &str)]| Step {
+        op: Operation::Join {
+            members: members.iter().map(|m| r(m, &[])).collect(),
+            member_keys: ["c", "d"][..members.len()]
+                .iter()
+                .map(|k| k.to_string())
+                .collect(),
+            mode,
+            accepted_outcomes: strings(accepted),
+            deadline_ms: 60_000,
+            remaining: RemainingPolicy::Track,
+            bind: "answer".into(),
+        },
+        edges: edges(to),
+        on_error: Some("end".into()),
+    };
     let join = |accepted: &[&str], to: &[(&str, &str)]| Step {
         op: Operation::Join {
             members: vec![r("j", &[])],
@@ -303,15 +380,259 @@ fn bases() -> Vec<Base> {
         ("failed", "end"),
         ("refused", "end"),
     ];
-    let base = |name, carrier, path, sound, carrier_missing, start: &str, steps| Base {
+    let base = |name, carrier: &str, path, sound, carrier_missing, start: &str, steps| Base {
         name,
-        carrier,
+        carrier: r(carrier, &[]),
         path,
         sound,
         carrier_missing,
+        needed_inside: false,
+        two_causes: false,
+        loose_item: carrier == "answer" || carrier == "vars",
+        depth: 3,
+        sites: IN_STEPS,
         content: playbook(&registry, start, steps),
     };
-    vec![
+    // A base composed two deep: the scope sources and sites beyond the first
+    // bases, which are composed three deep.
+    let shallow = |mut base: Base| {
+        base.depth = 2;
+        base
+    };
+    // A literal bound to a name: the value an author writes as a table.
+    let literal = |name, value: Value, path, sound| Base {
+        carrier: let_("lit", lit(value), r("lit", &[])),
+        sites: ANYWHERE,
+        ..base(name, "lit", path, sound, false, SLOT, vec![])
+    };
+    // A read given whole, over literal rows of which the second lacks `k`.
+    let rows = |name, read: Expr, needed_inside| Base {
+        carrier: let_("rows", lit(json!([{"k": "chore"}, {}])), read),
+        needed_inside,
+        depth: 2,
+        sites: ANYWHERE,
+        ..base(name, "rows", &[], false, true, SLOT, vec![])
+    };
+    let two_asked = [
+        ("accepted", "ask2"),
+        ("assessed", "end"),
+        ("failed", "end"),
+        ("refused", "end"),
+    ];
+    // `look` runs before the loop and again in its body; its `none` outcome
+    // leaves the loop by `noted`, whose failure inside the loop is the
+    // loop's to handle.
+    let looped = |name, on_failure: IterationFailure, sound: bool| {
+        let mut noted = look(&[("found", "end"), ("none", "end")]);
+        let Operation::Invoke { bind, .. } = &mut noted.op else {
+            unreachable!()
+        };
+        *bind = "seen2".into();
+        // The check follows a failure of any step in the body, `end` too,
+        // which `look`'s own `on_error` reaches without `seen`: where the
+        // loop goes on after a failure, `seen` itself may not be bound.
+        let two_causes = !sound;
+        let mut base = shallow(base(
+            name,
+            "seen",
+            &["kind"],
+            sound,
+            !sound,
+            "look",
+            vec![
+                ("look", look(&[("found", "each"), ("none", "noted")])),
+                (
+                    "each",
+                    Step {
+                        op: Operation::ForEach {
+                            collection: lit(json!(["a"])),
+                            item: "it0".into(),
+                            body: "again".into(),
+                            next: SLOT.into(),
+                            max_items: 1,
+                            concurrency: 1,
+                            on_failure,
+                        },
+                        edges: BTreeMap::new(),
+                        on_error: Some("end".into()),
+                    },
+                ),
+                ("again", decide(lit(json!(true)), "look")),
+                ("noted", noted),
+            ],
+        ));
+        base.two_causes = two_causes;
+        base
+    };
+    let always_asked = || {
+        vec![(
+            "ask",
+            ask(
+                &[
+                    ("accepted", SLOT),
+                    ("assessed", "end"),
+                    ("failed", "end"),
+                    ("refused", "end"),
+                ],
+                "end",
+            ),
+        )]
+    };
+    let joined = |name, members: &[&str], mode: JoinMode, accepted: &[&str], edge: &str, sound| {
+        let mut to = vec![
+            ("completed", "end"),
+            ("no_match", "end"),
+            ("timeout", "end"),
+        ];
+        for exit in &mut to {
+            if exit.0 == edge {
+                exit.1 = SLOT;
+            }
+        }
+        let mut steps = vec![("read", join_of(members, mode, accepted, &to))];
+        if members.len() == 2 {
+            steps.push(("ask", ask(&two_asked, "end")));
+            steps.push(("ask2", ask_as("j2", &to_join)));
+        } else {
+            steps.push(("ask", ask(&to_join, "end")));
+        }
+        shallow(base(
+            name,
+            "answer",
+            &["c", "participant"],
+            sound,
+            false,
+            "ask",
+            steps,
+        ))
+    };
+    let mut all = vec![
+        // Literals: a table's rows keep their own fields, an array its length.
+        literal(
+            "a field of a literal row that lacks it",
+            json!([{"k": "chore"}, {}]),
+            &["1", "k"],
+            false,
+        ),
+        literal(
+            "a position past the end of a literal array",
+            json!(["chore", "x"]),
+            &["5"],
+            false,
+        ),
+        literal(
+            "a field of a literal row that has it",
+            json!([{"k": "chore"}, {}]),
+            &["0", "k"],
+            true,
+        ),
+        // The reviewer's probes L1 and L1b.
+        rows(
+            "a lookup keyed on a field of every literal row, one of which lacks it",
+            Expr::Map {
+                collection: b(r("rows", &[])),
+                item: "row".into(),
+                value: b(lookup(r("row", &["k"]), vec![], lit(json!(true)))),
+                max_items: 2,
+            },
+            true,
+        ),
+        rows(
+            "a filter on a field of every literal row, one of which lacks it",
+            Expr::Filter {
+                collection: b(r("rows", &[])),
+                item: "row".into(),
+                predicate: b(eq(r("row", &["k"]), lit(json!("chore")))),
+                max_items: 2,
+            },
+            false,
+        ),
+        // The other roots.
+        shallow(base(
+            "a binding not bound on some way, read through `vars`",
+            "vars",
+            &["j", "handle"],
+            false,
+            false,
+            "ask",
+            vec![("ask", ask(&all_end, SLOT))],
+        )),
+        shallow(base(
+            "a field every way has, read through `vars`",
+            "vars",
+            &["j", "handle"],
+            true,
+            false,
+            "ask",
+            always_asked(),
+        )),
+        shallow(base(
+            "a captured definition",
+            "definitions",
+            &["levels", "0"],
+            true,
+            false,
+            SLOT,
+            vec![],
+        )),
+        Base {
+            sites: &[Site::Trigger],
+            ..shallow(base(
+                "a field of the trigger's event",
+                "event",
+                &["note"],
+                true,
+                false,
+                SLOT,
+                vec![],
+            ))
+        },
+        // Joins with several members, and `no_match`.
+        joined(
+            "a member another member can qualify before, in `any_accepted`",
+            &["j", "j2"],
+            JoinMode::AnyAccepted,
+            &["assessed"],
+            "completed",
+            false,
+        ),
+        joined(
+            "a member another member can complete before, in `any_completion`",
+            &["j", "j2"],
+            JoinMode::AnyCompletion,
+            &[],
+            "completed",
+            false,
+        ),
+        joined(
+            "a member on `no_match` of an `all` join",
+            &["j"],
+            JoinMode::All,
+            &["assessed"],
+            "no_match",
+            true,
+        ),
+        joined(
+            "a member on `no_match` of an `any_accepted` join",
+            &["j"],
+            JoinMode::AnyAccepted,
+            &["assessed"],
+            "no_match",
+            false,
+        ),
+        // A failure in a loop body.
+        looped(
+            "an outcome that reaches the end of a loop only by a failure in its body",
+            IterationFailure::Continue,
+            false,
+        ),
+        looped(
+            "an outcome a failure in a loop body takes out of the loop",
+            IterationFailure::Stop,
+            true,
+        ),
+    ];
+    all.extend([
         base(
             "an outcome-only field where two outcome edges meet",
             "j",
@@ -490,7 +811,8 @@ fn bases() -> Vec<Base> {
             "look",
             vec![("look", look(&[("found", SLOT), ("none", "end")]))],
         ),
-    ]
+    ]);
+    all
 }
 
 /// A combinator: wraps the expression built so far.
@@ -619,6 +941,23 @@ struct Built {
     /// The expression is a string (`lt` compares two of them).
     string: bool,
     layers: Vec<Layer>,
+    /// A string every way has, for the key of a table: `input.task` in a
+    /// step, `event.note` in a trigger.
+    key: Expr,
+}
+impl Built {
+    fn new(expr: Expr, string: bool, site: Site) -> Self {
+        let key = match site {
+            Site::Decide | Site::Input | Site::Output => r("input", &["task"]),
+            Site::Trigger => r("event", &["note"]),
+        };
+        Self {
+            expr,
+            string,
+            layers: vec![],
+            key,
+        }
+    }
 }
 impl Built {
     fn wrap(&mut self, wrap: Wrap, n: usize) -> bool {
@@ -650,7 +989,7 @@ impl Built {
             }
             Wrap::LookupBoth => {
                 string = self.string;
-                lookup(r("input", &["task"]), vec![(json!("a"), e.clone())], e)
+                lookup(self.key.clone(), vec![(json!("a"), e.clone())], e)
             }
             Wrap::MapResultIndex => {
                 string = self.string;
@@ -698,16 +1037,10 @@ impl Built {
                 });
                 r(&name("t"), &[])
             }
-            Wrap::LookupCase => lookup(
-                r("input", &["task"]),
-                vec![(json!("a"), e)],
-                lit(Value::Null),
-            ),
-            Wrap::LookupDefault => lookup(
-                r("input", &["task"]),
-                vec![(json!("a"), lit(Value::Null))],
-                e,
-            ),
+            Wrap::LookupCase => lookup(self.key.clone(), vec![(json!("a"), e)], lit(Value::Null)),
+            Wrap::LookupDefault => {
+                lookup(self.key.clone(), vec![(json!("a"), lit(Value::Null))], e)
+            }
             Wrap::Object => object("k", e),
             Wrap::Array => array(vec![e]),
             Wrap::MapBody => Expr::Map {
@@ -766,12 +1099,19 @@ impl Built {
                 other => panic!("not a value to read through: {other:?}"),
             }
         }
-        read(&mut self.expr, path);
-        self.string = true;
+        if !path.is_empty() {
+            read(&mut self.expr, path);
+            self.string = true;
+        }
     }
-    /// The steps from `SLOT` on: the layers, then a decide on the expression.
-    fn steps(self) -> Vec<(String, Step)> {
-        let mut steps = vec![];
+    /// Puts the generated read into `content`: the layers as steps from
+    /// `SLOT` on, then the expression where `site` needs its value.
+    fn install(self, site: Site, content: &mut ArtifactContent) {
+        let steps = &mut content.playbook.steps;
+        steps.retain(|name, _| {
+            name != SLOT && !(name.starts_with('g') && name[1..].parse::<usize>().is_ok())
+        });
+        content.playbook.triggers.clear();
         let names: Vec<String> = (0..=self.layers.len())
             .map(|i| if i == 0 { SLOT.into() } else { format!("g{i}") })
             .collect();
@@ -780,9 +1120,11 @@ impl Built {
         for (i, layer) in self.layers.into_iter().enumerate() {
             let next = &names[i + 1];
             match layer {
-                Layer::Later => steps.push((names[i].clone(), decide(lit(json!(true)), next))),
+                Layer::Later => {
+                    steps.insert(names[i].clone(), decide(lit(json!(true)), next));
+                }
                 Layer::ForEach { collection, item } => {
-                    steps.push((
+                    steps.insert(
                         names[i].clone(),
                         Step {
                             op: Operation::ForEach {
@@ -797,15 +1139,76 @@ impl Built {
                             edges: BTreeMap::new(),
                             on_error: Some("end".into()),
                         },
-                    ));
+                    );
                     after = names[i].clone();
                 }
             }
         }
         // A test of any value that is Missing where the value is.
         let reads = let_("v", self.expr, eq(r("v", &[]), r("v", &[])));
-        steps.push((names.last().unwrap().clone(), decide(reads, &after)));
-        steps
+        let last = names.last().unwrap().clone();
+        let flag = |reads: Expr| Expr::Object {
+            fields: BTreeMap::from([("flag".to_string(), reads)]),
+        };
+        let reader = match site {
+            Site::Decide => decide(reads, &after),
+            Site::Input => {
+                let work = &content.registry.commands["work.flag"];
+                Step {
+                    op: Operation::Invoke {
+                        command: ContractRef {
+                            name: work.name.clone(),
+                            fingerprint: work.fingerprint().unwrap(),
+                        },
+                        input: flag(reads),
+                        bind: "flagged".into(),
+                        retry: None,
+                    },
+                    edges: edges(&[("done", &after)]),
+                    on_error: Some("end".into()),
+                }
+            }
+            // A step that returns it, beside the way on to `end`.
+            Site::Output => {
+                steps.insert(
+                    "g99".into(),
+                    Step {
+                        op: Operation::Return {
+                            outcome: "told".into(),
+                            output: reads,
+                        },
+                        edges: BTreeMap::new(),
+                        on_error: None,
+                    },
+                );
+                Step {
+                    op: Operation::Decide {
+                        predicate: lit(json!(true)),
+                    },
+                    edges: edges(&[("true", "g99"), ("false", &after), ("unknown", &after)]),
+                    on_error: None,
+                }
+            }
+            Site::Trigger => {
+                let seen = &content.registry.events["aq.work.seen"];
+                let mut input = flag(reads);
+                let Expr::Object { fields } = &mut input else {
+                    unreachable!()
+                };
+                fields.insert("task".into(), r("event", &["note"]));
+                content.playbook.triggers.push(Trigger {
+                    id: "t".into(),
+                    event: ContractRef {
+                        name: seen.name.clone(),
+                        fingerprint: seen.fingerprint().unwrap(),
+                    },
+                    entry: "main".into(),
+                    input,
+                });
+                decide(lit(json!(true)), "end")
+            }
+        };
+        steps.insert(last, reader);
     }
 }
 
@@ -814,6 +1217,9 @@ impl Built {
 fn must_refuse(base: &Base, wraps: &[Wrap], split: usize) -> bool {
     if base.sound {
         return false;
+    }
+    if base.needed_inside {
+        return true;
     }
     let mut missing = base.carrier_missing;
     for (i, wrap) in wraps.iter().enumerate() {
@@ -827,7 +1233,7 @@ fn must_refuse(base: &Base, wraps: &[Wrap], split: usize) -> bool {
             Missing::Tests => return false,
         }
     }
-    // Read at last by a decide, which needs it.
+    // Read at last where its value is needed.
     true
 }
 /// The reasons of every refused read: "…this step: <reasons>. Read it only…".
@@ -868,20 +1274,14 @@ impl Tally {
 
 /// Every composition of up to `depth` combinators around `base` that starts
 /// with `first` (the direct read alone for `None`), with the path read after
-/// each possible prefix of value-preserving ones.
-fn check_base(base: &Base, depth: usize, first: Option<Wrap>) -> Tally {
+/// each possible prefix of value-preserving ones, consumed at `site`.
+fn check_base(base: &Base, depth: usize, first: Option<Wrap>, site: Site) -> Tally {
     let mut tally = Tally::default();
     let mut content = base.content.clone();
     let direct = {
-        let mut built = Built {
-            expr: r(base.carrier, base.path),
-            string: true,
-            layers: vec![],
-        };
-        built.string = true;
-        for (name, step) in built.steps() {
-            content.playbook.steps.insert(name, step);
-        }
+        let mut built = Built::new(base.carrier.clone(), true, site);
+        built.project(base.path);
+        built.install(site, &mut content);
         let issues = content.draft_issues(&[]);
         assert_eq!(
             content.validate_structure(),
@@ -919,13 +1319,22 @@ fn check_base(base: &Base, depth: usize, first: Option<Wrap>) -> Tally {
         last = next;
     }
     for wraps in &sequences {
-        let prefix = wraps.iter().take_while(|w| w.same_value()).count();
+        // A trigger's input is one expression: no step comes before it.
+        if site == Site::Trigger
+            && wraps
+                .iter()
+                .any(|w| matches!(w, Wrap::LaterStep | Wrap::ForEachItem))
+        {
+            continue;
+        }
+        // A read given whole has no path left to read after a combinator.
+        let prefix = if base.path.is_empty() {
+            0
+        } else {
+            wraps.iter().take_while(|w| w.same_value()).count()
+        };
         for split in 0..=prefix {
-            let mut built = Built {
-                expr: r(base.carrier, &[]),
-                string: false,
-                layers: vec![],
-            };
+            let mut built = Built::new(base.carrier.clone(), false, site);
             let mut applies = true;
             for (i, wrap) in wraps.iter().enumerate() {
                 if i == split {
@@ -939,22 +1348,21 @@ fn check_base(base: &Base, depth: usize, first: Option<Wrap>) -> Tally {
             if split == wraps.len() {
                 built.project(base.path);
             }
-            let steps = built.steps();
-            content.playbook.steps.retain(|name, _| {
-                name != SLOT && !(name.starts_with('g') && name[1..].parse::<usize>().is_ok())
-            });
-            for (name, step) in steps {
-                content.playbook.steps.insert(name, step);
-            }
+            built.install(site, &mut content);
             tally.cases += 1;
-            let case = || format!("{}: {wraps:?}, path read after {split}", base.name);
+            let case = || {
+                format!(
+                    "{} ({site:?}): {wraps:?}, path read after {split}",
+                    base.name
+                )
+            };
             // Ordinary typing accepts the draft, so only the draft check can
             // refuse it: checked for every composition of one combinator and
             // a sample of the deeper ones (it costs ten times the check).
             let sampled = match wraps.len() {
                 0 | 1 => true,
-                2 => tally.cases % 5 == 0,
-                _ => tally.cases % 199 == 0,
+                2 => tally.cases % 11 == 0,
+                _ => tally.cases % 397 == 0,
             };
             if sampled {
                 tally.typed += 1;
@@ -963,7 +1371,7 @@ fn check_base(base: &Base, depth: usize, first: Option<Wrap>) -> Tally {
                 // collection has anywhere in the playbook, not at the loop:
                 // a join's answer carried as an item types as nullable, and
                 // typing itself refuses the read.
-                let loose_item = base.carrier == "answer" && wraps.contains(&Wrap::ForEachItem);
+                let loose_item = base.loose_item && wraps.contains(&Wrap::ForEachItem);
                 if !ordinary.is_empty() && loose_item {
                     tally.typing_stricter += 1;
                 } else if !ordinary.is_empty() {
@@ -979,7 +1387,7 @@ fn check_base(base: &Base, depth: usize, first: Option<Wrap>) -> Tally {
                 let found = reasons(&issues);
                 if issues.iter().all(|i| i.code != "expression_type") {
                     tally.failures.push(format!("{}{ACCEPTED}", case()));
-                } else if found != direct {
+                } else if found != direct && !(base.two_causes && found.is_subset(&direct)) {
                     tally.failures.push(format!(
                         "{}{OTHER_REASONS}{found:?}, the direct read for {direct:?}",
                         case()
@@ -1002,13 +1410,20 @@ fn check_base(base: &Base, depth: usize, first: Option<Wrap>) -> Tally {
 fn every_wrapped_read_is_refused_or_accepted_as_the_direct_read_is() {
     let bases = bases();
     let mut tally = Tally::default();
-    // One task per base and first combinator, shared out over the cores.
-    let tasks: Vec<(&Base, Option<Wrap>)> = bases
-        .iter()
-        .flat_map(|base| {
-            std::iter::once((base, None)).chain(WRAPS.into_iter().map(move |w| (base, Some(w))))
-        })
-        .collect();
+    // One task per base, site and first combinator, shared out over the
+    // cores. A `decide` consumes the read at the base's full depth; the
+    // other sites at depth two at most.
+    let mut tasks: Vec<(&Base, Option<Wrap>, Site, usize)> = vec![];
+    for base in &bases {
+        for site in base.sites {
+            let depth = match site {
+                Site::Decide => base.depth,
+                Site::Input | Site::Output | Site::Trigger => base.depth.min(2),
+            };
+            tasks.push((base, None, *site, depth));
+            tasks.extend(WRAPS.into_iter().map(|w| (base, Some(w), *site, depth)));
+        }
+    }
     let next = std::sync::atomic::AtomicUsize::new(0);
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
     let results: Vec<Tally> = std::thread::scope(|scope| {
@@ -1016,10 +1431,10 @@ fn every_wrapped_read_is_refused_or_accepted_as_the_direct_read_is() {
             .map(|_| {
                 scope.spawn(|| {
                     let mut tally = Tally::default();
-                    while let Some((base, first)) =
+                    while let Some((base, first, site, depth)) =
                         tasks.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                     {
-                        tally.add(check_base(base, 3, *first));
+                        tally.add(check_base(base, *depth, *first, *site));
                     }
                     tally
                 })
@@ -1031,8 +1446,9 @@ fn every_wrapped_read_is_refused_or_accepted_as_the_direct_read_is() {
         tally.add(result);
     }
     println!(
-        "soundness: {} bases, {} combinators, {} compositions ({} must be refused, {} must be \
-         accepted; {} also checked against ordinary typing, which refused {} itself), {} failures",
+        "soundness: {} bases, {} combinators, 4 sites, {} compositions ({} must be refused, {} \
+         must be accepted; {} also checked against ordinary typing, which refused {} itself), {} \
+         failures",
         bases.len(),
         WRAPS.len(),
         tally.cases,
@@ -1119,11 +1535,7 @@ fn the_combinators_cover_every_expression() {
     }
     let mut used = BTreeSet::new();
     for (i, wrap) in WRAPS.into_iter().enumerate() {
-        let mut built = Built {
-            expr: r("input", &["task"]),
-            string: true,
-            layers: vec![],
-        };
+        let mut built = Built::new(r("input", &["task"]), true, Site::Decide);
         assert!(built.wrap(wrap, i), "{wrap:?}");
         for layer in &built.layers {
             if let Layer::ForEach { collection, .. } = layer {

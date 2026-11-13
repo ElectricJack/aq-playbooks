@@ -924,7 +924,7 @@ fn a_draft_is_bounded_in_steps_and_bytes_before_it_is_checked() {
     assert!(
         diagnostics[0]
             .message
-            .contains("a draft may be at most 262144 bytes")
+            .contains("a draft may be at most 786432 bytes")
     );
     let dir = std::env::temp_dir().join(format!("aq-draft-{}-big", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -1397,4 +1397,93 @@ fn a_failure_in_a_loop_body_is_followed_to_where_the_loop_takes_it() {
     // is reached only with the outcome that has the field.
     let diagnostics = check(&looped("stop"));
     assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+}
+
+// A literal is read as the value it is (A2 re-review round 4, I1; probes L1,
+// L1b and L2): each row keeps its own fields and an array its own length, as
+// for the same value written with `object` and `array` expressions.
+#[test]
+fn a_literal_table_is_read_row_by_row_and_an_array_to_its_end() {
+    let table = |rows: Value, body: Value| json!({"op": "exists", "value": let1("t", json!({"op": "literal", "value": rows}), body)});
+    let rows = json!([{"k": "chore"}, {}]);
+    let over = |op: &str, field: &str, body: Value| json!({"op": op, "item": "r", "max_items": 2, "collection": reference("t", &[]), field: body});
+    // L1: a lookup keyed on a field one row lacks would take its default
+    // for that row without a trace.
+    let (diagnostics, reasons) = at_peek(table(
+        rows.clone(),
+        over("map", "value", keyed_by(reference("r", &["k"]))),
+    ));
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    let message = &diagnostics[0].message;
+    assert!(
+        message.starts_with(
+            "steps.peek.predicate.exists.value.let.body.map.value.lookup.key: `r.k` (`r` is an \
+             item of its collection) is not there on every way to this step: "
+        ),
+        "{message}"
+    );
+    assert_eq!(reasons, "`k` is not in an object written with no fields");
+    assert!(
+        message.contains("a lookup key is held to this too"),
+        "{message}"
+    );
+    // L1b: outside `exists`, a filter on that field is Missing for that row.
+    let Value::Object(mut unwrapped) = table(
+        rows.clone(),
+        json!({"op": "contains", "value": {"op": "literal", "value": {"k": "chore"}},
+            "collection": over("filter", "predicate", eqx(reference("r", &["k"]), "chore"))}),
+    ) else {
+        unreachable!()
+    };
+    let (diagnostics, reasons) = at_peek(unwrapped.remove("value").unwrap());
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(reasons, "`k` is not in an object written with no fields");
+    // L2: a position past the end of a literal array, as a lookup key.
+    let (diagnostics, reasons) = at_peek(table(
+        json!(["chore", "x"]),
+        keyed_by(reference("t", &["5"])),
+    ));
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        reasons,
+        "position `5` is past the end of an array written with 2 items"
+    );
+    // A table whose rows all have the field, and a position that is there,
+    // check clean.
+    for accepted in [
+        table(
+            json!([{"k": "chore"}, {"k": "fix"}]),
+            over("map", "value", keyed_by(reference("r", &["k"]))),
+        ),
+        table(json!(["chore", "x"]), keyed_by(reference("t", &["1"]))),
+    ] {
+        let (diagnostics, _) = at_peek(accepted.clone());
+        assert!(diagnostics.is_empty(), "{accepted}: {diagnostics:#?}");
+    }
+}
+
+// What the diagnostic tells the author to do (A2 re-review round 4, m1):
+// `exists` is a test, and testing does not make a read allowed.
+#[test]
+fn the_remedy_does_not_promise_that_exists_makes_a_read_allowed() {
+    let w = |p: &[&str]| reference("work", p);
+    // Probe E1: the value read in the branch its own `exists` selects.
+    let (diagnostics, _) = at_peek(json!({"op": "lookup",
+        "key": {"op": "exists", "value": w(&["kind"])},
+        "cases": [{"when": true, "then": eqx(w(&["kind"]), "chore")}],
+        "default": {"op": "literal", "value": false}}));
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    let message = &diagnostics[0].message;
+    assert!(
+        message.starts_with("steps.peek.predicate.lookup.cases[0].then.eq.left: `work.kind`"),
+        "{message}"
+    );
+    for text in [
+        "after the outcome edge of the step that returns it",
+        "`exists` only tells you whether it is there: testing it does not make a read of it allowed",
+        "branch on the edge first and read the value in the step that edge leads to",
+    ] {
+        assert!(message.contains(text), "{text}: {message}");
+    }
+    assert!(!message.contains("Or test it first"), "{message}");
 }
