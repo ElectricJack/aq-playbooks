@@ -553,6 +553,9 @@ fn refused_with<T>(result: std::result::Result<T, StorageError>, text: &str) -> 
 fn removal_fences_hold(store: &PostgresStorage, ns: &str) {
     store.acquire(ns, "w").unwrap();
     let mut s = State::default();
+    // Round 1 (I2): a recorded expiry is at least acceptance plus the policy
+    // window, so the brief's 1_000 needs a 1_000 window.
+    s.retention.policy.admission_replay_ms = 1_000;
     s.retention.clock_ms = Some(500);
     s.keyed_admissions.insert("k".into(), receipt("k", 0));
     s.retention
@@ -593,8 +596,224 @@ fn removal_fences_hold_on_postgres() {
     removal_fences_hold(&support::protected(), &support::namespace("fence_f2"));
     removal_fences_hold(&support::records(), &support::namespace("fence_f3"));
 }
-/// No removal without a history record or an expired window entry, on every
-/// full commit path. A refusal writes nothing and writes no tombstone.
+fn audit(sequence: u64, run: &str) -> Receipt {
+    Receipt {
+        sequence,
+        run: run.into(),
+        step: "s".into(),
+        at_ms: 1,
+        kind: "terminal".into(),
+        detail: json!({}),
+    }
+}
+fn accepted_event(key: &str, accepted_at_ms: i64) -> AcceptedEvent {
+    AcceptedEvent {
+        key: key.into(),
+        envelope: aq_playbooks_model::EventEnvelope {
+            producer: "host".into(),
+            event_id: key.into(),
+            contract: aq_playbooks_model::ContractRef {
+                name: "test.completed".into(),
+                fingerprint: "fingerprint".into(),
+            },
+            scope: "project".into(),
+            correlation: BTreeMap::new(),
+            subject: None,
+            revision: None,
+            causation: None,
+            occurred_at_ms: None,
+            observed_at_ms: None,
+            payload: Value::Null,
+        },
+        digest: format!("digest-{key}"),
+        accepted_at_ms,
+        sequence: 1,
+        catalog_revision: 1,
+        destinations: vec![],
+    }
+}
+fn tombstone(digest: &str) -> retention::EventTombstone {
+    retention::EventTombstone {
+        producer: "host".into(),
+        epoch: 0,
+        digest: digest.into(),
+        disposed_at_ms: 5,
+    }
+}
+/// Policy windows: receipts 2_000, events 3_000; recorded expiries "k"
+/// 3_000 and "ev" 4_000; "fallback" has none. Receipt 1 belongs to the
+/// finished run-a, receipt 2 to the running run-b.
+fn fence_state() -> State {
+    let mut s = State::default();
+    s.retention.clock_ms = Some(500);
+    s.retention.policy.admission_replay_ms = 2_000;
+    s.retention.policy.event_replay_ms = 3_000;
+    s.runs.insert("run-a".into(), completed_run("run-a"));
+    s.runs.insert("run-b".into(), {
+        let mut run = completed_run("run-b");
+        run.status = RunStatus::Running;
+        run
+    });
+    s.receipts.push(audit(1, "run-a"));
+    s.receipts.push(audit(2, "run-b"));
+    s.keyed_admissions.insert("k".into(), receipt("k", 0));
+    s.keyed_admissions
+        .insert("fallback".into(), receipt("fallback", 0));
+    s.retention
+        .admission_expires_at_ms
+        .insert("k".into(), 3_000);
+    s.events.insert("ev".into(), accepted_event("ev", 0));
+    s.retention.event_expires_at_ms.insert("ev".into(), 4_000);
+    s
+}
+type Case = (&'static str, &'static str, Box<dyn Fn(&mut State)>);
+/// The refusals every commit path must make, each as a change of
+/// `fence_state()`.
+fn refusal_cases() -> Vec<Case> {
+    let early = retention::REFUSE_EARLY_REMOVAL;
+    let shortened = retention::REFUSE_EXPIRY;
+    vec![
+        (
+            "run",
+            retention::REFUSE_RUN_REMOVAL,
+            Box::new(|n| {
+                n.runs.remove("run-a");
+            }),
+        ),
+        (
+            "running settled run",
+            "unresolved run obligations cannot be disposed",
+            Box::new(|n| {
+                let running = n.runs.remove("run-b").unwrap();
+                n.receipts.retain(|r| r.sequence != 2);
+                let mut c = cohort_of(running);
+                c.receipts.push(audit(2, "run-b"));
+                n.settled.push(c);
+            }),
+        ),
+        (
+            "keyed admission",
+            early,
+            Box::new(|n| {
+                n.retention.clock_ms = Some(2_999);
+                n.keyed_admissions.remove("k");
+                n.retention.admission_expires_at_ms.remove("k");
+            }),
+        ),
+        (
+            "keyed admission, policy window",
+            early,
+            Box::new(|n| {
+                n.retention.clock_ms = Some(1_999);
+                n.keyed_admissions.remove("fallback");
+            }),
+        ),
+        (
+            "event",
+            early,
+            Box::new(|n| {
+                n.retention.clock_ms = Some(3_999);
+                n.events.remove("ev");
+                n.retention.event_expires_at_ms.remove("ev");
+            }),
+        ),
+        (
+            "forged legacy tombstone",
+            early,
+            Box::new(|n| {
+                n.events.remove("ev");
+                n.retention.event_expires_at_ms.remove("ev");
+                n.retention
+                    .event_tombstones
+                    .insert("ev".into(), tombstone("digest-ev"));
+            }),
+        ),
+        (
+            "changed receipt",
+            "immutable keyed admission receipt removed or changed",
+            Box::new(|n| {
+                n.keyed_admissions.get_mut("k").unwrap().run_id = "other".into();
+            }),
+        ),
+        (
+            "receipt of a live run",
+            retention::REFUSE_RUN_REMOVAL,
+            Box::new(|n| {
+                n.receipts.retain(|r| r.sequence != 2);
+            }),
+        ),
+        (
+            "receipt overwritten",
+            retention::REFUSE_RUN_REMOVAL,
+            Box::new(|n| {
+                *n.receipts.get_mut(1).unwrap() = audit(3, "run-b");
+            }),
+        ),
+        (
+            "receipt of a settled run without its history",
+            retention::REFUSE_RUN_REMOVAL,
+            Box::new(|n| {
+                let run = n.runs.remove("run-a").unwrap();
+                n.receipts.retain(|r| r.sequence != 1);
+                n.settled.push(cohort_of(run));
+            }),
+        ),
+        (
+            "lowered expiry",
+            shortened,
+            Box::new(|n| {
+                n.retention
+                    .admission_expires_at_ms
+                    .insert("k".into(), 2_500);
+            }),
+        ),
+        (
+            "expiry deleted, item kept",
+            shortened,
+            Box::new(|n| {
+                n.retention.event_expires_at_ms.remove("ev");
+            }),
+        ),
+        (
+            "new expiry below the fallback, stored item",
+            shortened,
+            Box::new(|n| {
+                n.retention
+                    .admission_expires_at_ms
+                    .insert("fallback".into(), 1_999);
+            }),
+        ),
+        (
+            "new expiry below the fallback, new item",
+            shortened,
+            Box::new(|n| {
+                n.keyed_admissions.insert("new".into(), receipt("new", 100));
+                n.retention
+                    .admission_expires_at_ms
+                    .insert("new".into(), 2_099);
+            }),
+        ),
+        (
+            "clock",
+            retention::REFUSE_CLOCK,
+            Box::new(|n| {
+                n.retention.clock_ms = Some(499);
+            }),
+        ),
+    ]
+}
+fn tombstone_rows(ns: &str) -> i64 {
+    support::client()
+        .query_one(
+            "SELECT count(*) FROM aq_playbooks.disposal_tombstones WHERE namespace=$1",
+            &[&ns],
+        )
+        .unwrap()
+        .get(0)
+}
+/// No removal without a history record or an expired window entry, and no
+/// expiry moved earlier, on every full commit path. A refusal writes
+/// nothing and writes no tombstone.
 #[test]
 fn removals_without_history_or_expiry_are_refused_on_every_full_commit_path() {
     let stores = [
@@ -603,115 +822,76 @@ fn removals_without_history_or_expiry_are_refused_on_every_full_commit_path() {
         ("f3_cas", support::records()),
     ];
     for (label, store) in stores {
-        let ns = support::namespace(label);
-        store.acquire(&ns, "w").unwrap();
-        let mut s = State::default();
-        s.retention.clock_ms = Some(500);
-        s.runs.insert("run-a".into(), completed_run("run-a"));
-        s.runs.insert("run-b".into(), {
-            let mut run = completed_run("run-b");
-            run.status = RunStatus::Running;
-            run
-        });
-        s.keyed_admissions.insert("k".into(), receipt("k", 0));
-        s.keyed_admissions
-            .insert("fallback".into(), receipt("fallback", 0));
-        s.retention
-            .admission_expires_at_ms
-            .insert("k".into(), 1_000);
-        s.retention.policy.admission_replay_ms = 2_000;
-        let base = store.compare_and_swap(&ns, "w", 0, &s).unwrap();
-        let cas = |next: &State| store.compare_and_swap(&ns, "w", base, next);
+        let s = fence_state();
+        let fresh = || {
+            let ns = support::namespace(label);
+            store.acquire(&ns, "w").unwrap();
+            let base = store.compare_and_swap(&ns, "w", 0, &s).unwrap();
+            (ns, base)
+        };
+        let mut failures = vec![];
+        for (case, text, f) in refusal_cases() {
+            let (ns, base) = fresh();
+            let mut next = s.clone();
+            f(&mut next);
+            let result = store.compare_and_swap(&ns, "w", base, &next);
+            if !refused_with(result.clone(), text) {
+                failures.push(format!("{case}: {result:?}"));
+            } else {
+                assert_eq!(store.load(&ns).unwrap().revision, base, "{label} {case}");
+                assert_eq!(
+                    (history_rows(&ns), tombstone_rows(&ns)),
+                    (0, 0),
+                    "{label} {case}"
+                );
+            }
+        }
+        assert!(failures.is_empty(), "{label}: {failures:#?}");
+        // Allowed: both receipts and the event expired with their records,
+        // the run with its history and its receipt. No tombstone row.
+        let (ns, base) = fresh();
         let mut next = s.clone();
-        next.runs.remove("run-a");
-        assert!(
-            refused_with(cas(&next), retention::REFUSE_RUN_REMOVAL),
-            "{label} run"
-        );
-        let mut next = s.clone();
-        let running = next.runs.remove("run-b").unwrap();
-        next.settled.push(cohort_of(running));
-        assert!(
-            refused_with(cas(&next), "unresolved run obligations cannot be disposed"),
-            "{label} running"
-        );
-        let mut next = s.clone();
-        next.keyed_admissions.remove("k");
-        next.retention.clock_ms = Some(999);
-        assert!(
-            refused_with(cas(&next), retention::REFUSE_EARLY_REMOVAL),
-            "{label} k"
-        );
-        let mut next = s.clone();
-        next.keyed_admissions.remove("fallback");
-        next.retention.clock_ms = Some(1_999);
-        assert!(
-            refused_with(cas(&next), retention::REFUSE_EARLY_REMOVAL),
-            "{label} fallback"
-        );
-        let mut next = s.clone();
-        next.keyed_admissions.get_mut("k").unwrap().run_id = "other".into();
-        assert!(
-            refused_with(
-                cas(&next),
-                "immutable keyed admission receipt removed or changed"
-            ),
-            "{label} changed"
-        );
-        let mut next = s.clone();
-        next.retention.clock_ms = None;
-        assert!(
-            refused_with(cas(&next), retention::REFUSE_CLOCK),
-            "{label} clock"
-        );
-        assert_eq!(store.load(&ns).unwrap().revision, base, "{label}");
-        assert_eq!(history_rows(&ns), 0, "{label}");
-        // Allowed: both receipts expired, the run with its history. No
-        // tombstone row is written for either.
-        let mut next = s.clone();
-        next.retention.clock_ms = Some(2_000);
+        next.retention.clock_ms = Some(4_000);
         next.keyed_admissions.clear();
+        next.retention.admission_expires_at_ms.remove("k");
+        next.events.remove("ev");
+        next.retention.event_expires_at_ms.remove("ev");
         let run = next.runs.remove("run-a").unwrap();
-        next.settled.push(cohort_of(run));
+        next.receipts.retain(|r| r.sequence != 1);
+        let mut c = cohort_of(run);
+        c.receipts.push(audit(1, "run-a"));
+        next.settled.push(c);
         store.compare_and_swap(&ns, "w", base, &next).unwrap();
-        assert_eq!(history_rows(&ns), 1, "{label}");
-        let tombstones: i64 = support::client()
-            .query_one(
-                "SELECT count(*) FROM aq_playbooks.disposal_tombstones WHERE namespace=$1",
-                &[&ns],
-            )
-            .unwrap()
-            .get(0);
-        assert_eq!(tombstones, 0, "{label}");
+        assert_eq!(history_rows(&ns), 2, "{label}");
+        assert_eq!(tombstone_rows(&ns), 0, "{label}");
     }
 }
-/// Format 3 bounded transitions: an expired window entry leaves
-/// incrementally; a removal with no history or before its expiry goes to
-/// the complete path and is refused there; a clock moving back is refused
-/// incrementally. Nothing is written by a refusal.
+/// Format 3 bounded transitions refuse the same commits, incrementally or
+/// on the complete path; nothing is written and no commit is counted. An
+/// expired window entry leaves incrementally; an event tombstone's row
+/// leaves with it.
 #[test]
 fn format_3_transitions_hold_the_removal_fences() {
-    let (ns, store) = (support::namespace("f3_fence"), support::records());
-    store.acquire(&ns, "w").unwrap();
-    let mut s = State::default();
+    let store = support::records();
+    let mut s = fence_state();
     s.indexes.initialized = true;
-    s.retention.clock_ms = Some(500);
-    s.runs.insert("run-a".into(), completed_run("run-a"));
-    for key in ["k", "j"] {
-        s.keyed_admissions.insert(key.into(), receipt(key, 0));
-        s.retention
-            .admission_expires_at_ms
-            .insert(key.into(), 1_000);
-    }
-    let base = store.compare_and_swap(&ns, "w", 0, &s).unwrap();
-    let transition = |f: &dyn Fn(&mut State)| {
+    s.retention
+        .event_tombstones
+        .insert("old".into(), tombstone("d"));
+    let fresh = || {
+        let ns = support::namespace("f3_fence");
+        store.acquire(&ns, "w").unwrap();
+        let base = store.compare_and_swap(&ns, "w", 0, &s).unwrap();
+        (ns, base)
+    };
+    let transition = |ns: &str, f: &dyn Fn(&mut State)| {
         let mut plan = |s: &mut State| {
             f(s);
             Ok(true)
         };
         let validate = |_: &State, _: &QuotaCounts| Ok(());
         storage_error(store.transition_v1(
-            &ns,
+            ns,
             "w",
             &mut TransitionRequest {
                 operation: "fence",
@@ -720,83 +900,118 @@ fn format_3_transitions_hold_the_removal_fences() {
             },
         ))
     };
-    let early = retention::REFUSE_EARLY_REMOVAL;
     store.reset_transition_stats();
-    // Heavy: the run removal and the early removal go to the complete path.
-    assert!(refused_with(
-        transition(&|s| {
-            s.runs.remove("run-a");
-        }),
-        retention::REFUSE_RUN_REMOVAL
-    ));
-    assert!(refused_with(
-        transition(&|s| {
-            s.retention.clock_ms = Some(999);
-            s.keyed_admissions.remove("k");
-            s.retention.admission_expires_at_ms.remove("k");
-        }),
-        early
-    ));
-    assert!(refused_with(
-        transition(&|s| {
-            s.retention.clock_ms = Some(999);
-            s.keyed_admissions.remove("k");
-        }),
-        early
-    ));
+    let mut cases = refusal_cases();
     // Also when the commit is heavy for another reason.
-    assert!(refused_with(
-        transition(&|s| {
-            s.execution_denied.insert("x".into());
-            s.retention.clock_ms = Some(999);
-            s.keyed_admissions.remove("k");
-            s.retention.admission_expires_at_ms.remove("k");
+    cases.push((
+        "early removal, heavy",
+        retention::REFUSE_EARLY_REMOVAL,
+        Box::new(|n| {
+            n.execution_denied.insert("x".into());
+            n.retention.clock_ms = Some(2_999);
+            n.keyed_admissions.remove("k");
+            n.retention.admission_expires_at_ms.remove("k");
         }),
-        early
     ));
-    // Incremental: the clock check of the header.
-    assert!(refused_with(
-        transition(&|s| {
-            s.retention.clock_ms = Some(499);
-        }),
-        retention::REFUSE_CLOCK
-    ));
-    assert!(refused_with(
-        transition(&|s| {
-            s.keyed_admissions.get_mut("j").unwrap().run_id = "other".into();
-        }),
-        "immutable keyed admission receipt removed or changed"
-    ));
+    // Refused by the bounded commit itself, before any complete path.
+    let bounded = [
+        "lowered expiry",
+        "new expiry below the fallback, new item",
+        "changed receipt",
+        "clock",
+    ];
+    let mut failures = vec![];
+    for (case, text, f) in &cases {
+        let (ns, base) = fresh();
+        store.set_profiling(true);
+        let result = transition(&ns, f.as_ref());
+        let complete_path = store
+            .profiling_snapshot()
+            .unwrap()
+            .operations
+            .contains_key("cas");
+        store.set_profiling(false);
+        if !refused_with(result.clone(), text) {
+            failures.push(format!("{case}: {result:?}"));
+        } else if bounded.contains(case) && complete_path {
+            failures.push(format!("{case}: refused only on the complete path"));
+        } else {
+            assert_eq!(store.load(&ns).unwrap().revision, base, "{case}");
+            assert_eq!(history_rows(&ns), 0, "{case}");
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
     let stats = store.transition_stats();
     assert_eq!((stats.incremental, stats.heavy), (0, 0));
-    assert_eq!(store.load(&ns).unwrap().revision, base);
-    // An expired receipt leaves in a bounded commit.
-    transition(&|s| {
-        s.retention.clock_ms = Some(1_000);
-        s.keyed_admissions.remove("k");
-        s.retention.admission_expires_at_ms.remove("k");
+    let (ns, _) = fresh();
+    // The in-State tombstone "old" has its row; removing it is bounded and
+    // takes the row with it.
+    let mut c = support::client();
+    let mut tx = c.transaction().unwrap();
+    tx.query_one(
+        "SELECT set_config('aq_playbooks.writer_namespace',$1,true),set_config('aq_playbooks.writer_format','3',true)",
+        &[&ns],
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO aq_playbooks.disposal_tombstones(namespace,kind,identity,content_digest,disposed_at_ms) VALUES($1,'event','old','d',5)",
+        &[&ns],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(tombstone_rows(&ns), 1);
+    transition(&ns, &|s| {
+        s.retention.event_tombstones.remove("old");
     })
     .unwrap();
     assert_eq!(store.transition_stats().incremental, 1);
+    assert_eq!(tombstone_rows(&ns), 0);
+    // Expired: a receipt and an event leave in one bounded commit, and an
+    // expiry moves later; no tombstone row is written.
+    transition(&ns, &|s| {
+        s.retention.clock_ms = Some(4_000);
+        s.keyed_admissions.remove("k");
+        s.retention.admission_expires_at_ms.remove("k");
+        s.events.remove("ev");
+        s.retention.event_expires_at_ms.remove("ev");
+        s.keyed_admissions
+            .insert("new".into(), receipt("new", 4_000));
+        s.retention
+            .admission_expires_at_ms
+            .insert("new".into(), 6_000);
+    })
+    .unwrap();
+    assert_eq!(store.transition_stats().incremental, 2);
+    transition(&ns, &|s| {
+        s.retention
+            .admission_expires_at_ms
+            .insert("new".into(), 7_000);
+    })
+    .unwrap();
+    assert_eq!(store.transition_stats().incremental, 3);
     let state = store.load(&ns).unwrap().state;
-    assert_eq!(state.keyed_admissions.keys().collect::<Vec<_>>(), vec!["j"]);
+    assert!(!state.keyed_admissions.contains_key("k") && state.events.is_empty());
+    assert_eq!(tombstone_rows(&ns), 0);
     // Without its expiry record in the patch, an expired receipt leaves
     // through the complete path.
-    transition(&|s| {
-        s.keyed_admissions.remove("j");
+    transition(&ns, &|s| {
+        s.keyed_admissions.remove("fallback");
     })
     .unwrap();
     assert_eq!(store.transition_stats().heavy, 1);
-    assert!(store.load(&ns).unwrap().state.keyed_admissions.is_empty());
-    // The run leaves with its history, through the complete path.
-    transition(&|s| {
-        s.runs.remove("run-a");
-        s.settled.push(cohort_of(completed_run("run-a")));
+    // The run leaves with its history and its receipt, through the complete
+    // path.
+    transition(&ns, &|s| {
+        let run = s.runs.remove("run-a").unwrap();
+        s.receipts.retain(|r| r.sequence != 1);
+        let mut c = cohort_of(run);
+        c.receipts.push(audit(1, "run-a"));
+        s.settled.push(c);
     })
     .unwrap();
     assert_eq!(store.transition_stats().heavy, 2);
-    assert!(store.load(&ns).unwrap().state.runs.is_empty());
-    assert_eq!(history_rows(&ns), 1);
+    assert!(!store.load(&ns).unwrap().state.runs.contains_key("run-a"));
+    assert_eq!(history_rows(&ns), 2);
 }
 #[test]
 fn full_commit_reads_only_created_identities_from_disposal_tombstones() {

@@ -507,6 +507,7 @@ impl PostgresStorage {
             &accounting,
             &patch,
             state.retention.clock_ms,
+            &state.retention.policy,
         )?;
         let live_keys = aq_playbooks_runner::history::patch_live_keys(&patch)?;
         (request.validate)(&state, &staged.accounting.counts())?;
@@ -692,6 +693,7 @@ fn stage(
     accounting: &Accounting,
     patch: &StatePatch,
     clock_ms: Option<i64>,
+    policy: &aq_playbooks_runner::RetentionPolicy,
 ) -> Result<Staged, StorageError> {
     let mut staged = Staged {
         full_header: patch.header.clone(),
@@ -734,6 +736,11 @@ fn stage(
     // tombstones this patch writes.
     let mut deleted: BTreeMap<(&'static str, Vec<u8>), Vec<u8>> = BTreeMap::new();
     let mut tombstoned: BTreeSet<Vec<u8>> = BTreeSet::new();
+    // Records written (field, key) and expiry records touched, with their
+    // stored and written values.
+    let mut written: BTreeMap<(&'static str, Vec<u8>), Vec<u8>> = BTreeMap::new();
+    type ExpiryChange = (&'static str, Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>);
+    let mut expiry_changes: Vec<ExpiryChange> = vec![];
     let mut replaced_old: BTreeMap<&'static str, BTreeMap<TreeKey, Vec<u8>>> = BTreeMap::new();
     for (path, change) in &patch.changes {
         let (name, _) = field(path.field).map_err(backend)?;
@@ -750,6 +757,17 @@ fn stage(
                         .accounting
                         .record(name, key, before.map(Vec::as_slice), new.as_deref())
                         .map_err(storage)?;
+                    // Audit receipts are positional: overwriting or deleting
+                    // a stored one removes it, which the complete path judges.
+                    if name == "receipts" && before.is_some() {
+                        staged.history_removed = true;
+                    }
+                    if WINDOWS.iter().any(|(_, expiry)| *expiry == name) && before != new.as_ref() {
+                        expiry_changes.push((name, encoded.clone(), before.cloned(), new.clone()));
+                    }
+                    if let Some(value) = new {
+                        written.insert((name, encoded.clone()), value.clone());
+                    }
                     // A changed receipt is refused; a deleted one is a window
                     // removal (see below).
                     if name == "keyed_admissions"
@@ -827,6 +845,40 @@ fn stage(
                     ));
                 }
             }
+        }
+    }
+    // Expiry records (`retention::check_expiry_change`): judged here when the
+    // patch shows the item, otherwise on the complete path.
+    let window_ms = |item: &str| match item {
+        "events" => policy.event_replay_ms,
+        _ => policy.admission_replay_ms,
+    };
+    for (expiry, key, before, after) in expiry_changes {
+        let (item, _) = WINDOWS
+            .iter()
+            .find(|(_, e)| *e == expiry)
+            .expect("an expiry field");
+        let at = |bytes: &Option<Vec<u8>>| -> Result<Option<i64>, StorageError> {
+            bytes
+                .as_deref()
+                .map(|b| serde_json::from_slice(b).map_err(backend))
+                .transpose()
+        };
+        let (old, new) = (at(&before)?, at(&after)?);
+        match (old, new) {
+            (Some(_), Some(_)) => {
+                aq_playbooks_runner::retention::check_expiry_change(old, new, true, None)?
+            }
+            (Some(_), None) if deleted.contains_key(&(*item, key.clone())) => {}
+            (None, Some(_)) if written.contains_key(&(*item, key.clone())) => {
+                let value: Value =
+                    serde_json::from_slice(&written[&(*item, key.clone())]).map_err(backend)?;
+                let fallback = value["accepted_at_ms"].as_i64().map(|accepted| {
+                    accepted.saturating_add(i64::try_from(window_ms(item)).unwrap_or(i64::MAX))
+                });
+                aq_playbooks_runner::retention::check_expiry_change(old, new, true, fallback)?
+            }
+            _ => staged.history_removed = true,
         }
     }
     for (item, expiry) in WINDOWS {

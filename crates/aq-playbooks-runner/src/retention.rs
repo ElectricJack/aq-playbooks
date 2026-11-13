@@ -6,7 +6,12 @@
 //! writes its history (a settled cohort), when it is a window entry whose
 //! expiry the clock has reached, or (until the legacy drain) when it carries
 //! a legacy disposal record. [`verify_removals`] is that one check, shared by
-//! every storage backend.
+//! every storage backend. It covers runs, operations, audit receipts, events
+//! and keyed admission receipts, and the expiry records the window rule
+//! reads (which may only move later). Waits, budgets and recovery requests
+//! are live sub-records that ordinary transitions consume (a wait wakes, a
+//! request is taken); the history-or-expiry rule cannot judge them, so they
+//! are not fenced here.
 use crate::lazy::{LazyMap, LazySeq};
 use crate::{Error, Intent, IntentStatus, Result, Run, State, StorageError};
 use serde::{Deserialize, Serialize};
@@ -84,6 +89,8 @@ pub const REFUSE_CLOCK: &str = "retention clock cannot decrease";
 const REFUSE_RUN_OBLIGATIONS: &str = "unresolved run obligations cannot be disposed";
 const REFUSE_EFFECT: &str = "unresolved effect cannot be disposed";
 const REFUSE_RECEIPT_CHANGE: &str = "immutable keyed admission receipt removed or changed";
+/// Refusal of a commit that lowers, orphans or under-sets a window expiry.
+pub const REFUSE_EXPIRY: &str = "window expiry cannot be shortened";
 fn window(ms: u64) -> i64 {
     i64::try_from(ms).unwrap_or(i64::MAX)
 }
@@ -113,6 +120,96 @@ pub fn admission_expiry(s: &State, key: &str) -> Option<i64> {
 /// expires before the first host time.
 pub fn expired(expiry: i64, clock_ms: Option<i64>) -> bool {
     clock_ms.is_some_and(|now| expiry <= now)
+}
+/// The window of a keyed admission receipt or an event in `s` without its
+/// recorded expiry: acceptance plus the policy's window.
+fn fallback_expiry(s: &State, window: Window, key: &str) -> Option<i64> {
+    let policy = &s.retention.policy;
+    match window {
+        Window::Event => s.events.get(key).map(|e| {
+            e.accepted_at_ms
+                .saturating_add(self::window(policy.event_replay_ms))
+        }),
+        Window::Admission => s.keyed_admissions.get(key).map(|r| {
+            r.accepted_at_ms
+                .saturating_add(self::window(policy.admission_replay_ms))
+        }),
+    }
+}
+/// Which expiry record: `event_expires_at_ms` or `admission_expires_at_ms`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Window {
+    Event,
+    Admission,
+}
+/// One change of an expiry record, from `old` to `new`, judged against the
+/// State the commit stores (`item_kept`: the item is still in it;
+/// `fallback`: its acceptance plus the policy window there). A recorded
+/// expiry may only move later, may be deleted only with its item, and a new
+/// one is at least the fallback.
+pub fn check_expiry_change(
+    old: Option<i64>,
+    new: Option<i64>,
+    item_kept: bool,
+    fallback: Option<i64>,
+) -> std::result::Result<(), StorageError> {
+    let allowed = match (old, new) {
+        (Some(old), Some(new)) => new >= old,
+        (Some(_), None) => !item_kept,
+        (None, Some(new)) => fallback.is_some_and(|fallback| new >= fallback),
+        (None, None) => true,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(refuse(REFUSE_EXPIRY))
+    }
+}
+/// [`check_expiry_change`] for record `key` of `window`, against `next`.
+pub(crate) fn check_expiry_record(
+    next: &State,
+    window: Window,
+    key: &str,
+    old: Option<i64>,
+    new: Option<i64>,
+) -> std::result::Result<(), StorageError> {
+    let item_kept = match window {
+        Window::Event => next.events.contains_key(key),
+        Window::Admission => next.keyed_admissions.contains_key(key),
+    };
+    let fallback = match (old, new) {
+        (None, Some(_)) => fallback_expiry(next, window, key),
+        _ => None,
+    };
+    check_expiry_change(old, new, item_kept, fallback)
+}
+/// Every expiry record change between two complete States.
+fn check_expiry_records(previous: &State, next: &State) -> std::result::Result<(), StorageError> {
+    for (window, old, new) in [
+        (
+            Window::Event,
+            &previous.retention.event_expires_at_ms,
+            &next.retention.event_expires_at_ms,
+        ),
+        (
+            Window::Admission,
+            &previous.retention.admission_expires_at_ms,
+            &next.retention.admission_expires_at_ms,
+        ),
+    ] {
+        for (key, at) in old {
+            let after = new.get(key).copied();
+            if after != Some(*at) {
+                check_expiry_record(next, window, key, Some(*at), after)?;
+            }
+        }
+        for (key, at) in new {
+            if !old.contains_key(key) {
+                check_expiry_record(next, window, key, None, Some(*at))?;
+            }
+        }
+    }
+    Ok(())
 }
 /// Move the clock to `now_ms` unless it is already later.
 pub(crate) fn advance_clock(s: &mut State, now_ms: i64) {
@@ -147,11 +244,15 @@ fn intent_settled(status: &IntentStatus) -> bool {
 ///   are terminal and its operations settled; or (legacy) a run disposal;
 /// - an operation: its own history and its run's are in `next.settled` and it
 ///   is settled; or (legacy) its run has a disposal;
-/// - an event: a matching legacy tombstone, or its expiry has been reached;
+/// - an audit receipt: its history is in `next.settled`; or (legacy) its run
+///   has a disposal;
+/// - an event: its expiry has been reached (with a legacy tombstone, the
+///   tombstone's digest must match);
 /// - a keyed admission receipt: its expiry has been reached (a changed
 ///   receipt is always refused).
 ///
-/// The clock never decreases. Event tombstones and correlation fences may
+/// The clock never decreases, and expiry records follow
+/// [`check_expiry_change`]. Event tombstones and correlation fences may
 /// always be removed. Artifact removals are checked by
 /// [`verify_artifact_removals`].
 pub fn verify_removals(
@@ -171,16 +272,23 @@ pub fn verify_removals(
             })
             .contains(id)
     };
-    check_removals(previous, next, &disposed_run)
+    let kept: BTreeSet<u64> = next.receipts.iter().map(|r| r.sequence).collect();
+    let removals = check_removals(previous, next, &disposed_run, &|sequence| {
+        kept.contains(&sequence)
+    })?;
+    check_expiry_records(previous, next)?;
+    Ok(removals)
 }
-/// [`verify_removals`] with the legacy run disposals of `next` given by
-/// `disposed_run`. `previous` need only hold the removed records, the
+/// [`verify_removals`] without the expiry records, with the legacy run
+/// disposals of `next` given by `disposed_run` and the receipts `next` keeps
+/// by `receipt_kept`. `previous` need only hold the removed records, the
 /// operations of removed runs and the children of removed runs (and its
 /// header fields), so a record backend can check a patch.
 pub(crate) fn check_removals(
     previous: &State,
     next: &State,
     disposed_run: &dyn Fn(&str) -> bool,
+    receipt_kept: &dyn Fn(u64) -> bool,
 ) -> std::result::Result<Removals, StorageError> {
     verify_artifact_removals(previous, next)?;
     let clock = next.retention.clock_ms;
@@ -204,13 +312,33 @@ pub(crate) fn check_removals(
         if next.events.contains_key(key) {
             continue;
         }
+        // A legacy tombstone records the removal; it never licenses one.
+        if !event_expiry(previous, key).is_some_and(|at| expired(at, clock)) {
+            return Err(refuse(REFUSE_EARLY_REMOVAL));
+        }
         if let Some(tombstone) = next.retention.event_tombstones.get(key) {
             if tombstone.digest != event.digest {
                 return Err(refuse("event disposal digest conflict"));
             }
             removals.legacy_events.push(key.clone());
-        } else if !event_expiry(previous, key).is_some_and(|at| expired(at, clock)) {
-            return Err(refuse(REFUSE_EARLY_REMOVAL));
+        }
+    }
+    let removed_receipts: Vec<&crate::Receipt> = previous
+        .receipts
+        .iter()
+        .filter(|r| !receipt_kept(r.sequence))
+        .collect();
+    if !removed_receipts.is_empty() {
+        let settled: BTreeSet<u64> = next
+            .settled
+            .iter()
+            .flat_map(|c| &c.receipts)
+            .map(|r| r.sequence)
+            .collect();
+        for receipt in removed_receipts {
+            if !settled.contains(&receipt.sequence) && !disposed_run(&receipt.run) {
+                return Err(refuse(REFUSE_RUN_REMOVAL));
+            }
         }
     }
     let removed_runs: Vec<(&String, &Run)> = previous
@@ -226,12 +354,16 @@ pub(crate) fn check_removals(
     if removed_runs.is_empty() && removed_intents.is_empty() {
         return Ok(removals);
     }
-    let settled_runs: BTreeMap<&str, &Run> = next
-        .settled
-        .iter()
-        .flat_map(|c| &c.runs)
-        .map(|r| (r.id.as_str(), r))
-        .collect();
+    // A cohort's runs belong to its root.
+    let mut settled_runs: BTreeMap<&str, &Run> = BTreeMap::new();
+    for cohort in &next.settled {
+        for run in &cohort.runs {
+            if run.root != cohort.root {
+                return Err(refuse(REFUSE_RUN_OBLIGATIONS));
+            }
+            settled_runs.insert(run.id.as_str(), run);
+        }
+    }
     let settled_intents: BTreeMap<&str, &Intent> = next
         .settled
         .iter()
@@ -261,13 +393,17 @@ pub(crate) fn check_removals(
                     .or_else(|| next.runs.get(child))
                     .is_none_or(|r| r.status.terminal())
             };
+            // An operation of a run that leaves goes with it: one still
+            // live would be stranded (its run's history is written).
             let settled_intent = |intent: &&Intent| {
-                let last = settled_intents
-                    .get(intent.id.as_str())
-                    .copied()
-                    .or_else(|| next.intents.get(&intent.id))
-                    .unwrap_or(intent);
-                intent_settled(&last.status)
+                !next.intents.contains_key(&intent.id)
+                    && intent_settled(
+                        &settled_intents
+                            .get(intent.id.as_str())
+                            .copied()
+                            .unwrap_or(intent)
+                            .status,
+                    )
             };
             !settled.status.terminal()
                 || !settled.children.iter().all(terminal)

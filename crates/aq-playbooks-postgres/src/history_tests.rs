@@ -53,9 +53,11 @@ fn check_plan(plan: &Value, under_sort: bool, problems: &mut Vec<String>) {
     }
 }
 
-/// Whether some scan of `run_history` in `plan` uses `index`.
+/// Whether some node of `plan` reads `index` (an index scan, an index-only
+/// scan, or the bitmap index scan under a bitmap heap scan, which names the
+/// index but not the table).
 fn uses_index(plan: &Value, index: &str) -> bool {
-    (plan["Relation Name"] == "run_history" && plan["Index Name"] == index)
+    plan["Index Name"] == index
         || plan["Plans"]
             .as_array()
             .into_iter()
