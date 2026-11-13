@@ -27,6 +27,52 @@ preserves left order and rejects missing/duplicate identities in either input.
 Collection lexical roots cannot shadow existing roots. Every evaluation has
 explicit depth, cumulative node/element work and serialized-byte limits.
 
+`lookup` chooses a value by a key learned at run time, from a literal table,
+with a required default:
+
+    {"op":"lookup","key":{"op":"ref","root":"input","path":["kind"]},
+     "cases":[{"when":"chore","then":{"op":"literal","value":"simple-high"}},
+              {"when":"design","then":{"op":"literal","value":"complex-high"}}],
+     "default":{"op":"literal","value":"standard-high"}}
+
+The key is evaluated first. An Unknown or Missing key is the result, unchanged;
+it never falls through to the default. A Known key selects the case whose
+`when` equals it (JSON value equality, which for canonical values is equality
+of canonical bytes), or the default when none does, and only that one
+expression is evaluated: the others are not evidence for the result, so an
+unresolved reference in an unselected case or default does not propagate.
+At most 256 cases; each `when` is at most 1024 canonical bytes; no two `when`
+are canonically equal. Every case is charged to the element budget, selected or
+not. Each `when` must be a value the key's type admits. The result type is the
+union of every case's `then` and the default (string results merge into one
+enum); past 16 alternatives the lookup is refused. Checked against a target
+schema, each result meets the target itself, as a literal does.
+
+`let` binds names in order; each binding sees the ones before it, and the body
+sees all of them:
+
+    {"op":"let","bindings":[{"name":"a","value":{"op":"literal","value":5}},
+                            {"name":"b","value":{"op":"literal","value":7}}],
+     "body":{"op":"lookup","key":{"op":"lt","left":{"op":"ref","root":"a"},
+                                  "right":{"op":"ref","root":"b"}},
+             "cases":[{"when":true,"then":{"op":"ref","root":"b"}}],
+             "default":{"op":"ref","root":"a"}}}
+
+is `max(a, b)`, 7, with no arithmetic. Each binding is evaluated exactly once,
+however often it is used. A binding that is Unknown makes the whole `let`
+Unknown, even when the body never reads it, as `and(false, unknown)` stays
+unknown. A Missing binding is bound as Missing, so `exists` reads it as false
+and any other use propagates it exactly as the inlined reference would. At
+most 16 bindings. A name is a valid identifier and is never `input`, `event`,
+`definitions` or `vars`, a step binding or iteration item anywhere in the
+playbook, or a name of an enclosing `let` or collection item, including an
+earlier binding of the same `let`.
+
+Both expressions are part of format 1: `FORMAT_VERSION` stays 1, and an
+artifact that does not use them keeps its canonical bytes, digest and
+executable fingerprint. A runner built before them refuses an artifact that
+uses them when it deserializes it (unknown `op`).
+
 Source header syntax is an opening `---aq-playbook` line, a single JSON object
 serialized as SourceHeader (may span lines), and a closing `---` line. Normalize
 CRLF and bare CR to LF; preserve every other byte, including final newline.

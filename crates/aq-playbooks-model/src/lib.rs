@@ -303,7 +303,36 @@ pub enum Expr {
         identity: Vec<String>,
         max_items: usize,
     },
+    /// Chooses by a run-time key from a literal table; `default` when no case matches.
+    Lookup {
+        key: Box<Expr>,
+        cases: Vec<LookupCase>,
+        default: Box<Expr>,
+    },
+    /// Sequential, single-assignment lexical bindings visible to later bindings and `body`.
+    Let {
+        bindings: Vec<LetBinding>,
+        body: Box<Expr>,
+    },
 }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LookupCase {
+    pub when: Value,
+    pub then: Expr,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LetBinding {
+    pub name: String,
+    pub value: Expr,
+}
+pub const MAX_LOOKUP_CASES: usize = 256;
+/// Canonical bytes of one lookup case's `when`.
+pub const MAX_LOOKUP_KEY_BYTES: usize = 1024;
+pub const MAX_LET_BINDINGS: usize = 16;
+/// Roots an expression's lexical names may never take.
+const RESERVED_ROOTS: [&str; 4] = ["input", "event", "definitions", "vars"];
 impl Expr {
     pub fn literal(value: impl Into<Value>) -> Self {
         Self::Literal {
@@ -1052,6 +1081,51 @@ fn eval_inner(
             }
             known(Value::Array(result))
         }
+        Expr::Lookup {
+            key,
+            cases,
+            default,
+        } => {
+            // Every case costs one element, evaluated or not.
+            if cases.len() > MAX_LOOKUP_CASES || cases.len() > *budget {
+                return Err(ModelError::Expression("lookup case/element bound".into()));
+            }
+            *budget -= cases.len();
+            // An unresolved key is returned unchanged: it never falls through to
+            // the default (conservative evidence, as for eq).
+            let key = match eval_inner(key, context, limits, depth + 1, budget)? {
+                EvalValue::Known(key) => key,
+                unresolved => return Ok(unresolved),
+            };
+            let chosen = cases
+                .iter()
+                .find(|c| c.when == key)
+                .map_or(&**default, |c| &c.then);
+            eval_inner(chosen, context, limits, depth + 1, budget)
+        }
+        Expr::Let { bindings, body } => {
+            if bindings.len() > MAX_LET_BINDINGS {
+                return Err(ModelError::Expression("let binding bound".into()));
+            }
+            let mut local = context.clone();
+            let mut unknown = None;
+            for b in bindings {
+                if local.contains_key(&b.name) {
+                    return Err(ModelError::Expression(
+                        "lexical binding shadows existing root".into(),
+                    ));
+                }
+                let value = eval_inner(&b.value, &local, limits, depth + 1, budget)?;
+                // Unknown is never dropped, used or not (as and(false, unknown)).
+                // Missing is bound as an observation that `exists` can test.
+                if unknown.is_none() && matches!(value, EvalValue::Unknown(_)) {
+                    unknown = Some(value.clone());
+                }
+                local.insert(b.name.clone(), value);
+            }
+            let result = eval_inner(body, &local, limits, depth + 1, budget)?;
+            Ok(unknown.unwrap_or(result))
+        }
     }
 }
 fn number_i128(n: &serde_json::Number) -> Result<i128, ModelError> {
@@ -1711,12 +1785,24 @@ impl ArtifactContent {
                 _ => None,
             })
             .collect();
+        // Roots a let may not rename, wherever in the playbook they are bound.
+        let step_roots: BTreeSet<String> = all_bind_names
+            .iter()
+            .cloned()
+            .chain(p.steps.values().filter_map(|s| match &s.op {
+                Operation::ForEach { item, .. } => Some(item.clone()),
+                _ => None,
+            }))
+            .collect();
         let mut item_names = BTreeSet::new();
         let mut bound_names = BTreeSet::new();
         for (name, step) in &p.steps {
             let path = format!("steps.{name}");
             if !valid_name(name) {
                 issue(&mut issues, "identifier", &path, "invalid step name");
+            }
+            for (at, e) in step_exprs(&step.op) {
+                check_expr_structure(e, &at, &step_roots, &mut vec![], &path, &mut issues);
             }
             for target in children(step) {
                 if !p.steps.contains_key(target) {
@@ -2023,6 +2109,14 @@ impl ArtifactContent {
         let mut trigger_ids = BTreeSet::new();
         for t in &p.triggers {
             let path = format!("triggers.{}", t.id);
+            check_expr_structure(
+                &t.input,
+                "input",
+                &step_roots,
+                &mut vec![],
+                &path,
+                &mut issues,
+            );
             if !valid_name(&t.id) || !trigger_ids.insert(t.id.clone()) {
                 issue(
                     &mut issues,
@@ -2120,6 +2214,208 @@ impl ArtifactContent {
             _ => {}
         }
         issues
+    }
+}
+/// Every expression of an operation, with its location inside the step.
+fn step_exprs(op: &Operation) -> Vec<(String, &Expr)> {
+    match op {
+        Operation::Invoke { input, .. } | Operation::Call { input, .. } => {
+            vec![("input".into(), input)]
+        }
+        Operation::Decide { predicate } => vec![("predicate".into(), predicate)],
+        Operation::Wait {
+            correlation,
+            minimum_revision,
+            ..
+        } => correlation
+            .iter()
+            .map(|(k, e)| (format!("correlation.{k}"), e))
+            .chain(
+                minimum_revision
+                    .iter()
+                    .map(|e| ("minimum_revision".into(), e)),
+            )
+            .collect(),
+        Operation::ForEach { collection, .. } => vec![("collection".into(), collection)],
+        Operation::Join { members, .. } => members
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (format!("members.{i}"), e))
+            .collect(),
+        Operation::Return { output, .. } => vec![("output".into(), output)],
+    }
+}
+/// Bounds of lookup tables and let bindings, and the names a let may take.
+/// `step_roots` are the playbook's binds and iteration items; `lexical` holds
+/// the names of enclosing lets and collection items.
+fn check_expr_structure(
+    expr: &Expr,
+    at: &str,
+    step_roots: &BTreeSet<String>,
+    lexical: &mut Vec<String>,
+    path: &str,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let sub = |e: &Expr, field: &str, lexical: &mut Vec<String>, issues: &mut Vec<_>| {
+        check_expr_structure(
+            e,
+            &format!("{at}.{field}"),
+            step_roots,
+            lexical,
+            path,
+            issues,
+        )
+    };
+    match expr {
+        Expr::Literal { .. } | Expr::Ref { .. } => {}
+        Expr::Object { fields } => {
+            for (k, e) in fields {
+                sub(e, &format!("fields.{k}"), lexical, issues);
+            }
+        }
+        Expr::Array { items } => {
+            for (i, e) in items.iter().enumerate() {
+                sub(e, &format!("items.{i}"), lexical, issues);
+            }
+        }
+        Expr::Exists { value } | Expr::Not { value } => sub(value, "value", lexical, issues),
+        Expr::And { values } | Expr::Or { values } => {
+            for (i, e) in values.iter().enumerate() {
+                sub(e, &format!("values.{i}"), lexical, issues);
+            }
+        }
+        Expr::Eq { left, right }
+        | Expr::Lt { left, right }
+        | Expr::Difference { left, right, .. } => {
+            sub(left, "left", lexical, issues);
+            sub(right, "right", lexical, issues);
+        }
+        Expr::Contains { collection, value } => {
+            sub(collection, "collection", lexical, issues);
+            sub(value, "value", lexical, issues);
+        }
+        Expr::Map {
+            collection,
+            item,
+            value,
+            ..
+        }
+        | Expr::Filter {
+            collection,
+            item,
+            predicate: value,
+            ..
+        } => {
+            sub(collection, "collection", lexical, issues);
+            lexical.push(item.clone());
+            sub(
+                value,
+                if matches!(expr, Expr::Map { .. }) {
+                    "value"
+                } else {
+                    "predicate"
+                },
+                lexical,
+                issues,
+            );
+            lexical.pop();
+        }
+        Expr::Lookup {
+            key,
+            cases,
+            default,
+        } => {
+            if cases.len() > MAX_LOOKUP_CASES {
+                issue(
+                    issues,
+                    "expression_limit",
+                    path,
+                    format!(
+                        "lookup at {at} has {} cases; at most {MAX_LOOKUP_CASES}",
+                        cases.len()
+                    ),
+                );
+            }
+            let mut seen = BTreeMap::new();
+            for (i, c) in cases.iter().enumerate() {
+                match canonical_bytes(&c.when) {
+                    Err(e) => issue(
+                        issues,
+                        "lookup_case",
+                        path,
+                        format!("lookup at {at} case {i}: `when` is not canonical JSON: {e}"),
+                    ),
+                    Ok(bytes) => {
+                        if bytes.len() > MAX_LOOKUP_KEY_BYTES {
+                            issue(
+                                issues,
+                                "expression_limit",
+                                path,
+                                format!(
+                                    "lookup at {at} case {i}: `when` is {} bytes; at most {MAX_LOOKUP_KEY_BYTES}",
+                                    bytes.len()
+                                ),
+                            );
+                        }
+                        if let Some(first) = seen.insert(bytes, i) {
+                            issue(
+                                issues,
+                                "lookup_case",
+                                path,
+                                format!(
+                                    "lookup at {at}: cases {first} and {i} have the same `when`"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            sub(key, "key", lexical, issues);
+            for (i, c) in cases.iter().enumerate() {
+                sub(&c.then, &format!("cases.{i}.then"), lexical, issues);
+            }
+            sub(default, "default", lexical, issues);
+        }
+        Expr::Let { bindings, body } => {
+            if bindings.len() > MAX_LET_BINDINGS {
+                issue(
+                    issues,
+                    "expression_limit",
+                    path,
+                    format!(
+                        "let at {at} has {} bindings; at most {MAX_LET_BINDINGS}",
+                        bindings.len()
+                    ),
+                );
+            }
+            let outer = lexical.len();
+            for (i, b) in bindings.iter().enumerate() {
+                sub(&b.value, &format!("bindings.{i}.value"), lexical, issues);
+                let name = &b.name;
+                let refusal = if !valid_name(name) {
+                    Some("is not a valid name")
+                } else if RESERVED_ROOTS.contains(&name.as_str()) {
+                    Some("is a reserved root")
+                } else if step_roots.contains(name) {
+                    Some("names a step binding or iteration item")
+                } else if lexical.contains(name) {
+                    Some("repeats or shadows an enclosing lexical name")
+                } else {
+                    None
+                };
+                if let Some(refusal) = refusal {
+                    issue(
+                        issues,
+                        "binding",
+                        path,
+                        format!("let binding `{name}` at {at}.bindings.{i} {refusal}"),
+                    );
+                }
+                lexical.push(name.clone());
+            }
+            sub(body, "body", lexical, issues);
+            lexical.truncate(outer);
+        }
     }
 }
 fn walk(name: &str, steps: &BTreeMap<String, Step>, seen: &mut BTreeSet<String>) {
@@ -2490,7 +2786,62 @@ fn infer_expr(
                 max_items: x,
             })
         }
+        Expr::Lookup {
+            key,
+            cases,
+            default,
+        } => {
+            check_lookup_key(key, cases, roots, depth)?;
+            let results = cases
+                .iter()
+                .map(|c| sub(&c.then))
+                .chain([sub(default)])
+                .collect::<Result<Vec<_>, _>>()?;
+            union_schemas(results.iter())
+                .ok_or_else(|| "lookup results exceed the bounded union of 16 alternatives".into())
+        }
+        Expr::Let { bindings, body } => {
+            let local = let_roots(bindings, roots, depth)?;
+            infer_expr(body, &local, depth + 1)
+        }
     }
+}
+/// Every `when` must be a value the key's type admits, so each case can match.
+fn check_lookup_key(
+    key: &Expr,
+    cases: &[LookupCase],
+    roots: &BTreeMap<String, Schema>,
+    depth: usize,
+) -> Result<(), String> {
+    let key = infer_expr(key, roots, depth + 1)?;
+    for (i, c) in cases.iter().enumerate() {
+        if key.validate(&c.when).is_err() {
+            return Err(format!(
+                "lookup case {i}: `when` {} is not a value of the key's type",
+                c.when
+            ));
+        }
+    }
+    Ok(())
+}
+/// The roots visible to a let body: each binding typed with the bindings before it.
+fn let_roots(
+    bindings: &[LetBinding],
+    roots: &BTreeMap<String, Schema>,
+    depth: usize,
+) -> Result<BTreeMap<String, Schema>, String> {
+    let mut local = roots.clone();
+    for b in bindings {
+        if local.contains_key(&b.name) || !valid_name(&b.name) {
+            return Err(format!(
+                "let binding `{}` is invalid or shadows an existing root",
+                b.name
+            ));
+        }
+        let schema = infer_expr(&b.value, &local, depth + 1)?;
+        local.insert(b.name.clone(), schema);
+    }
+    Ok(local)
 }
 fn check_expr_compat(
     expr: &Expr,
@@ -2550,6 +2901,31 @@ fn check_expr_compat(
         }
         for e in items {
             check_expr_compat(e, roots, target, path, issues);
+        }
+        return;
+    }
+    // Each result of a lookup, and a let's body, meets the target directly, so a
+    // literal result such as `[]` is checked as a literal is.
+    if let Expr::Lookup {
+        key,
+        cases,
+        default,
+    } = expr
+    {
+        if let Err(e) = check_lookup_key(key, cases, roots, 0) {
+            issue(issues, "expression_type", path, e);
+            return;
+        }
+        for c in cases {
+            check_expr_compat(&c.then, roots, target, path, issues);
+        }
+        check_expr_compat(default, roots, target, path, issues);
+        return;
+    }
+    if let Expr::Let { bindings, body } = expr {
+        match let_roots(bindings, roots, 0) {
+            Ok(local) => check_expr_compat(body, &local, target, path, issues),
+            Err(e) => issue(issues, "expression_type", path, e),
         }
         return;
     }
