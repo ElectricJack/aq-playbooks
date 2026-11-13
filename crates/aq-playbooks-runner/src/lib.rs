@@ -40,6 +40,22 @@ pub enum Error {
     NotFound(String),
     #[error("execution budget exhausted: {0}")]
     Exhausted(String),
+    /// A request for a key the engine no longer remembers whose request time
+    /// is at or before `cutoff_ms`: the later of `max(now, clock) - window`
+    /// and the stale floor a clock rebase recorded. Its text starts with
+    /// [`STALE_REQUEST`]. Nothing was written.
+    #[error("{}", stale_message(*.requested_at_ms, *.cutoff_ms, *.clock_ms, *.now_ms, *.window_ms, *.floor_ms))]
+    Stale {
+        requested_at_ms: i64,
+        cutoff_ms: i64,
+        /// The retention clock when the request was judged.
+        clock_ms: Option<i64>,
+        /// The host time of the request.
+        now_ms: i64,
+        window_ms: u64,
+        /// The stale floor, when a clock rebase recorded one.
+        floor_ms: Option<i64>,
+    },
 }
 pub type Result<T> = std::result::Result<T, Error>;
 const INVARIANT: &str = "engine invariant violated: ";
@@ -52,42 +68,69 @@ pub(crate) fn invariant(what: String) -> Error {
 fn is_invariant(error: &Error) -> bool {
     matches!(error, Error::Conflict(m) if m.starts_with(INVARIANT))
 }
-/// The start of every refusal of a request whose producer (request) time is
-/// older than its window; the rest of the message names the times.
+/// The start of the text of every [`Error::Stale`]: a request whose producer
+/// (request) time is older than its window.
 pub const STALE_REQUEST: &str = "stale request: producer time is older than the replay window";
+fn stale_message(
+    requested_at_ms: i64,
+    cutoff_ms: i64,
+    clock_ms: Option<i64>,
+    now_ms: i64,
+    window_ms: u64,
+    floor_ms: Option<i64>,
+) -> String {
+    let start = clock_ms.map_or(now_ms, |clock| clock.max(now_ms));
+    let mut message = format!(
+        "{STALE_REQUEST}: request time {requested_at_ms} ms is at or before the cut-off \
+         {cutoff_ms} ms (retention time {start} ms minus the {window_ms} ms window; host \
+         time {now_ms} ms"
+    );
+    if let Some(floor) = floor_ms {
+        message.push_str(&format!("; stale floor {floor} ms from a clock rebase"));
+    }
+    message.push(')');
+    if start > now_ms {
+        message.push_str(&format!(
+            "; the retention clock ({start} ms) is ahead of host time by {} ms, and while \
+             it is, every request that carries a real request time is refused as stale \
+             (a clock pinned by a far-future host time stays ahead until it is rebased)",
+            start.saturating_sub(now_ms)
+        ));
+    }
+    message
+}
 /// Refuse a request for a key the engine does not remember (absent, or
-/// expired and held by nothing) when its request time is older than the
-/// window before `max(now, clock)`, the time expiry is judged against.
-/// A request without a request time is not checked. The request time is
-/// only compared: it never moves the clock and is never stored.
+/// expired and held by nothing) when its request time is at or before the
+/// cut-off: the window before `max(now, clock)`, the time expiry is judged
+/// against, or the stale floor if that is later. A request without a
+/// request time is not checked, and the window is not computed. The request
+/// time is only compared: it never moves the clock and is never stored.
 fn refuse_stale(
     s: &State,
     requested_at_ms: Option<i64>,
-    window_ms: u64,
+    window_ms: impl FnOnce() -> u64,
     now_ms: i64,
 ) -> Result<()> {
     let Some(requested_at_ms) = requested_at_ms else {
         return Ok(());
     };
+    let window_ms = window_ms();
     let start = retention::window_start(s, now_ms);
-    let window = i64::try_from(window_ms).unwrap_or(i64::MAX);
-    let oldest = start.saturating_sub(window);
-    if requested_at_ms >= oldest {
+    let floor_ms = s.retention.stale_floor_ms;
+    let cutoff_ms = start
+        .saturating_sub(i64::try_from(window_ms).unwrap_or(i64::MAX))
+        .max(floor_ms.unwrap_or(i64::MIN));
+    if requested_at_ms > cutoff_ms {
         return Ok(());
     }
-    let mut message = format!(
-        "{STALE_REQUEST}: request time {requested_at_ms} ms is before {oldest} ms \
-         (retention time {start} ms minus the {window_ms} ms window; host time {now_ms} ms)"
-    );
-    if start > now_ms {
-        message.push_str(&format!(
-            "; the retention clock ({start} ms) is ahead of host time by {} ms, and while \
-             it is, every request that carries a real request time is refused as stale \
-             (a clock pinned by a far-future host time stays ahead)",
-            start.saturating_sub(now_ms)
-        ));
-    }
-    Err(Error::Refused(message))
+    Err(Error::Stale {
+        requested_at_ms,
+        cutoff_ms,
+        clock_ms: s.retention.clock_ms,
+        now_ms,
+        window_ms,
+        floor_ms,
+    })
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Authority {
@@ -818,9 +861,12 @@ impl<S: Storage> Engine<S> {
                 if retention::event_droppable(s, &key, start)? {
                     // Not remembered any more: a stale request is refused
                     // before this commit forgets the expired event.
-                    let contract_ms = find_event(s, &event.contract).map_or(0, |c| c.retention_ms);
-                    let window_ms = s.retention.policy.event_replay_ms.max(contract_ms);
-                    refuse_stale(s, requested_at_ms, window_ms, now_ms)?;
+                    refuse_stale(
+                        s,
+                        requested_at_ms,
+                        || retention::contract_event_window(s, &event.contract),
+                        now_ms,
+                    )?;
                     retention::forget_event(s, &key)?;
                     return Ok(None);
                 }
@@ -846,7 +892,7 @@ impl<S: Storage> Engine<S> {
                 .policy
                 .event_replay_ms
                 .max(contract.retention_ms);
-            refuse_stale(s, requested_at_ms, window_ms, now_ms)?;
+            refuse_stale(s, requested_at_ms, || window_ms, now_ms)?;
             validate_event(
                 &event,
                 &Registry {

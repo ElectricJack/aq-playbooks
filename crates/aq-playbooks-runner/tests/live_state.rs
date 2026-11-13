@@ -3081,11 +3081,19 @@ fn stale_producer_time_is_refused_and_missing_time_is_accepted_as_new() {
     })
     .unwrap();
     let now = 1_000_000;
-    assert!(
-        matches!(e.admit_once_at(keyed(&e, "k1"), Some(now - 600_001), now), Err(Error::Refused(m)) if m.starts_with(STALE_REQUEST))
-    );
+    assert!(stale(e.admit_once_at(
+        keyed(&e, "k1"),
+        Some(now - 600_001),
+        now
+    )));
+    // Ruling 1: the cut-off millisecond itself is stale.
+    assert!(stale(e.admit_once_at(
+        keyed(&e, "k1"),
+        Some(now - 600_000),
+        now
+    )));
     let first = e
-        .admit_once_at(keyed(&e, "k1"), Some(now - 600_000), now)
+        .admit_once_at(keyed(&e, "k1"), Some(now - 599_999), now)
         .unwrap();
     assert!(!first.duplicate);
     assert!(
@@ -3093,11 +3101,22 @@ fn stale_producer_time_is_refused_and_missing_time_is_accepted_as_new() {
             .unwrap()
             .duplicate
     );
+    assert!(stale(e.admit_event_at(
+        "host",
+        event("e1", 2),
+        0,
+        Some(now - 600_001),
+        now
+    )));
+    assert!(stale(e.admit_event_at(
+        "host",
+        event("e1", 2),
+        0,
+        Some(now - 600_000),
+        now
+    )));
     assert!(
-        matches!(e.admit_event_at("host", event("e1", 2), 0, Some(now - 600_001), now), Err(Error::Refused(m)) if m.starts_with(STALE_REQUEST))
-    );
-    assert!(
-        !e.admit_event_at("host", event("e1", 2), 0, Some(now - 600_000), now)
+        !e.admit_event_at("host", event("e1", 2), 0, Some(now - 599_999), now)
             .unwrap()
             .duplicate
     );
@@ -3109,8 +3128,9 @@ fn stale_producer_time_is_refused_and_missing_time_is_accepted_as_new() {
     assert!(!again.duplicate);
     assert_ne!(again.receipt.run_id, first.receipt.run_id);
 }
+/// A stale refusal: the typed error, whose text starts with `STALE_REQUEST`.
 fn stale(result: Result<impl std::fmt::Debug>) -> bool {
-    matches!(result, Err(Error::Refused(m)) if m.starts_with(STALE_REQUEST))
+    matches!(result, Err(e @ Error::Stale { .. }) if e.to_string().starts_with(STALE_REQUEST))
 }
 /// Carried item 1: an expired key or event the engine still holds in the
 /// record (no commit has dropped it yet) is forgotten by the first of two
@@ -3133,15 +3153,22 @@ fn a_stale_request_for_an_expired_entry_writes_nothing<S: Storage>(
     let before = e.store.load("test").unwrap();
     assert!(before.state.keyed_admissions.contains_key("k"));
     assert!(before.state.events.contains_key(&accepted.key));
-    // Judged against max(2_000, clock 0) - 1_000 = 1_000.
-    assert!(stale(e.admit_once_at(keyed_on(e, "k"), Some(999), 2_000)));
-    assert!(stale(e.admit_event_at(
-        "host",
-        event("e1", 2),
-        0,
-        Some(999),
-        2_000
-    )));
+    // Judged against max(2_000, clock 0) - 1_000 = 1_000, which is itself
+    // stale (ruling 1).
+    for requested in [999, 1_000] {
+        assert!(stale(e.admit_once_at(
+            keyed_on(e, "k"),
+            Some(requested),
+            2_000
+        )));
+        assert!(stale(e.admit_event_at(
+            "host",
+            event("e1", 2),
+            0,
+            Some(requested),
+            2_000
+        )));
+    }
     let after = e.store.load("test").unwrap();
     assert_eq!(after.revision, before.revision);
     assert_eq!(after.state.keyed_admissions["k"], first.receipt);
@@ -3155,14 +3182,14 @@ fn a_stale_request_for_an_expired_entry_writes_nothing<S: Storage>(
     // (the forget-then-new path); the second was dropped by that commit.
     let keyed_again = || {
         let again = e
-            .admit_once_at(keyed_on(e, "k"), Some(1_000), 2_000)
+            .admit_once_at(keyed_on(e, "k"), Some(1_001), 2_000)
             .unwrap();
         assert!(!again.duplicate);
         assert_ne!(again.receipt.run_id, first.receipt.run_id);
     };
     let event_again = || {
         let redelivered = e
-            .admit_event_at("host", event("e1", 2), 0, Some(1_000), 2_000)
+            .admit_event_at("host", event("e1", 2), 0, Some(1_001), 2_000)
             .unwrap();
         assert!(!redelivered.duplicate);
         assert_eq!(
@@ -3303,9 +3330,23 @@ fn a_pinned_clock_refuses_every_request_time_and_says_so() {
         e.admit_event_at("host", event("e1", 2), 0, Some(real), real)
             .map(|_| ()),
     ] {
-        let Err(Error::Refused(message)) = result else {
+        let Err(error) = result else {
             panic!("expected a stale refusal, got {result:?}");
         };
+        let Error::Stale {
+            requested_at_ms,
+            clock_ms,
+            now_ms,
+            ..
+        } = error
+        else {
+            panic!("expected Error::Stale, got {error:?}");
+        };
+        assert_eq!(
+            (requested_at_ms, clock_ms, now_ms),
+            (real, Some(pinned), real)
+        );
+        let message = error.to_string();
         assert!(message.starts_with(STALE_REQUEST), "{message}");
         assert!(message.contains(&real.to_string()), "{message}");
         assert!(message.contains(&pinned.to_string()), "{message}");
@@ -3330,4 +3371,112 @@ fn a_pinned_clock_refuses_every_request_time_and_says_so() {
             .duplicate
     );
     assert_eq!(e.snapshot().unwrap().retention.clock_ms, Some(pinned));
+}
+/// Review I1 (ruling 1): a key accepted at window start S expires at S + w.
+/// A retry carrying its original request time S that lands exactly on the
+/// expiry millisecond is stale, not admitted a second time.
+#[test]
+fn a_retry_at_the_expiry_millisecond_is_stale_not_new() {
+    let e = ret_engine();
+    install(&e, wait_artifact(), "waiter");
+    e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 1_000,
+        event_replay_ms: 1, // the event's window is the contract's 1_000
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    let first = e.admit_once_at(keyed(&e, "k"), Some(1_000), 1_000).unwrap();
+    assert!(e.advance(&first.receipt.run_id, 1_000).unwrap());
+    let accepted = e
+        .admit_event_at("host", event("e1", 2), 0, Some(1_000), 1_000)
+        .unwrap();
+    let s = e.snapshot().unwrap();
+    assert_eq!(
+        s.retention.admission_expires_at_ms.get("k").copied(),
+        Some(2_000)
+    );
+    assert_eq!(
+        s.retention.event_expires_at_ms.get(&accepted.key).copied(),
+        Some(2_000)
+    );
+    // At 2_000 both are expired and unheld: not remembered, and the retry
+    // is stale.
+    assert!(stale(e.admit_once_at(keyed(&e, "k"), Some(1_000), 2_000)));
+    assert!(stale(e.admit_event_at(
+        "host",
+        event("e1", 2),
+        0,
+        Some(1_000),
+        2_000
+    )));
+    let s = e.snapshot().unwrap();
+    assert_eq!(s.keyed_admissions["k"], first.receipt);
+    assert!(s.events.contains_key(&accepted.key));
+    // One millisecond earlier they are still remembered: duplicates.
+    let e = ret_engine();
+    install(&e, wait_artifact(), "waiter");
+    e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 1_000,
+        event_replay_ms: 1,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    let first = e.admit_once_at(keyed(&e, "k"), Some(1_000), 1_000).unwrap();
+    e.advance(&first.receipt.run_id, 1_000).unwrap();
+    e.admit_event_at("host", event("e1", 2), 0, Some(1_000), 1_000)
+        .unwrap();
+    assert!(
+        e.admit_once_at(keyed(&e, "k"), Some(1_000), 1_999)
+            .unwrap()
+            .duplicate
+    );
+    assert!(
+        e.admit_event_at("host", event("e1", 2), 0, Some(1_000), 1_999)
+            .unwrap()
+            .duplicate
+    );
+}
+/// Ruling 2: hosts match the variant, which carries the request time, the
+/// clock, the host time, the window and the cut-off.
+#[test]
+fn a_stale_refusal_is_typed_and_names_its_times() {
+    let e = ret_engine();
+    e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 1_000,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    e.admit("a", "main", Value::Null, authority(), 5_000)
+        .unwrap();
+    let error = e
+        .admit_once_at(keyed(&e, "k"), Some(3_000), 4_500)
+        .unwrap_err();
+    let Error::Stale {
+        requested_at_ms,
+        cutoff_ms,
+        clock_ms,
+        now_ms,
+        window_ms,
+        floor_ms,
+    } = error
+    else {
+        panic!("expected Error::Stale, got {error:?}");
+    };
+    assert_eq!(
+        (
+            requested_at_ms,
+            cutoff_ms,
+            clock_ms,
+            now_ms,
+            window_ms,
+            floor_ms
+        ),
+        (3_000, 4_000, Some(5_000), 4_500, 1_000, None)
+    );
+    let message = error.to_string();
+    assert!(message.starts_with(STALE_REQUEST), "{message}");
+    for part in ["3000", "4000", "5000", "4500", "1000"] {
+        assert!(message.contains(part), "{part}: {message}");
+    }
+    assert!(!matches!(error, Error::Refused(_)));
 }

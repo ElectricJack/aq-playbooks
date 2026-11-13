@@ -94,7 +94,7 @@ impl<S: Storage> Engine<S> {
     /// the request digest, never stored). A key the engine still remembers
     /// answers as before, whatever its request time. Otherwise a request
     /// time older than `max(now, clock) - policy.admission_replay_ms` is
-    /// refused with [`crate::STALE_REQUEST`] and nothing is written. `None`
+    /// refused with [`Error::Stale`] and nothing is written. `None`
     /// is not checked: an expired key is then accepted as new.
     pub fn admit_once_at(
         &self,
@@ -134,7 +134,7 @@ impl<S: Storage> Engine<S> {
                 if retention::admission_droppable(s, &request.key, start) {
                     // Not remembered any more: a stale request is refused
                     // before this commit forgets the expired receipt.
-                    refuse_stale(s, requested_at_ms, window_ms, now_ms)?;
+                    refuse_stale(s, requested_at_ms, || window_ms, now_ms)?;
                     retention::forget_admission(s, &request.key);
                     return Ok((None, true));
                 }
@@ -151,7 +151,7 @@ impl<S: Storage> Engine<S> {
                     false,
                 ));
             }
-            refuse_stale(s, requested_at_ms, window_ms, now_ms)?;
+            refuse_stale(s, requested_at_ms, || window_ms, now_ms)?;
             let activation = s
                 .bindings
                 .get(&request.binding)

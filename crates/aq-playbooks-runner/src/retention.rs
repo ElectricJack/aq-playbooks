@@ -81,6 +81,11 @@ pub struct RetentionState {
     /// Expiry of each keyed admission receipt that has one recorded.
     #[serde(default)]
     pub admission_expires_at_ms: LazyMap<String, i64>,
+    /// Set by a clock rebase: a request for a key the engine does not
+    /// remember whose request time is at or before it is stale. Never
+    /// decreases. Absent (and not written) until the first rebase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_floor_ms: Option<i64>,
 }
 /// The `RetentionState::expiry` key of `member` expiring at
 /// `expires_at_ms`: the expiry as 16 lowercase hex digits of its
@@ -895,13 +900,18 @@ fn drop_admission(s: &mut State, key: &str, clock: i64, report: &mut CommitRepor
 /// contract.retention_ms)`, as when it was accepted (the policy's alone if
 /// its contract is no longer installed); at least 1 ms.
 fn event_window(s: &State, key: &str) -> i64 {
-    let policy = s.retention.policy.event_replay_ms;
-    let contract = s
-        .events
-        .get(key)
-        .and_then(|e| crate::find_event(s, &e.envelope.contract).ok())
-        .map_or(0, |c| c.retention_ms);
-    window(policy.max(contract)).max(1)
+    let window_ms = match s.events.get(key) {
+        Some(e) => contract_event_window(s, &e.envelope.contract),
+        None => s.retention.policy.event_replay_ms,
+    };
+    window(window_ms).max(1)
+}
+/// The window of an event of `contract`: `max(policy.event_replay_ms,
+/// contract.retention_ms)`, the policy value alone when the contract is no
+/// longer installed. One scan of the installed artifacts.
+pub(crate) fn contract_event_window(s: &State, contract: &aq_playbooks_model::ContractRef) -> u64 {
+    let contract_ms = crate::find_event(s, contract).map_or(0, |c| c.retention_ms);
+    s.retention.policy.event_replay_ms.max(contract_ms)
 }
 fn drop_event(s: &mut State, key: &str, clock: i64, report: &mut CommitReport) -> Result<()> {
     let member = || format!("{WINDOW_EVENT}{key}");
