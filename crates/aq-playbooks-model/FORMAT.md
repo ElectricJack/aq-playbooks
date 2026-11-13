@@ -35,18 +35,23 @@ with a required default:
               {"when":"design","then":{"op":"literal","value":"complex-high"}}],
      "default":{"op":"literal","value":"standard-high"}}
 
-The key is evaluated first. An Unknown or Missing key is the result, unchanged;
-it never falls through to the default. A Known key selects the case whose
-`when` equals it (JSON value equality, which for canonical values is equality
-of canonical bytes), or the default when none does, and only that one
-expression is evaluated: the others are not evidence for the result, so an
-unresolved reference in an unselected case or default does not propagate.
-At most 256 cases; each `when` is at most 1024 canonical bytes; no two `when`
-are canonically equal. Every case is charged to the element budget, selected or
-not. Each `when` must be a value the key's type admits. The result type is the
-union of every case's `then` and the default (string results merge into one
-enum); past 16 alternatives the lookup is refused. Checked against a target
-schema, each result meets the target itself, as a literal does.
+The key is evaluated first. An Unknown key is the result, unchanged; it never
+falls through to the default. A Known key selects the case whose `when` equals
+it (JSON value equality, which for canonical values is equality of canonical
+bytes), or the default when none does. A Missing key, such as an absent
+optional field, also selects the default: `lookup(input.hint, [{when: 4, then:
+4}], default 0)` is 0 when `hint` is absent. Only the selected expression is
+evaluated: the others are not evidence for the result, so an unresolved
+reference in an unselected case or default does not propagate. At most 256
+cases; each `when` is at most 1024 canonical bytes; no two `when` are
+canonically equal. Each `when` must be a value the key can take: of the key's
+kind and shape, and in the key's string enum when it has one (an integer key
+accepts any integer, a string key any length). The result type is the union of
+every case's `then` and the default (string results merge into one enum); past
+16 alternatives the lookup is refused. Checked against a target schema, each
+result meets the target itself, as a literal does. An empty array, `[]` or an
+array expression with no items, has no item type of its own and fits any array
+type, also when it is merged with other results.
 
 `let` binds names in order; each binding sees the ones before it, and the body
 sees all of them:
@@ -67,6 +72,18 @@ most 16 bindings. A name is a valid identifier and is never `input`, `event`,
 `definitions` or `vars`, a step binding or iteration item anywhere in the
 playbook, or a name of an enclosing `let` or collection item, including an
 earlier binding of the same `let`.
+
+Evaluation stops past depth 32 and past 10 000 elements: one per expression
+evaluated, one per lookup case whether selected or not, and a map or filter body
+once per item. Validation refuses an expression that uses `lookup` or `let`
+when, on its worst path (every map or filter at its `max_items`, the costliest
+lookup branch), it could exceed either limit, so such an expression never fails
+on them at run time. A 256-case lookup on a plain key, inside a map, therefore
+fits a `max_items` of at most 38.
+
+Diagnostics for both name the place inside the step, for example
+`steps.route.input.level.lookup.cases[0].when`: object fields by name, array
+items as `[i]`, and every other expression by its `op` followed by its operand.
 
 Both expressions are part of format 1: `FORMAT_VERSION` stays 1, and an
 artifact that does not use them keeps its canonical bytes, digest and

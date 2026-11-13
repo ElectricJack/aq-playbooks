@@ -71,7 +71,28 @@ fn level_schema(values: &[&str]) -> Schema {
     }
 }
 
+/// Every field is required except `hint`, an optional integer fact.
 fn entry_input() -> Schema {
+    let Schema::Object {
+        mut properties,
+        required,
+    } = required_input()
+    else {
+        unreachable!()
+    };
+    properties.insert(
+        "hint".into(),
+        Schema::Integer {
+            minimum: 0,
+            maximum: 8,
+        },
+    );
+    Schema::Object {
+        properties,
+        required,
+    }
+}
+fn required_input() -> Schema {
     Schema::object(BTreeMap::from([
         (
             "kind".into(),
@@ -243,18 +264,39 @@ fn lookup_default_on_no_match_and_unresolved_key_propagates() {
         ev(&kind_table(r("stale", &[])), &ctx),
         EvalValue::Unknown("revision".into())
     );
+    // A Missing key takes the default, as a key that matches no case does.
     assert_eq!(
         ev(&kind_table(r("input", &["missing"])), &ctx),
-        EvalValue::Missing
+        known(json!("standard-high"))
     );
-    // An unresolved key never falls through to the default, even when the
+    // An Unknown key never falls through to the default, even when the
     // default is a literal that could be produced without the key.
     assert_eq!(
         ev(
-            &lookup(r("absent", &[]), vec![], lit(json!("standard-high"))),
+            &lookup(r("stale", &[]), vec![], lit(json!("standard-high"))),
             &ctx
         ),
-        EvalValue::Missing
+        EvalValue::Unknown("revision".into())
+    );
+    // lookup(optional_hint, ..., default 0) is 0 when the hint is absent.
+    let hint = lookup(
+        r("input", &["hint"]),
+        vec![case(json!(4), lit(json!(4))), case(json!(7), lit(json!(7)))],
+        lit(json!(0)),
+    );
+    let rank = Schema::Integer {
+        minimum: 0,
+        maximum: 8,
+    };
+    assert!(returning(hint.clone(), rank).is_empty());
+    assert_eq!(ev(&hint, &input_context(json!({}))), known(json!(0)));
+    assert_eq!(
+        ev(&hint, &input_context(json!({"hint": 7}))),
+        known(json!(7))
+    );
+    assert_eq!(
+        ev(&hint, &input_context(json!({"hint": 5}))),
+        known(json!(0))
     );
 }
 
@@ -306,7 +348,12 @@ fn lookup_refuses_duplicate_incompatible_or_too_many_cases() {
     );
     let issues = returning(duplicate, target.clone());
     assert!(
-        has_issue(&issues, "lookup_case", "steps.finish", "cases 0 and 2"),
+        has_issue(
+            &issues,
+            "lookup_case",
+            "steps.finish",
+            "steps.finish.output.lookup.cases[2].when: \"bugfix\" equals cases[0].when"
+        ),
         "{issues:?}"
     );
     // Canonically equal objects are duplicates whatever their key order.
@@ -322,13 +369,18 @@ fn lookup_refuses_duplicate_incompatible_or_too_many_cases() {
         &returning(objects, target.clone()),
         "lookup_case",
         "steps.finish",
-        "cases 0 and 1"
+        "cases[1].when: {\"a\":1,\"b\":2} equals cases[0].when"
     ));
     // A `when` the key's type cannot take: integer against a string key.
     let incompatible = lookup(key(), vec![case(json!(1), s("a"))], s("b"));
     let issues = returning(incompatible, target.clone());
     assert!(
-        has_issue(&issues, "expression_type", "steps.finish", "case 0"),
+        has_issue(
+            &issues,
+            "expression_type",
+            "steps.finish",
+            "steps.finish.output.lookup.cases[0].when: `when` 1 can never match: the key (output.lookup.key) has type string, one of \"bugfix\", \"chore\", \"design\", \"research\""
+        ),
         "{issues:?}"
     );
     // At most 256 cases.
@@ -356,7 +408,12 @@ fn lookup_refuses_duplicate_incompatible_or_too_many_cases() {
     assert!(returning(sized(1024), target.clone()).is_empty());
     let issues = returning(sized(1025), target);
     assert!(
-        has_issue(&issues, "expression_limit", "steps.finish", "1025 bytes"),
+        has_issue(
+            &issues,
+            "expression_limit",
+            "steps.finish",
+            "is 1025 canonical bytes"
+        ),
         "{issues:?}"
     );
 }
@@ -512,7 +569,12 @@ fn let_refuses_reserved_and_shadowing_names() {
     );
     let issues = route(nested);
     assert!(
-        has_issue(&issues, "binding", "steps.route", "input.body"),
+        has_issue(
+            &issues,
+            "binding",
+            "steps.route",
+            "steps.route.input.let.body.let.bindings[0].name: `a` is already bound"
+        ),
         "{issues:?}"
     );
     // At most 16 bindings.
@@ -595,6 +657,260 @@ fn an_invoke_input_using_lookup_and_let_validates_against_an_enum_target() {
     assert!(
         has_issue(&issues, "schema_compatibility", "steps.route", ""),
         "{issues:?}"
+    );
+}
+
+/// A chain of `n` lookups, each taking its default on `narrow: false`.
+fn lookup_chain(n: usize) -> Expr {
+    (0..n).fold(lit(json!("deepest")), |next, _| {
+        lookup(
+            r("input", &["narrow"]),
+            vec![case(json!(true), lit(json!("found")))],
+            next,
+        )
+    })
+}
+/// `n` nested lets, each binding one distinct name.
+fn let_chain(n: usize) -> Expr {
+    (0..n).fold(lit(json!("deepest")), |body, i| {
+        let_(vec![bind(&format!("v{i}"), lit(json!(i)))], body)
+    })
+}
+
+#[test]
+fn validation_refuses_what_evaluation_would_refuse_for_depth_and_budget() {
+    let ctx = input_context(json!({"narrow": false}));
+    let limits = EvalLimits::default();
+    for chain in [lookup_chain, let_chain] {
+        // 32 levels evaluate and validate; 33 fail both ways.
+        assert_eq!(ev(&chain(32), &ctx), known(json!("deepest")));
+        assert!(returning(chain(32), Schema::string(16)).is_empty());
+        assert!(eval(&chain(33), &ctx, &limits).is_err());
+        for n in [33, 40] {
+            let issues = returning(chain(n), Schema::string(16));
+            assert_eq!(issues.len(), 1, "{n}: {issues:?}");
+            assert!(
+                has_issue(
+                    &issues,
+                    "expression_limit",
+                    "steps.finish",
+                    &format!(
+                        "steps.finish.output: nests {n} levels deep; evaluation stops past depth 32"
+                    )
+                ),
+                "{n}: {issues:?}"
+            );
+        }
+    }
+    // Every case is charged on every map item: 100 items of a 256-case table
+    // cannot fit the 10 000-element budget; 30 items can.
+    let mapped = |max_items: usize| Expr::Map {
+        collection: Box::new(r("input", &["ranks"])),
+        item: "n".into(),
+        value: Box::new(lookup(
+            r("n", &[]),
+            (0..256).map(|i| case(json!(i), lit(json!(i)))).collect(),
+            lit(json!(0)),
+        )),
+        max_items,
+    };
+    let ranks = Schema::Array {
+        items: Box::new(Schema::Integer {
+            minimum: 0,
+            maximum: 255,
+        }),
+        max_items: 30,
+    };
+    let mut c = content(valid_route_input(), mapped(100), ranks.clone());
+    let Schema::Object { properties, .. } = &mut c.playbook.entries.get_mut("main").unwrap().input
+    else {
+        unreachable!()
+    };
+    properties.insert("ranks".into(), ranks.clone());
+    let issues = c.validate_structure();
+    assert!(
+        has_issue(
+            &issues,
+            "expression_limit",
+            "steps.finish",
+            "steps.finish.output: may charge up to 25902 elements; evaluation stops past 10000"
+        ),
+        "{issues:?}"
+    );
+    let hundred = input_context(json!({"ranks": (0..100).collect::<Vec<_>>()}));
+    assert!(eval(&mapped(100), &hundred, &limits).is_err());
+    if let Operation::Return { output, .. } = &mut c.playbook.steps.get_mut("finish").unwrap().op {
+        *output = mapped(30);
+    }
+    assert_eq!(c.validate_structure(), vec![]);
+    let thirty = input_context(json!({"ranks": (0..30).collect::<Vec<_>>()}));
+    // The bound is exact for a full collection: map, collection, and per item
+    // the lookup, its key, its chosen branch and its 256 cases.
+    let exact = 2 + 30 * (3 + 256);
+    let budget = |max_elements| EvalLimits {
+        max_elements,
+        ..EvalLimits::default()
+    };
+    assert!(eval(&mapped(30), &thirty, &budget(exact)).is_ok());
+    assert!(eval(&mapped(30), &thirty, &budget(exact - 1)).is_err());
+    assert_eq!(
+        ev(&mapped(30), &thirty),
+        known(json!((0..30).collect::<Vec<_>>()))
+    );
+}
+
+#[test]
+fn empty_array_branches_meet_any_array_target() {
+    let harnesses = || {
+        lookup(
+            r("input", &["kind"]),
+            vec![
+                case(json!("chore"), lit(json!(["codex"]))),
+                case(json!("design"), lit(json!([]))),
+            ],
+            lit(json!([])),
+        )
+    };
+    let without_claude = |collection: Expr| Expr::Filter {
+        collection: Box::new(collection),
+        item: "h".into(),
+        predicate: Box::new(Expr::Not {
+            value: Box::new(Expr::Eq {
+                left: Box::new(r("h", &[])),
+                right: Box::new(lit(json!("claude"))),
+            }),
+        }),
+        max_items: 4,
+    };
+    let strings = Schema::Array {
+        items: Box::new(Schema::string(16)),
+        max_items: 4,
+    };
+    let shapes = [
+        harnesses(),
+        without_claude(harnesses()),
+        let_(vec![bind("hs", harnesses())], r("hs", &[])),
+        let_(vec![bind("hs", harnesses())], without_claude(r("hs", &[]))),
+        let_(vec![bind("none", lit(json!([])))], r("none", &[])),
+        Expr::Array { items: vec![] },
+    ];
+    for e in shapes {
+        let issues = returning(e.clone(), strings.clone());
+        assert!(issues.is_empty(), "{e:?}: {issues:?}");
+    }
+    let e = without_claude(harnesses());
+    for (kind, expected) in [
+        ("chore", json!(["codex"])),
+        ("design", json!([])),
+        ("bugfix", json!([])),
+    ] {
+        assert_eq!(
+            ev(&e, &input_context(json!({"kind": kind}))),
+            known(expected)
+        );
+    }
+    // Non-empty arrays are checked as before: an integer item is refused.
+    let integers = lookup(
+        r("input", &["kind"]),
+        vec![case(json!("chore"), lit(json!([1])))],
+        lit(json!([])),
+    );
+    let issues = returning(without_claude(integers), strings);
+    assert!(
+        has_issue(
+            &issues,
+            "schema_compatibility",
+            "steps.finish",
+            "steps.finish.output: expression type/bounds not assignable to target schema: it has type array of at most 1 (the integer 1)"
+        ),
+        "{issues:?}"
+    );
+}
+
+#[test]
+fn diagnostics_name_the_place_the_key_type_and_the_branch_once() {
+    let s = |v: &str| lit(json!(v));
+    let strings = Schema::object(BTreeMap::from([
+        ("first".into(), Schema::string(16)),
+        ("second".into(), Schema::string(16)),
+    ]));
+    // Two tables in one output: the message names the one that is wrong.
+    let two = Expr::Object {
+        fields: BTreeMap::from([
+            (
+                "first".into(),
+                lookup(r("input", &["rank"]), vec![case(json!(1), s("a"))], s("b")),
+            ),
+            (
+                "second".into(),
+                lookup(
+                    r("input", &["kind"]),
+                    vec![case(json!("Chore"), s("a"))],
+                    s("b"),
+                ),
+            ),
+        ]),
+    };
+    let issues = returning(two, strings);
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    assert_eq!(
+        issues[0].message,
+        "steps.finish.output.second.lookup.cases[0].when: `when` \"Chore\" can never match: \
+         the key (output.second.lookup.key) has type string, one of \"bugfix\", \"chore\", \
+         \"design\", \"research\". Change the `when` to a value of the key's type, or change the key."
+    );
+    // An integer key may hold any integer as a case, whatever its declared range.
+    let wide = lookup(
+        r("input", &["rank"]),
+        vec![case(json!(5000), s("a"))],
+        s("b"),
+    );
+    assert!(returning(wide, Schema::string(16)).is_empty());
+    // A refused assignment names the branch and its type.
+    let deep = lookup(
+        r("input", &["kind"]),
+        vec![case(json!("research"), s("deep-high"))],
+        s("standard-high"),
+    );
+    let issues = returning(deep, level_schema(&LEVELS));
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    assert_eq!(
+        issues[0].message,
+        "steps.finish.output.lookup.cases[0].then: literal \"deep-high\" is not a value of the \
+         target type string, one of \"complex-high\", \"simple-high\", \"standard-high\""
+    );
+    // Inside a let, and nested in an inferred position, the branch is named too.
+    let nested = Expr::Contains {
+        collection: Box::new(lit(json!(["a"]))),
+        value: Box::new(let_(
+            vec![bind(
+                "x",
+                lookup(r("input", &["kind"]), vec![case(json!(2), s("a"))], s("b")),
+            )],
+            r("x", &[]),
+        )),
+    };
+    let issues = returning(nested, Schema::Boolean);
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    assert!(
+        issues[0].message.starts_with(
+            "steps.finish.output.contains.value.let.bindings[0].value.lookup.cases[0].when: `when` 2 can never match"
+        ),
+        "{issues:?}"
+    );
+    // A let name is refused once, by the structural check, with its reason.
+    let issues = returning(
+        let_(vec![bind("input", lit(json!(1)))], r("input", &[])),
+        Schema::Integer {
+            minimum: 0,
+            maximum: 9,
+        },
+    );
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    assert_eq!(
+        issues[0].message,
+        "steps.finish.output.let.bindings[0].name: `input` is a reserved root (input, event, \
+         definitions, vars); choose another name"
     );
 }
 
