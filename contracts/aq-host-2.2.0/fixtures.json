@@ -1291,6 +1291,162 @@
       }
     },
     {
+      "contract": "work.unroutable",
+      "kind": "input",
+      "name": "valid unroutable with the document's sentence",
+      "valid": true,
+      "value": {
+        "reasons": [
+          {
+            "code": "policy",
+            "detail": "Secrets rotation is never given to an agent."
+          }
+        ],
+        "subject": {
+          "id": "task-1",
+          "revision": 3
+        }
+      }
+    },
+    {
+      "contract": "work.unroutable",
+      "kind": "input",
+      "name": "valid unroutable with a code alone",
+      "valid": true,
+      "value": {
+        "reasons": [
+          {
+            "code": "policy"
+          }
+        ],
+        "subject": {
+          "id": "task-1",
+          "revision": 3
+        }
+      }
+    },
+    {
+      "contract": "work.unroutable",
+      "kind": "input",
+      "name": "invalid unroutable with a free-text code",
+      "valid": false,
+      "value": {
+        "reasons": [
+          {
+            "code": "nobody may take secrets work"
+          }
+        ],
+        "subject": {
+          "id": "task-1",
+          "revision": 3
+        }
+      }
+    },
+    {
+      "contract": "work.unroutable",
+      "kind": "input",
+      "name": "invalid unroutable without reasons",
+      "valid": false,
+      "value": {
+        "subject": {
+          "id": "task-1",
+          "revision": 3
+        }
+      }
+    },
+    {
+      "contract": "work.unroutable",
+      "kind": "input",
+      "name": "invalid unroutable with a route",
+      "valid": false,
+      "value": {
+        "level": "standard-high",
+        "reasons": [
+          {
+            "code": "policy",
+            "detail": "Secrets rotation is never given to an agent."
+          }
+        ],
+        "subject": {
+          "id": "task-1",
+          "revision": 3
+        }
+      }
+    },
+    {
+      "contract": "work.unroutable",
+      "kind": "output",
+      "name": "valid recorded",
+      "outcome": "recorded",
+      "valid": true,
+      "value": {
+        "reference": "task-1@3",
+        "subject": {
+          "id": "task-1",
+          "revision": 3
+        }
+      }
+    },
+    {
+      "contract": "work.unroutable",
+      "kind": "output",
+      "name": "valid stale",
+      "outcome": "stale",
+      "valid": true,
+      "value": {
+        "reference": "task-1@3",
+        "subject": {
+          "id": "task-1",
+          "revision": 3
+        }
+      }
+    },
+    {
+      "contract": "work.unroutable",
+      "kind": "output",
+      "name": "valid refusal without reasons",
+      "outcome": "refused",
+      "valid": true,
+      "value": {
+        "reason": "no_reasons",
+        "reference": "task-1@3",
+        "subject": {
+          "id": "task-1",
+          "revision": 3
+        }
+      }
+    },
+    {
+      "contract": "work.unroutable",
+      "kind": "output",
+      "name": "valid refusal of an owner route",
+      "outcome": "refused",
+      "valid": true,
+      "value": {
+        "reason": "owner_route",
+        "reference": "task-1@3",
+        "subject": {
+          "id": "task-1",
+          "revision": 3
+        }
+      }
+    },
+    {
+      "contract": "work.unroutable",
+      "kind": "output",
+      "name": "invalid refusal with an unlisted reason",
+      "outcome": "refused",
+      "valid": false,
+      "value": {
+        "reason": "not_offered",
+        "reference": "task-1@3",
+        "subject": {
+          "id": "task-1",
+          "revision": 3
+        }
+      }
+    },
+    {
       "contract": "judgment.assess",
       "kind": "input",
       "name": "valid routing classification request",
@@ -2282,7 +2438,8 @@
     "added_commands": {
       "judgment.assess": "sha256:da4d7908c8943ade3905b9e573a7426fe36759321f6a287d5b97559ab868aa13",
       "work.read": "sha256:aa1f30e38dfcd9682099595dd055c46359f9df7a5b2b8f34e39e30528138ce91",
-      "work.route": "sha256:04216580f2f561bf1a6c776dbb98aff83f421072ff57392817a139fc74ab77ee"
+      "work.route": "sha256:04216580f2f561bf1a6c776dbb98aff83f421072ff57392817a139fc74ab77ee",
+      "work.unroutable": "sha256:c8b7a70046269860789452d9c12b5d4979957eb9dc88cc9afdd74595d32f6793"
     },
     "added_events": {
       "aq.judgment.assessed": "sha256:4f9c791d3aa443dd05c040061cdced74733d17403252b45ed706b21fba263b3e",

@@ -1,11 +1,12 @@
 # AQ host catalog 2.2.0
 
-This bundle lets a playbook route a task. It adds five contracts:
+This bundle lets a playbook route a task. It adds six contracts:
 - `work.read` reads the facts of a task;
 - `judgment.assess` asks a model a classification with several fields at
   once;
 - `aq.judgment.assessed` delivers that answer;
 - `work.route` writes the route;
+- `work.unroutable` says that the document allows nobody to take a task;
 - `aq.work.route_needed` starts a run when a task needs a route.
 
 2.2.0 only adds contracts. All twelve commands and nine events of 2.1.0 are
@@ -24,10 +25,10 @@ The layout matches 2.1.0:
   section. That section records the 2.1.0 base, the unchanged and added
   fingerprints, and that no command changed.
 
-Fingerprint: `sha256:0eda50f583fa4f1bac6de34919a7ac4e01b3d248951cad786cba6e2f13e7431c`,
+Fingerprint: `sha256:ca3c3d68959d760cc761d0c39b8db8740a27b3e414ae54e76d64df944f9b677a`,
 which is `aq_playbooks_model::digest(&("2.2.0", &registry))`.
 
-All five new contracts share these properties:
+All six new contracts share these properties:
 - version 1.0.0;
 - scope `project`;
 - a 64 KiB payload bound (`max_payload_bytes` 65 536).
@@ -78,16 +79,20 @@ it to a neighbour, and especially never down.
    - the invoke's own `assessed`, `failed` and `refused` edges;
    - `on_error`.
 7. After each `work.route`:
-   - `routed`: end `routed`;
+   - `routed`: end;
    - `stale`: end. The host asks again for the new version;
-   - `refused` with `not_offered`: end with your playbook's "nothing allowed
-     could ever take it" outcome (for example `unservable`, with reason codes);
-   - any other `refused`: end without routing.
+   - `refused`, for any reason: end. On `not_offered` the host itself leaves
+     the task unrouted and raises it (see "When nothing could ever take a
+     task").
+8. Only where the document itself allows nobody for a task (for example
+   "secrets rotation is never given to an agent"), call `work.unroutable`
+   instead of `work.route`.
 
 A complete example is `crates/aq-playbooks-cli/tests/data/routing_draft.json`,
 the owner's routing document written as a draft. The contract test checks it
-against this catalog and evaluates the routes of 43 concrete tasks against the
-document's sentences.
+against this catalog and evaluates the routes of 55 concrete tasks against the
+document's sentences. That document allows somebody for every task, so the
+draft never calls `work.unroutable`.
 
 ## `work.read` 1.0.0: the facts of a task
 
@@ -141,7 +146,7 @@ Deadline 10 s. `reference` and `subject` are public result fields.
 | `harnesses` | ≤ 8 strings ≤ 64 B | The harnesses that **may** take the task, such as `claude`, `codex` or `opencode`. Empty means no restriction. |
 | `providers` | ≤ 8 strings ≤ 64 B | The providers that may serve the task, such as `anthropic`. Empty means no restriction. |
 | `prefer` | ≤ 8 strings ≤ 64 B | Harnesses to try first, in order. Empty means no preference. |
-| `hold` | boolean | `true` only for a sentence that tells some work to **wait** for a particular agent rather than go elsewhere, such as "Art goes to Codex, and waits for it". The task then never falls back outside its lists, and shows as held with your reasons. Otherwise `false`. `hold` is not how you say that nothing could ever take a task (see "Unservable" below). |
+| `hold` | boolean | `true` only for a sentence that tells some work to **wait** for a particular agent rather than go elsewhere, such as "Art goes to Codex, and waits for it". See "Held tasks" below. Otherwise `false`. `hold` is never how you say that nothing could ever take a task. |
 | `reasons` | ≤ 16 `{code, detail?}` | Why: every choice that set, raised, lowered or relaxed the level, and every limit on who may take the task. `code` is one of the codes below. `detail` is optional: a fixed sentence of at most 256 B, best the document's own, shown on the task. A playbook cannot build text, so write one reason per situation and select them with `filter`. |
 | `classification` | object or `null` | The judgment the route was based on, recorded with the route and shown on the task. `null` when there was none. The object has five fields: `reference` (the `assessed` output's `reference`), `fields` (the ids of the fields you asked, in order), and `labels`, `flags` and `rationale`, copied from the `assessed` answer. |
 
@@ -160,7 +165,7 @@ demand:
 | --- | --- |
 | `level_from_kind` | The level is the one the kind of work gets. |
 | `deep_reserved` | Deep was given because the work needs hard reasoning, or a level asked for was kept from Deep because it does not. |
-| `hint_respected` | The level whoever filed the task asked for was used. |
+| `hint_respected` | The level whoever filed the task asked for is the level of the route. When a later rule raised it, give that rule's reason instead. |
 | `hint_capped` | The level asked for was above what the task may have, so it was lowered. |
 | `level_lowered` | The level was lowered for another reason the document gives. |
 | `escalated_after_failure` | The level was raised because an earlier attempt failed (`charged_failures`). |
@@ -173,7 +178,7 @@ demand:
 | `harness_preferred` | Some harnesses are to be tried first (`prefer`). |
 | `harness_excluded` | A harness was left out on purpose. |
 | `held_for_harness` | The task waits for an allowed harness instead of going elsewhere (`hold`). |
-| `policy` | Any other rule of the document. Put the document's sentence in `detail`. |
+| `policy` | Any other rule of the document. Put the document's sentence in `detail`. Also the usual code for `work.unroutable`. |
 
 **Outcomes:**
 - `routed`: `{reference, subject, harnesses, providers, prefer}`. The route is
@@ -187,20 +192,64 @@ demand:
   - `not_offered`: Settings offers no profile at `level`, or a non-empty
     `harnesses` or `providers` list has nothing left at that level (for
     example, Art may go only to Codex, and no level offers Codex). Nothing
-    allowed could ever take the task as the document says. End with your
-    "unservable" outcome. Do not try another route the document does not
-    give.
+    allowed could ever take the task as the document says. End the run: the
+    host raises the task itself. Do not try another route the document does
+    not give.
   - `owner_route`: the owner has set this task's route. End without routing.
   - `not_on_router`: the task's project is not routed automatically. End
     without routing.
   - `unknown_task`: there is no such task. End without routing.
 
-**Unservable.** When nothing allowed could ever take a task, the playbook
-does not write a route. It ends with an entry outcome of its own, for example
-`unservable {reasons: [{code, detail}]}`. The server's failure path then
-leaves the task unrouted and visible, says why on the task, and raises it for
-the owner's attention. A task is never counted as routed because a playbook
-gave up on it.
+**Held tasks.** A route with `hold: true` is a route: the task is routed, so
+the "unrouted for too long" alarm does not apply to it. The host shows it as
+"Held for" the harnesses it kept, with your `held_for_harness` sentence and
+how long it has waited. When none of those harnesses is available right now,
+that is a wait, not a failure, for a held task and for any other: only a
+route that nothing in Settings could ever serve (`not_offered`, when it is
+written) is a failure.
+
+## When nothing could ever take a task
+
+There are exactly two ways, one per cause. Never decide it from the facts you
+were given when the playbook was authored (`definitions.offers`), because
+Settings may have changed since.
+- **Nothing in Settings can take it.** Write the route the document gives.
+  If the host refuses it with `not_offered`, end the run. The host itself
+  leaves the task unrouted and visible, records the refused route with its
+  reasons on the task, and raises it for the owner, once.
+- **The document allows nobody for it.** Call `work.unroutable` with the
+  reasons, usually `policy` with the document's sentence. Do not write a
+  route.
+
+A playbook's own entry outcomes (for example a return named `unservable`)
+are not signals the server reads. Name them however you like.
+
+## `work.unroutable` 1.0.0: the document allows nobody
+
+A mutation, replayed only with its idempotency key (`keyed_idempotent`).
+Deadline 10 s. `reference` and `subject` are public result fields.
+
+**Input**, both fields required:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `subject` | `{id, revision}` | The task, at the revision the playbook decided on. Use `task.subject` from `work.read`. |
+| `reasons` | ≤ 16 `{code, detail?}` | Why nobody may take it, with the same codes and optional sentence as `work.route`. Give at least one. |
+
+The host leaves the task unrouted and visible, shows the reasons on it, and
+raises it for the owner's attention. It does not ask for a route again
+(`aq.work.route_needed`) until the task or the active playbook changes.
+
+**Outcomes:**
+- `recorded`: `{reference, subject}`. End the run.
+- `stale`: `{reference, subject}`. The task changed after `work.read`;
+  nothing was recorded. End the run. The host asks again for the new version.
+- `refused`: `{reference, subject, reason}`. Nothing was recorded. End the
+  run.
+  - `no_reasons`: `reasons` was empty;
+  - `owner_route`: the owner has set this task's route;
+  - `not_on_router`: the task's project is not routed automatically;
+  - `unknown_task`: there is no such task.
 
 ## `judgment.assess` 1.0.0: a structured classification
 
@@ -290,8 +339,9 @@ event:
 - again for the same version at most every two minutes while the task stays
   unrouted, but **not while a run started for that version is unfinished**.
 
-Once the failure path has raised a task as unroutable, the server does not
-emit the event again until the task or the active playbook changes. So a
+Once a task has been raised as unroutable (after `not_offered`, or through
+`work.unroutable`), the server does not emit the event again until the task
+or the active playbook changes. So a
 playbook never sees two live runs for one task version. A run that ends
 without routing is not started again every two minutes for ever.
 
@@ -303,7 +353,7 @@ something the playbook says:
 | Sentence | Where it is handled |
 | --- | --- |
 | Holding a task until something allowed can take it | Placement. |
-| Raising a task nothing could ever take to the owner | The server's failure path, after `refused not_offered` and the playbook's unservable outcome. |
+| Raising a task nothing could ever take to the owner | The host, after `refused not_offered` or `work.unroutable`. |
 | When a route is needed | `aq.work.route_needed`. |
 | Never choosing by priority or load | `work.read` does not expose them. |
 | Which model a harness runs at a level | Settings. A route names harnesses, not models. |

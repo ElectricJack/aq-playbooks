@@ -7048,6 +7048,207 @@
       "sensitive_input_fields": [],
       "sensitive_output_fields": [],
       "version": "1.0.0"
+    },
+    "work.unroutable": {
+      "asynchronous": null,
+      "cancellation": false,
+      "capabilities": [
+        "work.unroutable"
+      ],
+      "deadline_ms": 10000,
+      "effect": "mutation",
+      "input": {
+        "properties": {
+          "reasons": {
+            "items": {
+              "properties": {
+                "code": {
+                  "max_length": 64,
+                  "type": "string",
+                  "values": [
+                    "classification_failed",
+                    "deep_reserved",
+                    "escalated_after_failure",
+                    "harness_excluded",
+                    "harness_preferred",
+                    "harnesses_limited",
+                    "held_for_harness",
+                    "hint_capped",
+                    "hint_respected",
+                    "level_from_kind",
+                    "level_lowered",
+                    "policy",
+                    "raised_for_risk",
+                    "risk_assumed",
+                    "risk_relaxed",
+                    "second_opinion"
+                  ]
+                },
+                "detail": {
+                  "max_length": 256,
+                  "type": "string",
+                  "values": []
+                }
+              },
+              "required": [
+                "code"
+              ],
+              "type": "object"
+            },
+            "max_items": 16,
+            "type": "array"
+          },
+          "subject": {
+            "properties": {
+              "id": {
+                "max_length": 4096,
+                "type": "string",
+                "values": []
+              },
+              "revision": {
+                "maximum": 9223372036854775807,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "id",
+              "revision"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "reasons",
+          "subject"
+        ],
+        "type": "object"
+      },
+      "max_payload_bytes": 65536,
+      "name": "work.unroutable",
+      "outcomes": {
+        "recorded": {
+          "properties": {
+            "reference": {
+              "max_length": 4096,
+              "type": "string",
+              "values": []
+            },
+            "subject": {
+              "properties": {
+                "id": {
+                  "max_length": 4096,
+                  "type": "string",
+                  "values": []
+                },
+                "revision": {
+                  "maximum": 9223372036854775807,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "id",
+                "revision"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "reference",
+            "subject"
+          ],
+          "type": "object"
+        },
+        "refused": {
+          "properties": {
+            "reason": {
+              "max_length": 128,
+              "type": "string",
+              "values": [
+                "no_reasons",
+                "not_on_router",
+                "owner_route",
+                "unknown_task"
+              ]
+            },
+            "reference": {
+              "max_length": 4096,
+              "type": "string",
+              "values": []
+            },
+            "subject": {
+              "properties": {
+                "id": {
+                  "max_length": 4096,
+                  "type": "string",
+                  "values": []
+                },
+                "revision": {
+                  "maximum": 9223372036854775807,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "id",
+                "revision"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "reason",
+            "reference",
+            "subject"
+          ],
+          "type": "object"
+        },
+        "stale": {
+          "properties": {
+            "reference": {
+              "max_length": 4096,
+              "type": "string",
+              "values": []
+            },
+            "subject": {
+              "properties": {
+                "id": {
+                  "max_length": 4096,
+                  "type": "string",
+                  "values": []
+                },
+                "revision": {
+                  "maximum": 9223372036854775807,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "id",
+                "revision"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "reference",
+            "subject"
+          ],
+          "type": "object"
+        }
+      },
+      "public_result_fields": [
+        "reference",
+        "subject"
+      ],
+      "recovery": "keyed_idempotent",
+      "scopes": [
+        "project"
+      ],
+      "sensitive_input_fields": [],
+      "sensitive_output_fields": [],
+      "version": "1.0.0"
     }
   },
   "events": {

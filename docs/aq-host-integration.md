@@ -366,7 +366,7 @@ The host still owns the OID format bound: lowercase hex, 40 characters for
 The [2.2.0 bundle](../contracts/aq-host-2.2.0/README.md) is published beside
 1.0.0, 2.0.0 and 2.1.0 and replaces none of them. Version `2.2.0` has
 fingerprint
-`sha256:0eda50f583fa4f1bac6de34919a7ac4e01b3d248951cad786cba6e2f13e7431c`
+`sha256:ca3c3d68959d760cc761d0c39b8db8740a27b3e414ae54e76d64df944f9b677a`
 over `["2.2.0", registry]`. The manifest records the 2.1.0 version and
 fingerprint it supersedes, and lists `commands_added` and `events_added`.
 
@@ -388,10 +388,11 @@ fingerprints, so 2.2.0 adds new contracts instead.
   byte-identical. `fixtures.json#compatibility` pins:
   - their fingerprints;
   - the 2.1.0 registry file SHA-256;
-  - the fingerprints of the five additions.
+  - the fingerprints of the six additions.
 
   An artifact sealed on 2.1.0 validates against 2.2.0 unchanged.
-- **New commands:** `work.read`, `work.route` and `judgment.assess`.
+- **New commands:** `work.read`, `work.route`, `work.unroutable` and
+  `judgment.assess`.
   - Each requires the capability of the same name.
   - `judgment.assess` declares `operation.get` as its reconciliation command.
 - **New events:** `aq.judgment.assessed`, the completion of
@@ -424,9 +425,19 @@ These are host semantics, not schema.
   - It answers `stale` when the task's revision moved since
     `subject.revision`.
 - **`hold`:** pins the task to its lists, for sentences that tell work to
-  wait for an agent. It is never a way to park a task that nothing can take.
-  That case ends the playbook with its own unservable outcome, and the failure
-  path (spec 0011 §4, W6) raises it.
+  wait for an agent. A held task is routed: the unrouted alarm does not apply,
+  and the task view shows it held, with its reason and how long it has
+  waited. "Nothing available right now" is a wait for every task, never a
+  failure; the "no candidate" failure means none in Settings.
+- **One trigger per cause for "nothing could ever take it":**
+  - Settings: `work.route` refused `not_offered`. The host raises the task
+    itself, once. The playbook only ends.
+  - The document: `work.unroutable {subject, reasons}`. The host leaves the
+    task unrouted and visible, shows the reasons, raises it, and does not
+    re-emit `aq.work.route_needed` until the task or the active playbook
+    changes.
+
+  A playbook's entry outcome is never read as this signal.
 - **`work.read` facts:**
   - They never include priority or provider load.
   - `level_hint` is always present (`""` for none).
@@ -434,8 +445,9 @@ These are host semantics, not schema.
 - **`aq.work.route_needed`:**
   - It is not emitted again for a task version while a run started for that
     version is unfinished.
-  - Once a task is raised as unroutable, it is not emitted again until the
-    task or the active playbook changes.
+  - Once a task is raised as unroutable (`not_offered` or
+    `work.unroutable`), it is not emitted again until the task or the active
+    playbook changes.
 
 `operation.get` 2.0.0 is unchanged, so its `completed` union does not include
 the `judgment.assess` outputs. A host reconciles a `judgment.assess` intent
