@@ -3056,3 +3056,278 @@ fn a_wait_inside_the_window_matches_and_one_after_it_times_out() {
         );
     }
 }
+
+// --- Task 7: stale requests refused by producer time ----------------------
+
+#[test]
+fn stale_producer_time_is_refused_and_missing_time_is_accepted_as_new() {
+    let e = engine();
+    install(&e, wait_artifact(), "waiter");
+    install(
+        &e,
+        artifact(
+            "a",
+            "done",
+            BTreeMap::from([("done".into(), ret("ok"))]),
+            Registry::default(),
+            BTreeMap::new(),
+        ),
+        "a",
+    );
+    e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 600_000,
+        event_replay_ms: 600_000,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    let now = 1_000_000;
+    assert!(
+        matches!(e.admit_once_at(keyed(&e, "k1"), Some(now - 600_001), now), Err(Error::Refused(m)) if m.starts_with(STALE_REQUEST))
+    );
+    let first = e
+        .admit_once_at(keyed(&e, "k1"), Some(now - 600_000), now)
+        .unwrap();
+    assert!(!first.duplicate);
+    assert!(
+        e.admit_once_at(keyed(&e, "k1"), Some(0), now + 1)
+            .unwrap()
+            .duplicate
+    );
+    assert!(
+        matches!(e.admit_event_at("host", event("e1", 2), 0, Some(now - 600_001), now), Err(Error::Refused(m)) if m.starts_with(STALE_REQUEST))
+    );
+    assert!(
+        !e.admit_event_at("host", event("e1", 2), 0, Some(now - 600_000), now)
+            .unwrap()
+            .duplicate
+    );
+    e.advance(&first.receipt.run_id, now + 2).unwrap();
+    let later = now + 600_001;
+    e.admit("a", "main", Value::Null, authority(), later)
+        .unwrap(); // drops k1
+    let again = e.admit_once_at(keyed(&e, "k1"), None, later + 1).unwrap();
+    assert!(!again.duplicate);
+    assert_ne!(again.receipt.run_id, first.receipt.run_id);
+}
+fn stale(result: Result<impl std::fmt::Debug>) -> bool {
+    matches!(result, Err(Error::Refused(m)) if m.starts_with(STALE_REQUEST))
+}
+/// Carried item 1: an expired key or event the engine still holds in the
+/// record (no commit has dropped it yet) is forgotten by the first of two
+/// commits. A stale request is refused before that commit: nothing is
+/// written and the expired entry stays.
+fn a_stale_request_for_an_expired_entry_writes_nothing<S: Storage>(
+    e: &Engine<S>,
+    event_first: bool,
+) {
+    install_on(e, wait_artifact(), "waiter");
+    e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 1_000,
+        event_replay_ms: 1, // the event's window is the contract's 1_000
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    let first = e.admit_once(keyed_on(e, "k"), 0).unwrap();
+    assert!(e.advance(&first.receipt.run_id, 0).unwrap());
+    let accepted = e.admit_event("host", event("e1", 2), 0).unwrap();
+    let before = e.store.load("test").unwrap();
+    assert!(before.state.keyed_admissions.contains_key("k"));
+    assert!(before.state.events.contains_key(&accepted.key));
+    // Judged against max(2_000, clock 0) - 1_000 = 1_000.
+    assert!(stale(e.admit_once_at(keyed_on(e, "k"), Some(999), 2_000)));
+    assert!(stale(e.admit_event_at(
+        "host",
+        event("e1", 2),
+        0,
+        Some(999),
+        2_000
+    )));
+    let after = e.store.load("test").unwrap();
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.state.keyed_admissions["k"], first.receipt);
+    assert!(after.state.events.contains_key(&accepted.key));
+    assert_eq!(
+        after.state.retention.clock_ms,
+        before.state.retention.clock_ms
+    );
+    // A request time inside the window: the expired entries leave and the
+    // repeats are new. The first of the two is forgotten by its own request
+    // (the forget-then-new path); the second was dropped by that commit.
+    let keyed_again = || {
+        let again = e
+            .admit_once_at(keyed_on(e, "k"), Some(1_000), 2_000)
+            .unwrap();
+        assert!(!again.duplicate);
+        assert_ne!(again.receipt.run_id, first.receipt.run_id);
+    };
+    let event_again = || {
+        let redelivered = e
+            .admit_event_at("host", event("e1", 2), 0, Some(1_000), 2_000)
+            .unwrap();
+        assert!(!redelivered.duplicate);
+        assert_eq!(
+            e.snapshot().unwrap().events[&redelivered.key].accepted_at_ms,
+            2_000
+        );
+    };
+    if event_first {
+        event_again();
+        keyed_again();
+    } else {
+        keyed_again();
+        event_again();
+    }
+}
+#[test]
+fn memory_storage_stale_request_for_an_expired_entry_writes_nothing() {
+    for event_first in [false, true] {
+        a_stale_request_for_an_expired_entry_writes_nothing(&ret_engine(), event_first);
+    }
+}
+#[test]
+fn record_storage_stale_request_for_an_expired_entry_writes_nothing() {
+    for event_first in [false, true] {
+        let r = Engine::new(RecordStorage::new(), "test", "incarnation-1").unwrap();
+        install_on(&r, done_artifact(), "a");
+        a_stale_request_for_an_expired_entry_writes_nothing(&r, event_first);
+    }
+}
+/// Carried item 3: an entry the engine still remembers answers as today,
+/// whatever the request time: inside its window, after it while its run is
+/// live, and an expired event that something still holds.
+#[test]
+fn a_remembered_entry_answers_as_today_whatever_its_request_time() {
+    let e = ret_engine();
+    install(&e, wait_artifact(), "waiter");
+    e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 1_000,
+        event_replay_ms: 1,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    // Inside the window.
+    let first = e.admit_once(keyed(&e, "k"), 0).unwrap();
+    let inside = e
+        .admit_once_at(keyed(&e, "k"), Some(i64::MIN), 500)
+        .unwrap();
+    assert!(inside.duplicate);
+    assert_eq!(inside.receipt, first.receipt);
+    let changed = KeyedAdmissionRequest {
+        input: json!(1),
+        ..keyed(&e, "k")
+    };
+    assert!(matches!(
+        e.admit_once_at(changed, Some(i64::MIN), 500),
+        Err(Error::Conflict(_))
+    ));
+    // Expired, but its run is still live (SC-10).
+    let live = e
+        .admit_once_at(keyed(&e, "k"), Some(i64::MIN), 5_000)
+        .unwrap();
+    assert!(live.duplicate);
+    assert_eq!(live.receipt, first.receipt);
+    // An expired event held by a live waiter (Task 6 ruling).
+    let waiter = e
+        .admit("waiter", "main", Value::Null, authority(), 5_000)
+        .unwrap();
+    e.advance(&waiter, 5_000).unwrap();
+    let held = e.admit_event("host", event("held", 1), 5_000).unwrap();
+    for at in [6_000, 50_000] {
+        let again = e
+            .admit_event_at("host", event("held", 1), 0, Some(i64::MIN), at)
+            .unwrap();
+        assert!(again.duplicate, "at {at}");
+        assert_eq!(again.key, held.key, "at {at}");
+    }
+}
+/// Request time is not part of any digest or stored record, and it never
+/// moves the retention clock, even when it lies in the future. A future
+/// request time is never stale, and it cannot make a remembered entry new.
+#[test]
+fn request_time_enters_no_digest_record_or_clock() {
+    let script = |requested: Option<i64>| {
+        let e = ret_engine();
+        install(&e, wait_artifact(), "waiter");
+        let k = e.admit_once_at(keyed(&e, "k"), requested, 1_000).unwrap();
+        let ev = e
+            .admit_event_at("host", event("e1", 2), 0, requested, 1_000)
+            .unwrap();
+        assert!(!k.duplicate && !ev.duplicate);
+        // A remembered key stays a duplicate.
+        assert!(
+            e.admit_once_at(keyed(&e, "k"), requested, 1_001)
+                .unwrap()
+                .duplicate
+        );
+        assert!(
+            e.admit_event_at("host", event("e1", 2), 0, requested, 1_001)
+                .unwrap()
+                .duplicate
+        );
+        (k, ev, e.snapshot().unwrap())
+    };
+    let (k_none, ev_none, s_none) = script(None);
+    let (k_future, ev_future, s_future) = script(Some(i64::MAX));
+    let (k_now, _, s_now) = script(Some(1_000));
+    assert_eq!(k_future.receipt, k_none.receipt);
+    assert_eq!(k_now.receipt, k_none.receipt);
+    assert_eq!(ev_future.key, ev_none.key);
+    // The last host time (an event duplicate commits), not the request time.
+    assert_eq!(s_future.retention.clock_ms, Some(1_001));
+    let json = |s: &State| serde_json::to_value(s).unwrap();
+    assert_eq!(json(&s_future), json(&s_none));
+    assert_eq!(json(&s_now), json(&s_none));
+    // The oldest possible request time does not overflow the check.
+    let e = ret_engine();
+    assert!(stale(e.admit_once_at(
+        keyed(&e, "x"),
+        Some(i64::MIN),
+        1_000
+    )));
+}
+/// Carried item 2: staleness is judged against the retention clock, as
+/// expiry is. One far-future host time pins the clock, and then every
+/// request with a real request time is refused as stale; the message names
+/// both times. Requests without a request time still go through.
+#[test]
+fn a_pinned_clock_refuses_every_request_time_and_says_so() {
+    let e = ret_engine();
+    install(&e, wait_artifact(), "waiter");
+    let pinned: i64 = 9_000_000_000_000;
+    let real: i64 = 1_700_000_000_000;
+    e.admit("a", "main", Value::Null, authority(), pinned)
+        .unwrap();
+    for result in [
+        e.admit_once_at(keyed(&e, "k"), Some(real), real)
+            .map(|_| ()),
+        e.admit_event_at("host", event("e1", 2), 0, Some(real), real)
+            .map(|_| ()),
+    ] {
+        let Err(Error::Refused(message)) = result else {
+            panic!("expected a stale refusal, got {result:?}");
+        };
+        assert!(message.starts_with(STALE_REQUEST), "{message}");
+        assert!(message.contains(&real.to_string()), "{message}");
+        assert!(message.contains(&pinned.to_string()), "{message}");
+        assert!(message.contains("retention clock"), "{message}");
+        assert!(message.contains("ahead of host time"), "{message}");
+    }
+    assert!(
+        !e.admit_once_at(keyed(&e, "k"), None, real)
+            .unwrap()
+            .duplicate
+    );
+    assert!(
+        !e.admit_event_at("host", event("e1", 2), 0, None, real)
+            .unwrap()
+            .duplicate
+    );
+    // The existing methods carry no request time, so they are not checked.
+    assert!(!e.admit_once(keyed(&e, "k2"), real).unwrap().duplicate);
+    assert!(
+        !e.admit_event("host", event("e2", 2), real)
+            .unwrap()
+            .duplicate
+    );
+    assert_eq!(e.snapshot().unwrap().retention.clock_ms, Some(pinned));
+}

@@ -52,6 +52,43 @@ pub(crate) fn invariant(what: String) -> Error {
 fn is_invariant(error: &Error) -> bool {
     matches!(error, Error::Conflict(m) if m.starts_with(INVARIANT))
 }
+/// The start of every refusal of a request whose producer (request) time is
+/// older than its window; the rest of the message names the times.
+pub const STALE_REQUEST: &str = "stale request: producer time is older than the replay window";
+/// Refuse a request for a key the engine does not remember (absent, or
+/// expired and held by nothing) when its request time is older than the
+/// window before `max(now, clock)`, the time expiry is judged against.
+/// A request without a request time is not checked. The request time is
+/// only compared: it never moves the clock and is never stored.
+fn refuse_stale(
+    s: &State,
+    requested_at_ms: Option<i64>,
+    window_ms: u64,
+    now_ms: i64,
+) -> Result<()> {
+    let Some(requested_at_ms) = requested_at_ms else {
+        return Ok(());
+    };
+    let start = retention::window_start(s, now_ms);
+    let window = i64::try_from(window_ms).unwrap_or(i64::MAX);
+    let oldest = start.saturating_sub(window);
+    if requested_at_ms >= oldest {
+        return Ok(());
+    }
+    let mut message = format!(
+        "{STALE_REQUEST}: request time {requested_at_ms} ms is before {oldest} ms \
+         (retention time {start} ms minus the {window_ms} ms window; host time {now_ms} ms)"
+    );
+    if start > now_ms {
+        message.push_str(&format!(
+            "; the retention clock ({start} ms) is ahead of host time by {} ms, and while \
+             it is, every request that carries a real request time is refused as stale \
+             (a clock pinned by a far-future host time stays ahead)",
+            start.saturating_sub(now_ms)
+        ));
+    }
+    Err(Error::Refused(message))
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Authority {
     pub actor: String,
@@ -693,11 +730,34 @@ impl<S: Storage> Engine<S> {
         epoch: u64,
         now_ms: i64,
     ) -> Result<EventDisposition> {
+        self.admit_event_at(authenticated_producer, event, epoch, None, now_ms)
+    }
+    /// [`Self::admit_event_in_epoch`] with the producer's request time (not
+    /// the event's `occurred_at_ms`, and not part of any digest). An event
+    /// the engine still remembers answers as before, whatever its request
+    /// time. Otherwise a request time older than
+    /// `max(now, clock) - max(policy.event_replay_ms, contract.retention_ms)`
+    /// is refused with [`STALE_REQUEST`] and nothing is written. `None` is
+    /// not checked: an expired event is then accepted as new.
+    pub fn admit_event_at(
+        &self,
+        authenticated_producer: &str,
+        event: EventEnvelope,
+        epoch: u64,
+        requested_at_ms: Option<i64>,
+        now_ms: i64,
+    ) -> Result<EventDisposition> {
         // An expired event that nothing holds is accepted as new; it leaves in
         // a commit of its own first (see `admit_once`).
         let mut result = Err(Error::Conflict("event changed during admission".into()));
         for _ in 0..2 {
-            match self.admit_event_commit(authenticated_producer, &event, epoch, now_ms) {
+            match self.admit_event_commit(
+                authenticated_producer,
+                &event,
+                epoch,
+                requested_at_ms,
+                now_ms,
+            ) {
                 Ok(None) => continue,
                 Ok(Some(disposition)) => result = Ok(disposition),
                 Err(error) => result = Err(error),
@@ -719,6 +779,7 @@ impl<S: Storage> Engine<S> {
         authenticated_producer: &str,
         event: &EventEnvelope,
         epoch: u64,
+        requested_at_ms: Option<i64>,
         now_ms: i64,
     ) -> Result<Option<EventDisposition>> {
         let event = event.clone();
@@ -755,6 +816,11 @@ impl<S: Storage> Engine<S> {
                 // answered as inside its window (SC-9).
                 let start = retention::window_start(s, now_ms);
                 if retention::event_droppable(s, &key, start)? {
+                    // Not remembered any more: a stale request is refused
+                    // before this commit forgets the expired event.
+                    let contract_ms = find_event(s, &event.contract).map_or(0, |c| c.retention_ms);
+                    let window_ms = s.retention.policy.event_replay_ms.max(contract_ms);
+                    refuse_stale(s, requested_at_ms, window_ms, now_ms)?;
                     retention::forget_event(s, &key)?;
                     return Ok(None);
                 }
@@ -775,6 +841,12 @@ impl<S: Storage> Engine<S> {
             {
                 return Err(Error::Refused("event producer or scope".into()));
             }
+            let window_ms = s
+                .retention
+                .policy
+                .event_replay_ms
+                .max(contract.retention_ms);
+            refuse_stale(s, requested_at_ms, window_ms, now_ms)?;
             validate_event(
                 &event,
                 &Registry {
@@ -897,11 +969,6 @@ impl<S: Storage> Engine<S> {
                 },
             );
             s.retention.event_epochs.insert(key.clone(), epoch);
-            let window_ms = s
-                .retention
-                .policy
-                .event_replay_ms
-                .max(contract.retention_ms);
             // From the later of host time and clock; a clock already near the
             // end of time saturates rather than refusing the event.
             let expires_at_ms = deadline(now_ms, window_ms)?.max(
