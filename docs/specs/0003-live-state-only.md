@@ -258,3 +258,17 @@ This changes §3 and §4:
    (`max_runs`, and the receipts and bytes of live runs). Hitting one does not
    lose the request: the engine answers "busy" and the host delivers it again.
    Over any length of time the number of runs is unbounded.
+
+## Owner direction, 2026-11-13 (final): no limits
+
+> "Just remove all 'limits' and just enforce deleting old records. This should
+> be how ALL SYSTEMS that log in agent queue are designed."
+
+There are no namespace limits. `max_runs`, `max_receipts`, `max_state_bytes`
+and `max_tombstones` are accepted in a stored policy and ignored; nothing is
+ever refused because a namespace holds too much. The record is bounded only by
+deletion: finished work is deleted when it finishes, remembered keys are the
+most recent `replay_keep`, and history is the most recent `history_keep` runs.
+Point 3 of the previous section is replaced by this. What stays is not a
+namespace limit: the limits a playbook declares for itself, input size checks,
+and the bounded amount of deletion work done per commit.
