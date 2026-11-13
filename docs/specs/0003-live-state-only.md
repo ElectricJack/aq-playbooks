@@ -227,3 +227,34 @@ rulings apply:
 - **Burst bound.** The 2 KB per run bound stands. If the measurement
   exceeds it, report the figure; do not change the bound.
 - **Version.** The engine crates go to 0.2.0.
+
+## Owner direction, 2026-11-13 (later): rolling bounds, and nothing finished may block new runs
+
+> "Doesn't replay protection just need to know the last one or maybe two runs?
+> And history runs we should just keep a rolling log of some number of them.
+> Nothing should have a cap that blocks additional runs. The expectation with
+> playbooks is that they trigger often and over time we will have infinite
+> runs."
+
+This changes §3 and §4:
+
+1. **Repeat protection is a rolling set, bounded by count as well as by
+   time.** The engine remembers the most recent `policy.replay_keep` event and
+   request keys (design call: default 256), and forgets a key when it is older
+   than its window *or* when newer keys push it out, whichever comes first.
+   Forgetting never waits for a clock and never refuses anything. Two is too
+   few as a single global number: when many tasks become ready together their
+   events arrive together, and a re-send of the first must still be recognised
+   after the others. An entry that work in progress still needs (a live wait, a
+   queued destination, an unknown completion handle, a live run's keyed
+   receipt) is not pushed out; it leaves when that need ends.
+2. **History is a rolling log.** The engine keeps the most recent
+   `policy.history_keep` finished runs per namespace (design call: default
+   10,000) and deletes older ones as new ones are written, a bounded number
+   per commit. Nothing reads history except inspection.
+3. **Nothing that is finished or merely remembered can refuse new work.**
+   Remembered keys and history never count toward any limit. The only limits
+   that can make a new run wait are on work that is running at this moment
+   (`max_runs`, and the receipts and bytes of live runs). Hitting one does not
+   lose the request: the engine answers "busy" and the host delivers it again.
+   Over any length of time the number of runs is unbounded.
