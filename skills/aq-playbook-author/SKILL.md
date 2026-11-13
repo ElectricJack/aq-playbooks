@@ -7,7 +7,7 @@ Read the repository's `docs/specs/0002-implementation.md` and model `FORMAT.md` 
 
 Discover the available command/event catalog and callable artifacts. The bundled catalog is a synthetic pilot contract set; a production host must supply its actual registrations. Discovery does not grant execution authority.
 
-Bind the Markdown source and explicit semantic proposal. Resolve terms such as “ready,” “independent reviewer,” and “required checks” against captured definitions and registered contracts. Record consequential unresolved interpretations as proposal questions; compilation must not invent answers. Preserve source mappings where useful.
+Bind the Markdown source and explicit semantic proposal. Resolve terms such as “ready,” “independent reviewer,” and “required checks” against captured definitions and registered contracts. When a consequential interpretation is unresolved, stop and ask the owner instead of packaging a guess; a proposal carries no questions, and compilation must not invent answers. Preserve source mappings where useful.
 
 Use native calls, joins, waits, branches, and finite iterations for coordination. Keep work, check evidence, model assessments, human decisions, and notification acceptance distinct. Bind evidence and decisions to exact subject revisions. A source document cannot grant capabilities, and a child cannot expand its caller's scope.
 

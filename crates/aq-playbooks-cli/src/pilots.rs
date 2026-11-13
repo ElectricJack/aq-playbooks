@@ -188,8 +188,6 @@ fn build(
         proposal: Proposal {
             playbook,
             source_map: BTreeMap::new(),
-            questions: vec![],
-            unsupported_features: vec![],
         },
         registry,
         dependencies,
@@ -872,8 +870,6 @@ pub fn compile_input(artifact: &Artifact) -> CompileInput {
         proposal: Proposal {
             playbook: c.playbook.clone(),
             source_map: c.source_map.clone(),
-            questions: vec![],
-            unsupported_features: vec![],
         },
         registry: c.registry.clone(),
         dependencies: c.dependencies.clone(),
@@ -1059,6 +1055,79 @@ mod tests {
                 .iter()
                 .any(|r| r["origin"].is_string() && r["parent"].is_null())
         );
+    }
+    /// The draft filler, given a pilot's Markdown, names and catalog,
+    /// reproduces the pilot's artifact byte for byte; for a pilot with
+    /// callable children it derives the same registry and capabilities.
+    #[test]
+    fn the_draft_filler_reproduces_every_pilot_artifact() {
+        use aq_playbooks_compiler::draft::{
+            SourceRecord, Workspace, retain_registry, seal, unfill,
+        };
+        let mut artifacts = vec![(
+            prepared_source_check(catalog_v2_1()).unwrap(),
+            catalog_v2_1(),
+        )];
+        for name in NAMES {
+            for a in scenario(name).unwrap().artifacts {
+                artifacts.push((a, catalog()));
+            }
+        }
+        let (mut filled, mut derived) = (0, 0);
+        for (artifact, catalog) in artifacts {
+            let c = &artifact.content;
+            let id = &c.playbook.id;
+            let (mut commands, mut events) = (BTreeSet::new(), BTreeSet::new());
+            for step in c.playbook.steps.values() {
+                match &step.op {
+                    Operation::Invoke { command, .. } => {
+                        commands.insert(command.name.clone());
+                    }
+                    Operation::Wait { event: Some(e), .. } => {
+                        events.insert(e.name.clone());
+                    }
+                    _ => {}
+                }
+            }
+            if c.dependencies.is_empty() {
+                let draft = unfill(&artifact);
+                assert!(!draft.to_string().contains("fingerprint"), "{id}");
+                let ws = Workspace {
+                    markdown: format!(
+                        "\n# {id}\n\nA synthetic bounded pilot. Domain services retain authority.\n"
+                    ),
+                    record: SourceRecord {
+                        id: id.clone(),
+                        binding: id.clone(),
+                        scope: c.playbook.scope.clone(),
+                        purpose: c.playbook.purpose.clone(),
+                        commands,
+                        events,
+                        capabilities: c.playbook.required_capabilities.clone(),
+                        facts_version: String::new(),
+                    },
+                    catalog,
+                    facts: BTreeMap::new(),
+                    draft,
+                };
+                let sealed = seal(&ws).unwrap_or_else(|d| panic!("{id}: {d:#?}"));
+                assert_eq!(
+                    canonical_bytes(&sealed).unwrap(),
+                    canonical_bytes(&artifact).unwrap(),
+                    "{id}"
+                );
+                filled += 1;
+            } else {
+                let (registry, capabilities) =
+                    retain_registry(&catalog, &commands, &events).unwrap();
+                assert_eq!(registry, c.registry, "{id}");
+                let children = c.dependencies.values().flat_map(|d| d.capabilities.clone());
+                let all: BTreeSet<String> = capabilities.into_iter().chain(children).collect();
+                assert_eq!(all, c.playbook.required_capabilities, "{id}");
+                derived += 1;
+            }
+        }
+        assert_eq!((filled, derived), (9, 2));
     }
     #[test]
     fn report_fallback_and_late_author_publish_once() {

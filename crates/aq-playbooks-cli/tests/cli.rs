@@ -70,7 +70,7 @@ fn offline_cli_round_trip_and_invalid_input_exit() {
     assert_eq!(value["complete"], true);
     let mut value: serde_json::Value =
         serde_json::from_slice(&fs::read(&proposal).unwrap()).unwrap();
-    value["proposal"]["questions"] = serde_json::json!(["Who may approve publication?"]);
+    value["proposal"]["playbook"]["entries"]["main"]["start"] = "nowhere".into();
     fs::write(&proposal, serde_json::to_vec(&value).unwrap()).unwrap();
     assert!(
         !cli(&["validate", proposal.to_str().unwrap()])

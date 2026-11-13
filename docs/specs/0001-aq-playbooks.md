@@ -125,7 +125,7 @@ For example:
 
 > When a change is ready, start documentation review while preparing its candidate. Validate that candidate. Wait for both reviews and validation before requesting publication. If validation reports an infrastructure failure, retry once. If a repair is needed, call the repair workflow and validate the resulting candidate again, at most twice.
 
-An authoring agent must establish what “ready,” “reviews,” and “infrastructure failure” mean using project definitions and registered contracts. It cannot silently invent authority, a test suite, or an approval rule. Unresolved consequential choices remain diagnostics/questions in the proposal.
+An authoring agent must establish what “ready,” “reviews,” and “infrastructure failure” mean using project definitions and registered contracts. It cannot silently invent authority, a test suite, or an approval rule. Unresolved consequential choices are put to the owner as a question and are never packaged (aq-server spec 0013 §4.2 replaced proposal questions).
 
 Named project definitions used by compilation are captured by version or digest in the artifact. A definition intentionally read at runtime is an explicit observation with recorded results; it cannot silently change the meaning of a supposedly fixed constant.
 
@@ -147,7 +147,7 @@ The skill is an authoring aid, not a source of runtime authority. A malicious so
 1. Parse the source header and structured proposal under a declared format version.
 2. Bind the exact source digest, named definitions, command/event manifests, and callable interfaces.
 3. Check schema conformance, reference resolution, input/output compatibility, reachable transitions, explicit unknown/error handling, bounded loops, child-call topology, and required capabilities.
-4. Reject unsupported features and unconditional recursion. Report unresolved interpretation questions separately from structural errors.
+4. Reject unsupported features and unconditional recursion. An unresolved interpretation is a question for the owner, not part of the proposal (aq-server spec 0013).
 5. Produce canonical executable content, source mappings, diagnostics, and a dependency/interface manifest.
 6. Package the validated artifact and optional scenario fixtures for inspection and installation.
 

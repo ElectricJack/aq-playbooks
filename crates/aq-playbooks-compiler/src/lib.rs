@@ -1,7 +1,10 @@
 //! Deterministic compilation accepts an explicit proposal; it never interprets prose.
+//! [`draft`] builds that proposal from a workspace that names contracts.
 use aq_playbooks_model::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+
+pub mod draft;
 
 pub const COMPILER_VERSION: &str = concat!("aq-playbooks-compiler/", env!("CARGO_PKG_VERSION"));
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -9,8 +12,6 @@ pub const COMPILER_VERSION: &str = concat!("aq-playbooks-compiler/", env!("CARGO
 pub struct Proposal {
     pub playbook: Playbook,
     pub source_map: BTreeMap<String, SourceLocation>,
-    pub questions: Vec<String>,
-    pub unsupported_features: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,7 +27,6 @@ pub struct CompileInput {
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     Error,
-    Question,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diagnostic {
@@ -109,23 +109,6 @@ pub fn validate(input: &CompileInput) -> Vec<Diagnostic> {
             None
         }
     };
-    for question in &input.proposal.questions {
-        issues.push(Diagnostic {
-            severity: Severity::Question,
-            code: "unresolved_interpretation".into(),
-            path: "proposal.questions".into(),
-            message: question.clone(),
-            line: None,
-            column: None,
-        });
-    }
-    for feature in &input.proposal.unsupported_features {
-        issues.push(Diagnostic::error(
-            "unsupported_feature",
-            "proposal.unsupported_features",
-            format!("unsupported feature: {feature}"),
-        ));
-    }
     if input.source.len() > 4_194_304 {
         issues.push(Diagnostic::error(
             "source_limit",
@@ -338,9 +321,6 @@ pub fn semantic_diff(before: &Artifact, after: &Artifact) -> Result<SemanticDiff
             .collect(),
     })
 }
-pub fn diff(before: &Artifact, after: &Artifact) -> Result<SemanticDiff, ModelError> {
-    semantic_diff(before, after)
-}
 
 #[cfg(test)]
 mod tests {
@@ -388,8 +368,6 @@ mod tests {
                     required_capabilities: BTreeSet::new(),
                 },
                 source_map: BTreeMap::new(),
-                questions: vec![],
-                unsupported_features: vec![],
             },
             registry: Registry::default(),
             dependencies: BTreeMap::new(),
@@ -539,22 +517,14 @@ mod tests {
         assert!(codes(&f).contains("unhandled_error"));
     }
     #[test]
-    fn t2_questions_and_unsupported_features_never_package() {
-        let mut f = fixture();
-        f.proposal.questions.push("Who may approve?".into());
-        assert!(compile(&f).is_err());
-        assert!(
-            validate(&f)
-                .iter()
-                .any(|d| d.severity == Severity::Question)
-        );
-        f.proposal.questions.clear();
-        f.proposal
-            .unsupported_features
-            .push("embedded_shell".into());
-        assert!(codes(&f).contains("unsupported_feature"));
+    fn t2_unknown_operations_and_retired_proposal_fields_never_package() {
         let unknown = json!({"kind":"eval_shell","script":"whoami"});
         assert!(serde_json::from_value::<Operation>(unknown).is_err());
+        // Questions and unsupported features are no longer part of a proposal:
+        // an agent asks the owner or gives up instead of packaging them.
+        let mut value = serde_json::to_value(&fixture().proposal).unwrap();
+        value["questions"] = json!(["Who may approve?"]);
+        assert!(serde_json::from_value::<Proposal>(value).is_err());
     }
     #[test]
     fn t2_unbounded_cycles_and_recursive_calls_rejected() {
