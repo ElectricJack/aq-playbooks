@@ -6,10 +6,15 @@
 //! Runs are admitted with `admit_once` (keyed admission).
 //!
 //! Usage: engine_growth <config a|b|c|d|e> <runs> <database url>
+//!                      [<run spacing ms> [<window ms>]]
 //!   a protected format 2, no GC          b unprotected format 2, no GC
 //!   c unprotected format 3, no GC        d format 3, GC after every run
 //!   e protected format 2, GC after every run
 //! d/e use the smallest retention windows the engine accepts (1 ms).
+//! The virtual clock starts each run `run spacing` (default 100 s) after the
+//! previous one and steps 10 ms per transition; spacing 0 freezes the clock
+//! (a burst: every commit carries time 0). `window` sets the policy's event
+//! and keyed admission windows (spec 0003), else they keep their defaults.
 //! JSON lines on stdout; progress on stderr.
 use aq_playbooks_model::*;
 use aq_playbooks_postgres::{PostgresStorage, ProtectionKeyring};
@@ -518,6 +523,10 @@ fn main() {
     let config = args[1].as_str();
     let runs: usize = args[2].parse().unwrap();
     let url = &args[3];
+    let spacing: i64 = args.get(4).map_or(RUN_SPACING_MS, |v| v.parse().unwrap());
+    let window_ms: Option<u64> = args.get(5).map(|v| v.parse().unwrap());
+    // A frozen clock does not step within a run either.
+    let step: i64 = if spacing == 0 { 0 } else { 10 };
     let protected = matches!(config, "a" | "e");
     let records = matches!(config, "c" | "d");
     let gc = matches!(config, "d" | "e");
@@ -553,6 +562,12 @@ fn main() {
         })
         .unwrap();
     }
+    if let Some(window_ms) = window_ms {
+        let mut policy = e.snapshot().unwrap().retention.policy;
+        policy.event_replay_ms = window_ms;
+        policy.admission_replay_ms = window_ms;
+        e.set_retention_policy(policy).unwrap();
+    }
     let format: i32 = e
         .store
         .monitor
@@ -567,6 +582,7 @@ fn main() {
     println!(
         "{}",
         json!({"kind":"setup","config":config,"protected":protected,"records":records,"gc":gc,
+               "run_spacing_ms":spacing,"window_ms":window_ms,
                "writer_format":format,"transition_v1_support":e.store.transition_v1_support(NS).unwrap(),
                "artifact_bytes": canonical_bytes(&e.snapshot().unwrap().artifacts[&digest]).unwrap().len(),
                "setup": sizes(&e.store.monitor)})
@@ -579,7 +595,7 @@ fn main() {
     let mut stopped = None;
     let started = Instant::now();
     for k in 1..=runs {
-        let mut now = k as i64 * RUN_SPACING_MS;
+        let mut now = k as i64 * spacing;
         let run_started = Instant::now();
         let wal0 = e.store.lsn();
         let ticket = format!("ticket-{k:06}");
@@ -601,13 +617,13 @@ fn main() {
             .run_id;
         let mut guard = 0;
         loop {
-            now += 10;
+            now += step;
             guard += 1;
             if e.drive(&mut host, now, 1).unwrap() == 0 || guard > 40 {
                 break;
             }
         }
-        now += 10;
+        now += step;
         let c = signal_contract();
         let d = e
             .admit_event(
@@ -633,7 +649,7 @@ fn main() {
             .unwrap();
         assert!(!d.duplicate);
         loop {
-            now += 10;
+            now += step;
             guard += 1;
             if e.drive(&mut host, now, 1).unwrap() == 0 || guard > 80 {
                 break;
