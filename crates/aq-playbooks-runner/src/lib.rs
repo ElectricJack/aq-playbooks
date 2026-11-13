@@ -750,19 +750,11 @@ impl<S: Storage> Engine<S> {
                 return Err(Error::Refused("forged producer identity".into()));
             }
             if let Some(old) = s.events.get(&key) {
+                // Past its window and held by nothing: it leaves first and
+                // is then new. A held one is still remembered, so it is
+                // answered as inside its window (SC-9).
                 let start = retention::window_start(s, now_ms);
-                if retention::event_expiry(s, &key)
-                    .is_some_and(|expiry| retention::expired(expiry, Some(start)))
-                {
-                    // Held (SC-9), or a forged producer: it stays, refused.
-                    if event.producer != authenticated_producer
-                        || !retention::event_droppable(s, &key, start)?
-                    {
-                        return Err(Error::Refused(
-                            "event replay horizon expired; explicit new replay identity required"
-                                .into(),
-                        ));
-                    }
+                if retention::event_droppable(s, &key, start)? {
                     retention::forget_event(s, &key)?;
                     return Ok(None);
                 }

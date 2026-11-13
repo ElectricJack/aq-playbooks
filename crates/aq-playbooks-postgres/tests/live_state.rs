@@ -1501,7 +1501,11 @@ fn window_drop_on_postgres_is_incremental_on_f3_and_fenced_on_f2() {
             "{format}"
         );
         assert_eq!(
-            s.retention.expiry.keys().copied().collect::<Vec<_>>(),
+            s.retention
+                .expiry
+                .keys()
+                .map(|k| retention::window_entry(k).unwrap().0)
+                .collect::<Vec<_>>(),
             vec![1_063, 1_064, 3_000],
             "{format}"
         );
@@ -1536,5 +1540,24 @@ fn window_drop_on_postgres_is_incremental_on_f3_and_fenced_on_f2() {
         );
         assert_eq!(e.snapshot().unwrap().events.len(), 1, "{format}");
         assert_eq!(tombstone_rows(&ns), 0, "{format}");
+        if format == "f3" {
+            // A burst in one millisecond: one small record per entry, and
+            // each admission stays on the bounded path.
+            e.store.reset_transition_stats();
+            for i in 0..20 {
+                e.admit_once(pg_keyed(&e, &format!("burst-{i:02}")), 2_003)
+                    .unwrap();
+            }
+            assert_eq!(e.store.transition_stats().heavy, 0);
+            let row = support::client()
+                .query_one(
+                    "SELECT count(*), max(octet_length(value)) FROM aq_playbooks.state_records WHERE namespace=$1 AND field='retention.expiry'",
+                    &[&ns],
+                )
+                .unwrap();
+            let (records, largest): (i64, i32) = (row.get(0), row.get(1));
+            assert_eq!(records, 23, "k-064, k-new, the event and 20 burst entries");
+            assert!(largest <= 8, "{largest} bytes");
+        }
     }
 }

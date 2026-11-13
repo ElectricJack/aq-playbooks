@@ -73,13 +73,26 @@ pub struct RetentionState {
     /// The latest host time any commit carried; never decreases.
     #[serde(default)]
     pub clock_ms: Option<i64>,
-    /// Window entries by expiry: `WINDOW_EVENT` or `WINDOW_ADMISSION` plus
-    /// the entry's key.
+    /// Window entries in expiry order, one record each, keyed
+    /// [`window_key`]`(expiry, member)`; a member is `WINDOW_EVENT` or
+    /// `WINDOW_ADMISSION` plus the entry's key.
     #[serde(default)]
-    pub expiry: LazyMap<i64, BTreeSet<String>>,
+    pub expiry: LazyMap<String, ()>,
     /// Expiry of each keyed admission receipt that has one recorded.
     #[serde(default)]
     pub admission_expires_at_ms: LazyMap<String, i64>,
+}
+/// The `RetentionState::expiry` key of `member` expiring at
+/// `expires_at_ms`: the expiry as 16 lowercase hex digits of its
+/// order-preserving unsigned form, then the member. Byte order of keys is
+/// expiry order, then member order.
+pub fn window_key(expires_at_ms: i64, member: &str) -> String {
+    format!("{:016x}{member}", (expires_at_ms as u64) ^ (1 << 63))
+}
+/// The expiry and member of a [`window_key`].
+pub fn window_entry(key: &str) -> Option<(i64, &str)> {
+    let at = u64::from_str_radix(key.get(..16)?, 16).ok()?;
+    Some(((at ^ (1 << 63)) as i64, key.get(16..)?))
 }
 /// `RetentionState::expiry` member prefix of an admitted event.
 pub const WINDOW_EVENT: &str = "e:";
@@ -677,18 +690,12 @@ pub(crate) fn window_start(s: &State, now_ms: i64) -> i64 {
 pub(crate) fn window_insert(s: &mut State, expires_at_ms: i64, member: String) {
     s.retention
         .expiry
-        .entry(expires_at_ms)
-        .or_default()
-        .insert(member);
+        .insert(window_key(expires_at_ms, &member), ());
 }
 fn window_remove(s: &mut State, expires_at_ms: i64, member: &str) {
-    let Some(members) = s.retention.expiry.get_mut(&expires_at_ms) else {
-        return;
-    };
-    members.remove(member);
-    if members.is_empty() {
-        s.retention.expiry.remove(&expires_at_ms);
-    }
+    s.retention
+        .expiry
+        .remove(&window_key(expires_at_ms, member));
 }
 /// Whether the keyed admission receipt `key` may leave at `clock`: its
 /// window has passed and its run is no longer live (SC-10).
@@ -813,7 +820,7 @@ fn remove_event(s: &mut State, key: &str, report: &mut CommitReport) -> Result<(
 /// Drop the window entries whose expiry the clock has reached, oldest first,
 /// examining at most `limit` members. An entry still needed is deferred: a
 /// keyed receipt of a live run by the admission window, an event (see
-/// [`event_held`]) by its own window, both from the clock, so it neither
+/// [`event_held`]) by its window ([`event_window`]), both from the clock, so it neither
 /// leaves early nor blocks the entries behind it. Finding the oldest entry
 /// is one ordered lookup; the work is O(members examined). A commit without
 /// a clock drops nothing.
@@ -822,23 +829,27 @@ pub(crate) fn drop_expired(s: &mut State, limit: usize, report: &mut CommitRepor
         return Ok(());
     };
     window_step();
-    let mut slot = s.retention.expiry.next_key_by_one::<i64>(None);
+    let mut head = s.retention.expiry.next_key_by_one::<String>(None);
     for _ in 0..limit {
-        let Some(at) = slot.filter(|at| *at <= clock) else {
+        let Some(key) = head else {
             break;
         };
-        let members = s.retention.expiry.get_mut(&at);
-        let member = members.and_then(|members| members.pop_first());
-        if s.retention.expiry.get(&at).is_none_or(BTreeSet::is_empty) {
-            s.retention.expiry.remove(&at);
-            // Deferred entries go after the clock, so nothing is added
-            // behind this cursor.
+        let Some((at, member)) = window_entry(&key) else {
+            // Not a window key: it is no entry; take it out of the order.
+            s.retention.expiry.remove(&key);
             window_step();
-            slot = s.retention.expiry.next_key_by_one(Some(&at));
-        }
-        let Some(member) = member else {
+            head = s.retention.expiry.next_key_by_one(Some(&key));
             continue;
         };
+        if at > clock {
+            break;
+        }
+        let member = member.to_string();
+        s.retention.expiry.remove(&key);
+        // Deferred entries go after the clock, so nothing is added behind
+        // this cursor.
+        window_step();
+        head = s.retention.expiry.next_key_by_one(Some(&key));
         window_step();
         if let Some(key) = member.strip_prefix(WINDOW_ADMISSION) {
             drop_admission(s, key, clock, report);
@@ -880,11 +891,23 @@ fn drop_admission(s: &mut State, key: &str, clock: i64, report: &mut CommitRepor
     remove_admission(s, key);
     report.admissions += 1;
 }
+/// The window of event `key`: `max(policy.event_replay_ms,
+/// contract.retention_ms)`, as when it was accepted (the policy's alone if
+/// its contract is no longer installed); at least 1 ms.
+fn event_window(s: &State, key: &str) -> i64 {
+    let policy = s.retention.policy.event_replay_ms;
+    let contract = s
+        .events
+        .get(key)
+        .and_then(|e| crate::find_event(s, &e.envelope.contract).ok())
+        .map_or(0, |c| c.retention_ms);
+    window(policy.max(contract)).max(1)
+}
 fn drop_event(s: &mut State, key: &str, clock: i64, report: &mut CommitReport) -> Result<()> {
     let member = || format!("{WINDOW_EVENT}{key}");
-    let Some(accepted_at_ms) = s.events.get(key).map(|e| e.accepted_at_ms) else {
+    if !s.events.contains_key(key) {
         return Ok(());
-    };
+    }
     let Some(at) = event_expiry(s, key) else {
         return Ok(());
     };
@@ -893,15 +916,7 @@ fn drop_event(s: &mut State, key: &str, clock: i64, report: &mut CommitReport) -
         return Ok(());
     }
     if event_held(s, key)? {
-        // Its own window (`max(event_replay_ms, contract.retention_ms)`).
-        let own = s
-            .retention
-            .event_expires_at_ms
-            .get(key)
-            .map(|expiry| expiry.saturating_sub(accepted_at_ms))
-            .unwrap_or_else(|| window(s.retention.policy.event_replay_ms))
-            .max(1);
-        let next = clock.saturating_add(own);
+        let next = clock.saturating_add(event_window(s, key));
         s.retention.event_expires_at_ms.insert(key.into(), next);
         window_insert(s, next, member());
         report.deferred += 1;
@@ -1381,7 +1396,36 @@ mod window_tests {
         assert!(s.keyed_admissions.contains_key("k-00000"));
         assert_eq!(
             s.retention.expiry.into_plain(),
-            BTreeMap::from([(2_000, BTreeSet::from(["k:k-00000".to_string()]))])
+            BTreeMap::from([(window_key(2_000, "k:k-00000"), ())])
         );
+    }
+    #[test]
+    fn window_keys_sort_by_expiry_then_member() {
+        let at = [i64::MIN, -1, 0, 1, 999, 1_000, i64::MAX];
+        let keys: Vec<String> = at.iter().map(|at| window_key(*at, "k:x")).collect();
+        assert!(keys.windows(2).all(|w| w[0] < w[1]), "{keys:?}");
+        assert!(window_key(5, "e:z") < window_key(6, "e:a"));
+        assert!(window_key(5, "e:a") < window_key(5, "k:a"));
+        for at in at {
+            assert_eq!(window_entry(&window_key(at, "k:x")), Some((at, "k:x")));
+        }
+    }
+    /// The order is one record per entry: a burst in one millisecond adds
+    /// records, it does not grow one.
+    #[test]
+    fn a_same_millisecond_burst_is_one_record_per_entry() {
+        let mut s = State::default();
+        for i in 0..100 {
+            window_insert(&mut s, 7, format!("{WINDOW_EVENT}e-{i:03}"));
+        }
+        assert_eq!(s.retention.expiry.len(), 100);
+        assert!(s.retention.expiry.keys().all(|k| k.len() == 16 + 2 + 5));
+    }
+    /// A State written by Task 6's first commit (`expiry` as expiry → set of
+    /// members) is refused when decoded, not silently emptied.
+    #[test]
+    fn the_first_task_6_expiry_shape_is_refused() {
+        let old = serde_json::json!({"1000": ["k:x"]});
+        assert!(serde_json::from_value::<LazyMap<String, ()>>(old).is_err());
     }
 }
