@@ -6563,7 +6563,25 @@
                 "level_hint": {
                   "max_length": 64,
                   "type": "string",
-                  "values": []
+                  "values": [
+                    "",
+                    "complex-high",
+                    "complex-low",
+                    "complex-max",
+                    "complex-medium",
+                    "deep-high",
+                    "deep-low",
+                    "deep-max",
+                    "deep-medium",
+                    "simple-high",
+                    "simple-low",
+                    "simple-max",
+                    "simple-medium",
+                    "standard-high",
+                    "standard-low",
+                    "standard-max",
+                    "standard-medium"
+                  ]
                 },
                 "origin": {
                   "max_length": 128,
@@ -6596,6 +6614,7 @@
                 "description",
                 "ended_attempts",
                 "kind",
+                "level_hint",
                 "origin",
                 "route",
                 "title"
@@ -6702,6 +6721,15 @@
           "classification": {
             "inner": {
               "properties": {
+                "fields": {
+                  "items": {
+                    "max_length": 64,
+                    "type": "string",
+                    "values": []
+                  },
+                  "max_items": 16,
+                  "type": "array"
+                },
                 "flags": {
                   "items": {
                     "max_length": 64,
@@ -6724,12 +6752,19 @@
                   "max_length": 4096,
                   "type": "string",
                   "values": []
+                },
+                "reference": {
+                  "max_length": 4096,
+                  "type": "string",
+                  "values": []
                 }
               },
               "required": [
+                "fields",
                 "flags",
                 "labels",
-                "rationale"
+                "rationale",
+                "reference"
               ],
               "type": "object"
             },
@@ -6741,7 +6776,7 @@
               "type": "string",
               "values": []
             },
-            "max_items": 16,
+            "max_items": 8,
             "type": "array"
           },
           "hold": {
@@ -6750,7 +6785,24 @@
           "level": {
             "max_length": 64,
             "type": "string",
-            "values": []
+            "values": [
+              "complex-high",
+              "complex-low",
+              "complex-max",
+              "complex-medium",
+              "deep-high",
+              "deep-low",
+              "deep-max",
+              "deep-medium",
+              "simple-high",
+              "simple-low",
+              "simple-max",
+              "simple-medium",
+              "standard-high",
+              "standard-low",
+              "standard-max",
+              "standard-medium"
+            ]
           },
           "prefer": {
             "items": {
@@ -6758,7 +6810,7 @@
               "type": "string",
               "values": []
             },
-            "max_items": 16,
+            "max_items": 8,
             "type": "array"
           },
           "providers": {
@@ -6767,7 +6819,7 @@
               "type": "string",
               "values": []
             },
-            "max_items": 16,
+            "max_items": 8,
             "type": "array"
           },
           "reasons": {
@@ -6778,6 +6830,7 @@
                   "type": "string",
                   "values": [
                     "classification_failed",
+                    "deep_reserved",
                     "escalated_after_failure",
                     "harness_excluded",
                     "harness_preferred",
@@ -6787,20 +6840,21 @@
                     "hint_respected",
                     "level_from_kind",
                     "level_lowered",
-                    "nothing_allowed",
+                    "policy",
                     "raised_for_risk",
-                    "risk_assumed"
+                    "risk_assumed",
+                    "risk_relaxed",
+                    "second_opinion"
                   ]
                 },
                 "detail": {
-                  "max_length": 400,
+                  "max_length": 256,
                   "type": "string",
                   "values": []
                 }
               },
               "required": [
-                "code",
-                "detail"
+                "code"
               ],
               "type": "object"
             },
@@ -6888,6 +6942,33 @@
         },
         "routed": {
           "properties": {
+            "harnesses": {
+              "items": {
+                "max_length": 64,
+                "type": "string",
+                "values": []
+              },
+              "max_items": 8,
+              "type": "array"
+            },
+            "prefer": {
+              "items": {
+                "max_length": 64,
+                "type": "string",
+                "values": []
+              },
+              "max_items": 8,
+              "type": "array"
+            },
+            "providers": {
+              "items": {
+                "max_length": 64,
+                "type": "string",
+                "values": []
+              },
+              "max_items": 8,
+              "type": "array"
+            },
             "reference": {
               "max_length": 4096,
               "type": "string",
@@ -6914,6 +6995,9 @@
             }
           },
           "required": [
+            "harnesses",
+            "prefer",
+            "providers",
             "reference",
             "subject"
           ],

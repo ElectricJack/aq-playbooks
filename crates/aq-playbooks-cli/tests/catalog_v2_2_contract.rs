@@ -10,9 +10,12 @@ use std::path::PathBuf;
 
 const ADDED_COMMANDS: [&str; 3] = ["judgment.assess", "work.read", "work.route"];
 const ADDED_EVENTS: [&str; 2] = ["aq.judgment.assessed", "aq.work.route_needed"];
-/// The fixed reasons a route may give; a playbook cannot build text.
-const ROUTE_REASONS: [&str; 13] = [
+/// The fixed reasons a route may give. A playbook cannot build text, so a
+/// reason is a code plus, optionally, a literal sentence; `policy` is the
+/// catch-all whose sentence is the document's own.
+const ROUTE_REASONS: [&str; 16] = [
     "classification_failed",
+    "deep_reserved",
     "escalated_after_failure",
     "harness_excluded",
     "harness_preferred",
@@ -21,11 +24,36 @@ const ROUTE_REASONS: [&str; 13] = [
     "hint_capped",
     "hint_respected",
     "level_from_kind",
-    "nothing_allowed",
+    "level_lowered",
+    "policy",
     "raised_for_risk",
     "risk_assumed",
-    "level_lowered",
+    "risk_relaxed",
+    "second_opinion",
 ];
+/// Every syntactically valid level: parent x effort (`aq_routing::Class`).
+/// Whether Settings offers one is the host's check when a route is written.
+const LEVELS: [&str; 16] = [
+    "simple-low",
+    "simple-medium",
+    "simple-high",
+    "simple-max",
+    "standard-low",
+    "standard-medium",
+    "standard-high",
+    "standard-max",
+    "complex-low",
+    "complex-medium",
+    "complex-high",
+    "complex-max",
+    "deep-low",
+    "deep-medium",
+    "deep-high",
+    "deep-max",
+];
+/// Harness and provider lists in a route: short enough for the 2 KiB route
+/// the host keeps on the task.
+const MAX_ROUTE_NAMES: usize = 8;
 
 fn fixtures() -> Value {
     serde_json::from_str(include_str!(
@@ -73,6 +101,12 @@ fn outcome(extra: &[(&str, Schema)]) -> Schema {
     Schema::Object {
         properties,
         required,
+    }
+}
+fn level(extra: &[&str]) -> Schema {
+    Schema::String {
+        max_length: 64,
+        values: LEVELS.iter().chain(extra).map(|s| (*s).into()).collect(),
     }
 }
 fn without_required(schema: Schema, optional: &[&str]) -> Schema {
@@ -142,22 +176,20 @@ fn event(name: &str, payload: Schema, correlation: &[&str], subject_path: &str) 
 }
 
 fn work_read() -> CommandContract {
-    let facts = without_required(
-        object(&[
-            ("kind", string(64)),
-            ("title", string(512)),
-            ("description", string(8192)),
-            (
-                "origin",
-                enumeration(&["owner", "agent", "supervisor", "playbook", "unknown"]),
-            ),
-            ("level_hint", string(64)),
-            ("charged_failures", range(0, 1000)),
-            ("ended_attempts", range(0, 1000)),
-            ("route", enumeration(&["none", "router", "owner"])),
-        ]),
-        &["level_hint"],
-    );
+    let facts = object(&[
+        ("kind", string(64)),
+        ("title", string(512)),
+        ("description", string(8192)),
+        (
+            "origin",
+            enumeration(&["owner", "agent", "supervisor", "playbook", "unknown"]),
+        ),
+        // `""` when none was asked for.
+        ("level_hint", level(&[""])),
+        ("charged_failures", range(0, 1000)),
+        ("ended_attempts", range(0, 1000)),
+        ("route", enumeration(&["none", "router", "owner"])),
+    ]);
     command(
         "work.read",
         object(&[("subject", subject())]),
@@ -179,29 +211,29 @@ fn work_read() -> CommandContract {
 }
 fn classification() -> Schema {
     object(&[
+        ("reference", text()),
+        ("fields", array(string(64), 16)),
         ("labels", array(string(128), 16)),
         ("flags", array(string(64), 32)),
         ("rationale", string(4096)),
     ])
 }
 fn work_route() -> CommandContract {
-    let names = || array(string(64), 16);
+    let names = || array(string(64), MAX_ROUTE_NAMES);
+    let reason = without_required(
+        object(&[("code", code(&ROUTE_REASONS)), ("detail", string(256))]),
+        &["detail"],
+    );
     command(
         "work.route",
         object(&[
             ("subject", subject()),
-            ("level", string(64)),
+            ("level", level(&[])),
             ("harnesses", names()),
             ("providers", names()),
             ("prefer", names()),
             ("hold", Schema::Boolean),
-            (
-                "reasons",
-                array(
-                    object(&[("code", code(&ROUTE_REASONS)), ("detail", string(400))]),
-                    16,
-                ),
-            ),
+            ("reasons", array(reason, 16)),
             (
                 "classification",
                 Schema::Nullable {
@@ -210,7 +242,16 @@ fn work_route() -> CommandContract {
             ),
         ]),
         &[
-            ("routed", result()),
+            // What remained of each list after the host intersected it
+            // with what the level offers.
+            (
+                "routed",
+                outcome(&[
+                    ("harnesses", names()),
+                    ("providers", names()),
+                    ("prefer", names()),
+                ]),
+            ),
             ("stale", result()),
             (
                 "refused",
@@ -547,6 +588,62 @@ fn catalog_v2_2_manifest_and_fixtures_are_pinned() {
     for field in ["labels", "flags", "rationale"] {
         assert_eq!(kept[field], answer[field], "{field}");
     }
+    // ...plus the judgment's reference and the field ids, to show it alone.
+    assert_eq!(kept["reference"], answer["reference"]);
+    assert_eq!(kept["fields"], array(string(64), 16));
+    // Levels are the closed set of classes; no hint is "".
+    assert_eq!(properties["level"], level(&[]));
+    let Schema::Object {
+        properties: observed,
+        ..
+    } = &read.outcomes["observed"]
+    else {
+        panic!("observed is an object")
+    };
+    let Schema::Object {
+        properties: facts,
+        required,
+    } = &observed["facts"]
+    else {
+        panic!("facts is an object")
+    };
+    assert_eq!(facts["level_hint"], level(&[""]));
+    assert!(required.contains("level_hint"));
+    assert!(!facts.contains_key("priority"));
+    // A reason's sentence is optional; no code pins "nothing allowed".
+    let Schema::Array { items, .. } = &properties["reasons"] else {
+        panic!("reasons is an array")
+    };
+    let Schema::Object {
+        properties: reason,
+        required,
+    } = items.as_ref()
+    else {
+        panic!("a reason is an object")
+    };
+    assert_eq!(required, &strings(&["code"]));
+    assert_eq!(reason["detail"], string(256));
+    assert_eq!(reason["code"], code(&ROUTE_REASONS));
+    for c in ["policy", "risk_relaxed", "deep_reserved", "second_opinion"] {
+        assert!(ROUTE_REASONS.contains(&c), "{c}");
+    }
+    assert!(!ROUTE_REASONS.contains(&"nothing_allowed"));
+    // `routed` reports what remained of each list at the level.
+    let Schema::Object {
+        properties: remained,
+        ..
+    } = &route.outcomes["routed"]
+    else {
+        panic!("routed is an object")
+    };
+    for list in ["harnesses", "providers", "prefer"] {
+        assert_eq!(remained[list], properties[list], "{list}");
+        assert_eq!(
+            properties[list],
+            array(string(64), MAX_ROUTE_NAMES),
+            "{list}"
+        );
+    }
 }
 
 #[test]
@@ -827,6 +924,50 @@ fn valid_and_invalid_fixture_cases_validate_as_declared() {
 const ROUTING_DRAFT: &str = include_str!("data/routing_draft.json");
 const ROUTING_MARKDOWN: &str = "# Routing\n\nThe owner's routing document (docs/specs/0011-routing-policy-default.md in aq-server).\n";
 
+/// What Settings offers in the owner's live shape, with every level the
+/// document names (Simple high, Standard high, Complex medium and high, Deep):
+/// a local model (opencode on ollama) only at Simple and Standard, gemini up to
+/// Complex, Deep only Claude and Codex.
+fn routing_facts() -> BTreeMap<String, Value> {
+    let everyone = json!({"harnesses": ["claude", "codex", "gemini", "opencode"],
+                          "providers": ["anthropic", "google", "ollama", "openai"]});
+    let hosted = json!({"harnesses": ["claude", "codex", "gemini"],
+                        "providers": ["anthropic", "google", "openai"]});
+    let deep = json!({"harnesses": ["claude", "codex"], "providers": ["anthropic", "openai"]});
+    let offers = json!({
+        "simple-low": everyone, "simple-high": everyone,
+        "standard-low": everyone, "standard-medium": everyone, "standard-high": everyone,
+        "complex-low": hosted, "complex-medium": hosted, "complex-high": hosted,
+        "deep-low": deep, "deep-high": deep,
+    });
+    BTreeMap::from([
+        (
+            "levels".into(),
+            json!([
+                "simple-low",
+                "simple-high",
+                "standard-low",
+                "standard-medium",
+                "standard-high",
+                "complex-low",
+                "complex-medium",
+                "complex-high",
+                "deep-low",
+                "deep-high"
+            ]),
+        ),
+        ("offers".into(), offers),
+        (
+            "harnesses".into(),
+            json!(["claude", "codex", "gemini", "opencode"]),
+        ),
+        (
+            "providers".into(),
+            json!(["anthropic", "google", "ollama", "openai"]),
+        ),
+    ])
+}
+
 fn routing_workspace() -> Workspace {
     Workspace {
         markdown: ROUTING_MARKDOWN.into(),
@@ -846,39 +987,7 @@ fn routing_workspace() -> Workspace {
             facts_version: "settings-1".into(),
         },
         catalog: catalog::catalog_v2_2(),
-        facts: BTreeMap::from([
-            (
-                "levels".into(),
-                json!([
-                    "simple-low",
-                    "simple-high",
-                    "standard-low",
-                    "standard-medium",
-                    "standard-high",
-                    "complex-low",
-                    "complex-high",
-                    "deep-low",
-                    "deep-high"
-                ]),
-            ),
-            (
-                "offers".into(),
-                json!([
-                    {"provider": "anthropic", "harness": "claude"},
-                    {"provider": "openai", "harness": "codex"},
-                    {"provider": "google", "harness": "gemini"},
-                    {"provider": "ollama", "harness": "opencode"}
-                ]),
-            ),
-            (
-                "harnesses".into(),
-                json!(["claude", "codex", "gemini", "opencode"]),
-            ),
-            (
-                "providers".into(),
-                json!(["anthropic", "google", "ollama", "openai"]),
-            ),
-        ]),
+        facts: routing_facts(),
         draft: serde_json::from_str(ROUTING_DRAFT).unwrap(),
     }
 }
@@ -918,6 +1027,8 @@ fn the_routing_document_draft_checks_against_catalog_2_2_0() {
     let mut wrong = ws.clone();
     wrong.draft["steps"]["assume"]["op"]["input"]["fields"]["classification"] = json!({
         "op": "object", "fields": {
+            "reference": {"op": "literal", "value": ""},
+            "fields": {"op": "literal", "value": []},
             "labels": {"op": "ref", "root": "answer", "path": ["c", "output", "labels"]},
             "flags": {"op": "literal", "value": []},
             "rationale": {"op": "literal", "value": ""}}});
@@ -963,15 +1074,24 @@ fn the_routing_document_draft_checks_against_catalog_2_2_0() {
     );
 }
 
-/// The route the draft computes for one classified task.
-fn route_for(facts: Value, labels: [&str; 2], flags: &[&str]) -> Value {
+/// The route the draft writes for one classified task: its `route` step's
+/// input, evaluated after a `work.read` and an `assessed` answer.
+fn route_for(task: &Task) -> Value {
     let ws = routing_workspace();
     let input: Expr =
         serde_json::from_value(ws.draft["steps"]["route"]["op"]["input"].clone()).unwrap();
     let subject = json!({"id": "task-1", "revision": 3});
+    let facts = json!({"kind": task.filed_kind, "title": "A task", "description": "",
+        "origin": "owner", "level_hint": task.hint, "charged_failures": task.failures,
+        "ended_attempts": task.failures, "route": "none"});
     let answer = json!({"c": {"participant": "judgment:op-1", "outcome": "assessed", "output": {
-        "reference": "judgment:op-1", "subject": subject, "labels": labels, "flags": flags,
-        "rationale": "Because.", "provenance": fixtures()["assessed_guarantee"]["assessed"]["provenance"]}}});
+        "reference": "judgment:op-1", "subject": subject, "labels": [task.kind, task.risk],
+        "flags": task.flags, "rationale": "Because.",
+        "provenance": fixtures()["assessed_guarantee"]["assessed"]["provenance"]}}});
+    let v22 = catalog::catalog_v2_2();
+    v22.commands["work.read"].outcomes["observed"]
+        .validate(&json!({"reference": "task-1@3", "subject": subject, "facts": facts}))
+        .unwrap();
     let context = EvalContext::from([
         (
             "task".into(),
@@ -988,122 +1108,550 @@ fn route_for(facts: Value, labels: [&str; 2], flags: &[&str]) -> Value {
     let EvalValue::Known(route) = eval(&input, &context, &EvalLimits::default()).unwrap() else {
         panic!("the route is known")
     };
-    catalog::catalog_v2_2().commands["work.route"]
-        .input
-        .validate(&route)
-        .unwrap();
+    v22.commands["work.route"].input.validate(&route).unwrap();
     route
 }
-fn task_facts(kind: &str, hint: Option<&str>, charged_failures: i64) -> Value {
-    let mut facts = json!({"kind": kind, "title": "A task", "description": "", "origin": "owner",
-        "charged_failures": charged_failures, "ended_attempts": charged_failures, "route": "none"});
-    if let Some(hint) = hint {
-        facts["level_hint"] = json!(hint);
+/// What the host keeps of a route at its level, as `work.route` documents:
+/// each list intersected with what the level offers, or `None` (`refused
+/// not_offered`) when the level is not offered or a restricting list is left
+/// empty. A `prefer` entry never causes a refusal.
+fn host_keeps(route: &Value) -> Option<Value> {
+    let offers = &routing_facts()["offers"];
+    let at = offers.get(route["level"].as_str().unwrap())?;
+    let mut kept = json!({});
+    for (list, offered) in [
+        ("harnesses", "harnesses"),
+        ("providers", "providers"),
+        ("prefer", "harnesses"),
+    ] {
+        let asked = route[list].as_array().unwrap();
+        let left: Vec<&Value> = asked
+            .iter()
+            .filter(|n| at[offered].as_array().unwrap().contains(n))
+            .collect();
+        if list != "prefer" && !asked.is_empty() && left.is_empty() {
+            return None;
+        }
+        kept[list] = json!(left);
     }
-    facts
+    Some(kept)
 }
-fn codes(route: &Value) -> Vec<&str> {
-    route["reasons"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r["code"].as_str().unwrap())
-        .collect()
+struct Task {
+    filed_kind: &'static str,
+    hint: &'static str,
+    failures: i64,
+    kind: &'static str,
+    risk: &'static str,
+    flags: &'static [&'static str],
+}
+struct Expected {
+    level: &'static str,
+    harnesses: &'static [&'static str],
+    prefer: &'static [&'static str],
+    hold: bool,
+    codes: &'static [&'static str],
+}
+const NT: &[&str] = &["narrow", "covered_by_test"];
+const CC: &[&str] = &["claude", "codex"];
+const ANY: &[&str] = &[];
+fn task(kind: &'static str, risk: &'static str, flags: &'static [&'static str]) -> Task {
+    Task {
+        filed_kind: kind,
+        hint: "",
+        failures: 0,
+        kind,
+        risk,
+        flags,
+    }
+}
+fn expect(
+    level: &'static str,
+    harnesses: &'static [&'static str],
+    codes: &'static [&'static str],
+) -> Expected {
+    Expected {
+        level,
+        harnesses,
+        prefer: &[],
+        hold: false,
+        codes,
+    }
 }
 
+/// Each row is a concrete task and the route the owner's routing document
+/// (aq-server `docs/specs/0011-routing-policy-default.md`) gives it; the
+/// comment quotes the sentence, with its line.
 #[test]
-fn the_routing_draft_computes_the_documents_routes() {
-    // "A bug fix that has already failed once for a real reason moves up to Complex."
-    let r = route_for(task_facts("bugfix", None, 1), ["bugfix", "high"], &[]);
-    assert_eq!(r["level"], "complex-high");
-    assert_eq!(r["harnesses"], json!(["claude", "codex"]));
-    assert_eq!(r["hold"], false);
+fn the_routing_draft_routes_as_the_document_says() {
+    let hint = |t: Task, hint| Task { hint, ..t };
+    let failed = |t: Task, failures| Task { failures, ..t };
+    let prefer = |e: Expected, prefer| Expected { prefer, ..e };
+    let rows: Vec<(&str, Task, Expected)> = vec![
+        // 16: "Features, bug fixes, refactors, tests and docs are Standard, high effort."
+        // 66: "Anything not mentioned here, takes only low risk work." Low risk: anyone.
+        (
+            "feature, low",
+            task("feature", "low", &[]),
+            expect("standard-high", ANY, &["level_from_kind"]),
+        ),
+        // 61: "High and very high risk work goes only to Claude or Codex."
+        // 52: "Medium and high risk work is at least Standard, high effort."
+        (
+            "refactor, high",
+            task("refactor", "high", &[]),
+            expect(
+                "standard-high",
+                CC,
+                &["level_from_kind", "harnesses_limited"],
+            ),
+        ),
+        // 62: "Medium risk work goes to Claude or Codex."
+        (
+            "bugfix, medium",
+            task("bugfix", "medium", &[]),
+            expect(
+                "standard-high",
+                CC,
+                &["level_from_kind", "harnesses_limited"],
+            ),
+        ),
+        // 64: "Low risk work that is narrow and covered by a test should go to a local model first."
+        (
+            "test, low, narrow and covered",
+            task("test", "low", NT),
+            prefer(
+                expect(
+                    "standard-high",
+                    ANY,
+                    &["level_from_kind", "harness_preferred"],
+                ),
+                &["opencode"],
+            ),
+        ),
+        (
+            "docs, low, narrow and covered",
+            task("docs", "low", NT),
+            prefer(
+                expect(
+                    "standard-high",
+                    ANY,
+                    &["level_from_kind", "harness_preferred"],
+                ),
+                &["opencode"],
+            ),
+        ),
+        // 18: "Chores and syncs are Simple, high effort."
+        (
+            "chore, low",
+            task("chore", "low", &[]),
+            expect("simple-high", ANY, &["level_from_kind"]),
+        ),
+        // 18 + 52: a medium-risk sync is raised to the risk floor.
+        (
+            "sync, medium",
+            task("sync", "medium", &[]),
+            expect(
+                "standard-high",
+                CC,
+                &["level_from_kind", "raised_for_risk", "harnesses_limited"],
+            ),
+        ),
+        // 19: "Specs, designs, implementation plans and reviews of someone else's work are Complex, high effort."
+        (
+            "spec, medium",
+            task("spec", "medium", &[]),
+            expect(
+                "complex-high",
+                CC,
+                &["level_from_kind", "harnesses_limited"],
+            ),
+        ),
+        (
+            "review, medium",
+            task("review", "medium", &[]),
+            expect(
+                "complex-high",
+                CC,
+                &["level_from_kind", "harnesses_limited"],
+            ),
+        ),
+        // 67: "Design and planning go to Claude first, and to Codex only when Claude can't take them."
+        (
+            "design, low",
+            task("design", "low", NT),
+            prefer(
+                expect(
+                    "complex-high",
+                    CC,
+                    &["level_from_kind", "harness_preferred"],
+                ),
+                &["claude"],
+            ),
+        ),
+        (
+            "plan, high",
+            task("plan", "high", &[]),
+            prefer(
+                expect(
+                    "complex-high",
+                    CC,
+                    &["level_from_kind", "harness_preferred"],
+                ),
+                &["claude"],
+            ),
+        ),
+        // 21: "Research is Standard, high effort, unless it is clearly harder, in which case it is Complex, high effort."
+        (
+            "research, low",
+            task("research", "low", &[]),
+            expect("standard-high", ANY, &["level_from_kind"]),
+        ),
+        (
+            "research, low, clearly harder",
+            task("research", "low", &["clearly_harder"]),
+            expect("complex-high", ANY, &["level_from_kind"]),
+        ),
+        // 23: "Deep is only for analysis, planning or spec writing that needs advanced mathematics or unusually hard reasoning."
+        (
+            "analysis, medium, deep reasoning",
+            task("analysis", "medium", &["needs_deep_reasoning"]),
+            expect(
+                "deep-high",
+                CC,
+                &["level_from_kind", "deep_reserved", "harnesses_limited"],
+            ),
+        ),
+        (
+            "plan, medium, deep reasoning",
+            task("plan", "medium", &["needs_deep_reasoning"]),
+            prefer(
+                expect(
+                    "deep-high",
+                    CC,
+                    &["level_from_kind", "deep_reserved", "harness_preferred"],
+                ),
+                &["claude"],
+            ),
+        ),
+        // Ambiguous (report): analysis without hard reasoning is not named; "Most tasks belong here" (17).
+        (
+            "analysis, low",
+            task("analysis", "low", &[]),
+            expect("standard-high", ANY, &["level_from_kind"]),
+        ),
+        // 24: "A big task is not a Deep task, and neither is a risky one."
+        (
+            "review, very high, deep reasoning flag",
+            task("review", "very_high", &["needs_deep_reasoning"]),
+            expect(
+                "complex-high",
+                CC,
+                &["level_from_kind", "harnesses_limited"],
+            ),
+        ),
+        // 69: "Art and visual design go to Codex, and wait for it rather than going elsewhere."
+        (
+            "art, medium",
+            task("art", "medium", &[]),
+            Expected {
+                hold: true,
+                ..expect(
+                    "standard-high",
+                    &["codex"],
+                    &["level_from_kind", "held_for_harness"],
+                )
+            },
+        ),
+        (
+            "art, low, narrow and covered",
+            task("art", "low", NT),
+            Expected {
+                hold: true,
+                ..expect(
+                    "standard-high",
+                    &["codex"],
+                    &["level_from_kind", "held_for_harness"],
+                )
+            },
+        ),
+        // 73: "Repairs to a failed integration or build never go to a local model."
+        (
+            "repair, low, narrow and covered",
+            task("repair", "low", NT),
+            expect(
+                "standard-high",
+                &["claude", "codex", "gemini"],
+                &["level_from_kind", "harness_excluded"],
+            ),
+        ),
+        (
+            "repair, medium, narrow and covered",
+            task("repair", "medium", NT),
+            expect(
+                "standard-high",
+                CC,
+                &["level_from_kind", "harnesses_limited", "harness_excluded"],
+            ),
+        ),
+        // 53: "Very high risk work is at least Complex, medium effort, ..."
+        (
+            "feature, very high",
+            task("feature", "very_high", &[]),
+            expect(
+                "complex-medium",
+                CC,
+                &["level_from_kind", "raised_for_risk", "harnesses_limited"],
+            ),
+        ),
+        // 53: "... unless it is narrow and covered by a test, in which case Standard, high effort is enough."
+        (
+            "feature, very high, narrow and covered",
+            task("feature", "very_high", NT),
+            expect(
+                "standard-high",
+                CC,
+                &["level_from_kind", "risk_relaxed", "harnesses_limited"],
+            ),
+        ),
+        // 62: "It may go to a local model only when the task is narrow, covered by a test, and Standard."
+        (
+            "refactor, medium, narrow and covered",
+            task("refactor", "medium", NT),
+            expect(
+                "standard-high",
+                &["claude", "codex", "opencode"],
+                &["level_from_kind", "harnesses_limited"],
+            ),
+        ),
+        (
+            "refactor, medium, narrow and covered, asked for Complex",
+            hint(task("refactor", "medium", NT), "complex-high"),
+            expect("complex-high", CC, &["hint_respected", "harnesses_limited"]),
+        ),
+        // 31: "A bug fix that has already failed once for a real reason moves up to Complex."
+        (
+            "bugfix, high, no failure",
+            task("bugfix", "high", &[]),
+            expect(
+                "standard-high",
+                CC,
+                &["level_from_kind", "harnesses_limited"],
+            ),
+        ),
+        (
+            "bugfix, high, one failure",
+            failed(task("bugfix", "high", &[]), 1),
+            expect(
+                "complex-high",
+                CC,
+                &[
+                    "level_from_kind",
+                    "escalated_after_failure",
+                    "harnesses_limited",
+                ],
+            ),
+        ),
+        (
+            "bugfix, high, two failures",
+            failed(task("bugfix", "high", &[]), 2),
+            expect(
+                "complex-high",
+                CC,
+                &[
+                    "level_from_kind",
+                    "escalated_after_failure",
+                    "harnesses_limited",
+                ],
+            ),
+        ),
+        // Failures only escalate bug fixes.
+        (
+            "feature, low, one failure",
+            failed(task("feature", "low", &[]), 1),
+            expect("standard-high", ANY, &["level_from_kind"]),
+        ),
+        // 27: "If whoever filed the task asked for a level, respect it, ..."
+        (
+            "feature, asked for Standard low",
+            hint(task("feature", "low", &[]), "standard-low"),
+            expect("standard-low", ANY, &["hint_respected"]),
+        ),
+        (
+            "chore, asked for Simple low",
+            hint(task("chore", "low", &[]), "simple-low"),
+            expect("simple-low", ANY, &["hint_respected"]),
+        ),
+        // 52: the risk floor still applies to a level asked for.
+        (
+            "bugfix, medium, asked for Simple low",
+            hint(task("bugfix", "medium", &[]), "simple-low"),
+            expect(
+                "standard-high",
+                CC,
+                &["hint_respected", "raised_for_risk", "harnesses_limited"],
+            ),
+        ),
+        // 28: "... but don't go above Standard for tests, docs, chores and syncs, ..."
+        (
+            "docs, asked for Complex",
+            hint(task("docs", "low", &[]), "complex-high"),
+            expect("standard-high", ANY, &["hint_capped"]),
+        ),
+        (
+            "sync, asked for Deep",
+            hint(task("sync", "low", &[]), "deep-high"),
+            expect("standard-high", ANY, &["hint_capped"]),
+        ),
+        // 28: "... or above Complex for ordinary implementation work."
+        (
+            "feature, asked for Deep",
+            hint(task("feature", "low", &[]), "deep-high"),
+            expect("complex-high", ANY, &["hint_capped"]),
+        ),
+        // 23 + 31 + 71: an escalated bug fix never reaches Deep, asked for or not.
+        (
+            "bugfix, one failure, asked for Deep",
+            failed(hint(task("bugfix", "high", &[]), "deep-high"), 1),
+            expect("complex-high", CC, &["hint_capped", "harnesses_limited"]),
+        ),
+        // 23: a level asked for does not lift other work to Deep.
+        (
+            "review, asked for Deep",
+            hint(task("review", "low", &[]), "deep-high"),
+            expect("complex-high", ANY, &["deep_reserved"]),
+        ),
+        (
+            "analysis, asked for Deep, no hard reasoning",
+            hint(task("analysis", "low", &[]), "deep-high"),
+            expect("complex-high", ANY, &["deep_reserved"]),
+        ),
+        (
+            "analysis, asked for Deep, hard reasoning",
+            hint(
+                task("analysis", "low", &["needs_deep_reasoning"]),
+                "deep-high",
+            ),
+            expect("deep-high", ANY, &["deep_reserved", "hint_respected"]),
+        ),
+        // A level Settings does not offer is not used (report: a reading).
+        (
+            "feature, asked for an unoffered level",
+            hint(task("feature", "low", &[]), "complex-max"),
+            expect("standard-high", ANY, &["level_from_kind", "policy"]),
+        ),
+        // 81: "If the risk or the kind of work can't be worked out, don't block the task.
+        //      Route it as medium risk at Standard, high effort, on Claude or Codex, and
+        //      say that the risk was assumed."
+        (
+            "unknown kind, low, narrow and covered",
+            Task {
+                kind: "unknown",
+                ..task("", "low", NT)
+            },
+            expect(
+                "standard-high",
+                CC,
+                &["level_from_kind", "risk_assumed", "harnesses_limited"],
+            ),
+        ),
+        (
+            "feature, unknown risk, narrow and covered",
+            task("feature", "unknown", NT),
+            expect(
+                "standard-high",
+                CC,
+                &["level_from_kind", "risk_assumed", "harnesses_limited"],
+            ),
+        ),
+        // 64 + C2: a local model first, but none is offered at Complex; the host drops it.
+        (
+            "spec, low, narrow and covered",
+            task("spec", "low", NT),
+            prefer(
+                expect(
+                    "complex-high",
+                    ANY,
+                    &["level_from_kind", "harness_preferred"],
+                ),
+                &["opencode"],
+            ),
+        ),
+    ];
+    assert!(rows.len() >= 16);
+    for (name, task, want) in &rows {
+        let r = route_for(task);
+        let codes: Vec<&str> = r["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["code"].as_str().unwrap())
+            .collect();
+        assert_eq!(r["level"], want.level, "{name}");
+        assert_eq!(r["harnesses"], json!(want.harnesses), "{name}");
+        assert_eq!(r["providers"], json!([]), "{name}");
+        assert_eq!(r["prefer"], json!(want.prefer), "{name}");
+        assert_eq!(r["hold"], want.hold, "{name}");
+        assert_eq!(codes, want.codes, "{name}");
+        assert_eq!(
+            r["classification"]["fields"],
+            json!(["kind", "risk"]),
+            "{name}"
+        );
+        assert_eq!(r["classification"]["reference"], "judgment:op-1", "{name}");
+        // Every reason says why, in the document's words.
+        for reason in r["reasons"].as_array().unwrap() {
+            assert!(
+                reason["detail"].as_str().is_some_and(|d| !d.is_empty()),
+                "{name}"
+            );
+        }
+        // Under the owner's Settings, nothing the document allows is refused.
+        assert!(host_keeps(&r).is_some(), "{name}: {r}");
+    }
+    // The host drops a preference the level does not offer; it never refuses.
+    let spec = route_for(&task("spec", "low", NT));
+    assert_eq!(host_keeps(&spec).unwrap()["prefer"], json!([]));
+}
+
+/// The playbook ends `unservable`, with its reason, exactly when `work.route`
+/// is refused `not_offered`: "If nothing allowed could ever take it, leave it
+/// unrouted and visible, say why on the task, and raise it for my attention."
+#[test]
+fn the_routing_draft_ends_unservable_only_when_nothing_is_offered() {
+    let ws = routing_workspace();
+    let steps = &ws.draft["steps"];
+    for (step, decide) in [("route", "route_refused"), ("assume", "assume_refused")] {
+        assert_eq!(steps[step]["edges"]["refused"], decide);
+        assert_eq!(steps[step]["edges"]["stale"], "skip");
+        assert_eq!(steps[decide]["edges"]["true"], "unservable");
+        assert_eq!(steps[decide]["edges"]["false"], "skip");
+        let predicate = &steps[decide]["op"]["predicate"];
+        assert_eq!(predicate["right"]["value"], "not_offered");
+    }
+    let unservable = &steps["unservable"]["op"];
+    assert_eq!(unservable["outcome"], "unservable");
+    let schema: Schema =
+        serde_json::from_value(ws.draft["entries"]["main"]["outcomes"]["unservable"].clone())
+            .unwrap();
+    schema.validate(&unservable["output"]["value"]).unwrap();
     assert_eq!(
-        codes(&r),
-        [
-            "level_from_kind",
-            "escalated_after_failure",
-            "harnesses_limited"
-        ]
+        unservable["output"]["value"]["reasons"][0]["code"],
+        "nothing_offered"
     );
-    assert_eq!(r["classification"]["labels"], json!(["bugfix", "high"]));
-    // Low risk, narrow and covered by a test: anyone, a local model first.
-    let r = route_for(
-        task_facts("docs", None, 0),
-        ["docs", "low"],
-        &["narrow", "covered_by_test"],
-    );
-    assert_eq!(r["level"], "standard-high");
-    assert_eq!(r["harnesses"], json!([]));
-    assert_eq!(r["prefer"], json!(["opencode"]));
-    assert_eq!(codes(&r), ["level_from_kind", "harness_preferred"]);
-    // Art goes to Codex and waits for it.
-    let r = route_for(task_facts("art", None, 0), ["art", "medium"], &[]);
-    assert_eq!(
-        (&r["level"], &r["harnesses"], &r["hold"]),
-        (&json!("standard-high"), &json!(["codex"]), &json!(true))
-    );
-    assert!(codes(&r).contains(&"held_for_harness"));
-    // A level hint is respected, but not above Standard for chores.
-    let r = route_for(
-        task_facts("chore", Some("deep-high"), 0),
-        ["chore", "low"],
-        &[],
-    );
-    assert_eq!(r["level"], "standard-high");
-    assert_eq!(codes(&r), ["hint_capped"]);
-    let r = route_for(
-        task_facts("feature", Some("standard-low"), 0),
-        ["feature", "low"],
-        &[],
-    );
-    assert_eq!(r["level"], "standard-low");
-    assert_eq!(codes(&r), ["hint_respected"]);
-    // Very high risk is at least Complex unless narrow and covered.
-    let r = route_for(
-        task_facts("feature", None, 0),
-        ["feature", "very_high"],
-        &[],
-    );
-    assert_eq!(r["level"], "complex-low");
-    assert!(codes(&r).contains(&"raised_for_risk"));
-    let r = route_for(
-        task_facts("feature", None, 0),
-        ["feature", "very_high"],
-        &["narrow", "covered_by_test"],
-    );
-    assert_eq!(r["level"], "standard-high");
-    // Medium risk may go to a local model only when narrow, covered and Standard.
-    let r = route_for(
-        task_facts("refactor", None, 0),
-        ["refactor", "medium"],
-        &["narrow", "covered_by_test"],
-    );
-    assert_eq!(r["harnesses"], json!(["claude", "codex", "opencode"]));
-    // Repairs never go to a local model.
-    let r = route_for(
-        task_facts("repair", None, 0),
-        ["repair", "low"],
-        &["narrow", "covered_by_test"],
-    );
-    assert_eq!(r["harnesses"], json!(["claude", "codex", "gemini"]));
-    assert_eq!(r["prefer"], json!([]));
-    // Deep analysis keeps Claude; Design and planning go to Claude first.
-    let r = route_for(
-        task_facts("analysis", None, 0),
-        ["analysis", "medium"],
-        &["needs_deep_reasoning"],
-    );
-    assert_eq!(r["level"], "deep-high");
-    assert_eq!(r["harnesses"], json!(["claude", "codex"]));
-    let r = route_for(task_facts("plan", None, 0), ["plan", "medium"], &[]);
-    assert_eq!(
-        (&r["level"], &r["prefer"]),
-        (&json!("complex-high"), &json!(["claude"]))
-    );
-    // A kind or risk the judgment could not tell is routed as medium risk.
-    let r = route_for(task_facts("", None, 0), ["unknown", "unknown"], &[]);
-    assert_eq!(r["level"], "standard-high");
-    assert_eq!(r["harnesses"], json!(["claude", "codex"]));
-    assert!(codes(&r).contains(&"risk_assumed"));
+    // Nothing else reaches it.
+    let reaching: Vec<&String> = steps
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(_, s)| {
+            s["edges"]
+                .as_object()
+                .unwrap()
+                .values()
+                .any(|t| t == "unservable")
+                || s["on_error"] == "unservable"
+        })
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(reaching, ["assume_refused", "route_refused"]);
 }

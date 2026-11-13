@@ -35,11 +35,40 @@
         "skipped": {
           "type": "null"
         },
-        "unservable": {
-          "type": "null"
-        },
         "failed": {
           "type": "null"
+        },
+        "unservable": {
+          "type": "object",
+          "required": [
+            "reasons"
+          ],
+          "properties": {
+            "reasons": {
+              "type": "array",
+              "max_items": 4,
+              "items": {
+                "type": "object",
+                "required": [
+                  "code",
+                  "detail"
+                ],
+                "properties": {
+                  "code": {
+                    "type": "string",
+                    "max_length": 64,
+                    "values": [
+                      "nothing_offered"
+                    ]
+                  },
+                  "detail": {
+                    "type": "string",
+                    "max_length": 256
+                  }
+                }
+              }
+            }
+          }
         }
       },
       "start": "read"
@@ -85,10 +114,36 @@
         }
       },
       "edges": {
-        "observed": "ask",
+        "observed": "owned",
         "refused": "skip"
       },
       "on_error": "failed"
+    },
+    "owned": {
+      "op": {
+        "kind": "decide",
+        "predicate": {
+          "op": "eq",
+          "left": {
+            "op": "ref",
+            "root": "task",
+            "path": [
+              "facts",
+              "route"
+            ]
+          },
+          "right": {
+            "op": "literal",
+            "value": "owner"
+          }
+        }
+      },
+      "edges": {
+        "true": "skip",
+        "false": "ask",
+        "unknown": "failed"
+      },
+      "on_error": null
     },
     "ask": {
       "op": {
@@ -108,7 +163,7 @@
             },
             "question": {
               "op": "literal",
-              "value": "Classify this task twice: by the kind of work, and by risk.\n\nKind of work: feature, bug fix, refactor, test, docs, chore, sync, spec, design, implementation plan, review of someone else's work, research, analysis, art or visual design, or repair of a failed integration or build. Answer unknown if you cannot tell.\n\nRisk is how much damage the change could do if it is wrong. Judge it separately from how hard the work is, and from how well the task is written.\n- High risk: merging and publishing, CI gating, crash and session recovery, git branch handling, database migrations and stored data, authentication, permissions and secrets, money and live trading, deleting anything. Treat it as very high when a mistake would be hard to undo or would reach outside the repository.\n- Medium risk: ordinary changes to shared code that other work depends on.\n- Low risk: docs, UI copy, isolated components and tests, where a mistake is visible and cheap to undo.\nWhen a task touches several areas, go by the riskiest. When you can't tell, call it medium.\n\n\"Narrow\" means the requirements are settled and the files to change are named or obvious. \"Covered by a test\" means an existing or specified test checks the result. Work that needs manual or end-to-end verification is not covered."
+              "value": "Classify this task twice: by the kind of work, and by risk.\n\nKind of work: feature, bug fix (bugfix), refactor, test, docs, chore, sync, spec, design, implementation plan (plan), review of someone else's work (review), research, analysis, art or visual design (art), or repair of a failed integration or build (repair). Answer unknown if you cannot tell.\n\nRisk is how much damage the change could do if it is wrong. Judge it separately from how hard the work is, and from how well the task is written.\n- High risk: merging and publishing, CI gating, crash and session recovery, git branch handling, database migrations and stored data, authentication, permissions and secrets, money and live trading, deleting anything. Treat it as very high when a mistake would be hard to undo or would reach outside the repository.\n- Medium risk: ordinary changes to shared code that other work depends on.\n- Low risk: docs, UI copy, isolated components and tests, where a mistake is visible and cheap to undo.\nWhen a task touches several areas, go by the riskiest. When you can't tell, call it medium.\n\n\"Narrow\" means the requirements are settled and the files to change are named or obvious. \"Covered by a test\" means an existing or specified test checks the result. Work that needs manual or end-to-end verification is not covered.\n\nNeeds deep reasoning: analysis, planning or spec writing that needs advanced mathematics or unusually hard reasoning. A big task is not a deep task, and neither is a risky one.\nClearly harder: research that is clearly harder than ordinary research."
             },
             "context": {
               "op": "object",
@@ -218,7 +273,7 @@
                 },
                 {
                   "id": "covered_by_test",
-                  "description": "An existing or specified test checks the result."
+                  "description": "An existing or specified test checks the result. Work that needs manual or end-to-end verification is not covered."
                 },
                 {
                   "id": "needs_deep_reasoning",
@@ -284,7 +339,7 @@
       "op": {
         "kind": "invoke",
         "command": "work.route",
-        "bind": "routed",
+        "bind": "route_result",
         "retry": null,
         "input": {
           "op": "let",
@@ -303,7 +358,7 @@
               }
             },
             {
-              "name": "risk",
+              "name": "label_risk",
               "value": {
                 "op": "ref",
                 "root": "answer",
@@ -375,17 +430,59 @@
               }
             },
             {
-              "name": "harder",
+              "name": "assumed",
               "value": {
-                "op": "contains",
-                "collection": {
+                "op": "or",
+                "values": [
+                  {
+                    "op": "eq",
+                    "left": {
+                      "op": "ref",
+                      "root": "kind",
+                      "path": []
+                    },
+                    "right": {
+                      "op": "literal",
+                      "value": "unknown"
+                    }
+                  },
+                  {
+                    "op": "eq",
+                    "left": {
+                      "op": "ref",
+                      "root": "label_risk",
+                      "path": []
+                    },
+                    "right": {
+                      "op": "literal",
+                      "value": "unknown"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "name": "risk",
+              "value": {
+                "op": "lookup",
+                "key": {
                   "op": "ref",
-                  "root": "flags",
+                  "root": "assumed",
                   "path": []
                 },
-                "value": {
-                  "op": "literal",
-                  "value": "clearly_harder"
+                "cases": [
+                  {
+                    "when": true,
+                    "then": {
+                      "op": "literal",
+                      "value": "medium"
+                    }
+                  }
+                ],
+                "default": {
+                  "op": "ref",
+                  "root": "label_risk",
+                  "path": []
                 }
               }
             },
@@ -413,56 +510,63 @@
                     "when": "simple-high",
                     "then": {
                       "op": "literal",
-                      "value": 2
+                      "value": 3
                     }
                   },
                   {
                     "when": "standard-low",
                     "then": {
                       "op": "literal",
-                      "value": 3
+                      "value": 5
                     }
                   },
                   {
                     "when": "standard-medium",
                     "then": {
                       "op": "literal",
-                      "value": 4
+                      "value": 6
                     }
                   },
                   {
                     "when": "standard-high",
                     "then": {
                       "op": "literal",
-                      "value": 5
+                      "value": 7
                     }
                   },
                   {
                     "when": "complex-low",
                     "then": {
                       "op": "literal",
-                      "value": 6
+                      "value": 9
+                    }
+                  },
+                  {
+                    "when": "complex-medium",
+                    "then": {
+                      "op": "literal",
+                      "value": 10
                     }
                   },
                   {
                     "when": "complex-high",
                     "then": {
                       "op": "literal",
-                      "value": 7
+                      "value": 11
                     }
                   },
                   {
                     "when": "deep-low",
                     "then": {
                       "op": "literal",
-                      "value": 8
+                      "value": 13
                     }
                   },
                   {
                     "when": "deep-high",
                     "then": {
                       "op": "literal",
-                      "value": 9
+                      "value": 15
                     }
                   }
                 ],
@@ -486,28 +590,14 @@
                     "when": "chore",
                     "then": {
                       "op": "literal",
-                      "value": 2
+                      "value": 3
                     }
                   },
                   {
                     "when": "sync",
                     "then": {
                       "op": "literal",
-                      "value": 2
-                    }
-                  },
-                  {
-                    "when": "design",
-                    "then": {
-                      "op": "literal",
-                      "value": 7
-                    }
-                  },
-                  {
-                    "when": "review",
-                    "then": {
-                      "op": "literal",
-                      "value": 7
+                      "value": 3
                     }
                   },
                   {
@@ -524,13 +614,13 @@
                           "when": true,
                           "then": {
                             "op": "literal",
-                            "value": 9
+                            "value": 15
                           }
                         }
                       ],
                       "default": {
                         "op": "literal",
-                        "value": 7
+                        "value": 11
                       }
                     }
                   },
@@ -548,7 +638,52 @@
                           "when": true,
                           "then": {
                             "op": "literal",
-                            "value": 9
+                            "value": 15
+                          }
+                        }
+                      ],
+                      "default": {
+                        "op": "literal",
+                        "value": 11
+                      }
+                    }
+                  },
+                  {
+                    "when": "design",
+                    "then": {
+                      "op": "literal",
+                      "value": 11
+                    }
+                  },
+                  {
+                    "when": "review",
+                    "then": {
+                      "op": "literal",
+                      "value": 11
+                    }
+                  },
+                  {
+                    "when": "research",
+                    "then": {
+                      "op": "lookup",
+                      "key": {
+                        "op": "contains",
+                        "collection": {
+                          "op": "ref",
+                          "root": "flags",
+                          "path": []
+                        },
+                        "value": {
+                          "op": "literal",
+                          "value": "clearly_harder"
+                        }
+                      },
+                      "cases": [
+                        {
+                          "when": true,
+                          "then": {
+                            "op": "literal",
+                            "value": 11
                           }
                         }
                       ],
@@ -572,49 +707,25 @@
                           "when": true,
                           "then": {
                             "op": "literal",
-                            "value": 9
+                            "value": 15
                           }
                         }
                       ],
                       "default": {
                         "op": "literal",
-                        "value": 5
-                      }
-                    }
-                  },
-                  {
-                    "when": "research",
-                    "then": {
-                      "op": "lookup",
-                      "key": {
-                        "op": "ref",
-                        "root": "harder",
-                        "path": []
-                      },
-                      "cases": [
-                        {
-                          "when": true,
-                          "then": {
-                            "op": "literal",
-                            "value": 7
-                          }
-                        }
-                      ],
-                      "default": {
-                        "op": "literal",
-                        "value": 5
+                        "value": 7
                       }
                     }
                   }
                 ],
                 "default": {
                   "op": "literal",
-                  "value": 5
+                  "value": 7
                 }
               }
             },
             {
-              "name": "cap",
+              "name": "top",
               "value": {
                 "op": "lookup",
                 "key": {
@@ -627,55 +738,106 @@
                     "when": "test",
                     "then": {
                       "op": "literal",
-                      "value": 5
+                      "value": 8
                     }
                   },
                   {
                     "when": "docs",
                     "then": {
                       "op": "literal",
-                      "value": 5
+                      "value": 8
                     }
                   },
                   {
                     "when": "chore",
                     "then": {
                       "op": "literal",
-                      "value": 5
+                      "value": 8
                     }
                   },
                   {
                     "when": "sync",
                     "then": {
                       "op": "literal",
-                      "value": 5
+                      "value": 8
                     }
                   },
                   {
-                    "when": "feature",
+                    "when": "analysis",
                     "then": {
-                      "op": "literal",
-                      "value": 7
+                      "op": "lookup",
+                      "key": {
+                        "op": "ref",
+                        "root": "deep",
+                        "path": []
+                      },
+                      "cases": [
+                        {
+                          "when": true,
+                          "then": {
+                            "op": "literal",
+                            "value": 16
+                          }
+                        }
+                      ],
+                      "default": {
+                        "op": "literal",
+                        "value": 12
+                      }
                     }
                   },
                   {
-                    "when": "bugfix",
+                    "when": "plan",
                     "then": {
-                      "op": "literal",
-                      "value": 7
+                      "op": "lookup",
+                      "key": {
+                        "op": "ref",
+                        "root": "deep",
+                        "path": []
+                      },
+                      "cases": [
+                        {
+                          "when": true,
+                          "then": {
+                            "op": "literal",
+                            "value": 16
+                          }
+                        }
+                      ],
+                      "default": {
+                        "op": "literal",
+                        "value": 12
+                      }
                     }
                   },
                   {
-                    "when": "refactor",
+                    "when": "spec",
                     "then": {
-                      "op": "literal",
-                      "value": 7
+                      "op": "lookup",
+                      "key": {
+                        "op": "ref",
+                        "root": "deep",
+                        "path": []
+                      },
+                      "cases": [
+                        {
+                          "when": true,
+                          "then": {
+                            "op": "literal",
+                            "value": 16
+                          }
+                        }
+                      ],
+                      "default": {
+                        "op": "literal",
+                        "value": 12
+                      }
                     }
                   }
                 ],
                 "default": {
                   "op": "literal",
-                  "value": 9
+                  "value": 12
                 }
               }
             },
@@ -704,12 +866,12 @@
                         "op": "lt",
                         "left": {
                           "op": "ref",
-                          "root": "hint",
+                          "root": "top",
                           "path": []
                         },
                         "right": {
                           "op": "ref",
-                          "root": "cap",
+                          "root": "hint",
                           "path": []
                         }
                       },
@@ -717,15 +879,38 @@
                         {
                           "when": true,
                           "then": {
-                            "op": "ref",
-                            "root": "hint",
-                            "path": []
+                            "op": "lookup",
+                            "key": {
+                              "op": "ref",
+                              "root": "top",
+                              "path": []
+                            },
+                            "cases": [
+                              {
+                                "when": 8,
+                                "then": {
+                                  "op": "literal",
+                                  "value": 7
+                                }
+                              },
+                              {
+                                "when": 12,
+                                "then": {
+                                  "op": "literal",
+                                  "value": 11
+                                }
+                              }
+                            ],
+                            "default": {
+                              "op": "literal",
+                              "value": 15
+                            }
                           }
                         }
                       ],
                       "default": {
                         "op": "ref",
-                        "root": "cap",
+                        "root": "hint",
                         "path": []
                       }
                     }
@@ -788,7 +973,7 @@
                         },
                         "right": {
                           "op": "literal",
-                          "value": 7
+                          "value": 11
                         }
                       },
                       "cases": [
@@ -796,7 +981,7 @@
                           "when": true,
                           "then": {
                             "op": "literal",
-                            "value": 7
+                            "value": 11
                           }
                         }
                       ],
@@ -829,21 +1014,14 @@
                     "when": "medium",
                     "then": {
                       "op": "literal",
-                      "value": 5
+                      "value": 7
                     }
                   },
                   {
                     "when": "high",
                     "then": {
                       "op": "literal",
-                      "value": 5
-                    }
-                  },
-                  {
-                    "when": "unknown",
-                    "then": {
-                      "op": "literal",
-                      "value": 5
+                      "value": 7
                     }
                   },
                   {
@@ -860,13 +1038,13 @@
                           "when": true,
                           "then": {
                             "op": "literal",
-                            "value": 5
+                            "value": 7
                           }
                         }
                       ],
                       "default": {
                         "op": "literal",
-                        "value": 6
+                        "value": 10
                       }
                     }
                   }
@@ -929,56 +1107,63 @@
                     }
                   },
                   {
-                    "when": 2,
+                    "when": 3,
                     "then": {
                       "op": "literal",
                       "value": "simple-high"
                     }
                   },
                   {
-                    "when": 3,
+                    "when": 5,
                     "then": {
                       "op": "literal",
                       "value": "standard-low"
                     }
                   },
                   {
-                    "when": 4,
+                    "when": 6,
                     "then": {
                       "op": "literal",
                       "value": "standard-medium"
                     }
                   },
                   {
-                    "when": 5,
+                    "when": 7,
                     "then": {
                       "op": "literal",
                       "value": "standard-high"
                     }
                   },
                   {
-                    "when": 6,
+                    "when": 9,
                     "then": {
                       "op": "literal",
                       "value": "complex-low"
                     }
                   },
                   {
-                    "when": 7,
+                    "when": 10,
+                    "then": {
+                      "op": "literal",
+                      "value": "complex-medium"
+                    }
+                  },
+                  {
+                    "when": 11,
                     "then": {
                       "op": "literal",
                       "value": "complex-high"
                     }
                   },
                   {
-                    "when": 8,
+                    "when": 13,
                     "then": {
                       "op": "literal",
                       "value": "deep-low"
                     }
                   },
                   {
-                    "when": 9,
+                    "when": 15,
                     "then": {
                       "op": "literal",
                       "value": "deep-high"
@@ -987,78 +1172,8 @@
                 ],
                 "default": {
                   "op": "literal",
-                  "value": "standard-high"
+                  "value": "deep-max"
                 }
-              }
-            },
-            {
-              "name": "standard",
-              "value": {
-                "op": "lookup",
-                "key": {
-                  "op": "ref",
-                  "root": "level",
-                  "path": []
-                },
-                "cases": [
-                  {
-                    "when": "standard-low",
-                    "then": {
-                      "op": "literal",
-                      "value": true
-                    }
-                  },
-                  {
-                    "when": "standard-medium",
-                    "then": {
-                      "op": "literal",
-                      "value": true
-                    }
-                  },
-                  {
-                    "when": "standard-high",
-                    "then": {
-                      "op": "literal",
-                      "value": true
-                    }
-                  }
-                ],
-                "default": {
-                  "op": "literal",
-                  "value": false
-                }
-              }
-            },
-            {
-              "name": "assumed",
-              "value": {
-                "op": "or",
-                "values": [
-                  {
-                    "op": "eq",
-                    "left": {
-                      "op": "ref",
-                      "root": "risk",
-                      "path": []
-                    },
-                    "right": {
-                      "op": "literal",
-                      "value": "unknown"
-                    }
-                  },
-                  {
-                    "op": "eq",
-                    "left": {
-                      "op": "ref",
-                      "root": "kind",
-                      "path": []
-                    },
-                    "right": {
-                      "op": "literal",
-                      "value": "unknown"
-                    }
-                  }
-                ]
               }
             }
           ],
@@ -1167,14 +1282,64 @@
                             "op": "and",
                             "values": [
                               {
+                                "op": "eq",
+                                "left": {
+                                  "op": "ref",
+                                  "root": "risk",
+                                  "path": []
+                                },
+                                "right": {
+                                  "op": "literal",
+                                  "value": "medium"
+                                }
+                              },
+                              {
                                 "op": "ref",
                                 "root": "nt",
                                 "path": []
                               },
                               {
-                                "op": "ref",
-                                "root": "standard",
-                                "path": []
+                                "op": "lookup",
+                                "key": {
+                                  "op": "ref",
+                                  "root": "level",
+                                  "path": []
+                                },
+                                "cases": [
+                                  {
+                                    "when": "standard-low",
+                                    "then": {
+                                      "op": "literal",
+                                      "value": true
+                                    }
+                                  },
+                                  {
+                                    "when": "standard-medium",
+                                    "then": {
+                                      "op": "literal",
+                                      "value": true
+                                    }
+                                  },
+                                  {
+                                    "when": "standard-high",
+                                    "then": {
+                                      "op": "literal",
+                                      "value": true
+                                    }
+                                  }
+                                ],
+                                "default": {
+                                  "op": "literal",
+                                  "value": false
+                                }
+                              },
+                              {
+                                "op": "not",
+                                "value": {
+                                  "op": "ref",
+                                  "root": "assumed",
+                                  "path": []
+                                }
                               }
                             ]
                           },
@@ -1214,96 +1379,36 @@
                 "predicate": {
                   "op": "not",
                   "value": {
-                    "op": "or",
+                    "op": "and",
                     "values": [
                       {
-                        "op": "and",
-                        "values": [
-                          {
-                            "op": "eq",
-                            "left": {
-                              "op": "ref",
-                              "root": "h",
-                              "path": []
-                            },
-                            "right": {
-                              "op": "literal",
-                              "value": "claude"
-                            }
-                          },
-                          {
-                            "op": "and",
-                            "values": [
-                              {
-                                "op": "lt",
-                                "left": {
-                                  "op": "literal",
-                                  "value": 7
-                                },
-                                "right": {
-                                  "op": "ref",
-                                  "root": "final",
-                                  "path": []
-                                }
-                              },
-                              {
-                                "op": "not",
-                                "value": {
-                                  "op": "contains",
-                                  "collection": {
-                                    "op": "literal",
-                                    "value": [
-                                      "design",
-                                      "review",
-                                      "analysis",
-                                      "plan",
-                                      "spec"
-                                    ]
-                                  },
-                                  "value": {
-                                    "op": "ref",
-                                    "root": "kind",
-                                    "path": []
-                                  }
-                                }
-                              }
-                            ]
-                          }
-                        ]
+                        "op": "eq",
+                        "left": {
+                          "op": "ref",
+                          "root": "h",
+                          "path": []
+                        },
+                        "right": {
+                          "op": "literal",
+                          "value": "opencode"
+                        }
                       },
                       {
-                        "op": "and",
-                        "values": [
-                          {
-                            "op": "eq",
-                            "left": {
-                              "op": "ref",
-                              "root": "h",
-                              "path": []
-                            },
-                            "right": {
-                              "op": "literal",
-                              "value": "opencode"
-                            }
-                          },
-                          {
-                            "op": "eq",
-                            "left": {
-                              "op": "ref",
-                              "root": "kind",
-                              "path": []
-                            },
-                            "right": {
-                              "op": "literal",
-                              "value": "repair"
-                            }
-                          }
-                        ]
+                        "op": "eq",
+                        "left": {
+                          "op": "ref",
+                          "root": "kind",
+                          "path": []
+                        },
+                        "right": {
+                          "op": "literal",
+                          "value": "repair"
+                        }
                       }
                     ]
                   }
                 },
-                "max_items": 16
+                "max_items": 8
               },
               "providers": {
                 "op": "literal",
@@ -1361,15 +1466,20 @@
                       {
                         "op": "not",
                         "value": {
-                          "op": "eq",
-                          "left": {
+                          "op": "contains",
+                          "collection": {
+                            "op": "literal",
+                            "value": [
+                              "repair",
+                              "art",
+                              "design",
+                              "plan"
+                            ]
+                          },
+                          "value": {
                             "op": "ref",
                             "root": "kind",
                             "path": []
-                          },
-                          "right": {
-                            "op": "literal",
-                            "value": "repair"
                           }
                         }
                       }
@@ -1420,22 +1530,115 @@
                           },
                           "detail": {
                             "op": "literal",
-                            "value": "The level is the one this kind of work gets."
+                            "value": "The level is the one the routing document gives this kind of work."
                           },
                           "when": {
-                            "op": "not",
-                            "value": {
-                              "op": "lt",
-                              "left": {
-                                "op": "literal",
-                                "value": 0
-                              },
-                              "right": {
-                                "op": "ref",
-                                "root": "hint",
-                                "path": []
-                              }
+                            "op": "eq",
+                            "left": {
+                              "op": "ref",
+                              "root": "hint",
+                              "path": []
+                            },
+                            "right": {
+                              "op": "literal",
+                              "value": 0
                             }
+                          }
+                        }
+                      },
+                      {
+                        "op": "object",
+                        "fields": {
+                          "code": {
+                            "op": "literal",
+                            "value": "deep_reserved"
+                          },
+                          "detail": {
+                            "op": "literal",
+                            "value": "Deep, because this analysis, planning or spec writing needs advanced mathematics or unusually hard reasoning."
+                          },
+                          "when": {
+                            "op": "lt",
+                            "left": {
+                              "op": "literal",
+                              "value": 12
+                            },
+                            "right": {
+                              "op": "ref",
+                              "root": "final",
+                              "path": []
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "op": "object",
+                        "fields": {
+                          "code": {
+                            "op": "literal",
+                            "value": "deep_reserved"
+                          },
+                          "detail": {
+                            "op": "literal",
+                            "value": "Deep is only for analysis, planning or spec writing that needs advanced mathematics or unusually hard reasoning, so the level asked for was lowered to Complex, high effort."
+                          },
+                          "when": {
+                            "op": "and",
+                            "values": [
+                              {
+                                "op": "and",
+                                "values": [
+                                  {
+                                    "op": "lt",
+                                    "left": {
+                                      "op": "ref",
+                                      "root": "top",
+                                      "path": []
+                                    },
+                                    "right": {
+                                      "op": "ref",
+                                      "root": "hint",
+                                      "path": []
+                                    }
+                                  },
+                                  {
+                                    "op": "lt",
+                                    "left": {
+                                      "op": "literal",
+                                      "value": 12
+                                    },
+                                    "right": {
+                                      "op": "ref",
+                                      "root": "hint",
+                                      "path": []
+                                    }
+                                  }
+                                ]
+                              },
+                              {
+                                "op": "not",
+                                "value": {
+                                  "op": "contains",
+                                  "collection": {
+                                    "op": "literal",
+                                    "value": [
+                                      "feature",
+                                      "bugfix",
+                                      "refactor",
+                                      "test",
+                                      "docs",
+                                      "chore",
+                                      "sync"
+                                    ]
+                                  },
+                                  "value": {
+                                    "op": "ref",
+                                    "root": "kind",
+                                    "path": []
+                                  }
+                                }
+                              }
+                            ]
                           }
                         }
                       },
@@ -1471,7 +1674,7 @@
                                   "op": "lt",
                                   "left": {
                                     "op": "ref",
-                                    "root": "cap",
+                                    "root": "top",
                                     "path": []
                                   },
                                   "right": {
@@ -1494,20 +1697,131 @@
                           },
                           "detail": {
                             "op": "literal",
-                            "value": "The level asked for was above what this kind of work may have, so it was lowered."
+                            "value": "The level asked for was above what this kind of work may have (Standard for tests, docs, chores and syncs; Complex for ordinary implementation work), so it was lowered."
                           },
                           "when": {
-                            "op": "lt",
-                            "left": {
-                              "op": "ref",
-                              "root": "cap",
-                              "path": []
-                            },
-                            "right": {
-                              "op": "ref",
-                              "root": "hint",
-                              "path": []
-                            }
+                            "op": "and",
+                            "values": [
+                              {
+                                "op": "lt",
+                                "left": {
+                                  "op": "ref",
+                                  "root": "top",
+                                  "path": []
+                                },
+                                "right": {
+                                  "op": "ref",
+                                  "root": "hint",
+                                  "path": []
+                                }
+                              },
+                              {
+                                "op": "or",
+                                "values": [
+                                  {
+                                    "op": "contains",
+                                    "collection": {
+                                      "op": "literal",
+                                      "value": [
+                                        "feature",
+                                        "bugfix",
+                                        "refactor",
+                                        "test",
+                                        "docs",
+                                        "chore",
+                                        "sync"
+                                      ]
+                                    },
+                                    "value": {
+                                      "op": "ref",
+                                      "root": "kind",
+                                      "path": []
+                                    }
+                                  },
+                                  {
+                                    "op": "not",
+                                    "value": {
+                                      "op": "and",
+                                      "values": [
+                                        {
+                                          "op": "lt",
+                                          "left": {
+                                            "op": "ref",
+                                            "root": "top",
+                                            "path": []
+                                          },
+                                          "right": {
+                                            "op": "ref",
+                                            "root": "hint",
+                                            "path": []
+                                          }
+                                        },
+                                        {
+                                          "op": "lt",
+                                          "left": {
+                                            "op": "literal",
+                                            "value": 12
+                                          },
+                                          "right": {
+                                            "op": "ref",
+                                            "root": "hint",
+                                            "path": []
+                                          }
+                                        }
+                                      ]
+                                    }
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        }
+                      },
+                      {
+                        "op": "object",
+                        "fields": {
+                          "code": {
+                            "op": "literal",
+                            "value": "policy"
+                          },
+                          "detail": {
+                            "op": "literal",
+                            "value": "The level asked for is not one that Settings offers, so the level for the kind of work was used."
+                          },
+                          "when": {
+                            "op": "and",
+                            "values": [
+                              {
+                                "op": "not",
+                                "value": {
+                                  "op": "eq",
+                                  "left": {
+                                    "op": "ref",
+                                    "root": "task",
+                                    "path": [
+                                      "facts",
+                                      "level_hint"
+                                    ]
+                                  },
+                                  "right": {
+                                    "op": "literal",
+                                    "value": ""
+                                  }
+                                }
+                              },
+                              {
+                                "op": "eq",
+                                "left": {
+                                  "op": "ref",
+                                  "root": "hint",
+                                  "path": []
+                                },
+                                "right": {
+                                  "op": "literal",
+                                  "value": 0
+                                }
+                              }
+                            ]
                           }
                         }
                       },
@@ -1520,7 +1834,7 @@
                           },
                           "detail": {
                             "op": "literal",
-                            "value": "A bug fix that already failed once for a real reason moves up to Complex."
+                            "value": "A bug fix that has already failed once for a real reason moves up to Complex."
                           },
                           "when": {
                             "op": "lt",
@@ -1546,20 +1860,151 @@
                           },
                           "detail": {
                             "op": "literal",
-                            "value": "Raised to the least level its risk requires."
+                            "value": "Medium and high risk work, and very high risk work that is narrow and covered by a test, is at least Standard, high effort."
                           },
                           "when": {
-                            "op": "lt",
-                            "left": {
-                              "op": "ref",
-                              "root": "esc",
-                              "path": []
-                            },
-                            "right": {
-                              "op": "ref",
-                              "root": "floor",
-                              "path": []
-                            }
+                            "op": "and",
+                            "values": [
+                              {
+                                "op": "lt",
+                                "left": {
+                                  "op": "ref",
+                                  "root": "esc",
+                                  "path": []
+                                },
+                                "right": {
+                                  "op": "ref",
+                                  "root": "floor",
+                                  "path": []
+                                }
+                              },
+                              {
+                                "op": "not",
+                                "value": {
+                                  "op": "and",
+                                  "values": [
+                                    {
+                                      "op": "eq",
+                                      "left": {
+                                        "op": "ref",
+                                        "root": "risk",
+                                        "path": []
+                                      },
+                                      "right": {
+                                        "op": "literal",
+                                        "value": "very_high"
+                                      }
+                                    },
+                                    {
+                                      "op": "not",
+                                      "value": {
+                                        "op": "ref",
+                                        "root": "nt",
+                                        "path": []
+                                      }
+                                    }
+                                  ]
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      },
+                      {
+                        "op": "object",
+                        "fields": {
+                          "code": {
+                            "op": "literal",
+                            "value": "raised_for_risk"
+                          },
+                          "detail": {
+                            "op": "literal",
+                            "value": "Very high risk work is at least Complex, medium effort."
+                          },
+                          "when": {
+                            "op": "and",
+                            "values": [
+                              {
+                                "op": "lt",
+                                "left": {
+                                  "op": "ref",
+                                  "root": "esc",
+                                  "path": []
+                                },
+                                "right": {
+                                  "op": "ref",
+                                  "root": "floor",
+                                  "path": []
+                                }
+                              },
+                              {
+                                "op": "eq",
+                                "left": {
+                                  "op": "ref",
+                                  "root": "risk",
+                                  "path": []
+                                },
+                                "right": {
+                                  "op": "literal",
+                                  "value": "very_high"
+                                }
+                              },
+                              {
+                                "op": "not",
+                                "value": {
+                                  "op": "ref",
+                                  "root": "nt",
+                                  "path": []
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      },
+                      {
+                        "op": "object",
+                        "fields": {
+                          "code": {
+                            "op": "literal",
+                            "value": "risk_relaxed"
+                          },
+                          "detail": {
+                            "op": "literal",
+                            "value": "Very high risk work that is narrow and covered by a test needs only Standard, high effort, not Complex."
+                          },
+                          "when": {
+                            "op": "and",
+                            "values": [
+                              {
+                                "op": "eq",
+                                "left": {
+                                  "op": "ref",
+                                  "root": "risk",
+                                  "path": []
+                                },
+                                "right": {
+                                  "op": "literal",
+                                  "value": "very_high"
+                                }
+                              },
+                              {
+                                "op": "ref",
+                                "root": "nt",
+                                "path": []
+                              },
+                              {
+                                "op": "lt",
+                                "left": {
+                                  "op": "ref",
+                                  "root": "esc",
+                                  "path": []
+                                },
+                                "right": {
+                                  "op": "literal",
+                                  "value": 10
+                                }
+                              }
+                            ]
                           }
                         }
                       },
@@ -1572,7 +2017,7 @@
                           },
                           "detail": {
                             "op": "literal",
-                            "value": "The risk or the kind of work could not be worked out, so medium risk was assumed."
+                            "value": "The risk or the kind of work could not be worked out, so it was routed as medium risk, on Claude or Codex."
                           },
                           "when": {
                             "op": "ref",
@@ -1590,57 +2035,43 @@
                           },
                           "detail": {
                             "op": "literal",
-                            "value": "Medium, high and very high risk work goes only to Claude or Codex."
+                            "value": "High and very high risk work goes only to Claude or Codex. Medium risk work goes to Claude or Codex, and to a local model only when it is narrow, covered by a test, and Standard."
                           },
                           "when": {
-                            "op": "or",
+                            "op": "and",
                             "values": [
                               {
-                                "op": "eq",
-                                "left": {
-                                  "op": "ref",
-                                  "root": "risk",
-                                  "path": []
-                                },
-                                "right": {
-                                  "op": "literal",
-                                  "value": "medium"
+                                "op": "not",
+                                "value": {
+                                  "op": "contains",
+                                  "collection": {
+                                    "op": "literal",
+                                    "value": [
+                                      "art",
+                                      "design",
+                                      "plan"
+                                    ]
+                                  },
+                                  "value": {
+                                    "op": "ref",
+                                    "root": "kind",
+                                    "path": []
+                                  }
                                 }
                               },
                               {
-                                "op": "eq",
-                                "left": {
-                                  "op": "ref",
-                                  "root": "risk",
-                                  "path": []
-                                },
-                                "right": {
-                                  "op": "literal",
-                                  "value": "high"
-                                }
-                              },
-                              {
-                                "op": "eq",
-                                "left": {
-                                  "op": "ref",
-                                  "root": "risk",
-                                  "path": []
-                                },
-                                "right": {
-                                  "op": "literal",
-                                  "value": "very_high"
-                                }
-                              },
-                              {
-                                "op": "eq",
-                                "left": {
-                                  "op": "ref",
-                                  "root": "risk",
-                                  "path": []
-                                },
-                                "right": {
-                                  "op": "literal",
-                                  "value": "unknown"
+                                "op": "not",
+                                "value": {
+                                  "op": "eq",
+                                  "left": {
+                                    "op": "ref",
+                                    "root": "risk",
+                                    "path": []
+                                  },
+                                  "right": {
+                                    "op": "literal",
+                                    "value": "low"
+                                  }
                                 }
                               }
                             ]
@@ -1656,7 +2087,7 @@
                           },
                           "detail": {
                             "op": "literal",
-                            "value": "Design and planning go to Claude first."
+                            "value": "Design and planning go to Claude first, and to Codex only when Claude can't take them."
                           },
                           "when": {
                             "op": "or",
@@ -1698,7 +2129,7 @@
                           },
                           "detail": {
                             "op": "literal",
-                            "value": "Low risk work that is narrow and covered by a test goes to a local model first."
+                            "value": "Low risk work that is narrow and covered by a test goes to a local model first, to save Claude and Codex usage."
                           },
                           "when": {
                             "op": "and",
@@ -1723,15 +2154,20 @@
                               {
                                 "op": "not",
                                 "value": {
-                                  "op": "eq",
-                                  "left": {
+                                  "op": "contains",
+                                  "collection": {
+                                    "op": "literal",
+                                    "value": [
+                                      "repair",
+                                      "art",
+                                      "design",
+                                      "plan"
+                                    ]
+                                  },
+                                  "value": {
                                     "op": "ref",
                                     "root": "kind",
                                     "path": []
-                                  },
-                                  "right": {
-                                    "op": "literal",
-                                    "value": "repair"
                                   }
                                 }
                               }
@@ -1748,7 +2184,7 @@
                           },
                           "detail": {
                             "op": "literal",
-                            "value": "Art and visual design go to Codex, and wait for it."
+                            "value": "Art and visual design go to Codex, and wait for it rather than going elsewhere."
                           },
                           "when": {
                             "op": "eq",
@@ -1786,57 +2222,6 @@
                               "op": "literal",
                               "value": "repair"
                             }
-                          }
-                        }
-                      },
-                      {
-                        "op": "object",
-                        "fields": {
-                          "code": {
-                            "op": "literal",
-                            "value": "harness_excluded"
-                          },
-                          "detail": {
-                            "op": "literal",
-                            "value": "The Deep Claude models are kept for design, review and deep analysis."
-                          },
-                          "when": {
-                            "op": "and",
-                            "values": [
-                              {
-                                "op": "lt",
-                                "left": {
-                                  "op": "literal",
-                                  "value": 7
-                                },
-                                "right": {
-                                  "op": "ref",
-                                  "root": "final",
-                                  "path": []
-                                }
-                              },
-                              {
-                                "op": "not",
-                                "value": {
-                                  "op": "contains",
-                                  "collection": {
-                                    "op": "literal",
-                                    "value": [
-                                      "design",
-                                      "review",
-                                      "analysis",
-                                      "plan",
-                                      "spec"
-                                    ]
-                                  },
-                                  "value": {
-                                    "op": "ref",
-                                    "root": "kind",
-                                    "path": []
-                                  }
-                                }
-                              }
-                            ]
                           }
                         }
                       }
@@ -1877,6 +2262,22 @@
               "classification": {
                 "op": "object",
                 "fields": {
+                  "reference": {
+                    "op": "ref",
+                    "root": "answer",
+                    "path": [
+                      "c",
+                      "output",
+                      "reference"
+                    ]
+                  },
+                  "fields": {
+                    "op": "literal",
+                    "value": [
+                      "kind",
+                      "risk"
+                    ]
+                  },
                   "labels": {
                     "op": "ref",
                     "root": "answer",
@@ -1909,9 +2310,34 @@
       "edges": {
         "routed": "done",
         "stale": "skip",
-        "refused": "unservable"
+        "refused": "route_refused"
       },
       "on_error": "failed"
+    },
+    "route_refused": {
+      "op": {
+        "kind": "decide",
+        "predicate": {
+          "op": "eq",
+          "left": {
+            "op": "ref",
+            "root": "route_result",
+            "path": [
+              "reason"
+            ]
+          },
+          "right": {
+            "op": "literal",
+            "value": "not_offered"
+          }
+        }
+      },
+      "edges": {
+        "true": "unservable",
+        "false": "skip",
+        "unknown": "failed"
+      },
+      "on_error": null
     },
     "assume": {
       "op": {
@@ -1956,12 +2382,12 @@
               "op": "literal",
               "value": [
                 {
-                  "code": "risk_assumed",
-                  "detail": "The risk or the kind of work could not be worked out, so medium risk was assumed."
-                },
-                {
                   "code": "classification_failed",
                   "detail": "The task could not be classified."
+                },
+                {
+                  "code": "risk_assumed",
+                  "detail": "The risk and the kind of work could not be worked out, so it was routed as medium risk at Standard, high effort, on Claude or Codex."
                 }
               ]
             },
@@ -1975,9 +2401,34 @@
       "edges": {
         "routed": "done",
         "stale": "skip",
-        "refused": "unservable"
+        "refused": "assume_refused"
       },
       "on_error": "failed"
+    },
+    "assume_refused": {
+      "op": {
+        "kind": "decide",
+        "predicate": {
+          "op": "eq",
+          "left": {
+            "op": "ref",
+            "root": "assumed_route",
+            "path": [
+              "reason"
+            ]
+          },
+          "right": {
+            "op": "literal",
+            "value": "not_offered"
+          }
+        }
+      },
+      "edges": {
+        "true": "unservable",
+        "false": "skip",
+        "unknown": "failed"
+      },
+      "on_error": null
     },
     "done": {
       "op": {
@@ -2009,7 +2460,14 @@
         "outcome": "unservable",
         "output": {
           "op": "literal",
-          "value": null
+          "value": {
+            "reasons": [
+              {
+                "code": "nothing_offered",
+                "detail": "Nothing this task may go to is offered at its level in Settings, so nothing allowed could ever take it."
+              }
+            ]
+          }
         }
       },
       "edges": {},

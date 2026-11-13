@@ -366,52 +366,78 @@ The host still owns the OID format bound: lowercase hex, 40 characters for
 The [2.2.0 bundle](../contracts/aq-host-2.2.0/README.md) is published beside
 1.0.0, 2.0.0 and 2.1.0 and replaces none of them. Version `2.2.0` has
 fingerprint
-`sha256:0eeb058e4ecbf1b89f2982dce595b327e879914d0737a959d30e183a5e4a2ef7`
+`sha256:0eda50f583fa4f1bac6de34919a7ac4e01b3d248951cad786cba6e2f13e7431c`
 over `["2.2.0", registry]`. The manifest records the 2.1.0 version and
 fingerprint it supersedes, and lists `commands_added` and `events_added`.
 
 ### Why
 
-Before 2.2.0 a playbook could not route a task:
+Before 2.2.0, a playbook could not route:
 - reading a task returned no facts about it;
 - no command set a route;
 - no event started a run when a task needed one;
 - a judgment returned a single label.
 
 Spec 0013 §6 words the fix as changes to `context.read`, `work.change` and
-`judgment.request`. Those three fingerprints are pinned by every Host8 coding
-artifact, so 2.2.0 adds new contracts instead.
+`judgment.request`. Every Host8 coding artifact pins those three
+fingerprints, so 2.2.0 adds new contracts instead.
 
 ### Compatibility decision
 
 - **Additive only.** All twelve commands and nine events of 2.1.0 are
-  byte-identical. `fixtures.json#compatibility` pins their fingerprints, the
-  2.1.0 registry file SHA-256, and the fingerprints of the five additions.
+  byte-identical. `fixtures.json#compatibility` pins:
+  - their fingerprints;
+  - the 2.1.0 registry file SHA-256;
+  - the fingerprints of the five additions.
+
   An artifact sealed on 2.1.0 validates against 2.2.0 unchanged.
-- **New commands:** `work.read`, `work.route` and `judgment.assess`. Each
-  requires the capability of the same name. `judgment.assess` also
-  reconciles through `operation.get`.
-- **New events:** `aq.judgment.assessed` (the completion of
-  `judgment.assess`) and `aq.work.route_needed` (payload `{subject}` only).
+- **New commands:** `work.read`, `work.route` and `judgment.assess`.
+  - Each requires the capability of the same name.
+  - `judgment.assess` declares `operation.get` as its reconciliation command.
+- **New events:** `aq.judgment.assessed`, the completion of
+  `judgment.assess`, and `aq.work.route_needed`, whose payload is
+  `{subject}` only.
 - **Consumers opt in with a new pin:** aq-server's Host9 profile, beside the
   untouched Host8 (2.1.0) pin.
 
 ### Bounds left to the host
 
-These are host semantics, not schema:
-- the 64 KiB request bound;
-- for `judgment.assess` `assessed`: one label per requested field, in field
-  order, each a declared choice; flags only from the declared flags, each
-  once. Otherwise the result is `failed` with `indeterminate`;
-- exactly one final `aq.judgment.assessed` for every accepted judgment,
-  including at the host's own deadline;
-- `work.route` checks the route against Settings (`not_offered`), never
-  replaces an owner route (`owner_route`), and answers `stale` when the
-  task's revision moved since `subject.revision`;
-- `work.read` facts never include priority or provider load, and
-  `charged_failures` counts only failures charged to the task.
+These are host semantics, not schema.
+
+- **The request bound:** 64 KiB.
+- **`judgment.assess` `assessed`:**
+  - one label per requested field, in field order;
+  - each label one of the field's declared choices;
+  - flags only from the declared flags, each once.
+
+  Otherwise the result is `failed` with `indeterminate`.
+- **Exactly one completion:** one final `aq.judgment.assessed` for every
+  accepted judgment, including at the host's own deadline.
+- **`work.route`:**
+  - It intersects `harnesses`, `providers` and `prefer` with what Settings
+    offers at the level, drops duplicates and drops `prefer` entries that are
+    not allowed. It reports what remained in `routed`.
+  - It refuses `not_offered` only when the level has no profile, or when a
+    non-empty list has nothing left. It then records the refused request in
+    the route history.
+  - It never replaces an owner route (`owner_route`).
+  - It answers `stale` when the task's revision moved since
+    `subject.revision`.
+- **`hold`:** pins the task to its lists, for sentences that tell work to
+  wait for an agent. It is never a way to park a task that nothing can take.
+  That case ends the playbook with its own unservable outcome, and the failure
+  path (spec 0011 §4, W6) raises it.
+- **`work.read` facts:**
+  - They never include priority or provider load.
+  - `level_hint` is always present (`""` for none).
+  - `charged_failures` counts only failures charged to the task.
+- **`aq.work.route_needed`:**
+  - It is not emitted again for a task version while a run started for that
+    version is unfinished.
+  - Once a task is raised as unroutable, it is not emitted again until the
+    task or the active playbook changes.
 
 `operation.get` 2.0.0 is unchanged, so its `completed` union does not include
 the `judgment.assess` outputs. A host reconciles a `judgment.assess` intent
 from its own record of the operation. A playbook reads the answer through the
-join, not through `operation.get`.
+join, never through `operation.get`.

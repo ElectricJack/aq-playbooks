@@ -315,7 +315,7 @@
     {
       "contract": "work.read",
       "kind": "output",
-      "name": "valid facts without a level hint",
+      "name": "valid facts with no level asked for",
       "outcome": "observed",
       "valid": true,
       "value": {
@@ -324,6 +324,54 @@
           "description": "The retry counter resets after a restart.",
           "ended_attempts": 2,
           "kind": "bugfix",
+          "level_hint": "",
+          "origin": "owner",
+          "route": "none",
+          "title": "Fix the retry counter"
+        },
+        "reference": "task-1@3",
+        "subject": {
+          "id": "task-1",
+          "revision": 3
+        }
+      }
+    },
+    {
+      "contract": "work.read",
+      "kind": "output",
+      "name": "invalid facts without the level_hint field",
+      "outcome": "observed",
+      "valid": false,
+      "value": {
+        "facts": {
+          "charged_failures": 1,
+          "description": "The retry counter resets after a restart.",
+          "ended_attempts": 2,
+          "kind": "bugfix",
+          "origin": "owner",
+          "route": "none",
+          "title": "Fix the retry counter"
+        },
+        "reference": "task-1@3",
+        "subject": {
+          "id": "task-1",
+          "revision": 3
+        }
+      }
+    },
+    {
+      "contract": "work.read",
+      "kind": "output",
+      "name": "invalid facts with a level hint that is not a level",
+      "outcome": "observed",
+      "valid": false,
+      "value": {
+        "facts": {
+          "charged_failures": 1,
+          "description": "The retry counter resets after a restart.",
+          "ended_attempts": 2,
+          "kind": "bugfix",
+          "level_hint": "complex-hgih",
           "origin": "owner",
           "route": "none",
           "title": "Fix the retry counter"
@@ -508,6 +556,10 @@
       "valid": true,
       "value": {
         "classification": {
+          "fields": [
+            "kind",
+            "risk"
+          ],
           "flags": [
             "narrow",
             "covered_by_test"
@@ -516,7 +568,8 @@
             "bugfix",
             "high"
           ],
-          "rationale": "Touches crash recovery; a test covers the counter."
+          "rationale": "Touches crash recovery; a test covers the counter.",
+          "reference": "judgment:op-1"
         },
         "harnesses": [
           "claude",
@@ -532,8 +585,7 @@
             "detail": "Bug fixes are Standard, high effort."
           },
           {
-            "code": "escalated_after_failure",
-            "detail": "A bug fix that already failed once moves up to Complex."
+            "code": "escalated_after_failure"
           }
         ],
         "subject": {
@@ -598,10 +650,223 @@
     {
       "contract": "work.route",
       "kind": "input",
-      "name": "invalid route with a free-text reason code",
+      "name": "valid route with the catch-all policy reason",
+      "valid": true,
+      "value": {
+        "classification": {
+          "fields": [
+            "kind",
+            "risk"
+          ],
+          "flags": [
+            "narrow",
+            "covered_by_test"
+          ],
+          "labels": [
+            "bugfix",
+            "high"
+          ],
+          "rationale": "Touches crash recovery; a test covers the counter.",
+          "reference": "judgment:op-1"
+        },
+        "harnesses": [
+          "claude",
+          "codex"
+        ],
+        "hold": false,
+        "level": "complex-high",
+        "prefer": [],
+        "providers": [],
+        "reasons": [
+          {
+            "code": "policy",
+            "detail": "Repairs to a failed integration or build never go to a local model."
+          }
+        ],
+        "subject": {
+          "id": "task-1",
+          "revision": 3
+        }
+      }
+    },
+    {
+      "contract": "work.route",
+      "kind": "input",
+      "name": "invalid route with a misspelt level",
       "valid": false,
       "value": {
         "classification": {
+          "fields": [
+            "kind",
+            "risk"
+          ],
+          "flags": [
+            "narrow",
+            "covered_by_test"
+          ],
+          "labels": [
+            "bugfix",
+            "high"
+          ],
+          "rationale": "Touches crash recovery; a test covers the counter.",
+          "reference": "judgment:op-1"
+        },
+        "harnesses": [
+          "claude",
+          "codex"
+        ],
+        "hold": false,
+        "level": "complex-hgih",
+        "prefer": [],
+        "providers": [],
+        "reasons": [
+          {
+            "code": "level_from_kind",
+            "detail": "Bug fixes are Standard, high effort."
+          },
+          {
+            "code": "escalated_after_failure"
+          }
+        ],
+        "subject": {
+          "id": "task-1",
+          "revision": 3
+        }
+      }
+    },
+    {
+      "contract": "work.route",
+      "kind": "input",
+      "name": "invalid route with the empty level",
+      "valid": false,
+      "value": {
+        "classification": {
+          "fields": [
+            "kind",
+            "risk"
+          ],
+          "flags": [
+            "narrow",
+            "covered_by_test"
+          ],
+          "labels": [
+            "bugfix",
+            "high"
+          ],
+          "rationale": "Touches crash recovery; a test covers the counter.",
+          "reference": "judgment:op-1"
+        },
+        "harnesses": [
+          "claude",
+          "codex"
+        ],
+        "hold": false,
+        "level": "",
+        "prefer": [],
+        "providers": [],
+        "reasons": [
+          {
+            "code": "level_from_kind",
+            "detail": "Bug fixes are Standard, high effort."
+          },
+          {
+            "code": "escalated_after_failure"
+          }
+        ],
+        "subject": {
+          "id": "task-1",
+          "revision": 3
+        }
+      }
+    },
+    {
+      "contract": "work.route",
+      "kind": "input",
+      "name": "invalid route pinning nothing allowed",
+      "valid": false,
+      "value": {
+        "classification": null,
+        "harnesses": [
+          "codex"
+        ],
+        "hold": true,
+        "level": "standard-high",
+        "prefer": [],
+        "providers": [],
+        "reasons": [
+          {
+            "code": "nothing_allowed"
+          }
+        ],
+        "subject": {
+          "id": "task-1",
+          "revision": 3
+        }
+      }
+    },
+    {
+      "contract": "work.route",
+      "kind": "input",
+      "name": "invalid route with nine harnesses",
+      "valid": false,
+      "value": {
+        "classification": {
+          "fields": [
+            "kind",
+            "risk"
+          ],
+          "flags": [
+            "narrow",
+            "covered_by_test"
+          ],
+          "labels": [
+            "bugfix",
+            "high"
+          ],
+          "rationale": "Touches crash recovery; a test covers the counter.",
+          "reference": "judgment:op-1"
+        },
+        "harnesses": [
+          "h0",
+          "h1",
+          "h2",
+          "h3",
+          "h4",
+          "h5",
+          "h6",
+          "h7",
+          "h8"
+        ],
+        "hold": false,
+        "level": "complex-high",
+        "prefer": [],
+        "providers": [],
+        "reasons": [
+          {
+            "code": "level_from_kind",
+            "detail": "Bug fixes are Standard, high effort."
+          },
+          {
+            "code": "escalated_after_failure"
+          }
+        ],
+        "subject": {
+          "id": "task-1",
+          "revision": 3
+        }
+      }
+    },
+    {
+      "contract": "work.route",
+      "kind": "input",
+      "name": "invalid classification without the judgment reference",
+      "valid": false,
+      "value": {
+        "classification": {
+          "fields": [
+            "kind",
+            "risk"
+          ],
           "flags": [
             "narrow",
             "covered_by_test"
@@ -611,6 +876,51 @@
             "high"
           ],
           "rationale": "Touches crash recovery; a test covers the counter."
+        },
+        "harnesses": [
+          "claude",
+          "codex"
+        ],
+        "hold": false,
+        "level": "complex-high",
+        "prefer": [],
+        "providers": [],
+        "reasons": [
+          {
+            "code": "level_from_kind",
+            "detail": "Bug fixes are Standard, high effort."
+          },
+          {
+            "code": "escalated_after_failure"
+          }
+        ],
+        "subject": {
+          "id": "task-1",
+          "revision": 3
+        }
+      }
+    },
+    {
+      "contract": "work.route",
+      "kind": "input",
+      "name": "invalid route with a free-text reason code",
+      "valid": false,
+      "value": {
+        "classification": {
+          "fields": [
+            "kind",
+            "risk"
+          ],
+          "flags": [
+            "narrow",
+            "covered_by_test"
+          ],
+          "labels": [
+            "bugfix",
+            "high"
+          ],
+          "rationale": "Touches crash recovery; a test covers the counter.",
+          "reference": "judgment:op-1"
         },
         "harnesses": [
           "claude",
@@ -639,6 +949,10 @@
       "valid": false,
       "value": {
         "classification": {
+          "fields": [
+            "kind",
+            "risk"
+          ],
           "flags": [
             "narrow",
             "covered_by_test"
@@ -647,7 +961,8 @@
             "bugfix",
             "high"
           ],
-          "rationale": "Touches crash recovery; a test covers the counter."
+          "rationale": "Touches crash recovery; a test covers the counter.",
+          "reference": "judgment:op-1"
         },
         "harnesses": [
           "claude",
@@ -662,8 +977,7 @@
             "detail": "Bug fixes are Standard, high effort."
           },
           {
-            "code": "escalated_after_failure",
-            "detail": "A bug fix that already failed once moves up to Complex."
+            "code": "escalated_after_failure"
           }
         ],
         "subject": {
@@ -679,6 +993,10 @@
       "valid": false,
       "value": {
         "classification": {
+          "fields": [
+            "kind",
+            "risk"
+          ],
           "flags": [
             "narrow",
             "covered_by_test"
@@ -687,7 +1005,8 @@
             "bugfix",
             "high"
           ],
-          "rationale": "Touches crash recovery; a test covers the counter."
+          "rationale": "Touches crash recovery; a test covers the counter.",
+          "reference": "judgment:op-1"
         },
         "harnesses": [
           "claude",
@@ -704,8 +1023,7 @@
             "detail": "Bug fixes are Standard, high effort."
           },
           {
-            "code": "escalated_after_failure",
-            "detail": "A bug fix that already failed once moves up to Complex."
+            "code": "escalated_after_failure"
           }
         ],
         "subject": {
@@ -721,6 +1039,10 @@
       "valid": false,
       "value": {
         "classification": {
+          "fields": [
+            "kind",
+            "risk"
+          ],
           "flags": [
             "narrow",
             "covered_by_test"
@@ -729,7 +1051,8 @@
             "bugfix",
             "high"
           ],
-          "rationale": "Touches crash recovery; a test covers the counter."
+          "rationale": "Touches crash recovery; a test covers the counter.",
+          "reference": "judgment:op-1"
         },
         "harnesses": [
           "claude",
@@ -822,6 +1145,10 @@
       "valid": false,
       "value": {
         "classification": {
+          "fields": [
+            "kind",
+            "risk"
+          ],
           "flags": [
             "narrow",
             "covered_by_test"
@@ -830,7 +1157,8 @@
             "bugfix",
             "high"
           ],
-          "rationale": "Touches crash recovery; a test covers the counter."
+          "rationale": "Touches crash recovery; a test covers the counter.",
+          "reference": "judgment:op-1"
         },
         "harnesses": [
           "claude",
@@ -843,7 +1171,7 @@
         "reasons": [
           {
             "code": "level_from_kind",
-            "detail": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            "detail": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
           }
         ],
         "subject": {
@@ -855,9 +1183,46 @@
     {
       "contract": "work.route",
       "kind": "output",
-      "name": "valid routed",
+      "name": "valid routed with what remained at the level",
       "outcome": "routed",
       "valid": true,
+      "value": {
+        "harnesses": [
+          "claude",
+          "codex"
+        ],
+        "prefer": [],
+        "providers": [],
+        "reference": "task-1@3",
+        "subject": {
+          "id": "task-1",
+          "revision": 3
+        }
+      }
+    },
+    {
+      "contract": "work.route",
+      "kind": "output",
+      "name": "valid routed with no restriction",
+      "outcome": "routed",
+      "valid": true,
+      "value": {
+        "harnesses": [],
+        "prefer": [],
+        "providers": [],
+        "reference": "task-1@3",
+        "subject": {
+          "id": "task-1",
+          "revision": 3
+        }
+      }
+    },
+    {
+      "contract": "work.route",
+      "kind": "output",
+      "name": "invalid routed without what remained",
+      "outcome": "routed",
+      "valid": false,
       "value": {
         "reference": "task-1@3",
         "subject": {
@@ -1916,8 +2281,8 @@
   "compatibility": {
     "added_commands": {
       "judgment.assess": "sha256:da4d7908c8943ade3905b9e573a7426fe36759321f6a287d5b97559ab868aa13",
-      "work.read": "sha256:28ae09a1b96cf1c38667359b6393ea9d250089bc60608243414be89568ef2b9a",
-      "work.route": "sha256:bfd071f302a5da616317661546b5a05d2d7bc7a51c0ae0c2e59ee1dac645abff"
+      "work.read": "sha256:aa1f30e38dfcd9682099595dd055c46359f9df7a5b2b8f34e39e30528138ce91",
+      "work.route": "sha256:04216580f2f561bf1a6c776dbb98aff83f421072ff57392817a139fc74ab77ee"
     },
     "added_events": {
       "aq.judgment.assessed": "sha256:4f9c791d3aa443dd05c040061cdced74733d17403252b45ed706b21fba263b3e",
