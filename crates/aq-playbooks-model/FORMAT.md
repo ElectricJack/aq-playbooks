@@ -121,9 +121,36 @@ A member is named by its binding, with no path. An owned child is
 `{"op":"ref","root":"<bind>"}` or `{"op":"ref","root":"<bind>","path":["child"]}`.
 An operation handle is `{"op":"ref","root":"<bind>"}` only: the binding the invoke
 step's `accepted` edge recorded (`{"handle": h}`). `<bind>` may also be written
-`{"op":"ref","root":"vars","path":["<bind>"]}`. A path inside an operation handle,
-such as `["handle"]`, is refused with `join_member_type`, in joins with or without
-`member_keys`. The runner would refuse that member when it reaches the join.
+`{"op":"ref","root":"vars","path":["<bind>"]}`. Compiling a draft refuses a path
+inside an operation handle, such as `["handle"]`, with `join_member_type`, in
+joins with or without `member_keys`. The runner refuses that member when the run
+reaches the join. Verifying a stored artifact still accepts it, so an artifact
+stored before this rule keeps loading.
+
+Reading a field that is not there on every way to a step. Ordinary typing merges
+the outcomes a binding can hold into one object. In that object, a field only one
+outcome has becomes optional, and an optional field types as present. Compiling a
+draft is stricter: each binding keeps its outcomes apart. A reference is refused
+with `expression_type` when it reads through a field that some way of reaching
+its step lacks:
+- an invoke or call outcome without the field, where several outcome edges meet
+  at one step;
+- an outcome without the field among a join's accepted outcomes. This includes
+  every outcome when `accepted_outcomes` is empty;
+- a join key that can be absent: on `timeout`, a member that has not answered.
+  The same holds for a member that was not selected in modes `any_accepted` and
+  `any_completion`;
+- a wait's binding on its `timeout` edge, where nothing is bound.
+
+The diagnostic names the step, the reference and the ways that lack the field.
+Read the field only where it is always present: after the outcome edge that
+returns it, or on the `completed` edge of a join whose `accepted_outcomes` lists
+only outcomes that have it. A `decide` on `outcome` does not narrow anything.
+The operand of `exists` is exempt, because `exists` turns a missing value into
+`false`. A `lookup` key is never exempt, even inside `exists`. A lookup with a
+missing key takes its default without a trace. A field that is merely optional
+in its one schema stays readable, also as a lookup key. Verifying a stored
+artifact does not apply this check.
 
 Ask, then read the answer. A wait on an asynchronous command's completion event
 binds the event's whole payload, which a wait does not narrow per outcome. To read
@@ -166,10 +193,17 @@ edge sees a different answer:
 - `timeout`: no answer arrived within `deadline_ms`. `answer` is `{}`.
 
 An answer that arrives before the run reaches the join is recorded on the
-operation, and the join reads it when the run arrives. After a timeout, the run
-holds its return until the operation it owns settles. A late answer settles the
-operation but does not change the outcome. Under `"remaining":"cancel"`, the
-engine also marks the unfinished operation for cancellation.
+operation, and the join reads it when the run arrives. An answer accepted at
+the join's deadline still counts. After a timeout, the run holds its return
+(status `finishing`) until the operation it owns settles. The answer, however
+late, settles the operation without changing the outcome. If no answer ever
+arrives, the operation becomes unknown at the command's own deadline (60 s for
+`judgment.request`), and the run stays live. The engine does not settle it by
+itself. `judgment.request` cannot be cancelled, so `"remaining":"cancel"` does not
+help, and as a `keyed_idempotent` command it is replayed only on an authorized
+recovery request. Bounding such a run is the host's duty: the host must always
+deliver a final completion (for example, `failed` when its own budget deadline
+passes).
 
 Callable dependencies declare `selection`: `exact` uses the captured artifact
 hash; `catalog` resolves the named binding at root admission. A catalog allowlist

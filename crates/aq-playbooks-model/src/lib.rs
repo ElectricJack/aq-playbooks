@@ -1,4 +1,5 @@
 //! Versioned, bounded portable workflow format. See FORMAT.md for canonical rules.
+mod draft;
 pub mod schedules;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -2079,20 +2080,6 @@ impl ArtifactContent {
                     if let Err(error) = self.join_schema(step, false) {
                         issue(&mut issues, "join_member_type", &path, error);
                     }
-                    // A join without member keys is not typed, but its members
-                    // resolve at run time exactly as a named join's do.
-                    if member_keys.is_empty() {
-                        for (i, member) in members.iter().enumerate() {
-                            if let Some(error) = self.handle_member_path(member) {
-                                issue(
-                                    &mut issues,
-                                    "join_member_type",
-                                    &path,
-                                    format!("members[{i}]: {error}"),
-                                );
-                            }
-                        }
-                    }
                     if *mode == JoinMode::AnyCompletion && !accepted_outcomes.is_empty() {
                         issue(
                             &mut issues,
@@ -3771,11 +3758,12 @@ fn dotted(root: &str, path: &[String]) -> String {
 /// there, and where the missing part would be readable.
 fn unreadable_ref(root: &str, path: &[String], schema: &Schema, error: String) -> String {
     let mut at = schema.clone();
+    let mut parent = None;
     let mut depth = 0;
     while let Some(key) = path.get(depth) {
         match schema_path(&at, std::slice::from_ref(key)) {
             Ok(next) => {
-                at = next;
+                parent = Some(std::mem::replace(&mut at, next));
                 depth += 1;
             }
             Err(_) => break,
@@ -3788,14 +3776,21 @@ fn unreadable_ref(root: &str, path: &[String], schema: &Schema, error: String) -
     let fields = |properties: &BTreeMap<String, Schema>| {
         properties.keys().cloned().collect::<Vec<_>>().join(", ")
     };
+    // A named join's answer for one member: {participant, outcome, output}.
+    let join_answer = matches!(&parent, Some(Schema::Object { properties, .. })
+        if properties.keys().map(String::as_str).eq(["outcome", "output", "participant"]));
     let why = match &at {
         Schema::Object { properties, .. } => {
             format!("{error}: `{prefix}` has fields {}", fields(properties))
         }
+        Schema::Nullable { .. } if join_answer => format!(
+            "`{prefix}` may be null at this step, so `{key}` cannot be read. A join's \
+             answer (`outcome`, `output`) is present only on the join's `completed` edge, \
+             in mode `all` or `any_accepted`: read it in a step reached through that edge"
+        ),
         Schema::Nullable { .. } => format!(
-            "`{prefix}` may be null at this step, so `{key}` cannot be read. Read it only \
-             where it is known to be present: a join's answer (`outcome`, `output`) is \
-             present only on the join's `completed` edge, in mode `all` or `any_accepted`"
+            "`{prefix}` may be null at this step, so `{key}` cannot be read. Read it after \
+             an edge on which it is not null, or test it first with `exists`"
         ),
         Schema::Union { variants } => {
             let objects: Vec<_> = variants
@@ -3821,10 +3816,9 @@ fn unreadable_ref(root: &str, path: &[String], schema: &Schema, error: String) -
                 "none"
             };
             format!(
-                "`{prefix}` has a different shape per outcome and {some} of them have `{key}`; \
-                 every outcome has {}. Read `{key}` after an edge that selects an outcome \
-                 that has it: an invoke's outcome edge, or a join's `completed` edge with \
-                 `accepted_outcomes`",
+                "`{prefix}` has a different shape per alternative and {some} of them have \
+                 `{key}`; every alternative has {}. Read `{key}` after an edge that selects \
+                 an alternative that has it, or test it first with `exists`",
                 if common.is_empty() {
                     "no common field".to_string()
                 } else {
@@ -3868,17 +3862,26 @@ impl ArtifactContent {
                 }
                 _ => None,
             })?;
+        let written = dotted(root, path);
+        if self
+            .registry
+            .commands
+            .get(command)
+            .is_some_and(|c| c.asynchronous.is_none())
+        {
+            return Some(format!(
+                "`{written}` is a result of step `{step}`, whose command {command} is \
+                 synchronous; only the handle of an asynchronous command can be joined. Use \
+                 the result directly on the step's outcome edges instead of joining it"
+            ));
+        }
         Some(format!(
-            "`{}` reads inside the operation handle bound by step `{step}` ({command}); \
+            "`{written}` reads inside the operation handle bound by step `{step}` ({command}); \
              a join names the handle by its binding alone: write \
-             {{\"op\":\"ref\",\"root\":\"{binding}\",\"path\":[]}}",
-            dotted(root, path)
+             {{\"op\":\"ref\",\"root\":\"{binding}\",\"path\":[]}}"
         ))
     }
     fn member_outcomes(&self, member: &Expr) -> Result<BTreeMap<String, Schema>, String> {
-        if let Some(error) = self.handle_member_path(member) {
-            return Err(error);
-        }
         let Expr::Ref { root, path } = member else {
             return Err("named join members must reference statically declared owned child or operation handles".into());
         };
@@ -3906,7 +3909,12 @@ impl ArtifactContent {
                         .map(|entry| entry.outcomes.clone())
                         .ok_or_else(|| "join references unknown child interface".into());
                 }
-                Operation::Invoke { command, bind, .. } if bind == binding && path.is_empty() => {
+                // `["handle"]` types as the handle itself so that stored
+                // artifacts keep verifying; a new draft is refused it
+                // (`draft_issues`), and the runner refuses it at the join.
+                Operation::Invoke { command, bind, .. }
+                    if bind == binding && (path.is_empty() || path == ["handle"]) =>
+                {
                     let command = self
                         .registry
                         .commands

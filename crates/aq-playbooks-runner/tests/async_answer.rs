@@ -337,7 +337,20 @@ fn a_failed_or_refused_answer_takes_no_match_without_reading_the_choice() {
         a.complete(payload, 10);
         a.assert_finished("unanswered");
         let run = a.run();
-        assert!(!run.variables.contains_key("decide"));
+        // The playbook never reached the step that reads `choice`.
+        let s = a.engine.snapshot().unwrap();
+        assert!(
+            !s.receipts
+                .iter()
+                .any(|r| r.run == a.run && r.step == "decide"),
+            "{:?}",
+            s.receipts
+        );
+        assert!(
+            s.receipts
+                .iter()
+                .any(|r| r.run == a.run && r.step == "unanswered")
+        );
         assert_eq!(run.variables["answer"]["c"]["outcome"], outcome);
         assert!(
             run.variables["answer"]["c"]["output"]
@@ -393,12 +406,84 @@ fn an_answer_that_never_arrives_takes_the_timeout_edge_at_the_deadline() {
 }
 
 #[test]
-fn the_handle_path_form_cannot_be_installed() {
+fn an_answer_landing_exactly_at_the_join_deadline_is_read() {
+    // The join counts an answer accepted at or before its deadline, and the
+    // engine records completions before it polls the join, so an answer
+    // accepted at the deadline wins over the timeout.
+    let mut a = ask(false);
+    a.complete(assessed("approve"), JOIN_DEADLINE_MS as i64);
+    a.assert_finished("approved");
+}
+
+#[test]
+fn an_answer_that_never_arrives_keeps_the_run_live_until_the_host_settles_it() {
+    let mut a = ask(false);
+    let deadline = a.artifact.content.registry.commands["judgment.request"].deadline_ms as i64;
+    assert_eq!(deadline, 60_000);
+    a.engine
+        .drive(&mut a.host, JOIN_DEADLINE_MS as i64, 20)
+        .unwrap();
+    assert_eq!(a.run().step, "late");
+    // Past the command's own deadline the operation is Unknown. The engine
+    // neither reconciles it (judgment.request is keyed_idempotent, so only an
+    // authorized recovery request replays it) nor cancels it (no
+    // cancellation), so the run stays Finishing however long it waits.
+    for now in [deadline, deadline + 1, 10 * deadline, 1_000 * deadline] {
+        a.engine.drive(&mut a.host, now, 20).unwrap();
+        let s = a.engine.snapshot().unwrap();
+        let intent = s.intents.values().find(|i| i.run == a.run).unwrap();
+        assert_eq!(intent.status, IntentStatus::Unknown, "at {now}");
+        let run = &s.runs[&a.run];
+        assert_eq!(run.status, RunStatus::Finishing, "at {now}");
+        assert_eq!(run.outcome, None);
+        assert_eq!(run.pending_return, Some(("late".into(), Value::Null)));
+    }
+    assert!(a.host.reconciliations.is_empty());
+    assert!(a.host.cancelled.is_empty());
+    // A final completion from the host, however late, settles it: the run
+    // finishes with the timeout's outcome.
+    a.complete(failed(), 1_000 * deadline + 1);
+    a.assert_finished("late");
+}
+
+#[test]
+fn a_stored_artifact_with_the_handle_path_installs_and_is_refused_at_the_join() {
+    // Verification stays lenient so an old artifact can never make its
+    // namespace unloadable; compiling a draft with this form is refused.
     let e = Engine::new(MemoryStorage::default(), "async-answer", "owner-1").unwrap();
-    let error = e
-        .install(playbook(r("j", &["handle"]), false))
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("steps.read"), "{error}");
-    assert!(error.contains("`j.handle`"), "{error}");
+    let artifact = playbook(r("j", &["handle"]), false);
+    e.install(artifact.clone()).unwrap();
+    e.activate("ask-then-read", &artifact.digest, authority())
+        .unwrap();
+    let run = e
+        .admit("ask-then-read", "main", Value::Null, authority(), 0)
+        .unwrap();
+    let mut host = FakeHost {
+        responses: BTreeMap::from([(
+            "judgment.request".into(),
+            vec![DispatchResult::Accepted {
+                handle: HANDLE.into(),
+            }],
+        )]),
+        ..Default::default()
+    };
+    e.drive(&mut host, 0, 20).unwrap();
+    // The runner resolves `j.handle` to the bare handle string, which is no
+    // owned child, refuses the join step and takes its `on_error` edge.
+    let s = e.snapshot().unwrap();
+    assert!(
+        s.receipts.iter().any(|r| r.run == run
+            && r.step == "read"
+            && r.kind == "error"
+            && r.detail["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("join requires owned child handle"))),
+        "{:?}",
+        s.receipts
+    );
+    assert_eq!(s.runs[&run].step, "error");
+    assert_eq!(
+        s.runs[&run].pending_return,
+        Some(("error".into(), Value::Null))
+    );
 }

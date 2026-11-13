@@ -127,6 +127,10 @@ pub fn validate(input: &CompileInput) -> Vec<Diagnostic> {
         let c = content(input, header);
         let mut found = c.validate_structure();
         draft_depth_issues(&c.playbook, &mut found);
+        // Join member forms and reads every way to a step can satisfy: a new
+        // draft only, as for depth, so stored artifacts keep loading.
+        let strict = c.draft_issues(&found);
+        found.extend(strict);
         for issue in found {
             let mut d = Diagnostic::error(&issue.code, &issue.path, issue.message);
             if let Some(loc) = c.source_map.get(&issue.path) {
