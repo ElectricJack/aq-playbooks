@@ -656,6 +656,7 @@ fn fence_state() -> State {
     });
     s.receipts.push(audit(1, "run-a"));
     s.receipts.push(audit(2, "run-b"));
+    s.sequence = 2;
     s.keyed_admissions.insert("k".into(), receipt("k", 0));
     s.keyed_admissions
         .insert("fallback".into(), receipt("fallback", 0));
@@ -664,7 +665,35 @@ fn fence_state() -> State {
         .insert("k".into(), 3_000);
     s.events.insert("ev".into(), accepted_event("ev", 0));
     s.retention.event_expires_at_ms.insert("ev".into(), 4_000);
+    // Round 2 (C1): an installed contract whose window (5_000) is longer
+    // than the policy's, and an event of it expiring at 9_000.
+    let long = long_artifact();
+    s.artifacts.insert(long.digest.clone(), long);
+    s.events.insert("ev-long".into(), {
+        let mut e = accepted_event("ev-long", 0);
+        e.envelope.contract = aq_playbooks_model::ContractRef {
+            name: long_contract().name,
+            fingerprint: long_contract().fingerprint().unwrap(),
+        };
+        e
+    });
+    s.retention
+        .event_expires_at_ms
+        .insert("ev-long".into(), 9_000);
     s
+}
+fn long_contract() -> aq_playbooks_model::EventContract {
+    aq_playbooks_model::EventContract {
+        name: "test.long".into(),
+        retention_ms: 5_000,
+        ..pg_event_contract()
+    }
+}
+fn long_artifact() -> aq_playbooks_model::Artifact {
+    let mut content = support::artifact("long").content;
+    let c = long_contract();
+    content.registry.events.insert(c.name.clone(), c);
+    aq_playbooks_model::Artifact::seal(content).unwrap()
 }
 type Case = (&'static str, &'static str, Box<dyn Fn(&mut State)>);
 /// The refusals every commit path must make, each as a change of
@@ -804,32 +833,59 @@ fn refusal_cases() -> Vec<Case> {
     cases.extend(rebase_refusal_cases());
     cases
 }
-/// The admin receipt of a clock rebase from `from_ms` to `to_ms`.
-fn rebase_receipt(sequence: u64, from_ms: i64, to_ms: i64) -> Receipt {
+/// An admin licence receipt of `kind` from `from_ms` to `to_ms`.
+fn licence_receipt(kind: &str, sequence: u64, from_ms: i64, to_ms: i64) -> Receipt {
     Receipt {
         sequence,
         run: "admin".into(),
         step: "retention".into(),
         at_ms: to_ms,
-        kind: retention::CLOCK_REBASE.into(),
+        kind: kind.into(),
         detail: json!({"from_ms": from_ms, "to_ms": to_ms}),
     }
 }
-/// That receipt as history written by the commit (the licence).
-fn rebase_cohort(sequence: u64, from_ms: i64, to_ms: i64) -> SettledCohort {
+/// That receipt as history written by the commit.
+fn licence_cohort(receipts: Vec<Receipt>) -> SettledCohort {
     SettledCohort {
         root: "admin".into(),
-        finished_at_ms: to_ms,
+        finished_at_ms: 1,
         runs: vec![],
         intents: vec![],
-        receipts: vec![rebase_receipt(sequence, from_ms, to_ms)],
+        receipts,
     }
 }
-/// Ruling 3: the clock and expiry fences open only for a commit that writes
-/// a clock rebase receipt to history, for exactly that rebase (changes of
-/// `fence_state()`: clock 500, windows 2_000 and 3_000).
+/// Write a licence receipt of `kind` as the commit's one new sequence
+/// number, as the engine does.
+fn license(n: &mut State, kind: &str, from_ms: i64, to_ms: i64) {
+    n.sequence += 1;
+    n.settled.push(licence_cohort(vec![licence_receipt(
+        kind, n.sequence, from_ms, to_ms,
+    )]));
+}
+/// The commit a rebase from 500 to 100 makes on `fence_state()`: clock 100,
+/// each expiry capped at 100 plus its own window ("ev-long" by its
+/// contract's 5_000), a stale floor.
+fn rebased(n: &mut State) {
+    n.retention.clock_ms = Some(100);
+    n.retention
+        .admission_expires_at_ms
+        .insert("k".into(), 2_100);
+    n.retention.event_expires_at_ms.insert("ev".into(), 3_100);
+    n.retention
+        .event_expires_at_ms
+        .insert("ev-long".into(), 5_100);
+    n.retention.stale_floor_ms = Some(50);
+    license(n, retention::CLOCK_REBASE, 500, 100);
+}
+/// Rulings 1 and 2 (round 2): a commit with a licence receipt must be
+/// exactly that licence and do nothing else; without one, the clock never
+/// decreases and the floor never changes. Cases on `fence_state()` (clock
+/// 500; windows 2_000 and 3_000; "k" 3_000, "ev" 4_000, "ev-long" 9_000
+/// with a 5_000 contract window), each (label, refusal, change).
 fn rebase_refusal_cases() -> Vec<Case> {
     let shortened = retention::REFUSE_EXPIRY;
+    let licence = retention::REFUSE_LICENCE;
+    let floor = retention::REFUSE_STALE_FLOOR;
     vec![
         (
             "clock lowered without a rebase",
@@ -841,95 +897,243 @@ fn rebase_refusal_cases() -> Vec<Case> {
             retention::REFUSE_CLOCK,
             Box::new(|n| {
                 n.retention.clock_ms = Some(100);
-                n.receipts.push(rebase_receipt(99, 500, 100));
+                n.sequence += 1;
+                n.receipts.push(licence_receipt(
+                    retention::CLOCK_REBASE,
+                    n.sequence,
+                    500,
+                    100,
+                ));
             }),
         ),
         (
             "clock lowered, rebase from another clock",
-            retention::REFUSE_CLOCK,
+            licence,
             Box::new(|n| {
                 n.retention.clock_ms = Some(100);
-                n.settled.push(rebase_cohort(99, 600, 100));
+                license(n, retention::CLOCK_REBASE, 600, 100);
             }),
         ),
         (
             "clock lowered, rebase to another clock",
-            retention::REFUSE_CLOCK,
+            licence,
             Box::new(|n| {
                 n.retention.clock_ms = Some(100);
-                n.settled.push(rebase_cohort(99, 500, 200));
+                license(n, retention::CLOCK_REBASE, 500, 200);
             }),
         ),
         (
-            "expiry lowered with a rebase the clock did not take",
+            "review probe: a receipt from 7 to 500, the clock left at 500, expiries lowered",
+            licence,
+            Box::new(|n| {
+                license(n, retention::CLOCK_REBASE, 7, 500);
+                n.retention
+                    .admission_expires_at_ms
+                    .insert("k".into(), 2_500);
+                n.retention.event_expires_at_ms.insert("ev".into(), 3_500);
+            }),
+        ),
+        (
+            "rebase upwards",
+            licence,
+            Box::new(|n| {
+                n.retention.clock_ms = Some(600);
+                license(n, retention::CLOCK_REBASE, 500, 600);
+            }),
+        ),
+        (
+            "replayed rebase receipt (not this commit's sequence)",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                let replayed = n.sequence - 1;
+                n.settled[0].receipts[0].sequence = replayed;
+            }),
+        ),
+        (
+            "rebase that also admits",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                n.sequence += 1;
+                n.keyed_admissions.insert("new".into(), receipt("new", 100));
+            }),
+        ),
+        (
+            "rebase that also accepts an event",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                n.events
+                    .insert("ev-new".into(), accepted_event("ev-new", 100));
+            }),
+        ),
+        (
+            "rebase that also settles a run",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                let run = n.runs.remove("run-a").unwrap();
+                n.receipts.retain(|r| r.sequence != 1);
+                let mut c = cohort_of(run);
+                c.receipts.push(audit(1, "run-a"));
+                n.settled.push(c);
+            }),
+        ),
+        (
+            "two licences in one commit",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                n.settled[0].receipts.push(licence_receipt(
+                    retention::STALE_FLOOR_LOWERED,
+                    77,
+                    50,
+                    10,
+                ));
+            }),
+        ),
+        (
+            "expiry lowered without a rebase",
             shortened,
             Box::new(|n| {
-                n.settled.push(rebase_cohort(99, 500, 100));
                 n.retention
                     .admission_expires_at_ms
                     .insert("k".into(), 2_100);
             }),
         ),
         (
-            "expiry capped below the rebased window",
+            "expiry lowered with a rebase the clock did not take",
+            licence,
+            Box::new(|n| {
+                license(n, retention::CLOCK_REBASE, 500, 100);
+                n.retention
+                    .admission_expires_at_ms
+                    .insert("k".into(), 2_100);
+            }),
+        ),
+        (
+            "expiry capped below its cap",
             shortened,
             Box::new(|n| {
-                n.retention.clock_ms = Some(100);
-                n.settled.push(rebase_cohort(99, 500, 100));
+                rebased(n);
                 n.retention
                     .admission_expires_at_ms
                     .insert("k".into(), 2_099);
             }),
         ),
         (
-            "event expiry capped below the rebased window",
+            "expiry lowered, but not to its cap",
             shortened,
             Box::new(|n| {
-                n.retention.clock_ms = Some(100);
-                n.settled.push(rebase_cohort(99, 500, 100));
+                rebased(n);
+                n.retention
+                    .admission_expires_at_ms
+                    .insert("k".into(), 2_200);
+            }),
+        ),
+        (
+            "event expiry capped below its cap",
+            shortened,
+            Box::new(|n| {
+                rebased(n);
                 n.retention.event_expires_at_ms.insert("ev".into(), 3_099);
+            }),
+        ),
+        (
+            "event capped to the policy window, its contract window is longer",
+            shortened,
+            Box::new(|n| {
+                rebased(n);
+                n.retention
+                    .event_expires_at_ms
+                    .insert("ev-long".into(), 3_100);
+            }),
+        ),
+        (
+            "floor raised without a licence",
+            floor,
+            Box::new(|n| n.retention.stale_floor_ms = Some(50)),
+        ),
+        (
+            "rebase raises the floor past its target",
+            floor,
+            Box::new(|n| {
+                rebased(n);
+                n.retention.stale_floor_ms = Some(101);
             }),
         ),
     ]
 }
-/// The commit a rebase from 500 to 100 makes on `fence_state()`.
-fn rebased(n: &mut State) {
-    n.retention.clock_ms = Some(100);
-    n.retention
-        .admission_expires_at_ms
-        .insert("k".into(), 2_100);
-    n.retention.event_expires_at_ms.insert("ev".into(), 3_100);
-    n.retention.stale_floor_ms = Some(50);
-    n.settled.push(rebase_cohort(99, 500, 100));
-}
-/// After that commit the licence is spent, and the floor never decreases.
+/// After that commit no licence is left, and the floor changes only with
+/// its own exact receipt. Changes of the stored state after the rebase
+/// (clock 100, floor 50).
 fn after_rebase_refusal_cases() -> Vec<Case> {
+    let licence = retention::REFUSE_LICENCE;
+    let floor = retention::REFUSE_STALE_FLOOR;
     vec![
         (
             "clock lowered again",
             retention::REFUSE_CLOCK,
-            Box::new(|n| {
-                n.settled.clear();
-                n.retention.clock_ms = Some(90);
-            }),
+            Box::new(|n| n.retention.clock_ms = Some(90)),
         ),
         (
-            "stale floor lowered",
-            retention::REFUSE_STALE_FLOOR,
-            Box::new(|n| {
-                n.settled.clear();
-                n.retention.stale_floor_ms = Some(40);
-            }),
+            "stale floor lowered without a licence",
+            floor,
+            Box::new(|n| n.retention.stale_floor_ms = Some(40)),
+        ),
+        (
+            "stale floor raised without a licence",
+            floor,
+            Box::new(|n| n.retention.stale_floor_ms = Some(60)),
         ),
         (
             "stale floor removed",
-            retention::REFUSE_STALE_FLOOR,
+            floor,
+            Box::new(|n| n.retention.stale_floor_ms = None),
+        ),
+        (
+            "floor lowered to another value than its receipt",
+            licence,
             Box::new(|n| {
-                n.settled.clear();
-                n.retention.stale_floor_ms = None;
+                n.retention.stale_floor_ms = Some(30);
+                license(n, retention::STALE_FLOOR_LOWERED, 50, 40);
+            }),
+        ),
+        (
+            "floor lowering from another floor",
+            licence,
+            Box::new(|n| {
+                n.retention.stale_floor_ms = Some(40);
+                license(n, retention::STALE_FLOOR_LOWERED, 60, 40);
+            }),
+        ),
+        (
+            "floor lowering that also moves the clock",
+            licence,
+            Box::new(|n| {
+                n.retention.stale_floor_ms = Some(40);
+                n.retention.clock_ms = Some(200);
+                license(n, retention::STALE_FLOOR_LOWERED, 50, 40);
+            }),
+        ),
+        (
+            "floor lowering that also changes an expiry",
+            retention::REFUSE_EXPIRY,
+            Box::new(|n| {
+                n.retention.stale_floor_ms = Some(40);
+                n.retention
+                    .admission_expires_at_ms
+                    .insert("k".into(), 9_000);
+                license(n, retention::STALE_FLOOR_LOWERED, 50, 40);
             }),
         ),
     ]
+}
+/// The floor lowering the fence accepts after `rebased`: 50 to 40.
+fn floor_lowered(n: &mut State) {
+    n.retention.stale_floor_ms = Some(40);
+    license(n, retention::STALE_FLOOR_LOWERED, 50, 40);
 }
 /// A licensed rebase commits on every full path (protected and plain
 /// format 2, format 3 compare-and-swap) and through a format 3 transition
@@ -959,6 +1163,11 @@ fn a_clock_rebase_is_licensed_on_every_commit_path() {
                 (Some(100), Some(50), Some(2_100)),
                 "{label}"
             );
+            assert_eq!(
+                s.retention.event_expires_at_ms.get("ev-long").copied(),
+                Some(5_100),
+                "{label}"
+            );
             assert_eq!(history_rows(&ns), 1, "{label}: the rebase receipt");
             let mut later = s.clone();
             f(&mut later);
@@ -969,6 +1178,20 @@ fn a_clock_rebase_is_licensed_on_every_commit_path() {
             );
             assert_eq!(store.load(&ns).unwrap().revision, r, "{label} {case}");
         }
+        let ns = support::namespace(label);
+        store.acquire(&ns, "w").unwrap();
+        let base = store.compare_and_swap(&ns, "w", 0, &fence_state()).unwrap();
+        let mut next = fence_state();
+        rebased(&mut next);
+        let r = store.compare_and_swap(&ns, "w", base, &next).unwrap();
+        let mut later = store.load(&ns).unwrap().state;
+        floor_lowered(&mut later);
+        store.compare_and_swap(&ns, "w", r, &later).unwrap();
+        assert_eq!(
+            store.load(&ns).unwrap().state.retention.stale_floor_ms,
+            Some(40),
+            "{label}"
+        );
     }
     let store = support::records();
     let ns = support::namespace("f3_rebase");
@@ -1008,13 +1231,20 @@ fn a_clock_rebase_is_licensed_on_every_commit_path() {
         let result = transition(f.as_ref());
         assert!(refused_with(result.clone(), text), "{case}: {result:?}");
     }
+    // The floor lowered with its own receipt, also on the complete path.
+    transition(&floor_lowered).unwrap();
+    assert_eq!(store.transition_stats().heavy, 2);
+    assert_eq!(
+        store.load(&ns).unwrap().state.retention.stale_floor_ms,
+        Some(40)
+    );
     // A rebase that lowers only the clock also takes the complete path.
     let ns = support::namespace("f3_rebase_clock_only");
     store.acquire(&ns, "w").unwrap();
     store.compare_and_swap(&ns, "w", 0, &s).unwrap();
     let mut plan = |s: &mut State| {
         s.retention.clock_ms = Some(100);
-        s.settled.push(rebase_cohort(99, 500, 100));
+        license(s, retention::CLOCK_REBASE, 500, 100);
         Ok(true)
     };
     let validate = |_: &State, _: &QuotaCounts| Ok(());
@@ -1218,7 +1448,7 @@ fn format_3_transitions_hold_the_removal_fences() {
     .unwrap();
     assert_eq!(store.transition_stats().incremental, 3);
     let state = store.load(&ns).unwrap().state;
-    assert!(!state.keyed_admissions.contains_key("k") && state.events.is_empty());
+    assert!(!state.keyed_admissions.contains_key("k") && !state.events.contains_key("ev"));
     assert_eq!(tombstone_rows(&ns), 0);
     // Without its expiry record in the patch, an expired receipt leaves
     // through the complete path.

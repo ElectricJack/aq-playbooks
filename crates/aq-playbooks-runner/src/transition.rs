@@ -536,6 +536,27 @@ fn verify_patch_removals(data: &RecordData, patch: &StatePatch, next: &State) ->
     let at = |field: &str, bytes: &[u8]| -> Result<i64> {
         serde_json::from_slice(bytes).map_err(|e| backend(format!("{field} record: {e}")))
     };
+    // A licensed admin commit adds no run, operation, event or keyed receipt.
+    if crate::retention::licence(next)?.is_some() {
+        for (path, change) in &patch.changes {
+            let field = field_name(path)?;
+            if !FENCED.contains(&field) {
+                continue;
+            }
+            let old = data.container(field);
+            let added = match change {
+                ContainerChange::Entries(rows) => rows
+                    .iter()
+                    .any(|(key, new)| new.is_some() && old.and_then(|c| c.get(key)).is_none()),
+                ContainerChange::Replace(rows) => rows
+                    .iter()
+                    .any(|(key, _)| old.and_then(|c| c.get(key)).is_none()),
+            };
+            if added {
+                return Err(backend(crate::retention::REFUSE_LICENCE));
+            }
+        }
+    }
     let mut removed: BTreeMap<&str, serde_json::Map<String, serde_json::Value>> = BTreeMap::new();
     let mut removed_receipts: Vec<serde_json::Value> = vec![];
     for (path, change) in &patch.changes {

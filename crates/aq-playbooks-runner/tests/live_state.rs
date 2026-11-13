@@ -832,6 +832,7 @@ fn fence_state() -> State {
     );
     s.receipts.push(audit(1, "run-a"));
     s.receipts.push(audit(2, "run-b"));
+    s.sequence = 2;
     s.keyed_admissions.insert("k".into(), receipt("k", 0));
     s.keyed_admissions
         .insert("fallback".into(), receipt("fallback", 0));
@@ -842,7 +843,42 @@ fn fence_state() -> State {
     s.retention.event_expires_at_ms.insert("ev".into(), 4_000);
     s.events
         .insert("ev-fallback".into(), accepted_event("ev-fallback", 0));
+    // Round 2 (C1): an installed contract whose window (5_000) is longer
+    // than the policy's, and an event of it expiring at 9_000.
+    let long = long_artifact();
+    s.artifacts.insert(long.digest.clone(), long);
+    s.events.insert("ev-long".into(), {
+        let mut e = accepted_event("ev-long", 0);
+        e.envelope.contract = ContractRef {
+            name: long_contract().name,
+            fingerprint: long_contract().fingerprint().unwrap(),
+        };
+        e
+    });
+    s.retention
+        .event_expires_at_ms
+        .insert("ev-long".into(), 9_000);
     s
+}
+fn long_contract() -> EventContract {
+    EventContract {
+        name: "test.long".into(),
+        retention_ms: 5_000,
+        ..event_contract()
+    }
+}
+fn long_artifact() -> Artifact {
+    let c = long_contract();
+    artifact(
+        "long",
+        "done",
+        BTreeMap::from([("done".into(), ret("ok"))]),
+        Registry {
+            commands: BTreeMap::new(),
+            events: BTreeMap::from([(c.name.clone(), c)]),
+        },
+        BTreeMap::new(),
+    )
 }
 fn tombstone(digest: &str) -> retention::EventTombstone {
     retention::EventTombstone {
@@ -852,33 +888,59 @@ fn tombstone(digest: &str) -> retention::EventTombstone {
         disposed_at_ms: 5,
     }
 }
-/// The admin receipt of a clock rebase from `from_ms` to `to_ms`.
-fn rebase_receipt(sequence: u64, from_ms: i64, to_ms: i64) -> Receipt {
+/// An admin licence receipt of `kind` from `from_ms` to `to_ms`.
+fn licence_receipt(kind: &str, sequence: u64, from_ms: i64, to_ms: i64) -> Receipt {
     Receipt {
         sequence,
         run: "admin".into(),
         step: "retention".into(),
         at_ms: to_ms,
-        kind: retention::CLOCK_REBASE.into(),
+        kind: kind.into(),
         detail: json!({"from_ms": from_ms, "to_ms": to_ms}),
     }
 }
-/// That receipt as history written by the commit (the licence).
-fn rebase_cohort(sequence: u64, from_ms: i64, to_ms: i64) -> SettledCohort {
+/// That receipt as history written by the commit.
+fn licence_cohort(receipts: Vec<Receipt>) -> SettledCohort {
     SettledCohort {
         root: "admin".into(),
-        finished_at_ms: to_ms,
+        finished_at_ms: 1,
         runs: vec![],
         intents: vec![],
-        receipts: vec![rebase_receipt(sequence, from_ms, to_ms)],
+        receipts,
     }
 }
-/// Ruling 3: the clock and expiry fences open only for a commit that writes
-/// a clock rebase receipt to history, for exactly that rebase. Cases on
-/// `fence_state()` (clock 500; windows 2_000 and 3_000; "k" 3_000, "ev"
-/// 4_000), each (label, refusal, change).
+/// Write a licence receipt of `kind` as the commit's one new sequence
+/// number, as the engine does.
+fn license(n: &mut State, kind: &str, from_ms: i64, to_ms: i64) {
+    n.sequence += 1;
+    n.settled.push(licence_cohort(vec![licence_receipt(
+        kind, n.sequence, from_ms, to_ms,
+    )]));
+}
+/// The commit a rebase from 500 to 100 makes on `fence_state()`: clock 100,
+/// each expiry capped at 100 plus its own window ("ev-long" by its
+/// contract's 5_000), a stale floor.
+fn rebased(n: &mut State) {
+    n.retention.clock_ms = Some(100);
+    n.retention
+        .admission_expires_at_ms
+        .insert("k".into(), 2_100);
+    n.retention.event_expires_at_ms.insert("ev".into(), 3_100);
+    n.retention
+        .event_expires_at_ms
+        .insert("ev-long".into(), 5_100);
+    n.retention.stale_floor_ms = Some(50);
+    license(n, retention::CLOCK_REBASE, 500, 100);
+}
+/// Rulings 1 and 2 (round 2): a commit with a licence receipt must be
+/// exactly that licence and do nothing else; without one, the clock never
+/// decreases and the floor never changes. Cases on `fence_state()` (clock
+/// 500; windows 2_000 and 3_000; "k" 3_000, "ev" 4_000, "ev-long" 9_000
+/// with a 5_000 contract window), each (label, refusal, change).
 fn rebase_refusal_cases() -> Vec<Case> {
     let shortened = retention::REFUSE_EXPIRY;
+    let licence = retention::REFUSE_LICENCE;
+    let floor = retention::REFUSE_STALE_FLOOR;
     vec![
         (
             "clock lowered without a rebase",
@@ -890,23 +952,100 @@ fn rebase_refusal_cases() -> Vec<Case> {
             retention::REFUSE_CLOCK,
             Box::new(|n| {
                 n.retention.clock_ms = Some(100);
-                n.receipts.push(rebase_receipt(99, 500, 100));
+                n.sequence += 1;
+                n.receipts.push(licence_receipt(
+                    retention::CLOCK_REBASE,
+                    n.sequence,
+                    500,
+                    100,
+                ));
             }),
         ),
         (
             "clock lowered, rebase from another clock",
-            retention::REFUSE_CLOCK,
+            licence,
             Box::new(|n| {
                 n.retention.clock_ms = Some(100);
-                n.settled.push(rebase_cohort(99, 600, 100));
+                license(n, retention::CLOCK_REBASE, 600, 100);
             }),
         ),
         (
             "clock lowered, rebase to another clock",
-            retention::REFUSE_CLOCK,
+            licence,
             Box::new(|n| {
                 n.retention.clock_ms = Some(100);
-                n.settled.push(rebase_cohort(99, 500, 200));
+                license(n, retention::CLOCK_REBASE, 500, 200);
+            }),
+        ),
+        (
+            "review probe: a receipt from 7 to 500, the clock left at 500, expiries lowered",
+            licence,
+            Box::new(|n| {
+                license(n, retention::CLOCK_REBASE, 7, 500);
+                n.retention
+                    .admission_expires_at_ms
+                    .insert("k".into(), 2_500);
+                n.retention.event_expires_at_ms.insert("ev".into(), 3_500);
+            }),
+        ),
+        (
+            "rebase upwards",
+            licence,
+            Box::new(|n| {
+                n.retention.clock_ms = Some(600);
+                license(n, retention::CLOCK_REBASE, 500, 600);
+            }),
+        ),
+        (
+            "replayed rebase receipt (not this commit's sequence)",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                let replayed = n.sequence - 1;
+                n.settled[0].receipts[0].sequence = replayed;
+            }),
+        ),
+        (
+            "rebase that also admits",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                n.sequence += 1;
+                n.keyed_admissions.insert("new".into(), receipt("new", 100));
+            }),
+        ),
+        (
+            "rebase that also accepts an event",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                n.events
+                    .insert("ev-new".into(), accepted_event("ev-new", 100));
+            }),
+        ),
+        (
+            "rebase that also settles a run",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                let run = n.runs.remove("run-a").unwrap();
+                let op = n.intents.remove("op-a").unwrap();
+                n.receipts.retain(|r| r.sequence != 1);
+                n.settled
+                    .push(cohort(run, vec![op], vec![audit(1, "run-a")]));
+            }),
+        ),
+        (
+            "two licences in one commit",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                n.settled[0].receipts.push(licence_receipt(
+                    retention::STALE_FLOOR_LOWERED,
+                    77,
+                    50,
+                    10,
+                ));
             }),
         ),
         (
@@ -920,75 +1059,136 @@ fn rebase_refusal_cases() -> Vec<Case> {
         ),
         (
             "expiry lowered with a rebase the clock did not take",
-            shortened,
+            licence,
             Box::new(|n| {
-                n.settled.push(rebase_cohort(99, 500, 100));
+                license(n, retention::CLOCK_REBASE, 500, 100);
                 n.retention
                     .admission_expires_at_ms
                     .insert("k".into(), 2_100);
             }),
         ),
         (
-            "expiry capped below the rebased window",
+            "expiry capped below its cap",
             shortened,
             Box::new(|n| {
-                n.retention.clock_ms = Some(100);
-                n.settled.push(rebase_cohort(99, 500, 100));
+                rebased(n);
                 n.retention
                     .admission_expires_at_ms
                     .insert("k".into(), 2_099);
             }),
         ),
         (
-            "event expiry capped below the rebased window",
+            "expiry lowered, but not to its cap",
             shortened,
             Box::new(|n| {
-                n.retention.clock_ms = Some(100);
-                n.settled.push(rebase_cohort(99, 500, 100));
+                rebased(n);
+                n.retention
+                    .admission_expires_at_ms
+                    .insert("k".into(), 2_200);
+            }),
+        ),
+        (
+            "event expiry capped below its cap",
+            shortened,
+            Box::new(|n| {
+                rebased(n);
                 n.retention.event_expires_at_ms.insert("ev".into(), 3_099);
+            }),
+        ),
+        (
+            "event capped to the policy window, its contract window is longer",
+            shortened,
+            Box::new(|n| {
+                rebased(n);
+                n.retention
+                    .event_expires_at_ms
+                    .insert("ev-long".into(), 3_100);
+            }),
+        ),
+        (
+            "floor raised without a licence",
+            floor,
+            Box::new(|n| n.retention.stale_floor_ms = Some(50)),
+        ),
+        (
+            "rebase raises the floor past its target",
+            floor,
+            Box::new(|n| {
+                rebased(n);
+                n.retention.stale_floor_ms = Some(101);
             }),
         ),
     ]
 }
-/// The commit a rebase from 500 to 100 makes on `fence_state()`: clock
-/// 100, each expiry capped at 100 plus its window, a stale floor.
-fn rebased(n: &mut State) {
-    n.retention.clock_ms = Some(100);
-    n.retention
-        .admission_expires_at_ms
-        .insert("k".into(), 2_100);
-    n.retention.event_expires_at_ms.insert("ev".into(), 3_100);
-    n.retention.stale_floor_ms = Some(50);
-    n.settled.push(rebase_cohort(99, 500, 100));
-}
-/// After that commit the licence is spent, and the floor never decreases.
+/// After that commit no licence is left, and the floor changes only with
+/// its own exact receipt. Changes of the stored state after the rebase
+/// (clock 100, floor 50).
 fn after_rebase_refusal_cases() -> Vec<Case> {
+    let licence = retention::REFUSE_LICENCE;
+    let floor = retention::REFUSE_STALE_FLOOR;
     vec![
         (
             "clock lowered again",
             retention::REFUSE_CLOCK,
-            Box::new(|n| {
-                n.settled.clear();
-                n.retention.clock_ms = Some(90);
-            }),
+            Box::new(|n| n.retention.clock_ms = Some(90)),
         ),
         (
-            "stale floor lowered",
-            retention::REFUSE_STALE_FLOOR,
-            Box::new(|n| {
-                n.settled.clear();
-                n.retention.stale_floor_ms = Some(40);
-            }),
+            "stale floor lowered without a licence",
+            floor,
+            Box::new(|n| n.retention.stale_floor_ms = Some(40)),
+        ),
+        (
+            "stale floor raised without a licence",
+            floor,
+            Box::new(|n| n.retention.stale_floor_ms = Some(60)),
         ),
         (
             "stale floor removed",
-            retention::REFUSE_STALE_FLOOR,
+            floor,
+            Box::new(|n| n.retention.stale_floor_ms = None),
+        ),
+        (
+            "floor lowered to another value than its receipt",
+            licence,
             Box::new(|n| {
-                n.settled.clear();
-                n.retention.stale_floor_ms = None;
+                n.retention.stale_floor_ms = Some(30);
+                license(n, retention::STALE_FLOOR_LOWERED, 50, 40);
+            }),
+        ),
+        (
+            "floor lowering from another floor",
+            licence,
+            Box::new(|n| {
+                n.retention.stale_floor_ms = Some(40);
+                license(n, retention::STALE_FLOOR_LOWERED, 60, 40);
+            }),
+        ),
+        (
+            "floor lowering that also moves the clock",
+            licence,
+            Box::new(|n| {
+                n.retention.stale_floor_ms = Some(40);
+                n.retention.clock_ms = Some(200);
+                license(n, retention::STALE_FLOOR_LOWERED, 50, 40);
+            }),
+        ),
+        (
+            "floor lowering that also changes an expiry",
+            retention::REFUSE_EXPIRY,
+            Box::new(|n| {
+                n.retention.stale_floor_ms = Some(40);
+                n.retention
+                    .admission_expires_at_ms
+                    .insert("k".into(), 9_000);
+                license(n, retention::STALE_FLOOR_LOWERED, 50, 40);
             }),
         ),
     ]
+}
+/// The floor lowering the fence accepts after `rebased`: 50 to 40.
+fn floor_lowered(n: &mut State) {
+    n.retention.stale_floor_ms = Some(40);
+    license(n, retention::STALE_FLOOR_LOWERED, 50, 40);
 }
 fn rebase_fences_hold_on_cas(store: &dyn Storage) {
     let s = fence_state();
@@ -1018,7 +1218,6 @@ fn rebase_fences_hold_on_cas(store: &dyn Storage) {
         let (ns, base) = fresh(&s);
         let r = store.compare_and_swap(&ns, "w", base, &next).unwrap();
         let mut later = store.load(&ns).unwrap().state;
-        later.settled.clear();
         f(&mut later);
         let result = store.compare_and_swap(&ns, "w", r, &later);
         if !refused_with(result.clone(), text) {
@@ -1026,6 +1225,17 @@ fn rebase_fences_hold_on_cas(store: &dyn Storage) {
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
+    // A rebase, then a floor lowering with its own receipt.
+    let (ns, base) = fresh(&s);
+    let r = store.compare_and_swap(&ns, "w", base, &next).unwrap();
+    let mut later = store.load(&ns).unwrap().state;
+    floor_lowered(&mut later);
+    store.compare_and_swap(&ns, "w", r, &later).unwrap();
+    let stored = store.load(&ns).unwrap().state.retention;
+    assert_eq!(
+        (stored.clock_ms, stored.stale_floor_ms),
+        (Some(100), Some(40))
+    );
 }
 #[test]
 fn memory_storage_opens_the_clock_fences_only_for_a_rebase() {
@@ -1484,6 +1694,11 @@ fn record_storage_transitions_hold_the_removal_fences() {
         let result = transition_in(&ns, f.as_ref());
         assert!(refused_with(result.clone(), text), "{label}: {result:?}");
     }
+    transition_in(&ns, &floor_lowered).unwrap();
+    assert_eq!(
+        store.load(&ns).unwrap().state.retention.stale_floor_ms,
+        Some(40)
+    );
     let (ns, _) = fresh();
     let transition = |f: &dyn Fn(&mut State)| transition_in(&ns, f);
     // Expired: both entries leave in one bounded transition.
@@ -3785,6 +4000,11 @@ fn pinned_clock_is_rebased_and_normal_operation_resumes<S: Storage>(e: &Engine<S
             .unwrap();
         e.advance(&d.receipt.run_id, t1 + i).unwrap();
     }
+    // An unheld event accepted during the pin, of a contract whose window
+    // (1_000) is longer than the policy's (1).
+    let pin_event = e
+        .admit_event("host", correlated_event("pin-e", "inv-pin"), t1)
+        .unwrap();
     e.admit("a", "main", Value::Null, authority(), t1 + 5_000)
         .unwrap();
     let s = e.snapshot().unwrap();
@@ -3799,12 +4019,14 @@ fn pinned_clock_is_rebased_and_normal_operation_resumes<S: Storage>(e: &Engine<S
             .get("pin-0")
             .is_some_and(|at| *at > pinned)
     );
-    // The rebase: refused unless now <= to < clock, and the floor <= to.
+    // The rebase: refused unless now <= to <= now + slack (0 here: a tenth
+    // of the smallest window, 1 ms) and the floor is in the past.
     let t2 = t0 + 500;
     for (to, floor, now) in [
         (pinned, t0, t2),
         (pinned + 1, t0, t2),
         (t2 - 1, t0, t2),
+        (t2 + 1, t0, t2),
         (t2, t2 + 1, t2),
     ] {
         assert!(
@@ -3820,14 +4042,23 @@ fn pinned_clock_is_rebased_and_normal_operation_resumes<S: Storage>(e: &Engine<S
             .is_err()
     );
     assert_eq!(json(&e.snapshot().unwrap()), json(&s));
+    // A dry run reports the same and commits nothing.
+    let preview = e
+        .rebase_retention_clock_dry_run(t2, t0, "ops", "pinned clock", t2)
+        .unwrap();
+    assert_eq!(json(&e.snapshot().unwrap()), json(&s));
     let report = e
         .rebase_retention_clock(t2, t0, "ops", "pinned clock", t2)
         .unwrap();
+    assert_eq!(preview, report);
     assert_eq!(
         (report.from_ms, report.to_ms, report.stale_floor_ms),
         (pinned, t2, t0)
     );
-    assert_eq!((report.capped_admissions, report.capped_events), (6, 1));
+    assert_eq!((report.capped_admissions, report.capped_events), (6, 2));
+    // The run admitted at the pinned time has its duration basis capped.
+    assert!(report.needs_operator_action.is_empty());
+    assert!(!report.adjusted_runs.is_empty());
     let s = e.snapshot().unwrap();
     assert_eq!(s.retention.clock_ms, Some(t2));
     assert_eq!(s.retention.stale_floor_ms, Some(t0));
@@ -3842,7 +4073,15 @@ fn pinned_clock_is_rebased_and_normal_operation_resumes<S: Storage>(e: &Engine<S
         s.retention.event_expires_at_ms.get(&held.key).copied(),
         Some(t2 + 1_000)
     );
+    // Capped by its contract's window, not the policy's.
+    assert_eq!(
+        s.retention.event_expires_at_ms.get(&pin_event.key).copied(),
+        Some(t2 + 1_000)
+    );
     assert!(window_entries(&s).iter().all(|(at, _)| *at <= t2 + 1_000));
+    for id in &report.adjusted_runs {
+        assert_eq!(s.runs[id].admitted_at_ms, t2, "{id}");
+    }
     // The receipt is history: who, when, the old and new clock.
     let receipts = inspect_all(e, InspectionKind::Receipts, Some("admin"));
     let rebase = receipts
@@ -3876,6 +4115,12 @@ fn pinned_clock_is_rebased_and_normal_operation_resumes<S: Storage>(e: &Engine<S
     );
     assert!(
         e.admit_once_at(keyed_on(e, "pin-0"), Some(t1), t2 + 10)
+            .unwrap()
+            .duplicate
+    );
+    // An event inside its contract window is still a duplicate.
+    assert!(
+        e.admit_event("host", correlated_event("pin-e", "inv-pin"), t2 + 10)
             .unwrap()
             .duplicate
     );
@@ -3947,29 +4192,331 @@ fn record_storage_pinned_clock_is_rebased_and_normal_operation_resumes() {
     install_on(&r, done_artifact(), "a");
     pinned_clock_is_rebased_and_normal_operation_resumes(&r);
 }
-/// A rebase needs a clock, an actor and a reason, and a second rebase
-/// never lowers the floor.
+/// Ruling 2 (round 2): a mistaken rebase cannot do lasting damage. It
+/// needs a clock pinned by more than the smallest window, a target from
+/// host time to the slack after it, a floor in the past, an actor and a
+/// reason; a second rebase never lowers the floor; and a floor set too high
+/// can be lowered with its own receipt.
 #[test]
-fn rebase_preconditions_and_the_floor_never_decreases() {
+fn rebase_preconditions_and_the_floor() {
     let e = ret_engine();
+    // Default windows: 1 day and 7 days, so the slack is one minute.
     assert!(matches!(
         e.rebase_retention_clock(10, 5, "ops", "r", 10),
         Err(Error::Refused(_))
     ));
-    e.admit("a", "main", Value::Null, authority(), 1_000_000)
+    e.admit("a", "main", Value::Null, authority(), 5_000)
         .unwrap();
-    assert!(e.rebase_retention_clock(100, 50, "ops", "", 100).is_err());
-    e.rebase_retention_clock(500_000, 400_000, "ops", "r", 100)
-        .unwrap();
-    e.admit("a", "main", Value::Null, authority(), 900_000)
-        .unwrap();
-    let report = e
-        .rebase_retention_clock(600_000, 300_000, "ops", "r", 600_000)
-        .unwrap();
-    assert_eq!(report.stale_floor_ms, 400_000);
-    let s = e.snapshot().unwrap();
-    assert_eq!(
-        (s.retention.clock_ms, s.retention.stale_floor_ms),
-        (Some(600_000), Some(400_000))
+    // Not pinned: ahead by 1 s, less than the smallest window.
+    let not_pinned = e
+        .rebase_retention_clock(4_000, 3_000, "ops", "r", 4_000)
+        .unwrap_err();
+    assert!(
+        not_pinned.to_string().contains("not pinned"),
+        "{not_pinned}"
     );
+    let pinned = 1_000_000_000_000;
+    e.admit("a", "main", Value::Null, authority(), pinned)
+        .unwrap();
+    let now = 1_000_000;
+    for (to, floor, actor, reason) in [
+        (now + 60_001, now - 1, "ops", "r"),
+        (now - 1, now - 1, "ops", "r"),
+        (now, now + 1, "ops", "r"),
+        // A floor after the host time, though not after the target.
+        (now + 60_000, now + 1, "ops", "r"),
+        (now, now - 1, "ops", ""),
+        (now, now - 1, "", "r"),
+    ] {
+        assert!(
+            matches!(
+                e.rebase_retention_clock(to, floor, actor, reason, now),
+                Err(Error::Refused(_))
+            ),
+            "to {to} floor {floor}"
+        );
+    }
+    let report = e
+        .rebase_retention_clock(now + 60_000, now - 100, "ops", "r", now)
+        .unwrap();
+    assert_eq!(report.stale_floor_ms, now - 100);
+    // A second pin and rebase with a lower floor keeps the higher one.
+    e.admit("a", "main", Value::Null, authority(), pinned)
+        .unwrap();
+    let later = now + 100_000;
+    let report = e
+        .rebase_retention_clock(later, now - 500, "ops", "r", later)
+        .unwrap();
+    assert_eq!(report.stale_floor_ms, now - 100);
+    // Lowering the floor: only below the current one, with its own receipt,
+    // and nothing else changes.
+    // Not below the current floor: refused by the engine itself.
+    for to in [now - 100, now] {
+        assert!(matches!(
+            e.lower_stale_floor(to, "ops", "r", later),
+            Err(Error::Refused(_))
+        ));
+    }
+    assert!(e.lower_stale_floor(now - 200, "ops", "", later).is_err());
+    let before = e.snapshot().unwrap();
+    assert_eq!(
+        e.lower_stale_floor(now - 200, "ops", "too high", later)
+            .unwrap(),
+        (now - 100, now - 200)
+    );
+    let s = e.snapshot().unwrap();
+    assert_eq!(s.retention.stale_floor_ms, Some(now - 200));
+    assert_eq!(s.retention.clock_ms, before.retention.clock_ms);
+    assert_eq!(s.runs.len(), before.runs.len());
+    let receipts = inspect_all(&e, InspectionKind::Receipts, Some("admin"));
+    assert!(
+        receipts
+            .iter()
+            .any(|r| r["kind"] == retention::STALE_FLOOR_LOWERED)
+    );
+    // No floor to lower.
+    let fresh = ret_engine();
+    assert!(fresh.lower_stale_floor(0, "ops", "r", 1).is_err());
+}
+/// Ruling 3 (round 2): a wait registered at the pinned time gets its
+/// deadline capped at the target plus its declared duration, so it times
+/// out normally after the rebase, and the run settles and leaves the
+/// record. An operation deadline set then is capped the same way.
+#[test]
+fn a_wait_registered_at_the_pinned_time_times_out_after_the_rebase() {
+    let e = ret_engine();
+    install(&e, wait_artifact(), "waiter");
+    install(
+        &e,
+        invoke_artifact(command(Recovery::KeyedIdempotent), None),
+        "invoke",
+    );
+    e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 1_000,
+        event_replay_ms: 1,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    let pinned: i64 = 1_000_000_000;
+    let waiter = e
+        .admit("waiter", "main", Value::Null, authority(), pinned)
+        .unwrap();
+    e.advance(&waiter, pinned).unwrap();
+    let invoke = e
+        .admit("invoke", "main", Value::Null, authority(), pinned)
+        .unwrap();
+    e.advance(&invoke, pinned).unwrap();
+    let s = e.snapshot().unwrap();
+    assert_eq!(s.runs[&waiter].status, RunStatus::Waiting);
+    let wait = s.waits.values().find(|w| w.run == waiter).unwrap().clone();
+    assert_eq!(wait.deadline, pinned + 100);
+    let intent = s
+        .intents
+        .values()
+        .find(|i| i.run == invoke)
+        .unwrap()
+        .clone();
+    assert_eq!(intent.deadline_at_ms, pinned + 100);
+    let t2: i64 = 10_000;
+    let report = e
+        .rebase_retention_clock(t2, t2 - 1_000, "ops", "pinned clock", t2)
+        .unwrap();
+    // Each run's duration basis, the wait and the operation deadline.
+    assert_eq!(report.capped_deadlines, 4);
+    assert_eq!(report.adjusted_runs, {
+        let mut ids = vec![waiter.clone(), invoke.clone()];
+        ids.sort();
+        ids
+    });
+    assert!(report.needs_operator_action.is_empty());
+    let s = e.snapshot().unwrap();
+    assert_eq!(s.waits[&wait.id].deadline, t2 + 100);
+    assert_eq!(s.intents[&intent.id].deadline_at_ms, t2 + 100);
+    assert_eq!(s.runs[&waiter].admitted_at_ms, t2);
+    // The receipt (in full, as the commit wrote it) names the runs.
+    let rebase = e
+        .store
+        .settled_cohorts("test")
+        .into_iter()
+        .flat_map(|c| c.receipts)
+        .find(|r| r.kind == retention::CLOCK_REBASE)
+        .unwrap();
+    assert_eq!(rebase.detail["capped_deadlines"], 4);
+    assert_eq!(rebase.detail["adjusted_runs"], json!(report.adjusted_runs));
+    assert_eq!(rebase.detail["needs_operator_action"], json!([]));
+    // Before its deadline the wait still waits; after it, it times out, the
+    // run settles and leaves the record.
+    e.drive(&mut FakeHost::default(), t2 + 99, 20).unwrap();
+    assert_eq!(
+        e.snapshot().unwrap().runs[&waiter].status,
+        RunStatus::Waiting
+    );
+    e.drive(&mut FakeHost::default(), t2 + 101, 20).unwrap();
+    assert!(!e.snapshot().unwrap().runs.contains_key(&waiter));
+    assert_eq!(runs_page(&e, Some(&waiter))[0]["outcome"], "error");
+}
+/// A deadline whose declared duration cannot be found (here a retry on a
+/// step with no retry policy, written directly) is left as it is and its
+/// run listed for the operator.
+#[test]
+fn a_deadline_without_its_declared_duration_needs_operator_action() {
+    let e = ret_engine();
+    e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 1_000,
+        event_replay_ms: 1,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    let pinned: i64 = 1_000_000_000;
+    let run = e
+        .admit("a", "main", Value::Null, authority(), pinned)
+        .unwrap();
+    let mut s = e.snapshot().unwrap();
+    {
+        let mut r = s.runs[&run].clone();
+        r.status = RunStatus::Waiting;
+        r.pending = Some(Pending::Retry {
+            deadline: pinned + 5_000,
+        });
+        s.runs.insert(run.clone(), r);
+    }
+    overwrite(&e.store, "incarnation-1", &s);
+    let report = e
+        .rebase_retention_clock(10_000, 9_000, "ops", "pinned clock", 10_000)
+        .unwrap();
+    assert_eq!(report.needs_operator_action, vec![run.clone()]);
+    let s = e.snapshot().unwrap();
+    assert!(matches!(
+        s.runs[&run].pending,
+        Some(Pending::Retry { deadline }) if deadline == pinned + 5_000
+    ));
+}
+/// A business retry scheduled at the pinned time is capped at the target
+/// plus its declared backoff.
+#[test]
+fn a_retry_scheduled_at_the_pinned_time_is_capped_by_its_backoff() {
+    let e = ret_engine();
+    install(
+        &e,
+        invoke_artifact(
+            command(Recovery::KeyedIdempotent),
+            Some(RetryPolicy {
+                max_attempts: 2,
+                backoff_ms: 10_000,
+                outcomes: set(&["retry"]),
+            }),
+        ),
+        "invoke",
+    );
+    e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 1_000,
+        event_replay_ms: 1,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    let pinned: i64 = 1_000_000_000;
+    let id = e
+        .admit("invoke", "main", Value::Null, authority(), pinned)
+        .unwrap();
+    e.advance(&id, pinned).unwrap();
+    let mut host = FakeHost {
+        responses: BTreeMap::from([(
+            "test.command".into(),
+            vec![DispatchResult::Completed {
+                outcome: "retry".into(),
+                output: Value::Null,
+            }],
+        )]),
+        ..Default::default()
+    };
+    e.dispatch_next(&mut host, pinned).unwrap();
+    e.advance(&id, pinned).unwrap();
+    assert!(matches!(
+        e.snapshot().unwrap().runs[&id].pending,
+        Some(Pending::Retry { deadline }) if deadline == pinned + 10_000
+    ));
+    let t2: i64 = 10_000;
+    let report = e
+        .rebase_retention_clock(t2, t2 - 1, "ops", "pinned clock", t2)
+        .unwrap();
+    assert!(report.adjusted_runs.contains(&id));
+    assert!(matches!(
+        e.snapshot().unwrap().runs[&id].pending,
+        Some(Pending::Retry { deadline }) if deadline == t2 + 10_000
+    ));
+}
+/// A join set at the pinned time (written directly: its step's declared
+/// deadline is 5_000) is capped at the target plus that duration.
+#[test]
+fn a_join_set_at_the_pinned_time_is_capped_by_its_declared_deadline() {
+    let e = engine();
+    install(
+        &e,
+        artifact(
+            "joiner",
+            "join",
+            BTreeMap::from([
+                (
+                    "join".into(),
+                    Step {
+                        op: Operation::Join {
+                            member_keys: vec![],
+                            members: vec![Expr::literal(json!({"child": "x"}))],
+                            mode: JoinMode::All,
+                            accepted_outcomes: set(&["ok"]),
+                            deadline_ms: 5_000,
+                            remaining: RemainingPolicy::Cancel,
+                            bind: "joined".into(),
+                        },
+                        edges: edges(&[
+                            ("completed", "ok"),
+                            ("no_match", "error"),
+                            ("timeout", "error"),
+                        ]),
+                        on_error: Some("error".into()),
+                    },
+                ),
+                ("ok".into(), ret("ok")),
+                ("error".into(), ret("error")),
+            ]),
+            Registry::default(),
+            BTreeMap::new(),
+        ),
+        "joiner",
+    );
+    e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 1_000,
+        event_replay_ms: 1,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    let pinned: i64 = 1_000_000_000;
+    let run = e
+        .admit("joiner", "main", Value::Null, authority(), pinned)
+        .unwrap();
+    let mut s = e.snapshot().unwrap();
+    {
+        let mut r = s.runs[&run].clone();
+        r.status = RunStatus::Waiting;
+        r.pending = Some(Pending::Join {
+            members: vec![],
+            member_keys: vec![],
+            mode: JoinMode::All,
+            accepted: set(&["ok"]),
+            deadline: pinned + 5_000,
+            remaining: RemainingPolicy::Cancel,
+            bind: "joined".into(),
+        });
+        s.runs.insert(run.clone(), r);
+    }
+    overwrite(&e.store, "incarnation-1", &s);
+    let report = e
+        .rebase_retention_clock(10_000, 9_000, "ops", "pinned clock", 10_000)
+        .unwrap();
+    assert!(report.adjusted_runs.contains(&run));
+    assert!(report.needs_operator_action.is_empty());
+    assert!(matches!(
+        e.snapshot().unwrap().runs[&run].pending,
+        Some(Pending::Join { deadline, .. }) if deadline == 15_000
+    ));
 }

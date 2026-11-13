@@ -76,10 +76,218 @@ pub struct ClockRebaseReport {
     pub stale_floor_ms: i64,
     pub capped_events: usize,
     pub capped_admissions: usize,
+    /// Wait, join, retry and operation deadlines and run duration bases
+    /// capped at `to_ms` plus their declared duration.
+    pub capped_deadlines: usize,
+    /// The live runs whose timers were capped (an operation's run included).
+    pub adjusted_runs: Vec<String>,
+    /// Live runs with a deadline after `to_ms` whose declared duration
+    /// could not be found (an inconsistent State): left as they are, for the
+    /// operator to cancel.
+    pub needs_operator_action: Vec<String>,
+}
+/// How a commit ends: with a host time (`None` for commits without one), or
+/// as a licensed admin commit.
+#[derive(Clone, Copy)]
+enum Finish {
+    Host(Option<i64>),
+    Licensed,
+}
+/// Of the windows in `policy`, the smallest (at least 1 ms).
+fn smallest_window(policy: &RetentionPolicy) -> i64 {
+    let ms = policy
+        .admission_replay_ms
+        .min(policy.event_replay_ms)
+        .max(1);
+    i64::try_from(ms).unwrap_or(i64::MAX)
+}
+/// How far past the host time a rebase target may be: a minute, or a tenth
+/// of the smallest window if that is less. Enough for clock skew between
+/// hosts; small enough that the rebased clock leaves nearly every window
+/// behind real time.
+fn rebase_slack(policy: &RetentionPolicy) -> i64 {
+    (smallest_window(policy) / 10).min(60_000)
+}
+/// The rebase of `s` to `to_ms` at host time `now_ms` (see
+/// [`Engine::rebase_retention_clock`]), without its receipt.
+fn rebase_plan(
+    s: &mut State,
+    to_ms: i64,
+    stale_floor_ms: i64,
+    now_ms: i64,
+) -> Result<ClockRebaseReport> {
+    let Some(from_ms) = s.retention.clock_ms else {
+        return Err(Error::Refused("no retention clock to rebase".into()));
+    };
+    let smallest = smallest_window(&s.retention.policy);
+    let ahead = from_ms.saturating_sub(now_ms);
+    if ahead <= smallest {
+        return Err(Error::Refused(format!(
+            "retention clock ({from_ms} ms) is not pinned: it is {ahead} ms ahead of host time \
+             ({now_ms} ms), not more than the smallest window ({smallest} ms)"
+        )));
+    }
+    let slack = rebase_slack(&s.retention.policy);
+    if to_ms < now_ms || to_ms > now_ms.saturating_add(slack) {
+        return Err(Error::Refused(format!(
+            "clock rebase target ({to_ms} ms) must be from host time ({now_ms} ms) to {slack} ms \
+             after it"
+        )));
+    }
+    if stale_floor_ms > now_ms {
+        return Err(Error::Refused(format!(
+            "stale floor ({stale_floor_ms} ms) must be in the past (host time {now_ms} ms)"
+        )));
+    }
+    let floor_ms = s
+        .retention
+        .stale_floor_ms
+        .map_or(stale_floor_ms, |old| old.max(stale_floor_ms));
+    if floor_ms > to_ms {
+        return Err(Error::Refused(format!(
+            "stale floor ({floor_ms} ms) is later than the rebase target ({to_ms} ms)"
+        )));
+    }
+    let (capped_events, capped_admissions) = retention::rebase_clock(s, to_ms);
+    let deadlines = rebase_deadlines(s, to_ms)?;
+    s.retention.stale_floor_ms = Some(floor_ms);
+    Ok(ClockRebaseReport {
+        from_ms,
+        to_ms,
+        stale_floor_ms: floor_ms,
+        capped_events,
+        capped_admissions,
+        capped_deadlines: deadlines.capped,
+        adjusted_runs: deadlines.adjusted.into_iter().collect(),
+        needs_operator_action: deadlines.unknown.into_iter().collect(),
+    })
+}
+#[derive(Default)]
+struct RebasedDeadlines {
+    capped: usize,
+    adjusted: BTreeSet<String>,
+    unknown: BTreeSet<String>,
+}
+/// Cap every live run's timers that lie beyond `to_ms` plus their declared
+/// duration at that value: a run's duration basis (`admitted_at_ms`, for
+/// `limits.max_duration_ms`), a wait (`Wait.deadline_ms`), a join
+/// (`Join.deadline_ms`), a retry (`RetryPolicy.backoff_ms`), and an
+/// operation (`command.deadline_ms`). Every capped value is still at least
+/// its real registration plus its duration, because the registration was
+/// at or before `to_ms`. A deadline after `to_ms` whose duration cannot be
+/// found is left, and its run listed.
+fn rebase_deadlines(s: &mut State, to_ms: i64) -> Result<RebasedDeadlines> {
+    let mut out = RebasedDeadlines::default();
+    let cap = |duration: u64| to_ms.saturating_add(i64::try_from(duration).unwrap_or(i64::MAX));
+    let ids: Vec<String> = s.runs.keys().cloned().collect();
+    for id in ids {
+        let Some(mut r) = s.runs.get(&id).cloned() else {
+            continue;
+        };
+        if r.status.terminal() {
+            continue;
+        }
+        let playbook = s.artifacts.get(&r.artifact).map(|a| &a.content.playbook);
+        let step = playbook
+            .and_then(|p| p.steps.get(&r.step))
+            .map(|step| &step.op);
+        let mut capped = 0;
+        let mut unknown = false;
+        // The duration basis: `admitted_at_ms + limits.max_duration_ms`.
+        if r.admitted_at_ms > to_ms {
+            if playbook.is_some() {
+                r.admitted_at_ms = to_ms;
+                capped += 1;
+            } else {
+                unknown = true;
+            }
+        }
+        let mut wait = None;
+        match &mut r.pending {
+            Some(Pending::Join { deadline, .. }) if *deadline > to_ms => match step {
+                Some(Operation::Join { deadline_ms, .. }) => {
+                    if *deadline > cap(*deadline_ms) {
+                        *deadline = cap(*deadline_ms);
+                        capped += 1;
+                    }
+                }
+                _ => unknown = true,
+            },
+            Some(Pending::Retry { deadline }) if *deadline > to_ms => match step {
+                Some(Operation::Invoke {
+                    retry: Some(policy),
+                    ..
+                }) => {
+                    if *deadline > cap(policy.backoff_ms) {
+                        *deadline = cap(policy.backoff_ms);
+                        capped += 1;
+                    }
+                }
+                _ => unknown = true,
+            },
+            Some(Pending::Event { wait: id }) => wait = Some(id.clone()),
+            _ => {}
+        }
+        if let Some(wait_id) = wait
+            && let Some(mut w) = s.waits.get(&wait_id).cloned()
+            && w.deadline > to_ms
+        {
+            let declared = playbook
+                .and_then(|p| p.steps.get(&w.step))
+                .and_then(|step| match &step.op {
+                    Operation::Wait { deadline_ms, .. } => Some(*deadline_ms),
+                    _ => None,
+                });
+            match declared {
+                Some(duration) if w.deadline > cap(duration) => {
+                    w.deadline = cap(duration);
+                    s.waits.insert(wait_id, w);
+                    capped += 1;
+                }
+                Some(_) => {}
+                None => unknown = true,
+            }
+        }
+        if unknown {
+            out.unknown.insert(id.clone());
+        }
+        if capped > 0 {
+            out.capped += capped;
+            s.runs.insert(id.clone(), r);
+            indexes::mark_run(s, &id);
+            out.adjusted.insert(id);
+        }
+    }
+    let intents: Vec<String> = s.intents.keys().cloned().collect();
+    for id in intents {
+        let Some(mut i) = s.intents.get(&id).cloned() else {
+            continue;
+        };
+        let limit = cap(i.command.deadline_ms);
+        if i.deadline_at_ms > limit {
+            i.deadline_at_ms = limit;
+            let run = i.run.clone();
+            s.intents.insert(id.clone(), i);
+            indexes::mark_intent(s, &id);
+            indexes::mark_run(s, &run);
+            out.capped += 1;
+            out.adjusted.insert(run);
+        }
+    }
+    Ok(out)
 }
 /// The start of the text of every [`Error::Stale`]: a request whose producer
 /// (request) time is older than its window.
 pub const STALE_REQUEST: &str = "stale request: producer time is older than the replay window";
+/// An admin operation's `actor` and `reason`: present and bounded.
+fn admin_text(actor: &str, reason: &str) -> Result<()> {
+    if actor.is_empty() || reason.is_empty() || actor.len() > 512 || reason.len() > 4096 {
+        return Err(Error::Refused(
+            "admin operation requires bounded actor and reason".into(),
+        ));
+    }
+    Ok(())
+}
 fn stale_message(
     requested_at_ms: i64,
     cutoff_ms: i64,
@@ -545,8 +753,17 @@ impl<S: Storage> Engine<S> {
         now_ms: Option<i64>,
         f: impl FnOnce(&mut State) -> Result<(T, bool)>,
     ) -> Result<T> {
-        self.transaction_report_at(now_ms, f)
+        self.transaction_report_at(Finish::Host(now_ms), f)
             .map(|(value, _)| value)
+    }
+    /// One licensed admin commit (a clock rebase or a floor lowering): it
+    /// carries no host time, settles and drops nothing, and moves only its
+    /// own admin receipt to history, so it is exactly its licence.
+    fn transaction_licensed<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        self.transaction_report_at(Finish::Licensed, |state| {
+            f(state).map(|value| (value, true))
+        })
+        .map(|(value, _)| value)
     }
     /// One commit, and what its retention work moved out of the State. When
     /// the plan changes the State, both paths run `candidate_roots`,
@@ -555,10 +772,16 @@ impl<S: Storage> Engine<S> {
     /// that settles it.
     fn transaction_report_at<T>(
         &self,
-        now_ms: Option<i64>,
+        now_ms: Finish,
         f: impl FnOnce(&mut State) -> Result<(T, bool)>,
     ) -> Result<(T, retention::CommitReport)> {
-        fn finish(state: &mut State, now_ms: Option<i64>) -> Result<retention::CommitReport> {
+        fn finish(state: &mut State, mode: Finish) -> Result<retention::CommitReport> {
+            let Finish::Host(now_ms) = mode else {
+                indexes::sync(state)?;
+                let report = retention::finish_licensed_commit(state)?;
+                indexes::sync(state)?;
+                return Ok(report);
+            };
             let candidates = retention::candidate_roots(state);
             indexes::sync(state)?;
             let report = retention::finish_commit(state, now_ms, candidates)?;
@@ -3473,21 +3696,25 @@ impl<S: Storage> Engine<S> {
     }
     /// Recover from a retention clock that a far-future host time pinned
     /// (see `docs/implementation/0003-live-state-only.md`, "If the clock was
-    /// pinned"). One commit, refused unless `now_ms <= to_ms < clock` and
-    /// `stale_floor_ms <= to_ms`:
+    /// pinned"). One licensed commit, refused unless the clock is ahead of
+    /// `now_ms` by more than the smallest window (it is pinned), `now_ms <=
+    /// to_ms <= now_ms + slack` (a minute, or a tenth of the smallest window
+    /// if less) and `stale_floor_ms <= now_ms`:
     ///
     /// - the clock becomes `to_ms` (the corrected real time);
     /// - every recorded expiry later than `to_ms` plus its own window is
     ///   capped there, so what the pin wrote expires in real time again and
     ///   no entry is remembered for less than its window from `to_ms`;
+    /// - every live run's timer beyond `to_ms` plus its declared duration is
+    ///   capped there (a wait, a join, a retry, an operation deadline, the
+    ///   run's duration basis); the runs are listed in the report;
     /// - the stale floor becomes the later of the old floor and
     ///   `stale_floor_ms`: a request for a key the engine does not remember
     ///   whose request time is at or before it is stale. Pass the last
-    ///   correct host time before the pin, so retries of keys the pin made
-    ///   the engine forget early cannot come back as new;
-    /// - an admin receipt (history) records the old and new clock, the
-    ///   floor, the counts, `actor` and `reason`. Every backend lowers the
-    ///   clock or an expiry only in a commit that carries this receipt.
+    ///   correct host time before the pin;
+    /// - an admin receipt (history) records all of it with `actor` and
+    ///   `reason`. Every backend lowers the clock or an expiry, or changes
+    ///   the floor, only in a commit that is exactly such a receipt's.
     pub fn rebase_retention_clock(
         &self,
         to_ms: i64,
@@ -3496,49 +3723,66 @@ impl<S: Storage> Engine<S> {
         reason: &str,
         now_ms: i64,
     ) -> Result<ClockRebaseReport> {
-        if actor.is_empty() || reason.is_empty() || actor.len() > 512 || reason.len() > 4096 {
-            return Err(Error::Refused(
-                "clock rebase requires bounded actor and reason".into(),
-            ));
-        }
-        self.transaction_at(Some(now_ms), |s| {
-            let Some(from_ms) = s.retention.clock_ms else {
-                return Err(Error::Refused("no retention clock to rebase".into()));
-            };
-            if !(now_ms <= to_ms && to_ms < from_ms) {
-                return Err(Error::Refused(format!(
-                    "clock rebase requires host time ({now_ms} ms) <= target ({to_ms} ms) < \
-                     retention clock ({from_ms} ms)"
-                )));
-            }
-            if stale_floor_ms > to_ms {
-                return Err(Error::Refused(format!(
-                    "stale floor ({stale_floor_ms} ms) must not be later than the target \
-                     ({to_ms} ms)"
-                )));
-            }
-            let floor_ms = s
-                .retention
-                .stale_floor_ms
-                .map_or(stale_floor_ms, |old| old.max(stale_floor_ms));
-            let (capped_events, capped_admissions) = retention::rebase_clock(s, to_ms);
-            s.retention.stale_floor_ms = Some(floor_ms);
-            let report = ClockRebaseReport {
-                from_ms,
-                to_ms,
-                stale_floor_ms: floor_ms,
-                capped_events,
-                capped_admissions,
-            };
+        admin_text(actor, reason)?;
+        self.transaction_licensed(|s| {
+            let report = rebase_plan(s, to_ms, stale_floor_ms, now_ms)?;
             receipt(
                 s,
                 "admin",
                 "retention",
                 now_ms,
                 retention::CLOCK_REBASE,
-                json!({"from_ms":from_ms,"to_ms":to_ms,"stale_floor_ms":floor_ms,"capped_events":capped_events,"capped_admissions":capped_admissions,"actor":actor,"reason":reason}),
+                json!({"from_ms":report.from_ms,"to_ms":report.to_ms,"stale_floor_ms":report.stale_floor_ms,"capped_events":report.capped_events,"capped_admissions":report.capped_admissions,"capped_deadlines":report.capped_deadlines,"adjusted_runs":report.adjusted_runs,"needs_operator_action":report.needs_operator_action,"actor":actor,"reason":reason}),
             );
             Ok(report)
+        })
+    }
+    /// What [`Self::rebase_retention_clock`] would do, on a snapshot, with
+    /// the same checks; nothing is committed.
+    pub fn rebase_retention_clock_dry_run(
+        &self,
+        to_ms: i64,
+        stale_floor_ms: i64,
+        actor: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<ClockRebaseReport> {
+        admin_text(actor, reason)?;
+        let mut s = self.snapshot()?;
+        rebase_plan(&mut s, to_ms, stale_floor_ms, now_ms)
+    }
+    /// Undo a stale floor set too high by an earlier rebase: lower it to
+    /// `to_ms`, accepting that keys the engine forgot after `to_ms` may be
+    /// re-admitted as new by a retry with a request time in between. One
+    /// licensed commit with its own admin receipt; nothing else changes.
+    /// Returns the old and new floor.
+    pub fn lower_stale_floor(
+        &self,
+        to_ms: i64,
+        actor: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<(i64, i64)> {
+        admin_text(actor, reason)?;
+        self.transaction_licensed(|s| {
+            let Some(from_ms) = s.retention.stale_floor_ms else {
+                return Err(Error::Refused("no stale floor to lower".into()));
+            };
+            if to_ms >= from_ms {
+                return Err(Error::Refused(format!(
+                    "stale floor can only be lowered: {to_ms} ms is not below {from_ms} ms"
+                )));
+            }
+            s.retention.stale_floor_ms = Some(to_ms);
+            receipt(
+                s,
+                "admin",
+                "retention",
+                now_ms,
+                retention::STALE_FLOOR_LOWERED,
+                json!({"from_ms":from_ms,"to_ms":to_ms,"actor":actor,"reason":reason}),
+            );
+            Ok((from_ms, to_ms))
         })
     }
     pub fn collect_garbage(&self, now_ms: i64, limit: usize) -> Result<GcReport> {

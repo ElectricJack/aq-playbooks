@@ -68,6 +68,9 @@ on any engine error except `Overloaded` (`driver.rs:752`, `delivery?`). When
 it adopts the `_at` methods, it must treat `Error::Stale` as an outcome of
 that one request: retire or hold that outbox row or admission. It must not
 fail the quantum, or one stale row would stop every event behind it.
+aq-playbook-host's `runner_error` turns every engine error it does not know
+into a string (`other => Error::Engine(other.to_string())`), so it needs an
+`Error::Stale` arm of its own.
 
 ### What a request time must be
 
@@ -151,62 +154,135 @@ much larger than normal clock skew, and that it appears on every request.
 
 ## If the clock was pinned
 
-`Engine::rebase_retention_clock(to_ms, stale_floor_ms, actor, reason,
-now_ms)`, or the CLI:
+Three admin operations, each one licensed commit with its own admin receipt
+in history:
+
+- `Engine::rebase_retention_clock_dry_run(to_ms, stale_floor_ms, actor,
+  reason, now_ms)` makes the same checks and returns the same report, on a
+  snapshot. It commits nothing.
+- `Engine::rebase_retention_clock(to_ms, stale_floor_ms, actor, reason,
+  now_ms)` is the rebase.
+- `Engine::lower_stale_floor(to_ms, actor, reason, now_ms)` undoes a floor
+  set too high (see "The stale floor" below).
+
+From the CLI:
 
 ```
-aq-playbooks rebase-retention-clock --to-ms <corrected real time> \
+# 1. Preview: old and new clock, floor, and what would be capped.
+aq-playbooks rebase-retention-clock --dry-run --to-ms <corrected real time> \
   --stale-floor-ms <last correct host time before the pin> \
-  --actor <who> --reason <why> --confirm-clock-rebase \
-  --database-url … --namespace …
+  --actor <who> --reason <why> --database-url … --namespace …
+# 2. Commit.
+aq-playbooks rebase-retention-clock --confirm-clock-rebase --to-ms … \
+  --stale-floor-ms … --actor … --reason … --database-url … --namespace …
 ```
 
-It is one commit. It is refused unless `now_ms ≤ to_ms < clock` and
-`stale_floor_ms ≤ to_ms`, and it needs an actor and a reason. The CLI passes
-the machine's time as `now_ms`, so `--to-ms` must not be in its past. The
-commit:
+The CLI passes the machine's own time as `now_ms`.
 
-1. sets the retention clock to `to_ms`;
-2. caps every recorded expiry later than `to_ms` plus its own window (the
-   admission window for a keyed receipt, `max(event_replay_ms,
-   contract.retention_ms)` for an event) at exactly that. An expiry at or
-   below its cap stays. So what the pin wrote expires in real time again,
-   and no entry is remembered for less than its window from `to_ms`. Held
-   entries (a receipt whose run is live, an event a wait or destination
-   needs) stay, and are deferred again in the normal way if still held at
-   their new expiry. Entries the pin had not yet drained become unexpired:
-   they are remembered longer, which is harmless;
-3. records the stale floor: the later of the existing floor and
-   `stale_floor_ms`;
-4. writes an admin receipt (`retention_clock_rebased`) that goes to history
-   in the same commit. It holds `from_ms`, `to_ms`, `stale_floor_ms`, the
-   capped counts, `actor`, `reason`, and the commit's host time as `at_ms`.
+### Preconditions
 
-The cost is one pass over the expiry order above `to_ms` plus the smallest
-window. That is the entries the pin wrote, all in this one commit.
+A mistaken rebase must not be able to do lasting damage. The rebase is
+refused unless all of these hold:
 
-**The fences.** The Task 4 fences (the clock never decreases; a recorded
-expiry only moves later) open only for a commit that writes this receipt to
-history. The shared check (`retention::verify_removals`, used by the
-in-memory store, the record store's full commit and patch, and PostgreSQL
-protected and plain format 2 and format 3) allows:
+- **The clock is pinned.** It is ahead of `now_ms` by more than the smallest
+  policy window (`min(admission_replay_ms, event_replay_ms)`). That is the
+  only case in which the pin refuses anything. A clock ahead by less cannot
+  be rebased.
+- **The target is the corrected real time.** `now_ms <= to_ms <= now_ms +
+  slack`, where the slack is one minute, or a tenth of the smallest window
+  if that is less. Choose `--to-ms` slightly ahead of every host's clock,
+  within the slack. A target below a correct host's time would cap entries
+  that host accepted at `A > to_ms` below `A + window`. A target much later
+  than real time would itself pin the clock.
+- **The floor is in the past:** `stale_floor_ms <= now_ms`. It is the last
+  correct clock before the pin.
+- An actor and a reason, both present and bounded.
 
-- the clock to go from exactly the receipt's `from_ms` to exactly its
-  `to_ms`;
-- a recorded expiry to be lowered, but not below `to_ms` plus the policy
-  window of its kind, and only if the clock took the rebase.
+### What the rebase does
 
-A format 3 transition that carries the receipt takes the complete path,
-where that check runs. Without the receipt, or with a receipt left in the
-live State, or one for another clock, the fences stay closed. History rows
-are inserted once, so a receipt licenses only the commit that writes it. The
-stale floor never decreases and is never removed (`REFUSE_STALE_FLOOR`).
+1. It sets the retention clock to `to_ms`.
+2. It caps every recorded expiry later than its own cap at exactly that
+   cap. The cap is `to_ms` plus the admission window for a keyed receipt,
+   and `to_ms + max(event_replay_ms, contract.retention_ms)` for an event,
+   never the bare policy window when the contract window is longer. An
+   expiry at or below its cap stays.
+   - What the pin wrote expires in real time again, and no entry is
+     remembered for less than its own window from `to_ms`.
+   - Held entries stay, and are deferred again in the normal way.
+   - Entries the pin had not yet drained become unexpired. They are
+     remembered longer, which is harmless.
+3. It caps every live run's timer that lies beyond `to_ms` plus its
+   declared duration at that value:
+   - a wait (`Wait.deadline_ms` of its step);
+   - a join (`Join.deadline_ms`);
+   - a retry (`RetryPolicy.backoff_ms`);
+   - an operation deadline (`command.deadline_ms`, stored with the
+     operation);
+   - the run's duration basis: `admitted_at_ms` is lowered to `to_ms`, so
+     `limits.max_duration_ms` counts from there.
 
-**What the stale floor guarantees.** After the rebase, a request for a key
-the engine does not remember is stale if its request time is at or before
-the floor. The floor never changes what happens to a key the engine still
-remembers. Once `max(now, clock)` reaches `floor + window`, the ordinary
-cut-off is later than the floor anyway.
+   Each capped value is still at least its real registration plus its
+   duration, because the registration was at or before `to_ms`. A wait set
+   at the pinned time then times out normally, and the run settles and
+   leaves the record. Every kind's duration is in the artifact or the
+   operation, so a consistent State never needs a guess. A deadline after
+   `to_ms` whose duration cannot be found (an inconsistent State, such as a
+   retry on a step without a retry policy) is left as it is. Its run is
+   listed in `needs_operator_action`: cancel it (`aq-playbooks cancel
+   <run>`), or reconcile its operation.
+4. It raises the stale floor to the later of the existing floor and
+   `stale_floor_ms`.
+5. It writes a `retention_clock_rebased` admin receipt. The receipt holds
+   `from_ms`, `to_ms`, `stale_floor_ms`, the capped counts, `adjusted_runs`,
+   `needs_operator_action`, `actor`, `reason`, and the host time as `at_ms`.
+   The report returns the same.
+
+The commit does nothing else. It carries no host time, so nothing settles
+and nothing is dropped in it. Its cost is one pass over the expiry order
+above the smallest cap, plus one pass over the live runs and operations. It
+is bounded by the namespace quotas (`max_events`, `max_receipts`,
+`max_runs`, `max_state_bytes`): at most one record's worth, the same order
+as any protected format 2 commit.
+
+### The fences
+
+Without a licence, the Task 4 fences are unchanged: the clock never
+decreases, a recorded expiry only moves later, and the stale floor never
+changes, not even upwards.
+
+A commit that carries a licence receipt (`retention_clock_rebased` or
+`stale_floor_lowered`) in its own history must be exactly that licence.
+Otherwise it is refused: `REFUSE_LICENCE`, or `REFUSE_EXPIRY` for a wrong cap and `REFUSE_STALE_FLOOR` for a wrong floor. This is checked by
+`retention::verify_removals`, used by the in-memory store, the record
+store's full commit, and PostgreSQL protected and plain format 2 and format
+3. The record store's patch path checks the same rules. A format 3
+transition that carries a licence takes the complete path.
+
+- **The receipt is new.** Its sequence is after the stored sequence. A
+  receipt cannot be replayed, even after `delete_history_before` removed its
+  history row. At most one licence per commit.
+- **A rebase** lowers the clock from exactly the receipt's `from_ms` (the
+  stored clock) to exactly its `to_ms`, with `to_ms < from_ms`. It may lower
+  a recorded expiry only to exactly its cap (above). It may only raise the
+  floor, to at most `to_ms`.
+- **A floor lowering** leaves the clock alone. It lowers the floor from
+  exactly the receipt's `from_ms` (the stored floor) to exactly its `to_ms`,
+  and changes no expiry.
+- **Neither** adds or removes a run, operation, event or keyed receipt, or
+  removes an audit receipt.
+
+So a receipt for another clock or floor, a receipt left in the live State,
+a replayed receipt, or a licensed commit that also does other work is
+refused. Run timers are not fenced, by any commit, as before.
+
+### The stale floor
+
+**What it guarantees.** After a rebase, a request for a key the engine does
+not remember whose request time is at or before the floor is stale. The
+floor never changes what happens to a key the engine still remembers. Once
+`max(now, clock)` reaches `floor + window`, the ordinary cut-off is later
+than the floor anyway. The floor must be in the past, so its extra effect
+lasts at most one window.
 
 - If the floor is at or after the last correct clock before the pin, every
   key the pin forgot early is covered. Their honest retries carry the
@@ -220,16 +296,28 @@ cut-off is later than the floor anyway.
     earlier than the pin started, keys forgotten early with request times
     between the floor and the pin can still be admitted again.
 - **It also refuses new requests created at or before it** that the engine
-  never admitted. Set it as late as covers the pin, and no later. Requests
-  created *during* the pin (after the floor) that were refused as stale are
-  accepted after the rebase. The safest choice when the start of the pin is
-  unknown is `--stale-floor-ms` equal to `--to-ms`, but then every request
-  created before the rebase that the engine never admitted is refused for
-  good.
+  never admitted. Requests stamped after the floor that the pin refused
+  are accepted after the rebase. Set the floor as late as covers the pin,
+  and no later.
 - Finding the last correct clock: the host's logs, or the newest history
   item or receipt dated before the jump (the first item dated far in the
   future is the jump).
 
-The rebase does not touch run timers, wait deadlines, or the `admitted_at`
-and `accepted_at` times that were written at `P`. Waits and operation
-deadlines set from `P` still fire at `P` + their deadline.
+**A floor set too high** (by a mistaken rebase) can be lowered:
+`aq-playbooks lower-stale-floor --to-ms <value> --actor … --reason …
+--confirm-floor-lowering`, or `Engine::lower_stale_floor`. It accepts that
+keys forgotten after that time may be re-admitted as new by a retry with a
+request time in between. The floor goes down only to the value the operator
+states, in a commit of its own with a `stale_floor_lowered` receipt.
+
+### When aq-server exposes these operations
+
+The engine does no authority check. `actor` and `reason` are free text. The
+server must:
+
+- allow the operations only to an operator or admin role;
+- set `actor` from the authenticated identity, not from the request;
+- pass its own clock as `now_ms`;
+- check `to_ms` (and the floor) against PostgreSQL `now()` before calling,
+  and refuse when they disagree beyond the slack;
+- require explicit confirmation, and offer the dry run first.

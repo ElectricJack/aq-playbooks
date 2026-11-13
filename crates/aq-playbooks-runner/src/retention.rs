@@ -106,8 +106,15 @@ pub const WINDOW_ADMISSION: &str = "k:";
 pub const REFUSE_RUN_REMOVAL: &str = "run removal requires a history record in the same commit";
 pub const REFUSE_EARLY_REMOVAL: &str = "window entry removed before its expiry";
 pub const REFUSE_CLOCK: &str = "retention clock cannot decrease";
-/// Refusal of a commit that lowers or removes the stale floor.
-pub const REFUSE_STALE_FLOOR: &str = "stale floor cannot decrease";
+/// Refusal of a commit that changes the stale floor without a licence, or
+/// beyond its licence.
+pub const REFUSE_STALE_FLOOR: &str = "stale floor changed without its licence";
+/// Refusal of a commit whose clock rebase or floor receipt is not exactly
+/// that commit (another clock or floor, a replayed receipt, or other work).
+pub const REFUSE_LICENCE: &str = "clock rebase or floor receipt does not match this commit";
+/// Kind of the admin receipt that lowers the stale floor
+/// ([`crate::Engine::lower_stale_floor`]).
+pub const STALE_FLOOR_LOWERED: &str = "stale_floor_lowered";
 /// Kind of the admin receipt a clock rebase writes
 /// ([`crate::Engine::rebase_retention_clock`]).
 pub const CLOCK_REBASE: &str = "retention_clock_rebased";
@@ -190,52 +197,154 @@ pub fn check_expiry_change(
         Err(refuse(REFUSE_EXPIRY))
     }
 }
-/// The clock rebase `next`'s commit carries: `(from_ms, to_ms)` of a
-/// [`CLOCK_REBASE`] admin receipt in `next.settled`, the history this same
-/// commit writes. History is inserted once, so a receipt licenses one
-/// commit only. A rebase receipt left in the live State licenses nothing.
-pub fn clock_rebase(next: &State) -> Option<(i64, i64)> {
+/// What an admin licence receipt in a commit's own history allows: exactly
+/// one clock rebase, or exactly one lowering of the stale floor. Each
+/// carries the receipt's sequence, which must be new in this commit (after
+/// the stored sequence), so a receipt cannot be replayed, even after its
+/// history row was deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Licence {
+    /// [`CLOCK_REBASE`]: the clock from `from_ms` down to `to_ms`.
+    Rebase {
+        from_ms: i64,
+        to_ms: i64,
+        sequence: u64,
+    },
+    /// [`STALE_FLOOR_LOWERED`]: the stale floor from `from_ms` down to
+    /// `to_ms`.
+    FloorLowered {
+        from_ms: i64,
+        to_ms: i64,
+        sequence: u64,
+    },
+}
+/// The licence `next`'s commit carries: a [`CLOCK_REBASE`] or
+/// [`STALE_FLOOR_LOWERED`] admin receipt in `next.settled`, the history this
+/// commit writes. A receipt left in the live State licenses nothing. More
+/// than one, or one without its clocks, is refused.
+pub fn licence(next: &State) -> std::result::Result<Option<Licence>, StorageError> {
+    let mut found = None;
+    for r in next
+        .settled
+        .iter()
+        .filter(|cohort| cohort.root == "admin")
+        .flat_map(|cohort| &cohort.receipts)
+        .filter(|r| r.run == "admin")
+    {
+        let clocks = || Some((r.detail["from_ms"].as_i64()?, r.detail["to_ms"].as_i64()?));
+        let licence = match r.kind.as_str() {
+            CLOCK_REBASE => clocks().map(|(from_ms, to_ms)| Licence::Rebase {
+                from_ms,
+                to_ms,
+                sequence: r.sequence,
+            }),
+            STALE_FLOOR_LOWERED => clocks().map(|(from_ms, to_ms)| Licence::FloorLowered {
+                from_ms,
+                to_ms,
+                sequence: r.sequence,
+            }),
+            _ => continue,
+        }
+        .ok_or_else(|| refuse(REFUSE_LICENCE))?;
+        if found.replace(licence).is_some() {
+            return Err(refuse(REFUSE_LICENCE));
+        }
+    }
+    Ok(found)
+}
+/// Whether `next`'s commit carries an admin licence receipt at all (valid
+/// or not): a format 3 store sends such a commit to its complete path,
+/// where [`verify_removals`] judges it.
+pub fn carries_licence(next: &State) -> bool {
     next.settled
         .iter()
         .filter(|cohort| cohort.root == "admin")
         .flat_map(|cohort| &cohort.receipts)
-        .find(|r| r.run == "admin" && r.kind == CLOCK_REBASE)
-        .and_then(|r| Some((r.detail["from_ms"].as_i64()?, r.detail["to_ms"].as_i64()?)))
+        .any(|r| r.run == "admin" && (r.kind == CLOCK_REBASE || r.kind == STALE_FLOOR_LOWERED))
 }
-/// Whether `next`'s commit may lower the clock from `old` to `new`: only a
-/// rebase from exactly `old` to exactly `new`.
-pub fn clock_decrease_licensed(next: &State, old: i64, new: Option<i64>) -> bool {
-    new.is_some_and(|new| clock_rebase(next) == Some((old, new)))
-}
-/// Whether `next`'s commit may lower an expiry record of `window` from
-/// `old` to `new`: only in a rebase to `to_ms` that the clock took, and never
-/// below `to_ms` plus the policy window of that kind (an event's own window
-/// is at least the policy's).
-fn expiry_decrease_licensed(next: &State, window: Window, new: i64) -> bool {
-    let Some((_, to_ms)) = clock_rebase(next) else {
-        return false;
-    };
-    let policy = &next.retention.policy;
+/// The expiry a clock rebase to `to_ms` gives entry `key` of `window`:
+/// `to_ms` plus the entry's own window (the admission window; for an event
+/// `max(policy.event_replay_ms, contract.retention_ms)`).
+pub fn rebase_cap(s: &State, window: Window, key: &str, to_ms: i64) -> i64 {
     let window_ms = match window {
-        Window::Event => policy.event_replay_ms,
-        Window::Admission => policy.admission_replay_ms,
+        Window::Admission => self::window(s.retention.policy.admission_replay_ms),
+        Window::Event => event_window(s, key),
     };
-    next.retention.clock_ms == Some(to_ms) && new >= to_ms.saturating_add(self::window(window_ms))
+    to_ms.saturating_add(window_ms)
 }
-/// The stale floor never decreases and is never removed.
-pub fn check_stale_floor(previous: &State, next: &State) -> std::result::Result<(), StorageError> {
-    if previous
-        .retention
-        .stale_floor_ms
-        .is_some_and(|old| next.retention.stale_floor_ms.is_none_or(|new| new < old))
-    {
+/// The clock, the stale floor and the licence of a commit from `previous`
+/// to `next`. Without a licence the clock never decreases and the floor
+/// never changes. With one, the commit must be exactly that licence: its
+/// receipt's sequence is new in this commit, and
+/// - a rebase lowers the clock from exactly `from_ms` to exactly `to_ms <
+///   from_ms`, and may only raise the floor, to at most `to_ms`;
+/// - a floor lowering leaves the clock alone and lowers the floor from
+///   exactly `from_ms` to exactly `to_ms < from_ms`.
+///
+/// What else such a commit may not do (add or remove a run, operation,
+/// event or keyed receipt, remove an audit receipt, change an expiry other
+/// than by a rebase cap) is checked where those records are.
+fn check_licence(
+    previous: &State,
+    next: &State,
+    licence: Option<Licence>,
+) -> std::result::Result<(), StorageError> {
+    let (old_clock, new_clock) = (previous.retention.clock_ms, next.retention.clock_ms);
+    let (old_floor, new_floor) = (
+        previous.retention.stale_floor_ms,
+        next.retention.stale_floor_ms,
+    );
+    let Some(licence) = licence else {
+        if old_clock.is_some_and(|old| new_clock.is_none_or(|new| new < old)) {
+            return Err(refuse(REFUSE_CLOCK));
+        }
+        return check_floor_unchanged(previous, next);
+    };
+    let (Licence::Rebase { sequence, .. } | Licence::FloorLowered { sequence, .. }) = licence;
+    if sequence <= previous.sequence || sequence > next.sequence {
+        return Err(refuse(REFUSE_LICENCE));
+    }
+    match licence {
+        Licence::Rebase { from_ms, to_ms, .. } => {
+            if old_clock != Some(from_ms) || new_clock != Some(to_ms) || to_ms >= from_ms {
+                return Err(refuse(REFUSE_LICENCE));
+            }
+            let raised = match (old_floor, new_floor) {
+                (_, Some(new)) => new <= to_ms && old_floor.is_none_or(|old| new >= old),
+                (None, None) => true,
+                (Some(_), None) => false,
+            };
+            if !raised {
+                return Err(refuse(REFUSE_STALE_FLOOR));
+            }
+        }
+        Licence::FloorLowered { from_ms, to_ms, .. } => {
+            if old_clock != new_clock
+                || old_floor != Some(from_ms)
+                || new_floor != Some(to_ms)
+                || to_ms >= from_ms
+            {
+                return Err(refuse(REFUSE_LICENCE));
+            }
+        }
+    }
+    Ok(())
+}
+/// Without a licence the stale floor never changes (a format 3 bounded
+/// commit never carries one).
+pub fn check_floor_unchanged(
+    previous: &State,
+    next: &State,
+) -> std::result::Result<(), StorageError> {
+    if previous.retention.stale_floor_ms != next.retention.stale_floor_ms {
         return Err(refuse(REFUSE_STALE_FLOOR));
     }
     Ok(())
 }
-/// [`check_expiry_change`] for record `key` of `window`, against `next`. A
-/// clock rebase licenses capping a recorded expiry (see
-/// [`expiry_decrease_licensed`]).
+/// [`check_expiry_change`] for record `key` of `window`, against `next`. In
+/// a commit with a licence the only allowed change is a rebase cap: a
+/// recorded expiry lowered to exactly [`rebase_cap`], with the clock at the
+/// rebase's `to_ms`.
 pub(crate) fn check_expiry_record(
     next: &State,
     window: Window,
@@ -243,11 +352,21 @@ pub(crate) fn check_expiry_record(
     old: Option<i64>,
     new: Option<i64>,
 ) -> std::result::Result<(), StorageError> {
-    if let (Some(old), Some(new)) = (old, new)
-        && new < old
-        && expiry_decrease_licensed(next, window, new)
-    {
-        return Ok(());
+    match licence(next)? {
+        Some(Licence::Rebase { to_ms, .. }) => {
+            if next.retention.clock_ms != Some(to_ms) {
+                return Err(refuse(REFUSE_LICENCE));
+            }
+            let capped = matches!((old, new), (Some(old), Some(new))
+                if new < old && new == rebase_cap(next, window, key, to_ms));
+            return if capped {
+                Ok(())
+            } else {
+                Err(refuse(REFUSE_EXPIRY))
+            };
+        }
+        Some(Licence::FloorLowered { .. }) => return Err(refuse(REFUSE_EXPIRY)),
+        None => {}
     }
     let item_kept = match window {
         Window::Event => next.events.contains_key(key),
@@ -327,11 +446,11 @@ fn intent_settled(status: &IntentStatus) -> bool {
 /// - a keyed admission receipt: its expiry has been reached (a changed
 ///   receipt is always refused).
 ///
-/// The clock never decreases, and expiry records follow
-/// [`check_expiry_change`], except in a commit that carries a clock rebase
-/// ([`clock_rebase`]): it may lower the clock from exactly the rebase's old
-/// clock to exactly its new one, and cap recorded expiries no lower than the
-/// new clock plus their policy window. The stale floor never decreases. Event tombstones and correlation fences may
+/// The clock never decreases, the stale floor never changes, and expiry
+/// records follow [`check_expiry_change`], except in a commit that carries
+/// an admin licence ([`licence`]), which must be exactly that licence and do
+/// nothing else (see [`check_licence`]): a clock rebase lowers the clock and
+/// caps expiries to [`rebase_cap`]; a floor lowering lowers the floor. Event tombstones and correlation fences may
 /// always be removed. Artifact removals are checked by
 /// [`verify_artifact_removals`].
 pub fn verify_removals(
@@ -351,6 +470,21 @@ pub fn verify_removals(
             })
             .contains(id)
     };
+    if licence(next)?.is_some() {
+        let added = next.runs.keys().any(|k| !previous.runs.contains_key(k))
+            || next
+                .intents
+                .keys()
+                .any(|k| !previous.intents.contains_key(k))
+            || next.events.keys().any(|k| !previous.events.contains_key(k))
+            || next
+                .keyed_admissions
+                .keys()
+                .any(|k| !previous.keyed_admissions.contains_key(k));
+        if added {
+            return Err(refuse(REFUSE_LICENCE));
+        }
+    }
     let kept: BTreeSet<u64> = next.receipts.iter().map(|r| r.sequence).collect();
     let removals = check_removals(previous, next, &disposed_run, &|sequence| {
         kept.contains(&sequence)
@@ -371,18 +505,22 @@ pub(crate) fn check_removals(
 ) -> std::result::Result<Removals, StorageError> {
     verify_artifact_removals(previous, next)?;
     let clock = next.retention.clock_ms;
-    if let Some(old) = previous.retention.clock_ms
-        && clock.is_none_or(|new| new < old)
-        && !clock_decrease_licensed(next, old, clock)
-    {
-        return Err(refuse(REFUSE_CLOCK));
-    }
-    check_stale_floor(previous, next)?;
+    let licensed = licence(next)?;
+    check_licence(previous, next, licensed)?;
+    // A licensed commit removes nothing.
+    let removal = || -> std::result::Result<(), StorageError> {
+        if licensed.is_some() {
+            return Err(refuse(REFUSE_LICENCE));
+        }
+        Ok(())
+    };
     for (key, receipt) in &previous.keyed_admissions {
         match next.keyed_admissions.get(key) {
             Some(kept) if kept == receipt => {}
             Some(_) => return Err(refuse(REFUSE_RECEIPT_CHANGE)),
-            None if admission_expiry(previous, key).is_some_and(|at| expired(at, clock)) => {}
+            None if admission_expiry(previous, key).is_some_and(|at| expired(at, clock)) => {
+                removal()?
+            }
             None => return Err(refuse(REFUSE_EARLY_REMOVAL)),
         }
     }
@@ -391,6 +529,7 @@ pub(crate) fn check_removals(
         if next.events.contains_key(key) {
             continue;
         }
+        removal()?;
         // A legacy tombstone records the removal; it never licenses one.
         if !event_expiry(previous, key).is_some_and(|at| expired(at, clock)) {
             return Err(refuse(REFUSE_EARLY_REMOVAL));
@@ -408,6 +547,7 @@ pub(crate) fn check_removals(
         .filter(|r| !receipt_kept(r.sequence))
         .collect();
     if !removed_receipts.is_empty() {
+        removal()?;
         let settled: BTreeSet<u64> = next
             .settled
             .iter()
@@ -433,6 +573,7 @@ pub(crate) fn check_removals(
     if removed_runs.is_empty() && removed_intents.is_empty() {
         return Ok(removals);
     }
+    removal()?;
     // A cohort's runs belong to its root.
     let mut settled_runs: BTreeMap<&str, &Run> = BTreeMap::new();
     for cohort in &next.settled {
@@ -770,17 +911,17 @@ pub(crate) fn admission_droppable(s: &State, key: &str, clock: i64) -> bool {
     })
 }
 /// Lower the retention clock to `to_ms` (a clock rebase) and cap every
-/// recorded expiry later than `to_ms` plus its own window at that: the
-/// admission window for a keyed receipt, `max(policy.event_replay_ms,
-/// contract.retention_ms)` for an event. An expiry at or below its cap stays.
-/// Walks the expiry order from the smallest possible cap upwards, so the
-/// cost is the number of entries above it. Returns (events, admissions)
-/// capped. The caller writes the [`CLOCK_REBASE`] receipt that licenses the
-/// commit.
+/// recorded expiry later than its [`rebase_cap`] at that: `to_ms` plus the
+/// entry's own window. An expiry at or below its cap stays. Walks the expiry
+/// order from the smallest possible cap upwards, so the cost is the number
+/// of entries above it (bounded by the namespace quotas). Returns (events,
+/// admissions) capped. The caller writes the [`CLOCK_REBASE`] receipt that
+/// licenses the commit.
 pub(crate) fn rebase_clock(s: &mut State, to_ms: i64) -> (usize, usize) {
     let policy = &s.retention.policy;
-    let admission = window(policy.admission_replay_ms);
-    let lowest = to_ms.saturating_add(admission.min(window(policy.event_replay_ms)));
+    let lowest = to_ms.saturating_add(
+        window(policy.admission_replay_ms).min(window(policy.event_replay_ms).max(1)),
+    );
     let mut keys = vec![];
     let mut after = window_key(lowest, "");
     loop {
@@ -797,38 +938,42 @@ pub(crate) fn rebase_clock(s: &mut State, to_ms: i64) -> (usize, usize) {
             continue;
         };
         let member = member.to_string();
-        if let Some(item) = member.strip_prefix(WINDOW_ADMISSION) {
-            let cap = to_ms.saturating_add(admission);
-            if s.retention
-                .admission_expires_at_ms
-                .get(item)
-                .is_some_and(|at| *at > cap)
-            {
-                s.retention
-                    .admission_expires_at_ms
-                    .insert(item.to_string(), cap);
-                s.retention.expiry.remove(&key);
-                window_insert(s, cap, member.clone());
-                admissions += 1;
-            }
+        let (window, item) = if let Some(item) = member.strip_prefix(WINDOW_ADMISSION) {
+            (Window::Admission, item)
         } else if let Some(item) = member.strip_prefix(WINDOW_EVENT) {
-            let cap = to_ms.saturating_add(event_window(s, item));
-            if s.retention
-                .event_expires_at_ms
-                .get(item)
-                .is_some_and(|at| *at > cap)
-            {
-                s.retention
-                    .event_expires_at_ms
-                    .insert(item.to_string(), cap);
-                s.retention.expiry.remove(&key);
-                window_insert(s, cap, member.clone());
-                events += 1;
+            (Window::Event, item)
+        } else {
+            continue;
+        };
+        let cap = rebase_cap(s, window, item, to_ms);
+        let records = match window {
+            Window::Admission => &mut s.retention.admission_expires_at_ms,
+            Window::Event => &mut s.retention.event_expires_at_ms,
+        };
+        if records.get(item).is_some_and(|at| *at > cap) {
+            records.insert(item.to_string(), cap);
+            s.retention.expiry.remove(&key);
+            window_insert(s, cap, member.clone());
+            match window {
+                Window::Admission => admissions += 1,
+                Window::Event => events += 1,
             }
         }
     }
     s.retention.clock_ms = Some(to_ms);
     (events, admissions)
+}
+/// The end of a licensed admin commit (a clock rebase or a floor
+/// lowering): only its `"admin"` receipt moves to history. The clock is not
+/// advanced, nothing settles and nothing is dropped, so the commit is
+/// exactly its licence.
+pub(crate) fn finish_licensed_commit(s: &mut State) -> Result<CommitReport> {
+    let mut report = CommitReport::default();
+    if let Some(cohort) = move_unowned_receipts(s, "admin")? {
+        report.receipts += cohort.receipts.len();
+        s.settled.push(cohort);
+    }
+    Ok(report)
 }
 /// Remove the keyed admission receipt `key` ahead of its drop, with its
 /// expiry record and window member. A receipt is never replaced in place, so

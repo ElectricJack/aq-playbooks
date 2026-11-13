@@ -501,9 +501,9 @@ impl PostgresStorage {
         };
         let mut tx: ObservedTransaction<'_> = lent.reclaim()?;
         let previous = header_state(&header)?;
-        // A clock rebase lowers the clock and caps expiries; only the
-        // complete path's `verify_removals` can license that.
-        let rebase = aq_playbooks_runner::retention::clock_rebase(&state).is_some();
+        // A commit with an admin licence (clock rebase, floor lowering)
+        // takes the complete path: only `verify_removals` judges a licence.
+        let rebase = aq_playbooks_runner::retention::carries_licence(&state);
         let staged = stage(
             &mut tx,
             namespace,
@@ -647,7 +647,7 @@ fn verify_header(previous: &State, next: &State) -> Result<(), StorageError> {
     {
         return Err(backend(aq_playbooks_runner::retention::REFUSE_CLOCK));
     }
-    aq_playbooks_runner::retention::check_stale_floor(previous, next)?;
+    aq_playbooks_runner::retention::check_floor_unchanged(previous, next)?;
     if next.sequence < previous.sequence {
         return Err(backend("namespace invocation sequence cannot decrease"));
     }
@@ -693,8 +693,8 @@ struct Staged {
 /// deletes its expiry record with an expiry `clock_ms` has reached (and, for
 /// an event, writes no legacy tombstone for it); otherwise it sets
 /// `history_removed`, so the complete path runs `verify_removals`. In a
-/// commit that carries a clock `rebase`, a lowered expiry is left to that
-/// path too (it is refused here otherwise).
+/// commit that carries an admin licence (`rebase`), a lowered expiry is left
+/// to that path too (it is refused here otherwise).
 fn stage(
     tx: &mut ObservedTransaction<'_>,
     namespace: &str,

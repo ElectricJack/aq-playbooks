@@ -184,23 +184,42 @@ enum Command {
     },
     /// Lower a retention clock that a far-future host time pinned (every
     /// request with a request time is refused as stale while it is ahead).
-    /// Caps expiries written from the pin, records a stale floor and an
-    /// admin receipt. Needs --confirm-clock-rebase.
+    /// Caps expiries and run timers written from the pin, records a stale
+    /// floor and an admin receipt. Run with --dry-run first; committing
+    /// needs --confirm-clock-rebase.
     RebaseRetentionClock {
-        /// The corrected real time (ms): at or after now, before the clock.
+        /// The corrected real time (ms): from now to a minute after it.
         #[arg(long)]
         to_ms: i64,
-        /// The last correct host time before the pin (ms): a retry of a key
-        /// the engine no longer remembers with a request time at or before
-        /// it is refused as stale. At most --to-ms.
+        /// The last correct host time before the pin (ms, in the past): a
+        /// retry of a key the engine no longer remembers with a request time
+        /// at or before it is refused as stale.
         #[arg(long)]
         stale_floor_ms: i64,
         #[arg(long)]
         actor: String,
         #[arg(long)]
         reason: String,
-        #[arg(long, required = true)]
+        /// Print what the rebase would change and commit nothing.
+        #[arg(long, conflicts_with = "confirm_clock_rebase")]
+        dry_run: bool,
+        #[arg(long, required_unless_present = "dry_run")]
         confirm_clock_rebase: bool,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Lower a stale floor an earlier rebase set too high, accepting that
+    /// keys forgotten after the new floor may be re-admitted as new by a
+    /// retry with a request time in between. Needs --confirm-floor-lowering.
+    LowerStaleFloor {
+        #[arg(long)]
+        to_ms: i64,
+        #[arg(long)]
+        actor: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, required = true)]
+        confirm_floor_lowering: bool,
         #[command(flatten)]
         store: StoreArgs,
     },
@@ -615,14 +634,37 @@ fn execute(cli: Cli) -> Result<()> {
             stale_floor_ms,
             actor,
             reason,
+            dry_run,
             confirm_clock_rebase,
             store,
         } => {
-            anyhow::ensure!(confirm_clock_rebase, "--confirm-clock-rebase required");
+            anyhow::ensure!(
+                dry_run || confirm_clock_rebase,
+                "--confirm-clock-rebase or --dry-run required"
+            );
             let e = engine(&store)?;
-            let report = e.rebase_retention_clock(to_ms, stale_floor_ms, &actor, &reason, time()?);
+            let report = if dry_run {
+                e.rebase_retention_clock_dry_run(to_ms, stale_floor_ms, &actor, &reason, time()?)
+            } else {
+                e.rebase_retention_clock(to_ms, stale_floor_ms, &actor, &reason, time()?)
+            };
             e.release()?;
-            print(&report?)
+            let report = report?;
+            print(&json!({"dry_run":dry_run,"report":report}))
+        }
+        Command::LowerStaleFloor {
+            to_ms,
+            actor,
+            reason,
+            confirm_floor_lowering,
+            store,
+        } => {
+            anyhow::ensure!(confirm_floor_lowering, "--confirm-floor-lowering required");
+            let e = engine(&store)?;
+            let lowered = e.lower_stale_floor(to_ms, &actor, &reason, time()?);
+            e.release()?;
+            let (from_ms, to_ms) = lowered?;
+            print(&json!({"from_ms":from_ms,"to_ms":to_ms}))
         }
         Command::RotateKeys { store } => {
             anyhow::ensure!(
