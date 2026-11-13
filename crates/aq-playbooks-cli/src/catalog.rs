@@ -97,6 +97,16 @@ pub const MANIFEST_2_1_JSON: &str = include_str!("../../../contracts/aq-host-2.1
 pub fn catalog_v2_1() -> Registry {
     serde_json::from_str(REGISTRY_2_1_JSON).expect("published AQ host registry 2.1.0")
 }
+/// Host catalog 2.2.0: 2.1.0 byte-identical, plus task facts (`work.read`),
+/// routes (`work.route`), structured judgments (`judgment.assess` and
+/// `aq.judgment.assessed`) and `aq.work.route_needed`. Additive only, so an
+/// artifact sealed on 2.1.0 pins the same contracts here.
+pub const VERSION_2_2: &str = "2.2.0";
+pub const REGISTRY_2_2_JSON: &str = include_str!("../../../contracts/aq-host-2.2.0/registry.json");
+pub const MANIFEST_2_2_JSON: &str = include_str!("../../../contracts/aq-host-2.2.0/manifest.json");
+pub fn catalog_v2_2() -> Registry {
+    serde_json::from_str(REGISTRY_2_2_JSON).expect("published AQ host registry 2.2.0")
+}
 pub fn describe_surface() -> serde_json::Value {
     let mut manifest: serde_json::Value =
         serde_json::from_str(MANIFEST_JSON).expect("AQ host manifest");

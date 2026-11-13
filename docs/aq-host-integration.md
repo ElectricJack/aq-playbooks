@@ -360,3 +360,58 @@ returns the source from the host that prepared it. A policy binds
 
 The host still owns the OID format bound: lowercase hex, 40 characters for
 `sha1` and 64 for `sha256`.
+
+## AQ host catalog 2.2.0 (routing: task facts, routes, structured judgments)
+
+The [2.2.0 bundle](../contracts/aq-host-2.2.0/README.md) is published beside
+1.0.0, 2.0.0 and 2.1.0 and replaces none of them. Version `2.2.0` has
+fingerprint
+`sha256:0eeb058e4ecbf1b89f2982dce595b327e879914d0737a959d30e183a5e4a2ef7`
+over `["2.2.0", registry]`. The manifest records the 2.1.0 version and
+fingerprint it supersedes, and lists `commands_added` and `events_added`.
+
+### Why
+
+Before 2.2.0 a playbook could not route a task:
+- reading a task returned no facts about it;
+- no command set a route;
+- no event started a run when a task needed one;
+- a judgment returned a single label.
+
+Spec 0013 §6 words the fix as changes to `context.read`, `work.change` and
+`judgment.request`. Those three fingerprints are pinned by every Host8 coding
+artifact, so 2.2.0 adds new contracts instead.
+
+### Compatibility decision
+
+- **Additive only.** All twelve commands and nine events of 2.1.0 are
+  byte-identical. `fixtures.json#compatibility` pins their fingerprints, the
+  2.1.0 registry file SHA-256, and the fingerprints of the five additions.
+  An artifact sealed on 2.1.0 validates against 2.2.0 unchanged.
+- **New commands:** `work.read`, `work.route` and `judgment.assess`. Each
+  requires the capability of the same name. `judgment.assess` also
+  reconciles through `operation.get`.
+- **New events:** `aq.judgment.assessed` (the completion of
+  `judgment.assess`) and `aq.work.route_needed` (payload `{subject}` only).
+- **Consumers opt in with a new pin:** aq-server's Host9 profile, beside the
+  untouched Host8 (2.1.0) pin.
+
+### Bounds left to the host
+
+These are host semantics, not schema:
+- the 64 KiB request bound;
+- for `judgment.assess` `assessed`: one label per requested field, in field
+  order, each a declared choice; flags only from the declared flags, each
+  once. Otherwise the result is `failed` with `indeterminate`;
+- exactly one final `aq.judgment.assessed` for every accepted judgment,
+  including at the host's own deadline;
+- `work.route` checks the route against Settings (`not_offered`), never
+  replaces an owner route (`owner_route`), and answers `stale` when the
+  task's revision moved since `subject.revision`;
+- `work.read` facts never include priority or provider load, and
+  `charged_failures` counts only failures charged to the task.
+
+`operation.get` 2.0.0 is unchanged, so its `completed` union does not include
+the `judgment.assess` outputs. A host reconciles a `judgment.assess` intent
+from its own record of the operation. A playbook reads the answer through the
+join, not through `operation.get`.
