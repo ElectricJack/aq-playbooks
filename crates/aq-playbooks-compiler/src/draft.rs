@@ -3,7 +3,7 @@
 //!
 //! A workspace is a directory of five files:
 //!
-//! | File | Written by | Content |
+//! | File | Provided by | Content |
 //! | --- | --- | --- |
 //! | `source.md` | the owner | the document, without any header |
 //! | `record.json` | the host | [`SourceRecord`]: id, binding, scope and what the source may use |
@@ -24,6 +24,11 @@
 //! and completion event, writes the `---aq-playbook` header, and captures the
 //! facts. Identities come only from the catalog: a draft cannot carry a
 //! fingerprint, a registry or a header of its own.
+//!
+//! A sealed artifact is only as trustworthy as the record, catalog, facts and
+//! Markdown it was filled from. In an agent's workspace those files are
+//! writable by the agent, so a host re-fills from its own copies and takes
+//! only the draft from an agent.
 use crate::{
     COMPILER_VERSION, ChangeKind, CompileInput, Diagnostic, Proposal, SemanticDiff, compile,
     semantic_diff, validate,
@@ -169,41 +174,71 @@ fn at(file: &str, path: &str) -> String {
     }
 }
 
+/// One step of a JSON path: an object key or an array index.
+#[derive(Debug, Clone, PartialEq)]
+enum Seg {
+    Key(String),
+    Index(usize),
+}
+/// `steps.read.op`, `triggers[0].event`.
+fn render(path: &[Seg]) -> String {
+    let mut out = String::new();
+    for seg in path {
+        match seg {
+            Seg::Key(key) => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(key);
+            }
+            Seg::Index(i) => out.push_str(&format!("[{i}]")),
+        }
+    }
+    out
+}
 enum Frame {
     Object(Option<String>),
     Array(usize),
 }
-fn render(frames: &[Frame]) -> String {
-    let mut path = String::new();
-    for frame in frames {
-        match frame {
-            Frame::Object(Some(key)) => {
-                if !path.is_empty() {
-                    path.push('.');
-                }
-                path.push_str(key);
-            }
-            Frame::Array(index) => path.push_str(&format!("[{index}]")),
-            Frame::Object(None) => {}
-        }
-    }
-    path
+fn segments(stack: &[Frame]) -> Vec<Seg> {
+    stack
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Object(Some(key)) => Some(Seg::Key(key.clone())),
+            Frame::Array(i) => Some(Seg::Index(*i)),
+            Frame::Object(None) => None,
+        })
+        .collect()
 }
-/// The JSON path (`steps.read.op`, `triggers[0]`) of the value being read at
-/// byte `offset` of `text`. An error serde reports once a whole object was
-/// read (it reads a tagged operation or expression whole before checking it,
-/// and reports past the enclosing step) names the object just closed.
-fn json_path_at(text: &str, offset: usize) -> String {
+/// Walks `text` up to byte `stop`, or until the value at `target` starts.
+/// Returns the path of the value being read at the stop, and the offset of
+/// the first byte of the value at `target`. An error serde reports once a
+/// whole object was read (it reads a tagged operation or expression whole
+/// before checking it) names the object just closed.
+fn scan(text: &str, stop: usize, target: Option<&[Seg]>) -> (Vec<Seg>, Option<usize>) {
     let mut stack: Vec<Frame> = vec![];
-    let mut closed: Option<String> = None;
+    let mut closed: Option<Vec<Seg>> = None;
+    let mut previous: Option<u8> = None;
     let bytes = text.as_bytes();
     let mut i = 0;
-    while i < bytes.len() && i < offset {
-        match bytes[i] {
+    while i < bytes.len() && i < stop {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let key = b == b'"' && matches!(stack.last(), Some(Frame::Object(None)));
+        let value = !key
+            && !matches!(b, b'}' | b']' | b',' | b':')
+            && matches!(previous, None | Some(b':' | b'[' | b','));
+        if value && target.is_some_and(|t| segments(&stack) == t) {
+            return (segments(&stack), Some(i));
+        }
+        match b {
             b'{' => stack.push(Frame::Object(None)),
             b'[' => stack.push(Frame::Array(0)),
             b'}' | b']' => {
-                closed = Some(render(&stack[..stack.len().saturating_sub(1)]));
+                closed = Some(segments(&stack[..stack.len().saturating_sub(1)]));
                 stack.pop();
             }
             b',' => match stack.last_mut() {
@@ -217,22 +252,86 @@ fn json_path_at(text: &str, offset: usize) -> String {
                 while i < bytes.len() && bytes[i] != b'"' {
                     i += if bytes[i] == b'\\' { 2 } else { 1 };
                 }
-                if let Some(Frame::Object(key @ None)) = stack.last_mut() {
+                if key && let Some(Frame::Object(slot)) = stack.last_mut() {
                     let raw = &text[start..i.min(bytes.len())];
-                    *key = Some(serde_json::from_str(&format!("\"{raw}\"")).unwrap_or(raw.into()));
+                    *slot = Some(serde_json::from_str(&format!("\"{raw}\"")).unwrap_or(raw.into()));
                 }
             }
             _ => {}
         }
-        if bytes
-            .get(i)
-            .is_some_and(|b| !matches!(b, b'}' | b']' | b',') && !b.is_ascii_whitespace())
-        {
+        if !matches!(b, b'}' | b']' | b',') {
             closed = None;
         }
+        previous = Some(b);
         i += 1;
     }
-    closed.unwrap_or_else(|| render(&stack))
+    (closed.unwrap_or_else(|| segments(&stack)), None)
+}
+#[cfg(test)]
+fn json_path_at(text: &str, offset: usize) -> String {
+    render(&scan(text, offset, None).0)
+}
+/// The value at `path` inside `value`.
+fn at_path<'a>(value: &'a Value, path: &[Seg]) -> Option<&'a Value> {
+    path.iter().try_fold(value, |v, seg| match seg {
+        Seg::Key(key) => v.get(key),
+        Seg::Index(i) => v.get(i),
+    })
+}
+/// Whether `value` is a tagged object (an operation, expression or schema)
+/// that does not parse as one; `None` when it is not tagged.
+fn tagged_fault(value: &Value) -> Option<bool> {
+    let tag = |key: &str| value.get(key).is_some_and(Value::is_string);
+    let fails = if tag("op") {
+        serde_json::from_value::<Expr>(value.clone()).is_err()
+    } else if tag("kind") {
+        serde_json::from_value::<DraftOperation>(value.clone()).is_err()
+    } else if tag("type") {
+        serde_json::from_value::<Schema>(value.clone()).is_err()
+    } else {
+        return None;
+    };
+    Some(fails)
+}
+/// Extends `path` to the deepest tagged object under `value` that does not
+/// parse, which is where serde's fault is.
+fn deepest_fault(value: &Value, path: &mut Vec<Seg>) {
+    let children: Vec<(Seg, &Value)> = match value {
+        Value::Object(map) => map.iter().map(|(k, v)| (Seg::Key(k.clone()), v)).collect(),
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (Seg::Index(i), v))
+            .collect(),
+        _ => return,
+    };
+    for (seg, child) in children {
+        path.push(seg);
+        let depth = path.len();
+        match tagged_fault(child) {
+            Some(true) => return deepest_fault(child, path),
+            Some(false) => {}
+            None => {
+                deepest_fault(child, path);
+                if path.len() > depth {
+                    return;
+                }
+            }
+        }
+        path.pop();
+    }
+}
+/// 1-based line and column of byte `offset`.
+fn line_column(text: &str, offset: usize) -> (usize, usize) {
+    let before = &text.as_bytes()[..offset.min(text.len())];
+    let line = before.iter().filter(|b| **b == b'\n').count() + 1;
+    let column = before.len()
+        - before
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map_or(0, |p| p + 1)
+        + 1;
+    (line, column)
 }
 
 /// A contract position holding anything but a name: refused where it is
@@ -243,13 +342,17 @@ fn contract_positions(draft: &Value) -> Vec<Diagnostic> {
     if let Some(steps) = draft.get("steps").and_then(Value::as_object) {
         for (name, step) in steps {
             let op = step.get("op");
-            for field in ["command", "event"] {
-                if let Some(value) = op.and_then(|op| op.get(field)) {
-                    let nullable = field == "event";
-                    if !value.is_string() && (!nullable || !value.is_null()) {
-                        places.push(format!("steps.{name}.op.{field}"));
-                    }
-                }
+            let kind = op.and_then(|op| op.get("kind")).and_then(Value::as_str);
+            let (field, nullable) = match kind {
+                Some("invoke") => ("command", false),
+                Some("wait") => ("event", true),
+                _ => continue,
+            };
+            if let Some(value) = op.and_then(|op| op.get(field))
+                && !value.is_string()
+                && (!nullable || !value.is_null())
+            {
+                places.push(format!("steps.{name}.op.{field}"));
             }
         }
     }
@@ -275,17 +378,34 @@ fn contract_positions(draft: &Value) -> Vec<Diagnostic> {
 }
 
 /// Strict JSON with the place of the first fault. With `positions`, line and
-/// column are those of `text`, the file the agent wrote.
-fn parse<T: DeserializeOwned>(file: &str, text: &str, positions: bool) -> Result<T, Diagnostic> {
+/// column are those of `text`, the file the agent wrote. With `parsed` (the
+/// same text as a value), a fault serde reports at the end of a step is moved
+/// to the operation, expression or schema inside it that is wrong.
+fn parse<T: DeserializeOwned>(
+    file: &str,
+    text: &str,
+    positions: bool,
+    parsed: Option<&Value>,
+) -> Result<T, Diagnostic> {
     serde_json::from_str(text).map_err(|e| {
-        let (line, column) = (e.line(), e.column());
+        let (mut line, mut column) = (e.line(), e.column());
         let offset: usize = text
             .split_inclusive('\n')
             .take(line.saturating_sub(1))
             .map(str::len)
             .sum::<usize>()
             + column;
-        let path = json_path_at(text, offset);
+        let mut path = scan(text, offset, None).0;
+        if let Some(inner) = parsed.and_then(|v| at_path(v, &path)) {
+            let reported = path.len();
+            deepest_fault(inner, &mut path);
+            if path.len() > reported
+                && let (_, Some(start)) = scan(text, text.len(), Some(&path))
+            {
+                (line, column) = line_column(text, start);
+            }
+        }
+        let path = render(&path);
         let full = e.to_string();
         let reason = full
             .rsplit_once(" at line ")
@@ -335,10 +455,35 @@ fn read_file(dir: &Path, name: &str, max: u64) -> Result<String, Diagnostic> {
     if meta.len() > max {
         return Err(too_big());
     }
+    let unreadable = |e: std::io::Error| fault(format!("{name}: cannot be read ({e})."));
+    let file = std::fs::File::open(&path).map_err(unreadable)?;
+    // What was opened must be the file that was checked: a file swapped in
+    // between the check and the open is refused before it is read.
+    let opened = file.metadata().map_err(unreadable)?;
+    if !opened.is_file() {
+        return Err(fault(format!("{name} is not a regular file.")));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (opened.dev(), opened.ino()) != (meta.dev(), meta.ino()) {
+            return Err(fault(format!(
+                "{name} was replaced while it was being read; write it once and run again."
+            )));
+        }
+        if opened.nlink() != 1 {
+            return Err(fault(format!(
+                "{name} has other hard links; the workspace accepts only files of its own. Write it as a new file."
+            )));
+        }
+    }
+    if opened.len() > max {
+        return Err(too_big());
+    }
     let mut bytes = vec![];
-    std::fs::File::open(&path)
-        .and_then(|f| f.take(max + 1).read_to_end(&mut bytes))
-        .map_err(|e| fault(format!("{name}: cannot be read ({e}).")))?;
+    file.take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
     if bytes.len() as u64 > max {
         return Err(too_big());
     }
@@ -352,24 +497,33 @@ fn keep<T>(result: Result<T, Diagnostic>, faults: &mut Vec<Diagnostic>) -> Optio
 impl Workspace {
     /// Reads `source.md`, `record.json`, `catalog.json`, `facts.json` and
     /// `draft.json` from `dir`, reporting every unreadable or malformed file.
+    ///
+    /// This is for the agent's own tools, in the agent's own directory. A
+    /// host never calls it on a directory an agent can write: it builds the
+    /// [`Workspace`] from its own record, catalog, facts and document, and
+    /// takes only `draft.json` from the agent.
     pub fn read(dir: &Path) -> Result<Self, Vec<Diagnostic>> {
         let mut faults = vec![];
         let f = &mut faults;
         let markdown = keep(read_file(dir, SOURCE_FILE, MAX_SOURCE_BYTES), f);
         let record = keep(read_file(dir, RECORD_FILE, MAX_RECORD_BYTES), f)
-            .and_then(|t| keep(parse::<SourceRecord>(RECORD_FILE, &t, true), f));
+            .and_then(|t| keep(parse::<SourceRecord>(RECORD_FILE, &t, true, None), f));
         let catalog = keep(read_file(dir, CATALOG_FILE, MAX_CATALOG_BYTES), f)
-            .and_then(|t| keep(parse::<Registry>(CATALOG_FILE, &t, true), f));
-        let facts = keep(read_file(dir, FACTS_FILE, MAX_FACTS_BYTES), f)
-            .and_then(|t| keep(parse::<BTreeMap<String, Value>>(FACTS_FILE, &t, true), f));
+            .and_then(|t| keep(parse::<Registry>(CATALOG_FILE, &t, true, None), f));
+        let facts = keep(read_file(dir, FACTS_FILE, MAX_FACTS_BYTES), f).and_then(|t| {
+            keep(
+                parse::<BTreeMap<String, Value>>(FACTS_FILE, &t, true, None),
+                f,
+            )
+        });
         let draft = keep(read_file(dir, DRAFT_FILE, MAX_DRAFT_BYTES), f).and_then(|t| {
-            let value = keep(parse::<Value>(DRAFT_FILE, &t, true), f)?;
+            let value = keep(parse::<Value>(DRAFT_FILE, &t, true, None), f)?;
             let names = contract_positions(&value);
             if !names.is_empty() {
                 f.extend(names);
                 return None;
             }
-            keep(parse::<Draft>(DRAFT_FILE, &t, true), f).map(|_| value)
+            keep(parse::<Draft>(DRAFT_FILE, &t, true, Some(&value)), f).map(|_| value)
         });
         match (markdown, record, catalog, facts, draft) {
             (Some(markdown), Some(record), Some(catalog), Some(facts), Some(draft)) => Ok(Self {
@@ -516,7 +670,7 @@ pub fn fill(ws: &Workspace) -> Result<CompileInput, Vec<Diagnostic>> {
         return Err(names);
     }
     let pretty = serde_json::to_string_pretty(&ws.draft).unwrap_or_default();
-    let draft: Draft = parse(DRAFT_FILE, &pretty, false).map_err(|d| vec![d])?;
+    let draft: Draft = parse(DRAFT_FILE, &pretty, false, Some(&ws.draft)).map_err(|d| vec![d])?;
     let record = &ws.record;
     let mut faults = vec![];
     let commands_allowed: BTreeSet<&String> = record
@@ -544,6 +698,17 @@ pub fn fill(ws: &Workspace) -> Result<CompileInput, Vec<Diagnostic>> {
                 let path = format!("steps.{name}.op.event");
                 allowed_name("event", event, &events_allowed, &path, &mut faults);
                 events.insert(event.clone());
+            }
+            DraftOperation::Call { dependency, .. } => {
+                let path = format!("steps.{name}.op");
+                faults.push(Diagnostic::error(
+                    "call",
+                    &at(DRAFT_FILE, &path),
+                    format!(
+                        "{path}: calls playbook {dependency:?}, but this source is offered no callable playbooks. Use the commands it may use instead: {}.",
+                        list(&commands_allowed.iter().map(|n| (*n).clone()).collect())
+                    ),
+                ));
             }
             _ => {}
         }
@@ -838,12 +1003,15 @@ fn place(mut d: Diagnostic, header_lines: u32) -> Diagnostic {
     } else {
         path
     };
-    if let Some(line) = d.line {
+    // A line and column are always positions in draft.json. A step mapped
+    // to the document names its source.md line in the message instead.
+    if let Some(line) = d.line.take() {
         let written = line.saturating_sub(header_lines);
         d.message = format!(
             "{} (the step is mapped to source.md line {written})",
             d.message
         );
+        d.column = None;
     }
     d
 }
@@ -857,6 +1025,9 @@ fn placed(ws: &Workspace, diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
 }
 
 /// Every diagnostic for the workspace's draft: filling, then validation.
+/// While the draft does not fill (a name, identity, capability, call or
+/// source mapping is wrong), only those faults are reported; validation runs
+/// once it fills.
 pub fn check(ws: &Workspace) -> Vec<Diagnostic> {
     match fill(ws) {
         Ok(input) => placed(ws, validate(&input)),
@@ -1048,8 +1219,30 @@ mod tests {
         for text in ["{\"a\\", "{\"é\\é", "}}]]", "{\"a\": [\"x\\\"] "] {
             json_path_at(text, text.len() + 5);
         }
-        let d = parse::<Value>(DRAFT_FILE, "{\"a\": [1, \"é\\", true).unwrap_err();
+        let d = parse::<Value>(DRAFT_FILE, "{\"a\": [1, \"é\\", true, None).unwrap_err();
         assert_eq!(d.code, "draft_format");
+    }
+
+    #[test]
+    fn a_fault_inside_an_operation_is_placed_at_the_deepest_wrong_object() {
+        let text = "{\"steps\": {\"a\": {\"op\": {\"kind\": \"return\", \"outcome\": \"x\",\n  \"output\": {\"op\": \"not\", \"valu\": {\"op\": \"literal\", \"value\": true}}},\n \"edges\": {}, \"on_error\": null}}}";
+        let value: Value = serde_json::from_str(text).unwrap();
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        struct Steps {
+            steps: BTreeMap<String, DraftStep>,
+        }
+        let d = parse::<Steps>(DRAFT_FILE, text, true, Some(&value)).unwrap_err();
+        assert_eq!(d.path, "draft.json:steps.a.op.output", "{d:#?}");
+        assert_eq!((d.line, d.column), (Some(2), Some(13)), "{d:#?}");
+        assert!(d.message.contains("unknown field `valu`"), "{d:#?}");
+        let mut path = vec![];
+        deepest_fault(&value, &mut path);
+        assert_eq!(render(&path), "steps.a.op.output");
+        assert_eq!(
+            scan(text, text.len(), Some(&path)).1,
+            Some(text.find("{\"op\": \"not\"").unwrap())
+        );
     }
 
     #[test]
@@ -1132,6 +1325,12 @@ mod tests {
             let faults = Workspace::read(&dir).unwrap_err();
             let link = faults.iter().find(|d| d.path == CATALOG_FILE).unwrap();
             assert!(link.message.contains("symbolic link"), "{faults:#?}");
+            // A hard link to a file elsewhere is refused too.
+            std::fs::remove_file(dir.join(CATALOG_FILE)).unwrap();
+            std::fs::hard_link(outside.join("catalog.json"), dir.join(CATALOG_FILE)).unwrap();
+            let faults = Workspace::read(&dir).unwrap_err();
+            let link = faults.iter().find(|d| d.path == CATALOG_FILE).unwrap();
+            assert!(link.message.contains("hard links"), "{faults:#?}");
             std::fs::remove_dir_all(outside).unwrap();
         }
         std::fs::remove_dir_all(dir).unwrap();
@@ -1158,9 +1357,17 @@ mod tests {
             "source.md"
         );
         assert_eq!(place(d("registry", None), 3).path, "registry");
+        let mapped = place(
+            Diagnostic {
+                column: Some(1),
+                ..d("steps.a", Some(15))
+            },
+            3,
+        );
         assert_eq!(
-            place(d("steps.a", Some(15)), 3).message,
+            mapped.message,
             "m (the step is mapped to source.md line 12)"
         );
+        assert_eq!((mapped.line, mapped.column), (None, None));
     }
 }

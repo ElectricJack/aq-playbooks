@@ -1124,6 +1124,19 @@ mod tests {
                 let children = c.dependencies.values().flat_map(|d| d.capabilities.clone());
                 let all: BTreeSet<String> = capabilities.into_iter().chain(children).collect();
                 assert_eq!(all, c.playbook.required_capabilities, "{id}");
+                // Every operation, calls included, unfills to the model's own
+                // JSON with names in place of contract references.
+                let mut steps = serde_json::to_value(&c.playbook.steps).unwrap();
+                for step in steps.as_object_mut().unwrap().values_mut() {
+                    let op = &mut step["op"];
+                    for field in ["command", "event"] {
+                        if let Some(name) = op.get(field).and_then(|r| r.get("name")).cloned() {
+                            op[field] = name;
+                        }
+                    }
+                }
+                assert_eq!(unfill(&artifact)["steps"], steps, "{id}");
+                assert!(steps.to_string().contains("\"kind\":\"call\""), "{id}");
                 derived += 1;
             }
         }

@@ -262,6 +262,19 @@ fn an_unknown_command_names_the_allowed_ones() {
         "{diagnostics:#?}"
     );
     assert!(diagnostics[0].message.contains("aq.work.route_needed"));
+    // A call: an authoring source is offered no callable playbooks.
+    let mut ws = workspace();
+    ws.draft["steps"]["read"]["op"] = json!({"kind": "call", "dependency": "review",
+        "entry": "main", "input": {"op": "literal", "value": null}, "mode": "wait", "bind": "work"});
+    let diagnostics = check(&ws);
+    assert!(
+        has(&diagnostics, "call", "draft.json:steps.read.op"),
+        "{diagnostics:#?}"
+    );
+    assert!(
+        diagnostics[0].message.contains("work.read, work.route"),
+        "{diagnostics:#?}"
+    );
 }
 
 #[test]
@@ -362,8 +375,15 @@ fn the_header_is_written_by_the_tool_and_lines_shift() {
         .iter()
         .find(|d| d.path == "draft.json:steps.done")
         .unwrap_or_else(|| panic!("{diagnostics:#?}"));
-    assert_eq!(d.line, Some(12 + lines));
+    // Ruling 2026-11-13 (A3 review I1), replacing the brief's `12 + lines`:
+    // line and column are only ever positions in draft.json, so a mapped step
+    // carries none; its message names the source.md line.
+    assert_eq!((d.line, d.column), (None, None));
     assert!(d.message.contains("source.md line 12"), "{}", d.message);
+    assert_eq!(
+        fill(&ws).unwrap().proposal.source_map["steps.done"].line,
+        12 + lines
+    );
     // A line past the end of source.md is refused where it is written.
     ws.draft["source_map"] = json!({"done": 13});
     assert!(has(&check(&ws), "source_map", "draft.json:source_map.done"));
@@ -428,8 +448,8 @@ fn unknown_fields_are_still_refused_with_a_draft_position() {
         diagnostics[0].path, "draft.json:steps.read.on_eror",
         "{diagnostics:#?}"
     );
-    // Inside an operation, which serde reads whole, the step is named and
-    // serde's message names the field.
+    // Inside an operation, which serde reads whole and reports at the end of
+    // the step, the operation is named, at its own line.
     let text = serde_json::to_string_pretty(&ws.draft).unwrap().replacen(
         "\"command\": \"work.read\"",
         "\"comand\": \"work.read\"",
@@ -438,11 +458,34 @@ fn unknown_fields_are_still_refused_with_a_draft_position() {
     std::fs::write(dir.join("draft.json"), &text).unwrap();
     let diagnostics = Workspace::read(&dir).unwrap_err();
     assert_eq!(
-        diagnostics[0].path, "draft.json:steps.read",
+        diagnostics[0].path, "draft.json:steps.read.op",
         "{diagnostics:#?}"
     );
     assert!(
         diagnostics[0].message.contains("unknown field `comand`"),
+        "{diagnostics:#?}"
+    );
+    let lines: Vec<&str> = text.lines().collect();
+    let comand = lines.iter().position(|l| l.contains("\"comand\"")).unwrap();
+    let op = lines[..comand]
+        .iter()
+        .rposition(|l| l.trim() == "\"op\": {")
+        .unwrap() as u32
+        + 1;
+    assert_eq!(diagnostics[0].line, Some(op), "{diagnostics:#?}");
+    // And inside an expression, the expression.
+    let text =
+        serde_json::to_string_pretty(&ws.draft)
+            .unwrap()
+            .replacen("\"default\"", "\"defualt\"", 1);
+    std::fs::write(dir.join("draft.json"), &text).unwrap();
+    let diagnostics = Workspace::read(&dir).unwrap_err();
+    assert_eq!(
+        diagnostics[0].path, "draft.json:steps.route.op.input.fields.level",
+        "{diagnostics:#?}"
+    );
+    assert!(
+        diagnostics[0].message.contains("`defualt`"),
         "{diagnostics:#?}"
     );
     std::fs::remove_dir_all(&dir).unwrap();
@@ -498,6 +541,18 @@ fn a_draft_claiming_another_scope_or_capabilities_is_refused() {
     let mut ws = workspace();
     ws.draft["registry"] = serde_json::to_value(&c).unwrap();
     assert!(has(&check(&ws), "draft_format", "draft.json:registry"));
+    // A stray `command` on an operation that takes none is an unknown field.
+    let mut ws = workspace();
+    ws.draft["steps"]["done"]["op"]["command"] = json!({"name": "work.read"});
+    let diagnostics = check(&ws);
+    assert!(
+        has(&diagnostics, "draft_format", "draft.json:steps.done.op"),
+        "{diagnostics:#?}"
+    );
+    assert!(
+        diagnostics[0].message.contains("unknown field `command`"),
+        "{diagnostics:#?}"
+    );
 }
 
 #[test]
@@ -533,6 +588,26 @@ fn compare_names_wording_only_behaviour_and_abilities() {
     let c = compare(&before, &before).unwrap();
     assert_eq!(c.change, ChangeKind::Identical);
     assert!(!c.abilities_changed);
+    // A new outcome of the entry changes the interface.
+    let mut interface = ws.clone();
+    interface.draft["entries"]["main"]["outcomes"]["held"] = json!({"type": "null"});
+    let c = compare(&before, &seal(&interface).unwrap()).unwrap();
+    assert_eq!(c.change, ChangeKind::Interface);
+    assert!(!c.abilities_changed);
+    // The same command name with a new contract that needs more.
+    let mut contract = ws.clone();
+    contract
+        .catalog
+        .commands
+        .get_mut("work.route")
+        .unwrap()
+        .capabilities
+        .insert("work.read".into());
+    let c = compare(&before, &seal(&contract).unwrap()).unwrap();
+    assert_eq!(c.change, ChangeKind::Executable);
+    assert!(c.abilities_changed);
+    assert_eq!(c.diff.changed_commands, vec!["work.route"]);
+    assert!(c.diff.capabilities_added.is_empty());
 }
 
 #[test]

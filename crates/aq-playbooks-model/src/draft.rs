@@ -3,7 +3,9 @@
 //! - a join member that is an operation handle is named by its binding alone;
 //! - a read through a field that some way of reaching the step lacks (an
 //!   outcome without it, a join member that has not answered, a wait that
-//!   timed out) is refused, except inside `exists`.
+//!   timed out) is refused, except inside `exists`;
+//! - so is a read of a binding on some way to the step that never bound it:
+//!   around the step that binds it, or through that step's `on_error`.
 //!
 //! Ordinary typing merges the outcomes a binding can hold into one object, in
 //! which a field only one outcome has is merely optional, and an optional
@@ -17,6 +19,8 @@ enum Variant {
     Shape(Schema),
     /// Not there at all on this way.
     Absent,
+    /// Bound, in a shape this check does not follow.
+    Bound,
     /// A named join's result: each key's own variants.
     Keys(BTreeMap<String, Variants>),
 }
@@ -72,8 +76,8 @@ impl ArtifactContent {
                 }
             }
         }
-        for entry in self.playbook.entries.values() {
-            for (name, context) in self.variant_contexts(entry) {
+        for (entry_name, entry) in &self.playbook.entries {
+            for (name, context) in self.variant_contexts(entry_name, entry) {
                 let Some(step) = self.playbook.steps.get(&name) else {
                     continue;
                 };
@@ -100,9 +104,21 @@ impl ArtifactContent {
         issues
     }
     /// The variants of every binding at every step reachable from `entry`,
-    /// along the same edges as `outcome_contexts`.
-    fn variant_contexts(&self, entry: &EntryPoint) -> BTreeMap<String, Context> {
-        let mut contexts = BTreeMap::from([(entry.start.clone(), Context::new())]);
+    /// along the same edges as `outcome_contexts`. Every step binding is
+    /// present in every context: `Absent` on a way that never bound it.
+    fn variant_contexts(&self, entry_name: &str, entry: &EntryPoint) -> BTreeMap<String, Context> {
+        let start: Context = self
+            .playbook
+            .steps
+            .iter()
+            .filter_map(|(name, step)| {
+                let way = format!(
+                    "the way from the start of entry `{entry_name}` that does not pass step `{name}`"
+                );
+                Some((binding_of(step)?.to_string(), vec![(Variant::Absent, way)]))
+            })
+            .collect();
+        let mut contexts = BTreeMap::from([(entry.start.clone(), start)]);
         let mut pending = std::collections::VecDeque::from([entry.start.clone()]);
         let mut queued = BTreeSet::from([entry.start.clone()]);
         while let Some(name) = pending.pop_front() {
@@ -116,11 +132,19 @@ impl ArtifactContent {
                 let mut next = current.clone();
                 if let Some((bind, variants)) = self.bound_on(&name, step, edge) {
                     next.insert(bind, variants);
+                } else if let Some(bind) = binding_of(step) {
+                    let way = format!("edge `{edge}` of step `{name}`");
+                    next.insert(bind.to_string(), vec![(Variant::Bound, way)]);
                 }
                 targets.push((target.clone(), next));
             }
             if let Some(target) = &step.on_error {
-                targets.push((target.clone(), current.clone()));
+                let mut next = current.clone();
+                if let Some(bind) = binding_of(step) {
+                    let way = format!("the `on_error` exit of step `{name}`");
+                    next.insert(bind.to_string(), vec![(Variant::Absent, way)]);
+                }
+                targets.push((target.clone(), next));
             }
             if let Operation::ForEach { body, next, .. } = &step.op {
                 targets.push((body.clone(), current.clone()));
@@ -272,6 +296,17 @@ impl ArtifactContent {
     }
 }
 
+/// The name a step binds, if it binds one.
+fn binding_of(step: &Step) -> Option<&str> {
+    match &step.op {
+        Operation::Invoke { bind, .. }
+        | Operation::Wait { bind, .. }
+        | Operation::Call { bind, .. }
+        | Operation::Join { bind, .. } => Some(bind),
+        _ => None,
+    }
+}
+
 /// Every reference in `expr` (at location `at`) that some variant of its
 /// binding cannot satisfy, as (location, message). `exempt` holds inside
 /// `exists`; `key` inside a lookup key, which is never exempt.
@@ -418,6 +453,7 @@ fn lacking(
             }
         }
         Variant::Shape(schema) => lacking_in(schema, way, binding, path, depth, lacks),
+        Variant::Bound => {}
     }
 }
 fn lacking_in(

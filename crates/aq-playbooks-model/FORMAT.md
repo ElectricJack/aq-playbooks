@@ -140,7 +140,11 @@ its step lacks:
 - a join key that can be absent: on `timeout`, a member that has not answered.
   The same holds for a member that was not selected in modes `any_accepted` and
   `any_completion`;
-- a wait's binding on its `timeout` edge, where nothing is bound.
+- a wait's binding on its `timeout` edge, where nothing is bound;
+- any binding on a way to the step that never bound it: through the binding
+  step's `on_error` (the operation failed, so nothing was bound), or around the
+  binding step altogether, for example from a branch that skips it or from the
+  start of a loop that has not yet run it.
 
 The diagnostic names the step, the reference and the ways that lack the field.
 Read the field only where it is always present: after the outcome edge that
