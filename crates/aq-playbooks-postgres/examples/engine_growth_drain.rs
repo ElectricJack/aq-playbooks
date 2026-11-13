@@ -48,6 +48,7 @@ fn main() {
         terminal_run_ms: 1,
         audit_ms: 1,
         max_tombstones: 100_000,
+        ..RetentionPolicy::default()
     })
     .unwrap();
     // Past the last run's activity (runs are spaced 100 s apart) and past the

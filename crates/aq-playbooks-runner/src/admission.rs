@@ -79,8 +79,9 @@ impl<S: Storage> Engine<S> {
             .cloned())
     }
     /// Exact replay performs no write, new resolution, quota consumption, or
-    /// authority grant. First admission creates run+receipt atomically. Keys are
-    /// retained indefinitely; combined receipt/state quotas refuse new work.
+    /// authority grant. First admission creates run+receipt atomically. A key is
+    /// remembered until its window (`admission_replay_ms`) expires; combined
+    /// receipt/state quotas refuse new work.
     pub fn admit_once(
         &self,
         request: KeyedAdmissionRequest,
@@ -88,7 +89,7 @@ impl<S: Storage> Engine<S> {
     ) -> Result<KeyedAdmissionDisposition> {
         request.validate()?;
         let request_digest = digest(&request)?;
-        self.transaction_choice(|s| {
+        self.transaction_choice_at(Some(now_ms), |s| {
             if let Some(receipt) = s.keyed_admissions.get(&request.key) {
                 if receipt.request_digest != request_digest {
                     return Err(Error::Conflict(
@@ -180,18 +181,12 @@ impl<S: Storage> Engine<S> {
     }
 }
 
-/// Storage adapters reject removal/rebinding even through their public CAS API.
-/// No receipt pruning/namespace reset protocol is provided in this version.
+/// Storage adapters reject rebinding a receipt, and removing one before its
+/// window expires, even through their public CAS API. This is part of the
+/// shared removal check, [`crate::retention::verify_removals`].
 pub fn verify_receipt_retention(
     previous: &State,
     next: &State,
 ) -> std::result::Result<(), StorageError> {
-    for (key, receipt) in &previous.keyed_admissions {
-        if next.keyed_admissions.get(key) != Some(receipt) {
-            return Err(StorageError::Backend(
-                "immutable keyed admission receipt removed or changed".into(),
-            ));
-        }
-    }
-    Ok(())
+    crate::retention::verify_removals(previous, next).map(|_| ())
 }

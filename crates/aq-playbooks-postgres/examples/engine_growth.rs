@@ -549,6 +549,7 @@ fn main() {
             terminal_run_ms: 1,
             audit_ms: 1,
             max_tombstones: 100_000,
+            ..RetentionPolicy::default()
         })
         .unwrap();
     }

@@ -699,6 +699,7 @@ fn event_gc_replay_tombstones_survive_restart_and_explicit_new_epoch_has_new_ide
             terminal_run_ms: 1,
             audit_ms: 1,
             max_tombstones: 1,
+            ..retention::RetentionPolicy::default()
         })
         .unwrap();
     for epoch in 0..4 {

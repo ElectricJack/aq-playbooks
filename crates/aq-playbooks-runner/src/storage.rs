@@ -327,9 +327,9 @@ impl Storage for MemoryStorage {
         if entry.versioned.revision != expected_revision {
             return Err(StorageError::Conflict);
         }
-        // Artifact addresses are append-only even for arbitrary trait callers.
-        crate::retention::verify_artifact_removals(&entry.versioned.state, state)?;
-        crate::admission::verify_receipt_retention(&entry.versioned.state, state)?;
+        // Nothing leaves the State without its history, an expired window
+        // or a legacy disposal, even for arbitrary trait callers.
+        crate::retention::verify_removals(&entry.versioned.state, state)?;
         let revision = expected_revision
             .checked_add(1)
             .ok_or_else(|| StorageError::Backend("revision exhausted".into()))?;

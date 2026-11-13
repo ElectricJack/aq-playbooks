@@ -369,7 +369,7 @@ impl<S: Storage> Engine<S> {
             metrics: metrics::Metrics::default(),
         };
         e.store.acquire(&e.namespace, &e.owner)?;
-        e.transaction(|s| {
+        e.transaction_at(None, |s| {
             if !s.indexes.initialized {
                 indexes::rebuild(s)?;
             }
@@ -428,10 +428,21 @@ impl<S: Storage> Engine<S> {
             .store
             .delete_history(&self.namespace, &self.owner, before_ms)?)
     }
-    fn transaction<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
-        self.transaction_choice(|state| f(state).map(|value| (value, true)))
+    /// One commit. `now_ms` is the host time the commit carries: when the plan
+    /// changes the State, the retention clock moves to it (never back). A
+    /// commit without host time leaves the clock where it is.
+    fn transaction_at<T>(
+        &self,
+        now_ms: Option<i64>,
+        f: impl FnOnce(&mut State) -> Result<T>,
+    ) -> Result<T> {
+        self.transaction_choice_at(now_ms, |state| f(state).map(|value| (value, true)))
     }
-    fn transaction_choice<T>(&self, f: impl FnOnce(&mut State) -> Result<(T, bool)>) -> Result<T> {
+    fn transaction_choice_at<T>(
+        &self,
+        now_ms: Option<i64>,
+        f: impl FnOnce(&mut State) -> Result<(T, bool)>,
+    ) -> Result<T> {
         let protection = self.store.protection_available();
         let mut f = Some(f);
         let mut result = None;
@@ -449,6 +460,9 @@ impl<S: Storage> Engine<S> {
             result = Some(value);
             if changed {
                 indexes::sync(state)?;
+                if let Some(now_ms) = now_ms {
+                    retention::advance_clock(state, now_ms);
+                }
             }
             Ok(changed)
         };
@@ -488,6 +502,9 @@ impl<S: Storage> Engine<S> {
             return Ok(result);
         }
         indexes::sync(&mut v.state)?;
+        if let Some(now_ms) = now_ms {
+            retention::advance_clock(&mut v.state, now_ms);
+        }
         check_quota(&self.config, &quota_counts(&v.state)?)?;
         let started = std::time::Instant::now();
         let committed =
@@ -500,7 +517,7 @@ impl<S: Storage> Engine<S> {
     }
     pub fn install(&self, artifact: Artifact) -> Result<()> {
         artifact.verify()?;
-        self.transaction(|s| {
+        self.transaction_at(None, |s| {
             if let Some(old) = s.artifacts.get(&artifact.digest)
                 && old != &artifact
             {
@@ -519,7 +536,8 @@ impl<S: Storage> Engine<S> {
             .last()
             .map(|receipt| receipt.at_ms)
             .unwrap_or(0);
-        self.activate_at(binding, artifact, authority, now_ms)
+        // A derived time, not host time: the clock does not move.
+        self.activate_with(binding, artifact, authority, now_ms, None)
     }
     pub fn activate_at(
         &self,
@@ -528,7 +546,17 @@ impl<S: Storage> Engine<S> {
         authority: Authority,
         now_ms: i64,
     ) -> Result<()> {
-        self.transaction(|s| {
+        self.activate_with(binding, artifact, authority, now_ms, Some(now_ms))
+    }
+    fn activate_with(
+        &self,
+        binding: &str,
+        artifact: &str,
+        authority: Authority,
+        now_ms: i64,
+        host_ms: Option<i64>,
+    ) -> Result<()> {
+        self.transaction_at(host_ms, |s| {
             let a = s
                 .artifacts
                 .get(artifact)
@@ -567,7 +595,7 @@ impl<S: Storage> Engine<S> {
         authority: Authority,
         now_ms: i64,
     ) -> Result<String> {
-        let result = self.transaction(|s| {
+        let result = self.transaction_at(Some(now_ms), |s| {
             let activation = s
                 .bindings
                 .get(binding)
@@ -598,7 +626,7 @@ impl<S: Storage> Engine<S> {
         result
     }
     pub fn advance(&self, run_id: &str, now_ms: i64) -> Result<bool> {
-        let (progress, queued_ms) = self.transaction(|s| {
+        let (progress, queued_ms) = self.transaction_at(Some(now_ms), |s| {
             let queued_ms = s
                 .runs
                 .get(run_id)
@@ -612,7 +640,7 @@ impl<S: Storage> Engine<S> {
         Ok(progress)
     }
     pub fn cancel(&self, run_id: &str, now_ms: i64) -> Result<()> {
-        self.transaction(|s| {
+        self.transaction_at(Some(now_ms), |s| {
             request_cancel(s, run_id, now_ms)?;
             Ok(())
         })
@@ -632,7 +660,7 @@ impl<S: Storage> Engine<S> {
         epoch: u64,
         now_ms: i64,
     ) -> Result<EventDisposition> {
-        let result = self.transaction(|s| {
+        let result = self.transaction_at(Some(now_ms), |s| {
             if s.retention
                 .producer_epochs
                 .get(authenticated_producer)
@@ -825,7 +853,7 @@ impl<S: Storage> Engine<S> {
         result
     }
     pub fn fanout(&self, event_key: &str, limit: usize, now_ms: i64) -> Result<usize> {
-        self.transaction(|s| {
+        self.transaction_at(Some(now_ms), |s| {
             let mut event = s
                 .events
                 .get(event_key)
@@ -882,7 +910,7 @@ impl<S: Storage> Engine<S> {
     /// Persist dispatch state before handing anything to a host. Crashes here leave
     /// a recoverable ambiguity rather than an apparently safe fresh invocation.
     pub fn dispatch_next(&self, host: &mut impl Host, now_ms: i64) -> Result<Option<String>> {
-        let cancellation = self.transaction(|s| {
+        let cancellation = self.transaction_at(Some(now_ms), |s| {
             let after = s.indexes.effect_cursor.get("cancel").cloned();
             let candidate = s
                 .indexes
@@ -930,7 +958,7 @@ impl<S: Storage> Engine<S> {
         })?;
         if let Some(intent) = cancellation {
             let disposition = self.measure_host(|| host.cancel(&intent));
-            self.transaction(|s| {
+            self.transaction_at(Some(now_ms), |s| {
                 indexes::mark_intent(s, &intent.id);
                 if matches!(disposition, CancellationResult::Confirmed) {
                     s.intents.get_mut(&intent.id).unwrap().status = IntentStatus::Cancelled;
@@ -948,7 +976,7 @@ impl<S: Storage> Engine<S> {
             return Ok(Some(intent.id));
         }
 
-        let selected = self.transaction(|s| {
+        let selected = self.transaction_at(Some(now_ms), |s| {
             let after = s.indexes.effect_cursor.get("dispatch").cloned();
             let Some(item) = s
                 .indexes
@@ -1040,7 +1068,9 @@ impl<S: Storage> Engine<S> {
         result: DispatchResult,
         now_ms: i64,
     ) -> Result<()> {
-        self.transaction(|s| record_result(s, intent_id, result, now_ms))
+        self.transaction_at(Some(now_ms), |s| {
+            record_result(s, intent_id, result, now_ms)
+        })
     }
     pub fn recover(&self, host: &mut impl Host, now_ms: i64) -> Result<usize> {
         let state = self.snapshot()?;
@@ -1067,7 +1097,7 @@ impl<S: Storage> Engine<S> {
             {
                 continue;
             }
-            self.transaction(|s| {
+            self.transaction_at(Some(now_ms), |s| {
                 s.indexes
                     .effect_item_cursor
                     .insert(format!("recovery:{}", item.scope), item.key.clone());
@@ -1089,7 +1119,7 @@ impl<S: Storage> Engine<S> {
                 let running = matches!(result, DispatchResult::Accepted { .. });
                 self.record_result(&intent.id, result, now_ms)?;
                 if running {
-                    self.transaction(|s| {
+                    self.transaction_at(Some(now_ms), |s| {
                         let current = s.intents.get_mut(&intent.id).unwrap();
                         current.cancel_dispatched = false;
                         indexes::mark_intent(s, &intent.id);
@@ -1125,7 +1155,7 @@ impl<S: Storage> Engine<S> {
                 Recovery::Observation
                 | Recovery::NaturallyIdempotent
                 | Recovery::KeyedIdempotent => {
-                    self.transaction(|s| {
+                    self.transaction_at(Some(now_ms), |s| {
                         let current = s.intents.get_mut(&intent.id).unwrap();
                         current.status = IntentStatus::Prepared;
                         indexes::mark_intent(s, &intent.id);
@@ -1136,7 +1166,7 @@ impl<S: Storage> Engine<S> {
                 }
                 Recovery::Reconcilable => {
                     if let Some(request) = authorized_request {
-                        self.transaction(|s| {
+                        self.transaction_at(Some(now_ms), |s| {
                             s.recovery_requests.get_mut(&request.id).unwrap().consumed = true;
                             Ok(())
                         })?;
@@ -1149,7 +1179,7 @@ impl<S: Storage> Engine<S> {
                         .values()
                         .find(|request| request.intent == intent.id && !request.consumed);
                     if let Some(request) = request {
-                        self.transaction(|s| {
+                        self.transaction_at(Some(now_ms), |s| {
                             s.recovery_requests.get_mut(&request.id).unwrap().consumed = true;
                             receipt(
                                 s,
@@ -1195,7 +1225,7 @@ impl<S: Storage> Engine<S> {
                 },
             )?;
             if !due.items.is_empty() || !completions.items.is_empty() {
-                self.transaction(|s| {
+                self.transaction_at(Some(now_ms), |s| {
                     process_completions(s, now_ms)?;
                     process_operation_deadlines(s, now_ms);
                     let timers = s
@@ -1245,7 +1275,7 @@ impl<S: Storage> Engine<S> {
             if item.is_none() && !has_effect {
                 break;
             }
-            let (effect_turn, queued_ms) = self.transaction(|s| {
+            let (effect_turn, queued_ms) = self.transaction_at(Some(now_ms), |s| {
                 if has_effect && (s.indexes.dispatch_turn || item.is_none()) {
                     s.indexes.dispatch_turn = false;
                     Ok((true, None))
@@ -3060,7 +3090,7 @@ impl<S: Storage> Engine<S> {
         controls: ActivationControls,
         now_ms: i64,
     ) -> Result<()> {
-        self.transaction(|s| {
+        self.transaction_at(Some(now_ms), |s| {
             let a = s
                 .bindings
                 .get_mut(binding)
@@ -3118,7 +3148,7 @@ impl<S: Storage> Engine<S> {
         revoked_capabilities: BTreeSet<String>,
         now_ms: i64,
     ) -> Result<()> {
-        self.transaction(|s| {
+        self.transaction_at(Some(now_ms), |s| {
             s.authority_revocations
                 .insert(digest(&(actor, scope))?, revoked_capabilities.clone());
             let ids = s
@@ -3168,12 +3198,13 @@ impl<S: Storage> Engine<S> {
             || policy.terminal_run_ms == 0
             || policy.audit_ms == 0
             || policy.max_tombstones == 0
+            || policy.admission_replay_ms == 0
         {
             return Err(Error::Refused(
                 "retention horizons and tombstone quota must be positive".into(),
             ));
         }
-        self.transaction(|s| {
+        self.transaction_at(None, |s| {
             if policy.max_tombstones < s.retention.event_tombstones.len() {
                 return Err(Error::Refused(
                     "retention policy cannot evict existing replay tombstones".into(),
@@ -3184,7 +3215,7 @@ impl<S: Storage> Engine<S> {
         })
     }
     pub fn collect_garbage(&self, now_ms: i64, limit: usize) -> Result<GcReport> {
-        self.transaction(|s| retention::gc(s, now_ms, limit))
+        self.transaction_at(Some(now_ms), |s| retention::gc(s, now_ms, limit))
     }
     pub fn advance_producer_epoch(
         &self,
@@ -3199,7 +3230,7 @@ impl<S: Storage> Engine<S> {
                 "epoch retirement requires actor and reason".into(),
             ));
         }
-        self.transaction(|s|{let old=s.retention.producer_epochs.get(producer).copied().unwrap_or(0);if new_epoch<=old{return Err(Error::Refused("producer epoch must increase".into()))}s.retention.producer_epochs.insert(producer.into(),new_epoch);s.retention.event_tombstones.retain(|_,t|t.producer!=producer||t.epoch>=new_epoch);if s.indexes.root_active.values().all(BTreeSet::is_empty){s.retention.expired_correlations.retain(|_,(p,epoch)|p!=producer||*epoch>=new_epoch);}receipt(s,"admin","replay",now_ms,"producer_epoch_retired",json!({"producer":producer,"old_epoch":old,"new_epoch":new_epoch,"actor":actor,"reason":reason}));Ok(())})
+        self.transaction_at(Some(now_ms), |s|{let old=s.retention.producer_epochs.get(producer).copied().unwrap_or(0);if new_epoch<=old{return Err(Error::Refused("producer epoch must increase".into()))}s.retention.producer_epochs.insert(producer.into(),new_epoch);s.retention.event_tombstones.retain(|_,t|t.producer!=producer||t.epoch>=new_epoch);if s.indexes.root_active.values().all(BTreeSet::is_empty){s.retention.expired_correlations.retain(|_,(p,epoch)|p!=producer||*epoch>=new_epoch);}receipt(s,"admin","replay",now_ms,"producer_epoch_retired",json!({"producer":producer,"old_epoch":old,"new_epoch":new_epoch,"actor":actor,"reason":reason}));Ok(())})
     }
     pub fn request_recovery(
         &self,
@@ -3220,7 +3251,7 @@ impl<S: Storage> Engine<S> {
                 "recovery requires bounded actor, reason and evidence references".into(),
             ));
         }
-        self.transaction(|s| {
+        self.transaction_at(Some(now_ms), |s| {
             let i = s
                 .intents
                 .get(intent_id)

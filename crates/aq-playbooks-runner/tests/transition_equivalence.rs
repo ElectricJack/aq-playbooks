@@ -524,6 +524,7 @@ fn scenario(p: &mut Pair) {
         terminal_run_ms: 1,
         audit_ms: 1,
         max_tombstones: 4,
+        ..RetentionPolicy::default()
     }));
     for now in [10_000i64, 10_001, 20_000] {
         both!(p, |e| e.collect_garbage(now, 8));

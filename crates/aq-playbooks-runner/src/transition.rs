@@ -122,6 +122,11 @@ impl State {
             ),
             ("retention.event_tombstones", &mut r.event_tombstones),
             ("retention.disposals", &mut r.disposals),
+            ("retention.expiry", &mut r.expiry),
+            (
+                "retention.admission_expires_at_ms",
+                &mut r.admission_expires_at_ms,
+            ),
         ]
     }
 }
@@ -475,7 +480,8 @@ fn apply(data: &mut RecordData, patch: StatePatch) -> Result<()> {
     }
     Ok(())
 }
-/// Incremental equivalent of `admission::verify_receipt_retention`.
+/// Keyed admission receipts are never rebound. Their removal is checked by
+/// [`verify_patch_removals`].
 fn verify_keyed_admissions(data: &RecordData, patch: &StatePatch) -> Result<()> {
     let refuse = || {
         Error::Storage(StorageError::Backend(
@@ -492,20 +498,164 @@ fn verify_keyed_admissions(data: &RecordData, patch: &StatePatch) -> Result<()> 
         match change {
             ContainerChange::Entries(rows) => {
                 for (key, new) in rows {
-                    if let Some(before) = old.get(key)
-                        && new.as_ref() != Some(before)
+                    if let (Some(before), Some(new)) = (old.get(key), new)
+                        && new != before
                     {
                         return Err(refuse());
                     }
                 }
             }
             ContainerChange::Replace(rows) => {
-                let rows: BTreeMap<_, _> = rows.iter().map(|(k, v)| (k, v)).collect();
-                if old.iter().any(|(k, v)| rows.get(k) != Some(&v)) {
+                if rows
+                    .iter()
+                    .any(|(k, v)| old.get(k).is_some_and(|before| before != v))
+                {
                     return Err(refuse());
                 }
             }
         }
+    }
+    Ok(())
+}
+/// Incremental equivalent of [`crate::retention::verify_removals`]: the same
+/// rules over the records `patch` deletes from `data`, checked against the
+/// bound `next`. Reads only the deleted records, the operations and children
+/// of deleted runs, and (for a legacy run disposal) the disposal records.
+fn verify_patch_removals(data: &RecordData, patch: &StatePatch, next: &State) -> Result<()> {
+    const FENCED: &[&str] = &["runs", "intents", "events", "keyed_admissions"];
+    let decode = |field: &str, bytes: &[u8]| -> Result<serde_json::Value> {
+        serde_json::from_slice(bytes).map_err(|e| backend(format!("{field} record: {e}")))
+    };
+    // The State header (policy, clock, artifacts) plus the deleted records.
+    let mut previous = header_state(&data.header)?;
+    let mut removed: BTreeMap<&str, serde_json::Map<String, serde_json::Value>> = BTreeMap::new();
+    for (path, change) in &patch.changes {
+        let field = field_name(path)?;
+        if !FENCED.contains(&field) {
+            continue;
+        }
+        let Some(old) = data.container(field) else {
+            continue;
+        };
+        let deleted: Vec<&TreeKey> = match change {
+            ContainerChange::Entries(rows) => rows
+                .iter()
+                .filter(|(key, new)| new.is_none() && old.contains_key(key))
+                .map(|(key, _)| key)
+                .collect(),
+            ContainerChange::Replace(rows) => {
+                let kept: std::collections::BTreeSet<&TreeKey> =
+                    rows.iter().map(|(k, _)| k).collect();
+                old.keys().filter(|key| !kept.contains(key)).collect()
+            }
+        };
+        for key in deleted {
+            let TreeKey::Str(id) = key else {
+                return Err(backend(format!("{field}: unexpected record key")));
+            };
+            removed
+                .entry(field)
+                .or_default()
+                .insert(id.clone(), decode(field, &old[key])?);
+        }
+    }
+    let expires = |field: &str, key: &str| -> Result<Option<serde_json::Value>> {
+        data.container(field)
+            .and_then(|c| c.get(&TreeKey::Str(key.to_string())))
+            .map(|bytes| decode(field, bytes))
+            .transpose()
+    };
+    let mut value = serde_json::to_value(&previous).map_err(backend)?;
+    for (field, records) in &removed {
+        let expiry_field = match *field {
+            "events" => Some(("event_expires_at_ms", "retention.event_expires_at_ms")),
+            "keyed_admissions" => Some((
+                "admission_expires_at_ms",
+                "retention.admission_expires_at_ms",
+            )),
+            _ => None,
+        };
+        if let Some((name, path)) = expiry_field {
+            for key in records.keys() {
+                if let Some(at) = expires(path, key)? {
+                    value["retention"][name][key] = at;
+                }
+            }
+        }
+        value[*field] = serde_json::Value::Object(records.clone());
+    }
+    if let Some(runs) = removed.get("runs") {
+        // Children of removed runs, and every operation of a removed run.
+        let mut all_runs = runs.clone();
+        let stored = data.container("runs");
+        for run in runs.values() {
+            for child in run["children"].as_array().into_iter().flatten() {
+                let Some(child) = child.as_str() else {
+                    continue;
+                };
+                if let Some(bytes) = stored.and_then(|c| c.get(&TreeKey::Str(child.into()))) {
+                    all_runs.insert(child.into(), decode("runs", bytes)?);
+                }
+            }
+        }
+        value["runs"] = serde_json::Value::Object(all_runs);
+        let mut intents = removed.get("intents").cloned().unwrap_or_default();
+        for (key, bytes) in data.container("intents").into_iter().flatten() {
+            let intent = decode("intents", bytes)?;
+            if intent["run"]
+                .as_str()
+                .is_some_and(|run| runs.contains_key(run))
+                && let TreeKey::Str(id) = key
+            {
+                intents.insert(id.clone(), intent);
+            }
+        }
+        value["intents"] = serde_json::Value::Object(intents);
+    }
+    previous =
+        serde_json::from_value(value).map_err(|e| backend(format!("removed records: {e}")))?;
+    // Legacy run disposals: the stored records plus those this patch writes.
+    let disposed: std::cell::OnceCell<Result<std::collections::BTreeSet<String>>> =
+        std::cell::OnceCell::new();
+    let disposals = || -> Result<std::collections::BTreeSet<String>> {
+        let mut records: Vec<&[u8]> = data
+            .container("retention.disposals")
+            .into_iter()
+            .flatten()
+            .map(|(_, v)| v.as_slice())
+            .collect();
+        for (path, change) in &patch.changes {
+            if path.field != "retention.disposals" {
+                continue;
+            }
+            match change {
+                ContainerChange::Entries(rows) => {
+                    records.extend(rows.iter().filter_map(|(_, v)| v.as_deref()));
+                }
+                ContainerChange::Replace(rows) => {
+                    records = rows.iter().map(|(_, v)| v.as_slice()).collect();
+                }
+            }
+        }
+        let mut runs = std::collections::BTreeSet::new();
+        for bytes in records {
+            let disposal: crate::retention::Disposal =
+                serde_json::from_slice(bytes).map_err(backend)?;
+            if disposal.kind == "run" {
+                runs.insert(disposal.key);
+            }
+        }
+        Ok(runs)
+    };
+    let disposed_run = |id: &str| {
+        disposed
+            .get_or_init(disposals)
+            .as_ref()
+            .is_ok_and(|runs| runs.contains(id))
+    };
+    crate::retention::check_removals(&previous, next, &disposed_run)?;
+    if let Some(Err(e)) = disposed.get() {
+        return Err(backend(e));
     }
     Ok(())
 }
@@ -614,8 +764,7 @@ impl Storage for RecordStorage {
             return Err(StorageError::Conflict);
         }
         let previous = assemble(&ns.data).map_err(to_storage)?;
-        crate::retention::verify_artifact_removals(&previous, state)?;
-        crate::admission::verify_receipt_retention(&previous, state)?;
+        crate::retention::verify_removals(&previous, state)?;
         let revision = expected_revision
             .checked_add(1)
             .ok_or_else(|| StorageError::Backend("revision exhausted".into()))?;
@@ -736,7 +885,8 @@ impl Storage for RecordStorage {
         if !changed {
             return Ok(TransitionOutcome::Unchanged);
         }
-        let items = crate::history_items(&std::mem::take(&mut state.settled));
+        // `settled` stays on the State for the removal check below.
+        let items = crate::history_items(&state.settled);
         crate::history::check_not_live(&state, &items)?;
         source.check()?;
         let patch = take_patch(&mut state)?;
@@ -745,8 +895,7 @@ impl Storage for RecordStorage {
         let accounting = stage(&ns.data, &ns.accounting, &patch)?;
         (request.validate)(&state, &accounting.counts())?;
         verify_keyed_admissions(&ns.data, &patch)?;
-        let previous = header_state(&ns.data.header)?;
-        crate::retention::verify_artifact_removals(&previous, &state)?;
+        verify_patch_removals(&ns.data, &patch, &state)?;
         source.check()?;
         crate::history::check_new(&ns.history, &items)?;
         drop(state);

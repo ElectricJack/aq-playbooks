@@ -700,8 +700,7 @@ impl PostgresStorage {
             previous
         };
         tx.phase("artifact_locks");
-        aq_playbooks_runner::retention::verify_artifact_removals(&previous, state)?;
-        aq_playbooks_runner::admission::verify_receipt_retention(&previous, state)?;
+        let removals = aq_playbooks_runner::retention::verify_removals(&previous, state)?;
         let addresses: std::collections::BTreeSet<_> = previous
             .artifacts
             .keys()
@@ -727,7 +726,7 @@ impl PostgresStorage {
             }
         }
         tx.phase("retention");
-        retention::verify_and_record(&mut tx, namespace, &previous, state)?;
+        retention::verify_and_record(&mut tx, namespace, &previous, state, &removals)?;
         let items = aq_playbooks_runner::history_items(&state.settled);
         aq_playbooks_runner::history::check_not_live(state, &items)?;
         history::check_unrecorded(

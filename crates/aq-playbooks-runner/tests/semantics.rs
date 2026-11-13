@@ -1264,6 +1264,7 @@ fn gc_preserves_bound_transitive_closure_then_collects_terminal_cohorts_in_pages
         terminal_run_ms: 1,
         audit_ms: 1,
         max_tombstones: 10,
+        ..RetentionPolicy::default()
     })
     .unwrap();
     assert_eq!(e.collect_garbage(100, 10).unwrap().artifacts, 0);
@@ -1291,6 +1292,7 @@ fn gc_tombstones_expired_event_identity_and_epoch_fence_compacts_safely() {
         terminal_run_ms: 1,
         audit_ms: 1,
         max_tombstones: 1,
+        ..RetentionPolicy::default()
     })
     .unwrap();
     let envelope = event("expired", 2);
@@ -1382,6 +1384,7 @@ fn pruned_general_wait_history_refuses_registration_and_captured_replay_horizon_
         terminal_run_ms: 1,
         audit_ms: 1,
         max_tombstones: 10,
+        ..RetentionPolicy::default()
     })
     .unwrap();
     let envelope = event("history", 2);
@@ -1391,6 +1394,7 @@ fn pruned_general_wait_history_refuses_registration_and_captured_replay_horizon_
         terminal_run_ms: 1,
         audit_ms: 1,
         max_tombstones: 10,
+        ..RetentionPolicy::default()
     })
     .unwrap();
     assert!(e.admit_event("host", envelope, 1001).is_err());
@@ -1503,6 +1507,7 @@ fn gc_preserves_possible_async_completion_while_lost_admission_handle_is_unknown
         terminal_run_ms: 1,
         audit_ms: 1,
         max_tombstones: 10,
+        ..RetentionPolicy::default()
     })
     .unwrap();
     let id = e
@@ -1546,6 +1551,7 @@ fn producer_epoch_compaction_keeps_history_fences_for_existing_invocations() {
         terminal_run_ms: 1,
         audit_ms: 1,
         max_tombstones: 10,
+        ..RetentionPolicy::default()
     })
     .unwrap();
     let id = e

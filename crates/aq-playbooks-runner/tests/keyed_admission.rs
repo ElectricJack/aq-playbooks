@@ -232,6 +232,7 @@ fn gc_and_direct_storage_cas_cannot_forget_or_rebind_a_key() {
         audit_ms: 1,
         event_replay_ms: 1,
         max_tombstones: 100,
+        ..RetentionPolicy::default()
     })
     .unwrap();
     for _ in 0..10 {

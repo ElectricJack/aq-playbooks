@@ -1,7 +1,14 @@
 //! Explicit replay horizons, disposal records and epoch fences. No unresolved
 //! obligation is evicted for quota pressure.
+//!
+//! The retention clock (`RetentionState::clock_ms`) is the latest host time a
+//! commit carried. A removal from the State is allowed only when the commit
+//! writes its history (a settled cohort), when it is a window entry whose
+//! expiry the clock has reached, or (until the legacy drain) when it carries
+//! a legacy disposal record. [`verify_removals`] is that one check, shared by
+//! every storage backend.
 use crate::lazy::{LazyMap, LazySeq};
-use crate::{Error, IntentStatus, Result, State};
+use crate::{Error, Intent, IntentStatus, Result, Run, State, StorageError};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10,6 +17,12 @@ pub struct RetentionPolicy {
     pub terminal_run_ms: u64,
     pub audit_ms: u64,
     pub max_tombstones: usize,
+    /// Window of a keyed admission receipt, from its acceptance.
+    #[serde(default = "default_admission_replay_ms")]
+    pub admission_replay_ms: u64,
+}
+fn default_admission_replay_ms() -> u64 {
+    604_800_000
 }
 impl Default for RetentionPolicy {
     fn default() -> Self {
@@ -18,6 +31,7 @@ impl Default for RetentionPolicy {
             terminal_run_ms: 604_800_000,
             audit_ms: 604_800_000,
             max_tombstones: 100_000,
+            admission_replay_ms: default_admission_replay_ms(),
         }
     }
 }
@@ -49,6 +63,257 @@ pub struct RetentionState {
     pub artifact_disposals: BTreeMap<String, i64>,
     pub disposals: LazySeq<Disposal>,
     pub gc_cursor: Option<String>,
+    /// The latest host time any commit carried; never decreases.
+    #[serde(default)]
+    pub clock_ms: Option<i64>,
+    /// Window entries by expiry: `WINDOW_EVENT` or `WINDOW_ADMISSION` plus
+    /// the entry's key.
+    #[serde(default)]
+    pub expiry: LazyMap<i64, BTreeSet<String>>,
+    /// Expiry of each keyed admission receipt that has one recorded.
+    #[serde(default)]
+    pub admission_expires_at_ms: LazyMap<String, i64>,
+}
+/// `RetentionState::expiry` member prefix of an admitted event.
+pub const WINDOW_EVENT: &str = "e:";
+/// `RetentionState::expiry` member prefix of a keyed admission receipt.
+pub const WINDOW_ADMISSION: &str = "k:";
+pub const REFUSE_RUN_REMOVAL: &str = "run removal requires a history record in the same commit";
+pub const REFUSE_EARLY_REMOVAL: &str = "window entry removed before its expiry";
+pub const REFUSE_CLOCK: &str = "retention clock cannot decrease";
+const REFUSE_RUN_OBLIGATIONS: &str = "unresolved run obligations cannot be disposed";
+const REFUSE_EFFECT: &str = "unresolved effect cannot be disposed";
+const REFUSE_RECEIPT_CHANGE: &str = "immutable keyed admission receipt removed or changed";
+fn window(ms: u64) -> i64 {
+    i64::try_from(ms).unwrap_or(i64::MAX)
+}
+/// Expiry of event `key`: its recorded expiry, else acceptance plus the
+/// policy's replay window.
+pub fn event_expiry(s: &State, key: &str) -> Option<i64> {
+    if let Some(at) = s.retention.event_expires_at_ms.get(key) {
+        return Some(*at);
+    }
+    s.events.get(key).map(|e| {
+        e.accepted_at_ms
+            .saturating_add(window(s.retention.policy.event_replay_ms))
+    })
+}
+/// Expiry of keyed admission receipt `key`: its recorded expiry, else
+/// acceptance plus the policy's admission window.
+pub fn admission_expiry(s: &State, key: &str) -> Option<i64> {
+    if let Some(at) = s.retention.admission_expires_at_ms.get(key) {
+        return Some(*at);
+    }
+    s.keyed_admissions.get(key).map(|r| {
+        r.accepted_at_ms
+            .saturating_add(window(s.retention.policy.admission_replay_ms))
+    })
+}
+/// Whether an entry expiring at `expiry` has expired at `clock_ms`. Nothing
+/// expires before the first host time.
+pub fn expired(expiry: i64, clock_ms: Option<i64>) -> bool {
+    clock_ms.is_some_and(|now| expiry <= now)
+}
+/// Move the clock to `now_ms` unless it is already later.
+pub(crate) fn advance_clock(s: &mut State, now_ms: i64) {
+    let clock = s
+        .retention
+        .clock_ms
+        .map_or(now_ms, |clock| clock.max(now_ms));
+    s.retention.clock_ms = Some(clock);
+}
+/// Removals that carry a legacy disposal record (written by `gc` before the
+/// retention clock). Backends record their durable tombstones as before.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Removals {
+    pub legacy_runs: Vec<String>,
+    pub legacy_intents: Vec<String>,
+    pub legacy_events: Vec<String>,
+}
+fn refuse(text: &str) -> StorageError {
+    StorageError::Backend(text.into())
+}
+fn intent_settled(status: &IntentStatus) -> bool {
+    matches!(
+        status,
+        IntentStatus::Completed | IntentStatus::Rejected | IntentStatus::Cancelled
+    )
+}
+/// The one removal check every backend runs on a commit from `previous` to
+/// `next` (see the module docs). Each record of `previous` missing from
+/// `next` must be allowed:
+///
+/// - a run: its history is in `next.settled`, it is terminal, its children
+///   are terminal and its operations settled; or (legacy) a run disposal;
+/// - an operation: its own history and its run's are in `next.settled` and it
+///   is settled; or (legacy) its run has a disposal;
+/// - an event: a matching legacy tombstone, or its expiry has been reached;
+/// - a keyed admission receipt: its expiry has been reached (a changed
+///   receipt is always refused).
+///
+/// The clock never decreases. Event tombstones and correlation fences may
+/// always be removed. Artifact removals are checked by
+/// [`verify_artifact_removals`].
+pub fn verify_removals(
+    previous: &State,
+    next: &State,
+) -> std::result::Result<Removals, StorageError> {
+    let disposed: std::cell::OnceCell<BTreeSet<String>> = std::cell::OnceCell::new();
+    let disposed_run = |id: &str| {
+        disposed
+            .get_or_init(|| {
+                next.retention
+                    .disposals
+                    .iter()
+                    .filter(|d| d.kind == "run")
+                    .map(|d| d.key.clone())
+                    .collect()
+            })
+            .contains(id)
+    };
+    check_removals(previous, next, &disposed_run)
+}
+/// [`verify_removals`] with the legacy run disposals of `next` given by
+/// `disposed_run`. `previous` need only hold the removed records, the
+/// operations of removed runs and the children of removed runs (and its
+/// header fields), so a record backend can check a patch.
+pub(crate) fn check_removals(
+    previous: &State,
+    next: &State,
+    disposed_run: &dyn Fn(&str) -> bool,
+) -> std::result::Result<Removals, StorageError> {
+    verify_artifact_removals(previous, next)?;
+    let clock = next.retention.clock_ms;
+    if previous
+        .retention
+        .clock_ms
+        .is_some_and(|old| clock.is_none_or(|new| new < old))
+    {
+        return Err(refuse(REFUSE_CLOCK));
+    }
+    for (key, receipt) in &previous.keyed_admissions {
+        match next.keyed_admissions.get(key) {
+            Some(kept) if kept == receipt => {}
+            Some(_) => return Err(refuse(REFUSE_RECEIPT_CHANGE)),
+            None if admission_expiry(previous, key).is_some_and(|at| expired(at, clock)) => {}
+            None => return Err(refuse(REFUSE_EARLY_REMOVAL)),
+        }
+    }
+    let mut removals = Removals::default();
+    for (key, event) in &previous.events {
+        if next.events.contains_key(key) {
+            continue;
+        }
+        if let Some(tombstone) = next.retention.event_tombstones.get(key) {
+            if tombstone.digest != event.digest {
+                return Err(refuse("event disposal digest conflict"));
+            }
+            removals.legacy_events.push(key.clone());
+        } else if !event_expiry(previous, key).is_some_and(|at| expired(at, clock)) {
+            return Err(refuse(REFUSE_EARLY_REMOVAL));
+        }
+    }
+    let removed_runs: Vec<(&String, &Run)> = previous
+        .runs
+        .iter()
+        .filter(|(id, _)| !next.runs.contains_key(*id))
+        .collect();
+    let removed_intents: Vec<(&String, &Intent)> = previous
+        .intents
+        .iter()
+        .filter(|(id, _)| !next.intents.contains_key(*id))
+        .collect();
+    if removed_runs.is_empty() && removed_intents.is_empty() {
+        return Ok(removals);
+    }
+    let settled_runs: BTreeMap<&str, &Run> = next
+        .settled
+        .iter()
+        .flat_map(|c| &c.runs)
+        .map(|r| (r.id.as_str(), r))
+        .collect();
+    let settled_intents: BTreeMap<&str, &Intent> = next
+        .settled
+        .iter()
+        .flat_map(|c| &c.intents)
+        .map(|i| (i.id.as_str(), i))
+        .collect();
+    let mut intents_of: BTreeMap<&str, Vec<&Intent>> = BTreeMap::new();
+    if !removed_runs.is_empty() {
+        for intent in previous
+            .intents
+            .values()
+            .chain(settled_intents.values().copied())
+        {
+            intents_of
+                .entry(intent.run.as_str())
+                .or_default()
+                .push(intent);
+        }
+    }
+    for (id, run) in removed_runs {
+        let unresolved = if let Some(settled) = settled_runs.get(id.as_str()) {
+            // Each run and operation as this commit leaves it.
+            let terminal = |child: &String| {
+                settled_runs
+                    .get(child.as_str())
+                    .copied()
+                    .or_else(|| next.runs.get(child))
+                    .is_none_or(|r| r.status.terminal())
+            };
+            let settled_intent = |intent: &&Intent| {
+                let last = settled_intents
+                    .get(intent.id.as_str())
+                    .copied()
+                    .or_else(|| next.intents.get(&intent.id))
+                    .unwrap_or(intent);
+                intent_settled(&last.status)
+            };
+            !settled.status.terminal()
+                || !settled.children.iter().all(terminal)
+                || !intents_of
+                    .get(id.as_str())
+                    .into_iter()
+                    .flatten()
+                    .all(settled_intent)
+        } else if disposed_run(id) {
+            removals.legacy_runs.push(id.clone());
+            !run.status.terminal()
+                || run.children.iter().any(|child| {
+                    previous
+                        .runs
+                        .get(child)
+                        .is_some_and(|r| !r.status.terminal())
+                })
+                || intents_of
+                    .get(id.as_str())
+                    .into_iter()
+                    .flatten()
+                    .any(|i| !intent_settled(&i.status))
+        } else {
+            return Err(refuse(REFUSE_RUN_REMOVAL));
+        };
+        if unresolved {
+            return Err(refuse(REFUSE_RUN_OBLIGATIONS));
+        }
+    }
+    for (id, intent) in removed_intents {
+        let status = if let Some(settled) = settled_intents
+            .get(id.as_str())
+            .filter(|_| settled_runs.contains_key(intent.run.as_str()))
+        {
+            &settled.status
+        } else if disposed_run(&intent.run) {
+            removals.legacy_intents.push(id.clone());
+            &intent.status
+        } else {
+            return Err(refuse(REFUSE_RUN_REMOVAL));
+        };
+        if !intent_settled(status) {
+            return Err(refuse(REFUSE_EFFECT));
+        }
+    }
+    Ok(removals)
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GcReport {

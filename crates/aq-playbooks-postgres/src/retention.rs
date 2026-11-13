@@ -1,7 +1,8 @@
 use crate::backend;
 use crate::profiling::ObservedTransaction;
 use aq_playbooks_model::{canonical_bytes, hash_bytes};
-use aq_playbooks_runner::{IntentStatus, State, StorageError};
+use aq_playbooks_runner::retention::Removals;
+use aq_playbooks_runner::{State, StorageError};
 
 fn record(
     tx: &mut ObservedTransaction<'_>,
@@ -32,11 +33,16 @@ pub(crate) fn collect(
     }
     Ok(())
 }
+/// Durable side of the shared removal check. `removals` is what
+/// `retention::verify_removals` allowed for this commit: only its legacy
+/// removals (and artifact disposals) write tombstone rows. A removal allowed
+/// by its history or by an expired window entry writes none.
 pub(crate) fn verify_and_record(
     tx: &mut ObservedTransaction<'_>,
     namespace: &str,
     previous: &State,
     next: &State,
+    removals: &Removals,
 ) -> Result<(), StorageError> {
     if next.sequence < previous.sequence {
         return Err(backend("namespace invocation sequence cannot decrease"));
@@ -60,105 +66,104 @@ pub(crate) fn verify_and_record(
             return Err(backend("producer replay epoch cannot decrease"));
         }
     }
-    for (id, tombstone) in &previous.retention.event_tombstones {
-        if !next.retention.event_tombstones.contains_key(id) {
-            if next
-                .retention
-                .producer_epochs
-                .get(&tombstone.producer)
-                .copied()
-                .unwrap_or(0)
-                <= tombstone.epoch
-            {
-                return Err(backend(
-                    "event replay tombstone removal requires producer epoch retirement",
-                ));
-            }
-            tx.execute("DELETE FROM aq_playbooks.disposal_tombstones WHERE namespace=$1 AND kind='event' AND identity=$2",&[&namespace,id]).map_err(backend)?;
-        }
-    }
+    // Event tombstones may always be removed; their rows go with them.
+    let retired: Vec<&String> = previous
+        .retention
+        .event_tombstones
+        .keys()
+        .filter(|id| !next.retention.event_tombstones.contains_key(*id))
+        .collect();
+    forget_event_tombstones(tx, namespace, &retired)?;
     collect(tx, namespace, next)?;
-    for row in tx.query("SELECT kind,identity,content_digest FROM aq_playbooks.disposal_tombstones WHERE namespace=$1",&[&namespace]).map_err(backend)?{
-        let kind:String=row.get(0);let id:String=row.get(1);match kind.as_str(){
-            "event" if next.events.contains_key(&id)=>return Err(backend("disposed event identity cannot be reused")),
-            "run" if next.runs.contains_key(&id)=>return Err(backend("disposed run identity cannot be reused")),
-            "intent" if next.intents.contains_key(&id)=>return Err(backend("disposed operation identity cannot be reused")),
-            "artifact"=>{if let Some(artifact)=next.artifacts.get(&id){let bytes=canonical_bytes(artifact).map_err(backend)?;if row.get::<_,Option<String>>(2).as_deref()!=Some(hash_bytes(&bytes).as_str()){return Err(backend("disposed artifact address content conflict"));}}},_=>{}
+    // Only identities this commit creates can collide with a tombstone.
+    let mut kinds: Vec<&str> = vec![];
+    let mut ids: Vec<&String> = vec![];
+    let created = [
+        (
+            "run",
+            next.runs
+                .keys()
+                .filter(|id| !previous.runs.contains_key(*id))
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "intent",
+            next.intents
+                .keys()
+                .filter(|id| !previous.intents.contains_key(*id))
+                .collect(),
+        ),
+        (
+            "event",
+            next.events
+                .keys()
+                .filter(|id| !previous.events.contains_key(*id))
+                .collect(),
+        ),
+        (
+            "artifact",
+            next.artifacts
+                .keys()
+                .filter(|id| !previous.artifacts.contains_key(*id))
+                .collect(),
+        ),
+    ];
+    for (kind, identities) in &created {
+        for id in identities {
+            kinds.push(kind);
+            ids.push(id);
         }
     }
-    for (id, event) in &previous.events {
-        if !next.events.contains_key(id) {
-            let tombstone = next
-                .retention
-                .event_tombstones
-                .get(id)
-                .ok_or_else(|| backend("event removal requires retained replay tombstone"))?;
-            if tombstone.digest != event.digest {
-                return Err(backend("event disposal digest conflict"));
+    if !ids.is_empty() {
+        for row in tx.query("SELECT kind,identity,content_digest FROM aq_playbooks.disposal_tombstones WHERE namespace=$1 AND (kind,identity) IN (SELECT * FROM unnest($2::text[],$3::text[]))",&[&namespace,&kinds,&ids]).map_err(backend)? {
+            let kind: String = row.get(0);
+            let id: String = row.get(1);
+            match kind.as_str() {
+                "event" => return Err(backend("disposed event identity cannot be reused")),
+                "run" => return Err(backend("disposed run identity cannot be reused")),
+                "intent" => return Err(backend("disposed operation identity cannot be reused")),
+                "artifact" => {
+                    let bytes = canonical_bytes(&next.artifacts[&id]).map_err(backend)?;
+                    if row.get::<_, Option<String>>(2).as_deref() != Some(hash_bytes(&bytes).as_str()) {
+                        return Err(backend("disposed artifact address content conflict"));
+                    }
+                }
+                _ => {}
             }
-            record(
-                tx,
-                namespace,
-                "event",
-                id,
-                Some(&event.digest),
-                tombstone.disposed_at_ms,
-            )?;
         }
     }
-    for (id, run) in &previous.runs {
-        if !next.runs.contains_key(id) {
-            let disposal = next
-                .retention
-                .disposals
-                .iter()
-                .find(|d| d.kind == "run" && d.key == *id)
-                .ok_or_else(|| backend("run removal requires explicit disposal"))?;
-            if !run.status.terminal()
-                || previous.intents.values().any(|intent| {
-                    intent.run == *id
-                        && !matches!(
-                            intent.status,
-                            IntentStatus::Completed
-                                | IntentStatus::Rejected
-                                | IntentStatus::Cancelled
-                        )
-                })
-                || run.children.iter().any(|child| {
-                    previous
-                        .runs
-                        .get(child)
-                        .is_some_and(|r| !r.status.terminal())
-                })
-            {
-                return Err(backend("unresolved run obligations cannot be disposed"));
-            }
-            record(tx, namespace, "run", id, None, disposal.at_ms)?;
-        }
+    for id in &removals.legacy_events {
+        let tombstone = &next.retention.event_tombstones[id];
+        record(
+            tx,
+            namespace,
+            "event",
+            id,
+            Some(&previous.events[id].digest),
+            tombstone.disposed_at_ms,
+        )?;
     }
-    for (id, intent) in &previous.intents {
-        if !next.intents.contains_key(id) {
-            let disposal = next
-                .retention
-                .disposals
-                .iter()
-                .find(|d| d.kind == "run" && d.key == intent.run)
-                .ok_or_else(|| backend("operation removal requires owning run disposal"))?;
-            if !matches!(
-                intent.status,
-                IntentStatus::Completed | IntentStatus::Rejected | IntentStatus::Cancelled
-            ) {
-                return Err(backend("unresolved effect cannot be disposed"));
-            }
-            record(
-                tx,
-                namespace,
-                "intent",
-                id,
-                Some(&intent.input_digest),
-                disposal.at_ms,
-            )?;
-        }
+    let disposed_at = |run: &str| {
+        next.retention
+            .disposals
+            .iter()
+            .find(|d| d.kind == "run" && d.key == run)
+            .map(|d| d.at_ms)
+            .ok_or_else(|| backend("run removal requires explicit disposal"))
+    };
+    for id in &removals.legacy_runs {
+        record(tx, namespace, "run", id, None, disposed_at(id)?)?;
+    }
+    for id in &removals.legacy_intents {
+        let intent = &previous.intents[id];
+        record(
+            tx,
+            namespace,
+            "intent",
+            id,
+            Some(&intent.input_digest),
+            disposed_at(&intent.run)?,
+        )?;
     }
     for (id, artifact) in &previous.artifacts {
         if !next.artifacts.contains_key(id) {
@@ -182,6 +187,17 @@ pub(crate) fn verify_and_record(
         return Err(backend(
             "durable disposal tombstone quota reached; GC refused without deleting work",
         ));
+    }
+    Ok(())
+}
+/// Delete the tombstone rows of event tombstones the State no longer holds.
+pub(crate) fn forget_event_tombstones(
+    tx: &mut ObservedTransaction<'_>,
+    namespace: &str,
+    ids: &[&String],
+) -> Result<(), StorageError> {
+    if !ids.is_empty() {
+        tx.execute("DELETE FROM aq_playbooks.disposal_tombstones WHERE namespace=$1 AND kind='event' AND identity=ANY($2)",&[&namespace,&ids]).map_err(backend)?;
     }
     Ok(())
 }

@@ -1164,6 +1164,7 @@ fn retired_producer_epochs_need_no_new_tombstones_for_late_gc() {
         terminal_run_ms: 1,
         audit_ms: 1,
         max_tombstones: 1,
+        ..RetentionPolicy::default()
     })
     .unwrap();
     e.admit_event("host", envelope("old-epoch"), 0).unwrap();
@@ -1209,6 +1210,7 @@ fn expired_replay_tombstones_and_retired_epochs_refuse_old_identities() {
         terminal_run_ms: 1,
         audit_ms: 1,
         max_tombstones: 1,
+        ..RetentionPolicy::default()
     })
     .unwrap();
     e.admit_event("host", envelope("original"), 0).unwrap();
@@ -1375,6 +1377,7 @@ fn completed_cohort_gc_removes_ready_timer_and_dependency_index_residue() {
         terminal_run_ms: 1,
         audit_ms: 1,
         max_tombstones: 10,
+        ..RetentionPolicy::default()
     })
     .unwrap();
     for _ in 0..20 {

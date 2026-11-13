@@ -387,12 +387,15 @@ impl Drop for Lent {
     }
 }
 
-const HISTORY_REMOVALS: &[&str] = &[
-    "events",
-    "runs",
-    "intents",
-    "retention.event_tombstones",
-    "retention.disposals",
+/// Deleting one of these records always takes the complete path, where
+/// `retention::verify_removals` checks it against the whole State.
+const HISTORY_REMOVALS: &[&str] = &["runs", "intents", "retention.disposals"];
+/// Window entries a bounded commit may delete, each with its expiry record:
+/// allowed only when the same patch deletes that record with an expiry the
+/// clock has reached.
+const WINDOWS: &[(&str, &str)] = &[
+    ("keyed_admissions", "retention.admission_expires_at_ms"),
+    ("events", "retention.event_expires_at_ms"),
 ];
 const IDENTITIES: &[(&str, &str)] = &[("events", "event"), ("runs", "run"), ("intents", "intent")];
 
@@ -498,7 +501,13 @@ impl PostgresStorage {
         };
         let mut tx: ObservedTransaction<'_> = lent.reclaim()?;
         let previous = header_state(&header)?;
-        let staged = stage(&mut tx, namespace, &accounting, &patch)?;
+        let staged = stage(
+            &mut tx,
+            namespace,
+            &accounting,
+            &patch,
+            state.retention.clock_ms,
+        )?;
         let live_keys = aq_playbooks_runner::history::patch_live_keys(&patch)?;
         (request.validate)(&state, &staged.accounting.counts())?;
         source.check()?;
@@ -546,6 +555,8 @@ impl PostgresStorage {
         if state.retention.last_gc_at_ms != previous.retention.last_gc_at_ms {
             crate::retention::collect(&mut tx, namespace, &state)?;
         }
+        let retired: Vec<&String> = staged.retired_event_tombstones.iter().collect();
+        crate::retention::forget_event_tombstones(&mut tx, namespace, &retired)?;
         if !staged.deleted_fields.is_empty() {
             tx.execute("DELETE FROM aq_playbooks.state_records r USING unnest($2::text[],$3::bytea[]) AS d(f,k) WHERE r.namespace=$1 AND r.field=d.f AND r.sort_key=d.k",&[&namespace,&staged.deleted_fields,&staged.deleted_keys]).map_err(backend)?;
         }
@@ -618,9 +629,18 @@ pub(crate) fn owns_lock(
     Ok(tx.query_one("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid() AND classid::bigint=$1 AND objid::bigint=$2 AND objsubid=1 AND granted)", &[&high,&low]).map_err(backend)?.get(0))
 }
 
-/// Header-only invariants of `retention::verify_and_record` for a transition
-/// that removes no retained history and leaves artifacts unchanged.
+/// Header-only invariants of `retention::verify_and_record` and
+/// `retention::verify_removals` for a transition that removes no retained
+/// history (other than expired window entries, see `stage`) and leaves
+/// artifacts unchanged.
 fn verify_header(previous: &State, next: &State) -> Result<(), StorageError> {
+    if previous
+        .retention
+        .clock_ms
+        .is_some_and(|old| next.retention.clock_ms.is_none_or(|new| new < old))
+    {
+        return Err(backend(aq_playbooks_runner::retention::REFUSE_CLOCK));
+    }
     if next.sequence < previous.sequence {
         return Err(backend("namespace invocation sequence cannot decrease"));
     }
@@ -651,6 +671,8 @@ struct Staged {
     accounting: Accounting,
     replaced: bool,
     history_removed: bool,
+    /// Event tombstone records this patch deletes.
+    retired_event_tombstones: Vec<String>,
     created: Vec<(String, String)>,
     fields: Vec<String>,
     keys: Vec<Vec<u8>>,
@@ -659,18 +681,24 @@ struct Staged {
     deleted_keys: Vec<Vec<u8>>,
 }
 /// Exact accounting of the patch against the current records (one read of
-/// every touched key), plus the keyed admission immutability check.
+/// every touched key), plus the keyed admission immutability check. A
+/// keyed admission or event deletion stays bounded only when the same patch
+/// deletes its expiry record with an expiry `clock_ms` has reached (and, for
+/// an event, writes no legacy tombstone for it); otherwise it sets
+/// `history_removed`, so the complete path runs `verify_removals`.
 fn stage(
     tx: &mut ObservedTransaction<'_>,
     namespace: &str,
     accounting: &Accounting,
     patch: &StatePatch,
+    clock_ms: Option<i64>,
 ) -> Result<Staged, StorageError> {
     let mut staged = Staged {
         full_header: patch.header.clone(),
         accounting: accounting.clone(),
         replaced: false,
         history_removed: false,
+        retired_event_tombstones: vec![],
         created: vec![],
         fields: vec![],
         keys: vec![],
@@ -702,6 +730,10 @@ fn stage(
             old.insert((row.get(0), row.get(1)), row.get(2));
         }
     }
+    // Deleted records (field, key) with their old value, and the event
+    // tombstones this patch writes.
+    let mut deleted: BTreeMap<(&'static str, Vec<u8>), Vec<u8>> = BTreeMap::new();
+    let mut tombstoned: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut replaced_old: BTreeMap<&'static str, BTreeMap<TreeKey, Vec<u8>>> = BTreeMap::new();
     for (path, change) in &patch.changes {
         let (name, _) = field(path.field).map_err(backend)?;
@@ -718,13 +750,22 @@ fn stage(
                         .accounting
                         .record(name, key, before.map(Vec::as_slice), new.as_deref())
                         .map_err(storage)?;
-                    if name == "keyed_admissions" && before.is_some() && before != new.as_ref() {
+                    // A changed receipt is refused; a deleted one is a window
+                    // removal (see below).
+                    if name == "keyed_admissions"
+                        && new.is_some()
+                        && before.is_some()
+                        && before != new.as_ref()
+                    {
                         return Err(backend(
                             "immutable keyed admission receipt removed or changed",
                         ));
                     }
                     match new {
                         Some(value) => {
+                            if name == "retention.event_tombstones" {
+                                tombstoned.insert(encoded.clone());
+                            }
                             if before.is_none()
                                 && let Some((_, kind)) = IDENTITIES.iter().find(|(f, _)| *f == name)
                                 && let TreeKey::Str(id) = key
@@ -736,8 +777,16 @@ fn stage(
                             staged.values.push(value.clone());
                         }
                         None => {
-                            if before.is_some() && HISTORY_REMOVALS.contains(&name) {
-                                staged.history_removed = true;
+                            if let Some(before) = before {
+                                if HISTORY_REMOVALS.contains(&name) {
+                                    staged.history_removed = true;
+                                }
+                                if name == "retention.event_tombstones"
+                                    && let TreeKey::Str(id) = key
+                                {
+                                    staged.retired_event_tombstones.push(id.clone());
+                                }
+                                deleted.insert((name, encoded.clone()), before.clone());
                             }
                             staged.deleted_fields.push(name.to_string());
                             staged.deleted_keys.push(encoded);
@@ -766,14 +815,32 @@ fn stage(
                         .record(name, key, None, Some(bytes))
                         .map_err(storage)?;
                 }
-                if name == "keyed_admissions" {
-                    let next: BTreeMap<_, _> = rows.iter().map(|(k, v)| (k, v)).collect();
-                    if current.iter().any(|(k, v)| next.get(k) != Some(&v)) {
-                        return Err(backend(
-                            "immutable keyed admission receipt removed or changed",
-                        ));
-                    }
+                // A replaced container takes the complete path, where removals
+                // are checked; a changed receipt is refused here.
+                if name == "keyed_admissions"
+                    && rows
+                        .iter()
+                        .any(|(k, v)| current.get(k).is_some_and(|before| before != v))
+                {
+                    return Err(backend(
+                        "immutable keyed admission receipt removed or changed",
+                    ));
                 }
+            }
+        }
+    }
+    for (item, expiry) in WINDOWS {
+        for (field, key) in deleted.keys() {
+            if field != item {
+                continue;
+            }
+            let at: Option<i64> = deleted
+                .get(&(*expiry, key.clone()))
+                .and_then(|bytes| serde_json::from_slice(bytes).ok());
+            let expired =
+                at.is_some_and(|at| aq_playbooks_runner::retention::expired(at, clock_ms));
+            if !expired || (*item == "events" && tombstoned.contains(key)) {
+                staged.history_removed = true;
             }
         }
     }
