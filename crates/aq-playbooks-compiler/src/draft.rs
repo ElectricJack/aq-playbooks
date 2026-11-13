@@ -684,7 +684,7 @@ fn list(names: &BTreeSet<String>) -> String {
 
 /// A draft past the step or byte bound, refused before any other work.
 fn draft_limits(steps: usize, bytes: usize) -> Vec<Diagnostic> {
-    let advice = "Split the work into sub-workflows, or shorten it: one step per decision, with `lookup` and `let` for tables instead of chains of steps.";
+    let advice = "Shorten it: one step per decision, with `lookup` and `let` for tables instead of chains of steps. A draft cannot call other playbooks, so if the document needs more than that, ask the owner to split the document.";
     let mut faults = vec![];
     if steps > MAX_DRAFT_STEPS {
         faults.push(Diagnostic::error(

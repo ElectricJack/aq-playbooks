@@ -125,15 +125,20 @@ pub fn validate(input: &CompileInput) -> Vec<Diagnostic> {
     }
     if let Some(header) = header {
         let c = content(input, header);
-        let mut found = c.validate_structure();
-        draft_depth_issues(&c.playbook, &mut found);
-        // Join member forms and reads every way to a step can satisfy: a new
-        // draft only, as for depth, so stored artifacts keep loading. Not
-        // while a binding name is reused: every way then carries every
-        // earlier variant forward, which costs far more and says nothing new.
-        if !found.iter().any(|i| i.code == "binding") {
-            let strict = c.draft_issues(&found);
-            found.extend(strict);
+        // First, and alone when it fails: typing and the read check grow with
+        // an expression's size once every name is replaced by its value.
+        let mut found = draft_expansion_issues(&c.playbook);
+        if found.is_empty() {
+            found = c.validate_structure();
+            draft_depth_issues(&c.playbook, &mut found);
+            // Join member forms and reads every way to a step can satisfy: a
+            // new draft only, as for depth, so stored artifacts keep loading.
+            // Not while a binding name is reused: every way then carries every
+            // earlier variant forward, which costs far more and says nothing new.
+            if !found.iter().any(|i| i.code == "binding") {
+                let strict = c.draft_issues(&found);
+                found.extend(strict);
+            }
         }
         for issue in found {
             let mut d = Diagnostic::error(&issue.code, &issue.path, issue.message);
@@ -219,6 +224,130 @@ fn depth(expr: &Expr) -> (usize, bool) {
         .into_iter()
         .map(depth)
         .fold((0, own), |(d, l), (cd, cl)| (d.max(cd + 1), l || cl))
+}
+/// The most nodes one expression of a new draft may expand to, and all of
+/// its expressions together. Checking costs about 1 KB and 2 µs per expanded
+/// node (measured in release), so these bound one expression near 200 MB and
+/// 0.4 s and a whole draft near 2 s.
+pub const MAX_DRAFT_EXPANSION: u64 = 200_000;
+pub const MAX_DRAFT_EXPANSION_TOTAL: u64 = 1_000_000;
+/// Nodes in a literal value.
+fn value_nodes(value: &serde_json::Value) -> u64 {
+    1 + match value {
+        serde_json::Value::Array(items) => items.iter().map(value_nodes).sum(),
+        serde_json::Value::Object(map) => map.values().map(value_nodes).sum(),
+        _ => 0,
+    }
+}
+/// The size of `expr` with every `let` name, and every `map` or `filter`
+/// item, replaced by what it stands for. Linear to compute: each binding's
+/// size is computed once. Saturating.
+fn expanded(expr: &Expr, names: &BTreeMap<String, u64>) -> u64 {
+    let sum = |exprs: &mut dyn Iterator<Item = &Expr>| {
+        exprs.fold(1u64, |n, e| n.saturating_add(expanded(e, names)))
+    };
+    match expr {
+        Expr::Literal { value } => value_nodes(value),
+        Expr::Ref { root, .. } => names.get(root).copied().unwrap_or(1),
+        Expr::Object { fields } => sum(&mut fields.values()),
+        Expr::Array { items: values } | Expr::And { values } | Expr::Or { values } => {
+            sum(&mut values.iter())
+        }
+        Expr::Exists { value } | Expr::Not { value } => sum(&mut [&**value].into_iter()),
+        Expr::Eq { left, right }
+        | Expr::Lt { left, right }
+        | Expr::Difference { left, right, .. } => sum(&mut [&**left, &**right].into_iter()),
+        Expr::Contains { collection, value } => sum(&mut [&**collection, &**value].into_iter()),
+        Expr::Map {
+            collection,
+            item,
+            value: body,
+            ..
+        }
+        | Expr::Filter {
+            collection,
+            item,
+            predicate: body,
+            ..
+        } => {
+            let c = expanded(collection, names);
+            let mut inner = names.clone();
+            inner.insert(item.clone(), c);
+            1u64.saturating_add(c)
+                .saturating_add(expanded(body, &inner))
+        }
+        Expr::Lookup {
+            key,
+            cases,
+            default,
+        } => cases.iter().fold(
+            1u64.saturating_add(expanded(key, names))
+                .saturating_add(expanded(default, names)),
+            |n, c| {
+                n.saturating_add(value_nodes(&c.when))
+                    .saturating_add(expanded(&c.then, names))
+            },
+        ),
+        Expr::Let { bindings, body } => {
+            let mut inner = names.clone();
+            let mut n = 1u64;
+            for b in bindings {
+                let size = expanded(&b.value, &inner);
+                n = n.saturating_add(size);
+                inner.insert(b.name.clone(), size);
+            }
+            n.saturating_add(expanded(body, &inner))
+        }
+    }
+}
+/// A new draft's expressions, each bounded in its expanded size. Building a
+/// value from the same name twice at every level doubles it each time, and
+/// typing and the draft read check follow every copy, so such a draft is
+/// refused before either runs.
+fn draft_expansion_issues(playbook: &Playbook) -> Vec<ValidationIssue> {
+    let steps = playbook.steps.iter().flat_map(|(name, step)| {
+        step_exprs(&step.op)
+            .into_iter()
+            .map(move |(at, e)| (format!("steps.{name}"), at, e))
+    });
+    let triggers = playbook
+        .triggers
+        .iter()
+        .map(|t| (format!("triggers.{}", t.id), "input".to_string(), &t.input));
+    let mut issues = vec![];
+    let mut total = 0u64;
+    for (path, at, expr) in steps.chain(triggers) {
+        let size = expanded(expr, &BTreeMap::new());
+        total = total.saturating_add(size);
+        if size > MAX_DRAFT_EXPANSION {
+            issues.push(ValidationIssue {
+                code: "expression_limit".into(),
+                message: format!(
+                    "{path}.{at}: expands to {} nodes with every `let` name and `map` or `filter` item replaced by what it stands for; an expression may expand to at most {MAX_DRAFT_EXPANSION}. Build each value from a name once, not twice at every level, or read the bindings directly.",
+                    shown(size)
+                ),
+                path,
+            });
+        }
+    }
+    if issues.is_empty() && total > MAX_DRAFT_EXPANSION_TOTAL {
+        issues.push(ValidationIssue {
+            code: "expression_limit".into(),
+            path: "playbook".into(),
+            message: format!(
+                "the draft's expressions expand to {} nodes in all with every `let` name and `map` or `filter` item replaced by what it stands for; a draft may expand to at most {MAX_DRAFT_EXPANSION_TOTAL}. Build each value from a name once, or shorten the draft.",
+                shown(total)
+            ),
+        });
+    }
+    issues
+}
+fn shown(size: u64) -> String {
+    if size == u64::MAX {
+        "too many".into()
+    } else {
+        size.to_string()
+    }
 }
 /// A new draft is held to the evaluator's depth limit in every expression.
 /// The model checks this only for lookup and let, because it also verifies

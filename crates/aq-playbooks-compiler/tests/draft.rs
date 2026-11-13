@@ -904,7 +904,13 @@ fn a_draft_is_bounded_in_steps_and_bytes_before_it_is_checked() {
         "{}",
         d.message
     );
-    assert!(d.message.contains("sub-workflows"), "{}", d.message);
+    assert!(
+        d.message.contains("Shorten it")
+            && d.message.contains("ask the owner to split the document"),
+        "{}",
+        d.message
+    );
+    assert!(!d.message.contains("sub-workflow"), "{}", d.message);
     // Bytes: the serialized draft, and the file.
     let mut big = workspace();
     let padding = "x".repeat(MAX_DRAFT_JSON_BYTES);
@@ -963,5 +969,240 @@ fn a_reused_binding_name_is_reported_without_the_costly_read_check() {
             .iter()
             .all(|d| !d.message.contains("is not there on every way")),
         "{diagnostics:#?}"
+    );
+}
+
+// Computed aliases (A2 re-review round 2, I1). `read` reaches `peek` on both
+// outcomes and `missing` is `{}`, with no `kind`; ordinary typing accepts
+// every read here, because `kind` is merely optional in the merged type.
+fn eqx(left: Value, value: &str) -> Value {
+    json!({"op": "eq", "left": left, "right": {"op": "literal", "value": value}})
+}
+fn let1(name: &str, value: Value, body: Value) -> Value {
+    json!({"op": "let", "bindings": [{"name": name, "value": value}], "body": body})
+}
+fn keyed_by(key: Value) -> Value {
+    json!({"op": "lookup", "key": key,
+           "cases": [{"when": "chore", "then": {"op": "literal", "value": true}}],
+           "default": {"op": "literal", "value": false}})
+}
+fn partial(predicate: Value) -> Workspace {
+    let mut ws = object_outcomes();
+    ws.catalog
+        .commands
+        .get_mut("work.read")
+        .unwrap()
+        .outcomes
+        .insert("missing".into(), Schema::object(BTreeMap::new()));
+    ws.draft["steps"]["read"]["edges"] = json!({"read": "peek", "missing": "peek"});
+    ws.draft["steps"]["peek"] = decide(predicate, "route");
+    ws.draft["steps"]["route"]["op"]["input"]["fields"]["level"]["key"] =
+        reference("input", &["task"]);
+    ws
+}
+/// The diagnostics at `peek`, and the reasons ("…this step: <reasons>.
+/// Read it only…") of the first.
+fn at_peek(predicate: Value) -> (Vec<aq_playbooks_compiler::Diagnostic>, String) {
+    let diagnostics: Vec<_> = check(&partial(predicate))
+        .into_iter()
+        .filter(|d| d.path == "draft.json:steps.peek")
+        .collect();
+    let reasons = diagnostics
+        .first()
+        .and_then(|d| d.message.split_once("this step: "))
+        .and_then(|(_, rest)| rest.split_once(". Read it only"))
+        .map(|(reasons, _)| reasons.to_string())
+        .unwrap_or_default();
+    (diagnostics, reasons)
+}
+
+#[test]
+fn a_computed_alias_is_held_to_the_same_check() {
+    let w = |p: &[&str]| reference("work", p);
+    let (direct, reasons) = at_peek(eqx(w(&["kind"]), "chore"));
+    assert_eq!(direct.len(), 1, "{direct:#?}");
+    assert!(
+        reasons.contains(
+            "outcome `missing` of step `read` has no `kind` in `work` (it has no fields)"
+        ),
+        "{reasons}"
+    );
+    let object = |field: Value| json!({"op": "object", "fields": {"k": field}});
+    let refused = [
+        // Probe 10: an object holding the binding, read through.
+        let1(
+            "o",
+            object(w(&[])),
+            eqx(reference("o", &["k", "kind"]), "chore"),
+        ),
+        // Probe 11: a lookup that yields the binding.
+        let1(
+            "o",
+            json!({"op": "lookup", "key": {"op": "literal", "value": "a"},
+                   "cases": [{"when": "a", "then": w(&[])}], "default": w(&[])}),
+            eqx(reference("o", &["kind"]), "chore"),
+        ),
+        // A lookup that yields the binding in one case and a literal otherwise.
+        let1(
+            "o",
+            json!({"op": "lookup", "key": reference("input", &["task"]),
+                   "cases": [{"when": "a", "then": w(&[])}],
+                   "default": {"op": "literal", "value": {"kind": "chore", "kinds": []}}}),
+            eqx(reference("o", &["kind"]), "chore"),
+        ),
+        // Probe 12, and a let nested deeper.
+        let1(
+            "o",
+            let1("p", w(&[]), reference("p", &[])),
+            eqx(reference("o", &["kind"]), "chore"),
+        ),
+        let1(
+            "o",
+            let1(
+                "p",
+                object(w(&[])),
+                let1("q", reference("p", &["k"]), reference("q", &[])),
+            ),
+            eqx(reference("o", &["kind"]), "chore"),
+        ),
+        // An array of bindings, indexed by position.
+        let1(
+            "a",
+            json!({"op": "array", "items": [reference("input", &[]), w(&[])]}),
+            eqx(reference("a", &["1", "kind"]), "chore"),
+        ),
+        // Probe 13: a map item of an array of objects holding the binding.
+        json!({"op": "contains", "value": {"op": "literal", "value": "chore"},
+               "collection": {"op": "map", "item": "it", "max_items": 1,
+                   "collection": {"op": "array", "items": [object(w(&[]))]},
+                   "value": reference("it", &["k", "kind"])}}),
+    ];
+    for (i, predicate) in refused.into_iter().enumerate() {
+        let (diagnostics, alias_reasons) = at_peek(predicate);
+        assert_eq!(diagnostics.len(), 1, "{i}: {diagnostics:#?}");
+        assert_eq!(diagnostics[0].code, "expression_type", "{i}");
+        assert_eq!(alias_reasons, reasons, "{i}: {}", diagnostics[0].message);
+    }
+    // Probe 16: as a lookup key, the silent default is refused too.
+    let (diagnostics, alias_reasons) = at_peek(let1(
+        "o",
+        object(w(&[])),
+        keyed_by(reference("o", &["k", "kind"])),
+    ));
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(alias_reasons, reasons);
+    assert!(
+        diagnostics[0]
+            .message
+            .contains("a lookup key is held to this too")
+    );
+    // `exists` stays the one exemption, and a field every way has is fine.
+    for accepted in [
+        let1(
+            "o",
+            object(w(&[])),
+            json!({"op": "exists", "value": reference("o", &["k", "kind"])}),
+        ),
+        let1(
+            "o",
+            object(reference("input", &[])),
+            eqx(reference("o", &["k", "task"]), "chore"),
+        ),
+        let1(
+            "a",
+            json!({"op": "array", "items": [reference("input", &[]), w(&[])]}),
+            eqx(reference("a", &["0", "task"]), "chore"),
+        ),
+    ] {
+        let (diagnostics, _) = at_peek(accepted.clone());
+        assert!(diagnostics.is_empty(), "{accepted}: {diagnostics:#?}");
+    }
+    // A field read where it is embedded is refused there, once.
+    let (diagnostics, _) = at_peek(let1(
+        "o",
+        object(w(&["kind"])),
+        eqx(reference("o", &["k"]), "chore"),
+    ));
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert!(
+        diagnostics[0]
+            .message
+            .starts_with("steps.peek.predicate.let.bindings[0].value.k: `work.kind`"),
+        "{diagnostics:#?}"
+    );
+}
+
+/// `depth` nested bindings, each an object holding the previous one twice:
+/// the value doubles at every level once names are replaced by their values.
+fn doubling(depth: usize) -> Value {
+    let mut bindings = vec![json!({"name": "b0", "value": {"op": "object",
+        "fields": {"k": reference("input", &[])}}})];
+    for j in 1..depth {
+        let p = format!("b{}", j - 1);
+        bindings.push(json!({"name": format!("b{j}"), "value": {"op": "object",
+            "fields": {"a": reference(&p, &[]), "b": reference(&p, &[])}}}));
+    }
+    json!({"op": "let", "bindings": bindings,
+           "body": {"op": "exists", "value": reference(&format!("b{}", depth - 1), &[])}})
+}
+/// The fixture with one decide step per predicate chained in front of `read`.
+fn deciding(predicates: Vec<Value>) -> Workspace {
+    let mut ws = workspace();
+    let n = predicates.len();
+    let steps = ws.draft["steps"].as_object_mut().unwrap();
+    for (i, predicate) in predicates.into_iter().enumerate() {
+        let next = if i + 1 == n {
+            "read".to_string()
+        } else {
+            format!("d{}", i + 1)
+        };
+        steps.insert(format!("d{i}"), decide(predicate, &next));
+    }
+    ws.draft["entries"]["main"]["start"] = json!("d0");
+    ws
+}
+
+#[test]
+fn an_expression_that_expands_past_the_bound_is_refused_before_it_is_typed() {
+    // Depth 15 expands to about 147 000 nodes: accepted, and it checks.
+    assert!(check(&deciding(vec![doubling(15)])).is_empty());
+    // Depth 16, about 295 000: refused, alone, before typing and the read
+    // check run (either would follow every copy).
+    let diagnostics = check(&deciding(vec![doubling(16)]));
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    let d = &diagnostics[0];
+    assert_eq!(
+        (d.code.as_str(), d.path.as_str()),
+        ("expression_limit", "draft.json:steps.d0")
+    );
+    assert!(
+        d.message.starts_with("steps.d0.predicate: expands to "),
+        "{}",
+        d.message
+    );
+    assert!(
+        d.message
+            .contains("an expression may expand to at most 200000"),
+        "{}",
+        d.message
+    );
+    // Far past it the count saturates and still refuses at once.
+    let diagnostics = check(&deciding(vec![doubling(70)]));
+    assert!(
+        diagnostics[0].message.contains("expands to too many nodes"),
+        "{diagnostics:#?}"
+    );
+    // Six such expressions fit the whole draft's bound; seven do not.
+    assert!(check(&deciding(vec![doubling(15); 6])).is_empty());
+    let diagnostics = check(&deciding(vec![doubling(15); 7]));
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        (diagnostics[0].code.as_str(), diagnostics[0].path.as_str()),
+        ("expression_limit", "draft.json")
+    );
+    assert!(
+        diagnostics[0]
+            .message
+            .contains("a draft may expand to at most 1000000")
     );
 }

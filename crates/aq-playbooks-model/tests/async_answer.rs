@@ -1095,3 +1095,32 @@ fn an_item_named_like_a_binding_gets_no_second_unbound_diagnostic() {
         "{issues:?}"
     );
 }
+
+#[test]
+fn a_single_member_any_accepted_join_reads_its_member_on_completed() {
+    // A2 re-review R1-M1: with one member, that member is the one that
+    // qualified, so `answer.c` is there on `completed`.
+    let mut c = base();
+    let Operation::Join { mode, .. } = &mut c.playbook.steps.get_mut("read").unwrap().op else {
+        unreachable!()
+    };
+    *mode = JoinMode::AnyAccepted;
+    assert_eq!(c.validate_structure(), vec![]);
+    assert_eq!(draft(&c), vec![]);
+    // The member's outcome is still held to the accepted outcomes.
+    accepting(&mut c, &["assessed", "refused"]);
+    let issues = draft(&c);
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    assert!(
+        issues[0]
+            .message
+            .contains("outcome `refused` of member `c`"),
+        "{}",
+        issues[0].message
+    );
+    assert!(
+        !issues[0].message.contains("another member"),
+        "{}",
+        issues[0].message
+    );
+}

@@ -23,8 +23,12 @@ enum Variant {
     Bound,
     /// Missing, for the reason given (an alias of a field some way lacks).
     Lacks(String),
-    /// A named join's result: each key's own variants.
+    /// A named join's result, or an object or array an expression builds:
+    /// each key's (or position's) own variants.
     Keys(BTreeMap<String, Variants>),
+    /// `variant`, read from the reference written as the string: reasons
+    /// name it as a direct read would.
+    Origin(String, Box<Variant>),
 }
 /// Variants with the way each one arises, for diagnostics.
 type Variants = Vec<(Variant, String)>;
@@ -275,7 +279,8 @@ impl ArtifactContent {
                             format!("outcome `{o}` of member `{key}` on {on_edge}"),
                         ));
                     }
-                    if *mode == JoinMode::AnyAccepted {
+                    // With one member, that member is the one that qualified.
+                    if *mode == JoinMode::AnyAccepted && members.len() > 1 {
                         variants.push(absent("when another member qualified first"));
                     }
                 }
@@ -284,11 +289,12 @@ impl ArtifactContent {
                 }
                 ("completed", JoinMode::AnyCompletion) | ("timeout", _) => {
                     variants.push((Variant::Shape(loose.get(key)?.clone()), on_edge.clone()));
-                    variants.push(absent(if edge == "timeout" {
-                        "when that member has not answered"
-                    } else {
-                        "when another member completed first"
-                    }));
+                    if edge == "timeout" {
+                        variants.push(absent("when that member has not answered"));
+                    } else if members.len() > 1 {
+                        // With one member, that member is the one that completed.
+                        variants.push(absent("when another member completed first"));
+                    }
                 }
                 _ => variants.push(absent("where no member is kept")),
             }
@@ -387,6 +393,16 @@ fn project(variant: &Variant, way: &str, binding: &str, path: &[String], depth: 
             out
         }
         Variant::Shape(schema) => project_schema(schema, way, binding, path, depth),
+        Variant::Origin(origin, inner) => {
+            let rest = &path[depth..];
+            project(inner, way, origin, rest, 0)
+                .into_iter()
+                .map(|(v, w)| match v {
+                    Variant::Lacks(_) | Variant::Bound => (v, w),
+                    other => (Variant::Origin(dotted(origin, rest), Box::new(other)), w),
+                })
+                .collect()
+        }
     }
 }
 fn project_schema(
@@ -410,10 +426,11 @@ fn project_schema(
         Schema::Object { properties, .. } => match properties.get(key) {
             Some(next) => project_schema(next, way, binding, path, depth + 1),
             None => vec![(
-                Variant::Lacks(format!(
-                    "{way} has no `{key}` in `{}` (it has {})",
-                    dotted(binding, &path[..depth]),
-                    properties.keys().cloned().collect::<Vec<_>>().join(", ")
+                Variant::Lacks(no_field(
+                    way,
+                    key,
+                    &dotted(binding, &path[..depth]),
+                    properties,
                 )),
                 way.to_string(),
             )],
@@ -422,57 +439,116 @@ fn project_schema(
         _ => vec![(Variant::Bound, way.to_string())],
     }
 }
-/// The variants of an item of `collection`: the items of each array it can
-/// be. Where the collection itself is missing its own read is refused, so
-/// the item is taken as bound there.
-fn item_variants(collection: &Expr, context: &Context, scope: &Scope) -> Lexical {
-    let mut out = vec![];
-    let mut add = |variants: Variants, of_array: bool| {
-        for (variant, way) in variants {
-            let items = match (&variant, of_array) {
-                (Variant::Shape(Schema::Array { items, .. }), true) => {
-                    vec![(Variant::Shape((**items).clone()), way)]
-                }
-                (Variant::Shape(Schema::Union { variants }), true) => variants
-                    .iter()
-                    .map(|v| match v {
-                        Schema::Array { items, .. } => {
-                            (Variant::Shape((**items).clone()), way.clone())
-                        }
-                        _ => (Variant::Bound, way.clone()),
+/// What `expr` evaluates to on each way, derived from its structure: a
+/// reference projects its binding or alias; an object or array maps each
+/// field or position to what its expression carries; a `lookup` carries
+/// every case and its default; a `let` carries its body. `None` when it
+/// carries nothing tracked. A reference inside is also read where it is
+/// written, so a part missing there is taken as bound here.
+fn carried(expr: &Expr, context: &Context, scope: &Scope) -> Option<Variants> {
+    let part = |e: &Expr| {
+        carried(e, context, scope).unwrap_or_else(|| vec![(Variant::Bound, String::new())])
+    };
+    match expr {
+        Expr::Ref { .. } => {
+            let (variants, origin) = alias(expr, context, scope)?;
+            Some(
+                variants
+                    .into_iter()
+                    .map(|(v, w)| match v {
+                        Variant::Lacks(_) | Variant::Absent | Variant::Bound => (Variant::Bound, w),
+                        other => (Variant::Origin(origin.clone(), Box::new(other)), w),
                     })
                     .collect(),
-                (Variant::Shape(_) | Variant::Keys(_), false) => vec![(variant, way)],
-                _ => vec![(Variant::Bound, way)],
-            };
-            push_unique(&mut out, items);
+            )
         }
-    };
-    match collection {
-        Expr::Array { items } => {
-            for item in items {
-                match alias(item, context, scope) {
-                    Some((variants, _)) => add(variants, false),
-                    None => add(vec![(Variant::Bound, String::new())], false),
-                }
+        Expr::Object { fields } => Some(vec![(
+            Variant::Keys(fields.iter().map(|(k, e)| (k.clone(), part(e))).collect()),
+            String::new(),
+        )]),
+        Expr::Array { items } => Some(vec![(
+            Variant::Keys(
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| (i.to_string(), part(e)))
+                    .collect(),
+            ),
+            String::new(),
+        )]),
+        Expr::Lookup { cases, default, .. } => {
+            let mut out = vec![];
+            for e in cases.iter().map(|c| &c.then).chain([&**default]) {
+                push_unique(&mut out, part(e));
             }
-            Lexical {
-                variants: out,
-                shown: None,
-                note: Some("is an item of its collection".into()),
-            }
+            Some(out)
         }
-        _ => match alias(collection, context, scope) {
-            Some((variants, origin)) => {
-                add(variants, true);
-                Lexical {
-                    variants: out,
-                    shown: None,
-                    note: Some(format!("is an item of `{origin}`")),
-                }
+        Expr::Let { bindings, body } => {
+            let mut inner = scope.clone();
+            for b in bindings {
+                let name = let_name(&b.value, context, &inner);
+                inner.insert(b.name.clone(), name);
             }
-            None => bound_name(),
+            carried(body, context, &inner)
+        }
+        _ => None,
+    }
+}
+/// What a `let` name holds: an alias of a reference reads as its origin; a
+/// computed value carries what its expression carries.
+fn let_name(value: &Expr, context: &Context, scope: &Scope) -> Lexical {
+    if let Some((variants, origin)) = alias(value, context, scope) {
+        return Lexical {
+            variants,
+            note: Some(format!("is `{origin}`")),
+            shown: Some(origin),
+        };
+    }
+    match carried(value, context, scope) {
+        Some(variants) => Lexical {
+            variants,
+            shown: None,
+            note: Some("is computed from other values".into()),
         },
+        None => bound_name(),
+    }
+}
+/// The items of each array in `variants`; an array an expression builds
+/// gives its items as they are.
+fn items_of(variants: Variants) -> Variants {
+    let mut out = vec![];
+    for (variant, way) in variants {
+        let items = match variant {
+            Variant::Origin(_, inner) => items_of(vec![(*inner, way)]),
+            Variant::Shape(Schema::Array { items, .. }) => vec![(Variant::Shape(*items), way)],
+            Variant::Shape(Schema::Union { variants }) => variants
+                .into_iter()
+                .map(|v| match v {
+                    Schema::Array { items, .. } => (Variant::Shape(*items), way.clone()),
+                    _ => (Variant::Bound, way.clone()),
+                })
+                .collect(),
+            Variant::Keys(keys) => keys.into_values().flatten().collect(),
+            _ => vec![(Variant::Bound, way)],
+        };
+        push_unique(&mut out, items);
+    }
+    out
+}
+/// The variants of an item of `collection`. Where the collection itself is
+/// missing its own read is refused, so the item is taken as bound there.
+fn item_variants(collection: &Expr, context: &Context, scope: &Scope) -> Lexical {
+    let Some(variants) = carried(collection, context, scope) else {
+        return bound_name();
+    };
+    let note = match alias(collection, context, scope) {
+        Some((_, origin)) => format!("is an item of `{origin}`"),
+        None => "is an item of its collection".into(),
+    };
+    Lexical {
+        variants: items_of(variants),
+        shown: None,
+        note: Some(note),
     }
 }
 fn bound_name() -> Lexical {
@@ -620,31 +696,19 @@ fn strict_reads(
             for (i, b) in bindings.iter().enumerate() {
                 // An alias of a binding is checked where it is used, as the
                 // binding would be: binding a missing value has no effect
-                // until it is read.
-                match alias(&b.value, context, &inner) {
-                    Some((variants, origin)) => {
-                        let note = Some(format!("is `{origin}`"));
-                        let shown = Some(origin);
-                        inner.insert(
-                            b.name.clone(),
-                            Lexical {
-                                variants,
-                                shown,
-                                note,
-                            },
-                        );
-                    }
-                    None => {
-                        sub(
-                            &b.value,
-                            &format!(".bindings[{i}].value"),
-                            exempt,
-                            key,
-                            &inner,
-                        );
-                        inner.insert(b.name.clone(), bound_name());
-                    }
+                // until it is read. A computed value is checked where it is
+                // written too, since a missing part spoils it there.
+                if alias(&b.value, context, &inner).is_none() {
+                    sub(
+                        &b.value,
+                        &format!(".bindings[{i}].value"),
+                        exempt,
+                        key,
+                        &inner,
+                    );
                 }
+                let name = let_name(&b.value, context, &inner);
+                inner.insert(b.name.clone(), name);
             }
             sub(body, ".body", exempt, key, &inner);
         }
@@ -684,8 +748,18 @@ fn lacking(
             }
         }
         Variant::Shape(schema) => lacking_in(schema, way, binding, path, depth, lacks),
+        Variant::Origin(origin, inner) => lacking(inner, way, origin, &path[depth..], 0, lacks),
         Variant::Bound => {}
     }
+}
+/// "<way> has no `key` in `at` (it has a, b)", or "(it has no fields)".
+fn no_field(way: &str, key: &str, at: &str, properties: &BTreeMap<String, Schema>) -> String {
+    let has = if properties.is_empty() {
+        "no fields".to_string()
+    } else {
+        properties.keys().cloned().collect::<Vec<_>>().join(", ")
+    };
+    format!("{way} has no `{key}` in `{at}` (it has {has})")
 }
 fn lacking_in(
     schema: &Schema,
@@ -707,11 +781,7 @@ fn lacking_in(
         Schema::Object { properties, .. } => match properties.get(key) {
             Some(next) => lacking_in(next, way, binding, path, depth + 1, lacks),
             None => {
-                let text = format!(
-                    "{way} has no `{key}` in `{}` (it has {})",
-                    dotted(binding, &path[..depth]),
-                    properties.keys().cloned().collect::<Vec<_>>().join(", ")
-                );
+                let text = no_field(way, key, &dotted(binding, &path[..depth]), properties);
                 if !lacks.contains(&text) {
                     lacks.push(text);
                 }

@@ -84,7 +84,11 @@ lookup branch), it could exceed either limit, so such an expression never fails
 on them at run time. A 256-case lookup on a plain key, inside a map, therefore
 fits a `max_items` of at most 38. The compiler also holds every expression of a new draft
 to the depth limit; verifying a stored artifact does not, so artifacts stored
-before these rules keep loading.
+before these rules keep loading. It also bounds a new draft's expressions by
+their size with every `let` name and `map` or `filter` item replaced by what it
+stands for: at most 200 000 nodes for one expression and 1 000 000 for all of
+them. A value built from the same name twice at every level doubles each time,
+and typing follows every copy.
 
 Diagnostics for both name the place inside the step, for example
 `steps.route.input.level.lookup.cases[0].when`: object fields by name, array
@@ -147,8 +151,10 @@ its step lacks:
   start of a loop that has not yet run it.
 
 A `let` alias of a binding (`let out = answer.c.output`), an alias of an alias,
-and a `map` or `filter` item of a collection derived from a binding are held to
-the same check where they are read, with the same reasons as the direct read.
+a value computed from bindings (an object or array holding them, a `lookup` or
+`let` that can return them), and a `map` or `filter` item of a collection
+derived from any of these are held to the same check where they are read, with
+the same reasons as the direct read.
 Binding a missing value has no effect until it is read, so an alias used only
 inside `exists` is fine.
 
