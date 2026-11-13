@@ -1,0 +1,404 @@
+//! Ask, then read the answer, end to end on the in-memory engine: a playbook
+//! invokes the asynchronous `judgment.request` (host catalog 2.1.0), joins its
+//! handle by name, and branches on `choice`, a field only the `assessed`
+//! outcome has. The fake host admits the request; the completion arrives as
+//! the pinned `aq.judgment.completed` event.
+use aq_playbooks_model::*;
+use aq_playbooks_runner::*;
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
+
+const REGISTRY_2_1: &str = include_str!("../../../contracts/aq-host-2.1.0/registry.json");
+const HANDLE: &str = "judgment-op-1";
+const PRODUCER: &str = "aq.host.bridge@1";
+const JOIN_DEADLINE_MS: u64 = 1000;
+const HOLD_MS: u64 = 50;
+
+fn set(xs: &[&str]) -> BTreeSet<String> {
+    xs.iter().map(|s| s.to_string()).collect()
+}
+fn edges(xs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    xs.iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+fn r(root: &str, path: &[&str]) -> Expr {
+    Expr::Ref {
+        root: root.into(),
+        path: path.iter().map(|s| s.to_string()).collect(),
+    }
+}
+fn ret(outcome: &str) -> Step {
+    Step {
+        op: Operation::Return {
+            outcome: outcome.into(),
+            output: Expr::literal(Value::Null),
+        },
+        edges: BTreeMap::new(),
+        on_error: None,
+    }
+}
+fn authority() -> Authority {
+    Authority {
+        actor: "owner".into(),
+        scope: "project".into(),
+        capabilities: set(&["judgment.request.v2"]),
+    }
+}
+fn registry() -> Registry {
+    let all: Registry = serde_json::from_str(REGISTRY_2_1).unwrap();
+    Registry {
+        commands: all
+            .commands
+            .into_iter()
+            .filter(|(name, _)| ["judgment.request", "operation.get"].contains(&name.as_str()))
+            .collect(),
+        events: all
+            .events
+            .into_iter()
+            .filter(|(name, _)| name == "aq.judgment.completed")
+            .collect(),
+    }
+}
+/// `ask` → (`hold`, a 50 ms timer, when `hold`) → `read`, a join on the handle
+/// under the key `c` → `decide` on `answer.c.output.choice`.
+fn playbook(member: Expr, hold: bool) -> Artifact {
+    let registry = registry();
+    let judgment = &registry.commands["judgment.request"];
+    let after_ask = if hold { "hold" } else { "read" };
+    let mut steps = BTreeMap::from([
+        (
+            "ask".into(),
+            Step {
+                op: Operation::Invoke {
+                    command: ContractRef {
+                        name: judgment.name.clone(),
+                        fingerprint: judgment.fingerprint().unwrap(),
+                    },
+                    input: Expr::literal(json!({
+                        "budget": {"deadline_ms": 60000, "max_cost_microunits": 50000, "max_input_tokens": 8192, "max_output_tokens": 512},
+                        "context": {"artifacts": [], "text": "Work item summary."},
+                        "output": {"choices": ["approve", "decline"], "rationale_max_bytes": 2048},
+                        "question": "Should this change be approved?",
+                        "subject": {"id": "work-1", "revision": 1},
+                    })),
+                    bind: "j".into(),
+                    retry: None,
+                },
+                edges: edges(&[
+                    ("accepted", after_ask),
+                    ("assessed", "error"),
+                    ("failed", "error"),
+                    ("refused", "error"),
+                ]),
+                on_error: Some("error".into()),
+            },
+        ),
+        (
+            "read".into(),
+            Step {
+                op: Operation::Join {
+                    members: vec![member],
+                    member_keys: vec!["c".into()],
+                    mode: JoinMode::All,
+                    accepted_outcomes: set(&["assessed"]),
+                    deadline_ms: JOIN_DEADLINE_MS,
+                    remaining: RemainingPolicy::Track,
+                    bind: "answer".into(),
+                },
+                edges: edges(&[
+                    ("completed", "decide"),
+                    ("no_match", "unanswered"),
+                    ("timeout", "late"),
+                ]),
+                on_error: Some("error".into()),
+            },
+        ),
+        (
+            "decide".into(),
+            Step {
+                op: Operation::Decide {
+                    predicate: Expr::Eq {
+                        left: Box::new(r("answer", &["c", "output", "choice"])),
+                        right: Box::new(Expr::literal("approve")),
+                    },
+                },
+                edges: edges(&[
+                    ("true", "approved"),
+                    ("false", "declined"),
+                    ("unknown", "error"),
+                ]),
+                on_error: None,
+            },
+        ),
+        ("approved".into(), ret("approved")),
+        ("declined".into(), ret("declined")),
+        ("unanswered".into(), ret("unanswered")),
+        ("late".into(), ret("late")),
+        ("error".into(), ret("error")),
+    ]);
+    if hold {
+        steps.insert(
+            "hold".into(),
+            Step {
+                op: Operation::Wait {
+                    event: None,
+                    correlation: BTreeMap::new(),
+                    minimum_revision: None,
+                    deadline_ms: HOLD_MS,
+                    bind: "held".into(),
+                },
+                edges: edges(&[("timeout", "read")]),
+                on_error: Some("error".into()),
+            },
+        );
+    }
+    Artifact::seal(ArtifactContent {
+        format_version: FORMAT_VERSION,
+        compiler: "test".into(),
+        source: SourceBinding {
+            digest: hash_bytes(b"ask-then-read"),
+            header: SourceHeader {
+                format_version: FORMAT_VERSION,
+                id: "ask-then-read".into(),
+                scope: "project".into(),
+                interfaces: set(&["main"]),
+                definitions: BTreeSet::new(),
+            },
+        },
+        playbook: Playbook {
+            id: "ask-then-read".into(),
+            purpose: "ask, then read the answer".into(),
+            scope: "project".into(),
+            entries: BTreeMap::from([(
+                "main".into(),
+                EntryPoint {
+                    input: Schema::Null,
+                    outcomes: ["approved", "declined", "unanswered", "late", "error"]
+                        .into_iter()
+                        .map(|o| (o.to_string(), Schema::Null))
+                        .collect(),
+                    start: "ask".into(),
+                },
+            )]),
+            steps,
+            triggers: vec![],
+            limits: Limits::default(),
+            required_capabilities: set(&["judgment.request.v2"]),
+        },
+        registry,
+        dependencies: BTreeMap::new(),
+        definitions: BTreeMap::new(),
+        source_map: BTreeMap::new(),
+    })
+    .unwrap()
+}
+fn provenance() -> Value {
+    json!({
+        "context_digest": format!("sha256:{}", "a".repeat(64)),
+        "credential_profile": "profile/judgment-default",
+        "model": "model-a",
+        "output_digest": format!("sha256:{}", "b".repeat(64)),
+        "prompt_digest": format!("sha256:{}", "c".repeat(64)),
+        "provider": "provider-a",
+        "usage": {"cost_microunits": 4100, "input_tokens": 900, "output_tokens": 120},
+    })
+}
+fn assessed(choice: &str) -> Value {
+    json!({"outcome": "assessed", "output": {
+        "choice": choice,
+        "provenance": provenance(),
+        "rationale": "The change is covered by a test.",
+        "reference": format!("judgment:{HANDLE}"),
+        "subject": {"id": "work-1", "revision": 1},
+    }})
+}
+fn failed() -> Value {
+    json!({"outcome": "failed", "output": {
+        "provenance": null,
+        "reason": "provider_unavailable",
+        "reference": format!("judgment:{HANDLE}"),
+        "subject": {"id": "work-1", "revision": 1},
+    }})
+}
+fn refused() -> Value {
+    json!({"outcome": "refused", "output": {
+        "provenance": provenance(),
+        "reason": "budget_exceeded",
+        "reference": format!("judgment:{HANDLE}"),
+        "subject": {"id": "work-1", "revision": 1},
+    }})
+}
+fn completion(a: &Artifact, payload: Value) -> EventEnvelope {
+    let contract = &a.content.registry.events["aq.judgment.completed"];
+    EventEnvelope {
+        producer: PRODUCER.into(),
+        event_id: "judgment-completed-1".into(),
+        contract: ContractRef {
+            name: contract.name.clone(),
+            fingerprint: contract.fingerprint().unwrap(),
+        },
+        scope: "project".into(),
+        correlation: BTreeMap::from([("operation".into(), HANDLE.into())]),
+        subject: Some("work-1".into()),
+        revision: Some(1),
+        causation: None,
+        occurred_at_ms: None,
+        observed_at_ms: None,
+        payload,
+    }
+}
+struct Ask {
+    engine: Engine<MemoryStorage>,
+    host: FakeHost,
+    artifact: Artifact,
+    run: String,
+}
+/// Installs and admits the playbook, then drives it at time 0: the host admits
+/// the judgment request and the run waits (at the join, or at `hold`).
+fn ask(hold: bool) -> Ask {
+    let engine = Engine::new(MemoryStorage::default(), "async-answer", "owner-1").unwrap();
+    let artifact = playbook(r("j", &[]), hold);
+    engine.install(artifact.clone()).unwrap();
+    engine
+        .activate("ask-then-read", &artifact.digest, authority())
+        .unwrap();
+    let run = engine
+        .admit("ask-then-read", "main", Value::Null, authority(), 0)
+        .unwrap();
+    let mut host = FakeHost {
+        responses: BTreeMap::from([(
+            "judgment.request".into(),
+            vec![DispatchResult::Accepted {
+                handle: HANDLE.into(),
+            }],
+        )]),
+        ..Default::default()
+    };
+    engine.drive(&mut host, 0, 20).unwrap();
+    let s = engine.snapshot().unwrap();
+    assert_eq!(s.runs[&run].status, RunStatus::Waiting);
+    assert_eq!(s.runs[&run].step, if hold { "hold" } else { "read" });
+    assert_eq!(s.runs[&run].variables["j"], json!({"handle": HANDLE}));
+    Ask {
+        engine,
+        host,
+        artifact,
+        run,
+    }
+}
+impl Ask {
+    fn complete(&mut self, payload: Value, at_ms: i64) {
+        self.engine
+            .admit_event(PRODUCER, completion(&self.artifact, payload), at_ms)
+            .unwrap();
+        self.engine.drive(&mut self.host, at_ms, 20).unwrap();
+    }
+    fn run(&self) -> Run {
+        self.engine.snapshot().unwrap().runs[&self.run].clone()
+    }
+    fn assert_finished(&self, outcome: &str) {
+        let run = self.run();
+        assert_eq!(run.status, RunStatus::Completed, "{run:?}");
+        assert_eq!(run.outcome.as_deref(), Some(outcome), "{run:?}");
+        assert!(
+            !self
+                .engine
+                .snapshot()
+                .unwrap()
+                .receipts
+                .iter()
+                .any(|r| r.kind == "engine_failure"),
+        );
+    }
+}
+
+#[test]
+fn an_assessed_answer_is_read_by_name_and_branches_on_its_choice() {
+    for (choice, outcome) in [("approve", "approved"), ("decline", "declined")] {
+        let mut a = ask(false);
+        a.complete(assessed(choice), 10);
+        a.assert_finished(outcome);
+        let answer = &a.run().variables["answer"];
+        assert_eq!(answer["c"]["outcome"], "assessed");
+        assert_eq!(answer["c"]["output"]["choice"], choice);
+        // `participant` is the operation the engine owns, not the host handle.
+        let s = a.engine.snapshot().unwrap();
+        let intent = s.intents.values().find(|i| i.run == a.run).unwrap();
+        assert_eq!(answer["c"]["participant"], intent.id.as_str());
+    }
+}
+
+#[test]
+fn a_failed_or_refused_answer_takes_no_match_without_reading_the_choice() {
+    for payload in [failed(), refused()] {
+        let outcome = payload["outcome"].clone();
+        let mut a = ask(false);
+        a.complete(payload, 10);
+        a.assert_finished("unanswered");
+        let run = a.run();
+        assert!(!run.variables.contains_key("decide"));
+        assert_eq!(run.variables["answer"]["c"]["outcome"], outcome);
+        assert!(
+            run.variables["answer"]["c"]["output"]
+                .get("choice")
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn an_answer_that_arrives_before_the_join_is_reached_is_read_there() {
+    let mut a = ask(true);
+    a.complete(assessed("approve"), 10);
+    // The completion is recorded on the operation while the run still holds.
+    let run = a.run();
+    assert_eq!(
+        (run.status, run.step.as_str()),
+        (RunStatus::Waiting, "hold")
+    );
+    let s = a.engine.snapshot().unwrap();
+    let intent = s.intents.values().find(|i| i.run == a.run).unwrap();
+    assert_eq!(intent.status, IntentStatus::Completed);
+    a.engine.drive(&mut a.host, HOLD_MS as i64, 20).unwrap();
+    a.assert_finished("approved");
+    assert_eq!(
+        a.run().variables["answer"]["c"]["output"]["choice"],
+        "approve"
+    );
+}
+
+#[test]
+fn an_answer_that_never_arrives_takes_the_timeout_edge_at_the_deadline() {
+    let mut a = ask(false);
+    a.engine
+        .drive(&mut a.host, JOIN_DEADLINE_MS as i64 - 1, 20)
+        .unwrap();
+    assert_eq!(a.run().status, RunStatus::Waiting);
+    a.engine
+        .drive(&mut a.host, JOIN_DEADLINE_MS as i64, 20)
+        .unwrap();
+    // The timeout edge is taken at the deadline with nothing read. The run
+    // holds its `late` return until the operation it still owns settles.
+    let run = a.run();
+    assert_eq!(run.step, "late", "{run:?}");
+    assert_eq!(run.status, RunStatus::Finishing, "{run:?}");
+    assert_eq!(run.pending_return, Some(("late".into(), Value::Null)));
+    assert_eq!(run.variables["answer"], json!({}));
+    // A completion after the deadline settles the operation but cannot
+    // replace the recorded timeout.
+    a.complete(assessed("approve"), JOIN_DEADLINE_MS as i64 + 10);
+    a.assert_finished("late");
+    assert_eq!(a.run().variables["answer"], json!({}));
+}
+
+#[test]
+fn the_handle_path_form_cannot_be_installed() {
+    let e = Engine::new(MemoryStorage::default(), "async-answer", "owner-1").unwrap();
+    let error = e
+        .install(playbook(r("j", &["handle"]), false))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("steps.read"), "{error}");
+    assert!(error.contains("`j.handle`"), "{error}");
+}

@@ -927,10 +927,9 @@ mod tests {
                 edge(
                     Operation::Join {
                         member_keys: vec![],
-                        members: vec![
-                            reference("judgment", &["handle"]),
-                            reference("check", &["handle"]),
-                        ],
+                        // A join names each handle by its binding: the runner
+                        // resolves `{"handle": h}`, not the bare handle string.
+                        members: vec![reference("judgment", &[]), reference("check", &[])],
                         mode: JoinMode::All,
                         accepted_outcomes: strings(&["assessed", "passed"]),
                         deadline_ms: 60_000,

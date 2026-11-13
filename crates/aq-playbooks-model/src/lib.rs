@@ -2079,6 +2079,20 @@ impl ArtifactContent {
                     if let Err(error) = self.join_schema(step, false) {
                         issue(&mut issues, "join_member_type", &path, error);
                     }
+                    // A join without member keys is not typed, but its members
+                    // resolve at run time exactly as a named join's do.
+                    if member_keys.is_empty() {
+                        for (i, member) in members.iter().enumerate() {
+                            if let Some(error) = self.handle_member_path(member) {
+                                issue(
+                                    &mut issues,
+                                    "join_member_type",
+                                    &path,
+                                    format!("members[{i}]: {error}"),
+                                );
+                            }
+                        }
+                    }
                     if *mode == JoinMode::AnyCompletion && !accepted_outcomes.is_empty() {
                         issue(
                             &mut issues,
@@ -2932,7 +2946,8 @@ fn infer_node(
             let current = roots
                 .get(root)
                 .ok_or_else(|| format!("unknown or unsupported typed root {root}"))?;
-            Ok(schema_path(current, path)?)
+            schema_path(current, path)
+                .map_err(|error| unreadable_ref(root, path, current, error).into())
         }
         Expr::Object { fields } => Ok(Schema::object(
             fields
@@ -3746,8 +3761,124 @@ fn schema_path(schema: &Schema, path: &[String]) -> Result<Schema, String> {
         )),
     }
 }
+fn dotted(root: &str, path: &[String]) -> String {
+    std::iter::once(root)
+        .chain(path.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+/// Why `root.path` cannot be read, said at the deepest part that can: what is
+/// there, and where the missing part would be readable.
+fn unreadable_ref(root: &str, path: &[String], schema: &Schema, error: String) -> String {
+    let mut at = schema.clone();
+    let mut depth = 0;
+    while let Some(key) = path.get(depth) {
+        match schema_path(&at, std::slice::from_ref(key)) {
+            Ok(next) => {
+                at = next;
+                depth += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    let Some(key) = path.get(depth) else {
+        return format!("`{}` cannot be read: {error}", dotted(root, path));
+    };
+    let prefix = dotted(root, &path[..depth]);
+    let fields = |properties: &BTreeMap<String, Schema>| {
+        properties.keys().cloned().collect::<Vec<_>>().join(", ")
+    };
+    let why = match &at {
+        Schema::Object { properties, .. } => {
+            format!("{error}: `{prefix}` has fields {}", fields(properties))
+        }
+        Schema::Nullable { .. } => format!(
+            "`{prefix}` may be null at this step, so `{key}` cannot be read. Read it only \
+             where it is known to be present: a join's answer (`outcome`, `output`) is \
+             present only on the join's `completed` edge, in mode `all` or `any_accepted`"
+        ),
+        Schema::Union { variants } => {
+            let objects: Vec<_> = variants
+                .iter()
+                .filter_map(|v| match v {
+                    Schema::Object { properties, .. } => Some(properties),
+                    _ => None,
+                })
+                .collect();
+            let common: Vec<_> = objects
+                .first()
+                .map(|first| {
+                    first
+                        .keys()
+                        .filter(|k| objects.iter().all(|o| o.contains_key(*k)))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let some = if objects.iter().any(|o| o.contains_key(key)) {
+                "only some"
+            } else {
+                "none"
+            };
+            format!(
+                "`{prefix}` has a different shape per outcome and {some} of them have `{key}`; \
+                 every outcome has {}. Read `{key}` after an edge that selects an outcome \
+                 that has it: an invoke's outcome edge, or a join's `completed` edge with \
+                 `accepted_outcomes`",
+                if common.is_empty() {
+                    "no common field".to_string()
+                } else {
+                    format!("fields {}", common.join(", "))
+                }
+            )
+        }
+        Schema::Array { .. } => {
+            format!("{error} (`{prefix}` is an array; `{key}` is not an index)")
+        }
+        other => format!(
+            "`{prefix}` is {}, which has no field `{key}`",
+            describe(other)
+        ),
+    };
+    format!("`{}` cannot be read: {why}", dotted(root, path))
+}
 impl ArtifactContent {
+    /// A join names an operation handle by the binding of the invoke that
+    /// admitted it, as the runner resolves members (`{"handle": h}`). Returns
+    /// the fix when `member` reads a path inside such a binding instead.
+    fn handle_member_path(&self, member: &Expr) -> Option<String> {
+        let Expr::Ref { root, path } = member else {
+            return None;
+        };
+        let (binding, rest) = match (root.as_str(), path.split_first()) {
+            ("vars", Some((binding, rest))) => (binding, rest),
+            ("vars", None) => return None,
+            _ => (root, path.as_slice()),
+        };
+        if rest.is_empty() {
+            return None;
+        }
+        let (step, command) = self
+            .playbook
+            .steps
+            .iter()
+            .find_map(|(name, s)| match &s.op {
+                Operation::Invoke { command, bind, .. } if bind == binding => {
+                    Some((name, &command.name))
+                }
+                _ => None,
+            })?;
+        Some(format!(
+            "`{}` reads inside the operation handle bound by step `{step}` ({command}); \
+             a join names the handle by its binding alone: write \
+             {{\"op\":\"ref\",\"root\":\"{binding}\",\"path\":[]}}",
+            dotted(root, path)
+        ))
+    }
     fn member_outcomes(&self, member: &Expr) -> Result<BTreeMap<String, Schema>, String> {
+        if let Some(error) = self.handle_member_path(member) {
+            return Err(error);
+        }
         let Expr::Ref { root, path } = member else {
             return Err("named join members must reference statically declared owned child or operation handles".into());
         };
@@ -3775,9 +3906,7 @@ impl ArtifactContent {
                         .map(|entry| entry.outcomes.clone())
                         .ok_or_else(|| "join references unknown child interface".into());
                 }
-                Operation::Invoke { command, bind, .. }
-                    if bind == binding && (path.is_empty() || path == ["handle"]) =>
-                {
+                Operation::Invoke { command, bind, .. } if bind == binding && path.is_empty() => {
                     let command = self
                         .registry
                         .commands
@@ -3826,8 +3955,10 @@ impl ArtifactContent {
         }
         let guaranteed_business = completed && *mode != JoinMode::AnyCompletion;
         let mut properties = BTreeMap::new();
-        for (key, member) in member_keys.iter().zip(members) {
-            let outcomes = self.member_outcomes(member)?;
+        for (i, (key, member)) in member_keys.iter().zip(members).enumerate() {
+            let outcomes = self
+                .member_outcomes(member)
+                .map_err(|e| format!("members[{i}] (key {key}): {e}"))?;
             let selected: BTreeMap<_, _> = outcomes
                 .iter()
                 .filter(|(outcome, _)| {

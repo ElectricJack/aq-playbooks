@@ -117,6 +117,60 @@ can read, for example, `joined.review.output.subject`. Engine failure/cancellati
 keeps nullable outcome/output outside successful qualification. Membership and
 ownership remain runtime-checked; a declared result key is not bearer authority.
 
+A member is named by its binding, with no path. An owned child is
+`{"op":"ref","root":"<bind>"}` or `{"op":"ref","root":"<bind>","path":["child"]}`.
+An operation handle is `{"op":"ref","root":"<bind>"}` only: the binding the invoke
+step's `accepted` edge recorded (`{"handle": h}`). `<bind>` may also be written
+`{"op":"ref","root":"vars","path":["<bind>"]}`. A path inside an operation handle,
+such as `["handle"]`, is refused with `join_member_type`, in joins with or without
+`member_keys`. The runner would refuse that member when it reaches the join.
+
+Ask, then read the answer. A wait on an asynchronous command's completion event
+binds the event's whole payload, which a wait does not narrow per outcome. To read
+the answer, join the operation handle by name instead. `ask` invokes catalog
+2.1.0's `judgment.request`. Its `accepted` edge binds the handle as `j`. `read`
+joins `j` under the key `c` and accepts only `assessed`. On `completed`,
+`answer.c.output` is exactly the `assessed` output, so `decide` can branch on
+`choice`, a field only that outcome has:
+
+    "ask":    {"op":{"kind":"invoke","bind":"j","retry":null,
+                     "command":{"name":"judgment.request","fingerprint":"sha256:…"},
+                     "input":{"op":"literal","value":{"question":"Should this change be approved?",
+                       "subject":{"id":"work-1","revision":1},
+                       "context":{"text":"Work item summary.","artifacts":[]},
+                       "output":{"choices":["approve","decline"],"rationale_max_bytes":2048},
+                       "budget":{"deadline_ms":60000,"max_cost_microunits":50000,
+                                 "max_input_tokens":8192,"max_output_tokens":512}}}},
+               "edges":{"accepted":"read","assessed":"error","failed":"error",
+                        "refused":"error"},
+               "on_error":"error"},
+    "read":   {"op":{"kind":"join","members":[{"op":"ref","root":"j","path":[]}],
+                     "member_keys":["c"],"mode":"all","accepted_outcomes":["assessed"],
+                     "deadline_ms":60000,"remaining":"track","bind":"answer"},
+               "edges":{"completed":"decide","no_match":"unanswered","timeout":"late"},
+               "on_error":"error"},
+    "decide": {"op":{"kind":"decide","predicate":{"op":"eq",
+                     "left":{"op":"ref","root":"answer","path":["c","output","choice"]},
+                     "right":{"op":"literal","value":"approve"}}},
+               "edges":{"true":"approved","false":"declined","unknown":"error"},
+               "on_error":null}
+
+`approved`, `declined`, `unanswered`, `late` and `error` are `return` steps. Each
+edge sees a different answer:
+- `completed`: the answer was `assessed`. `answer.c.outcome` is `"assessed"` and
+  `answer.c.output.choice` is a string of at most 512 bytes.
+- `no_match`: the answer was `failed` or `refused`. `answer.c.output` is typed
+  null-or-any-outcome, so reading `answer.c.output.choice` there is refused with
+  `expression_type`. The diagnostic names the step, the reference and why it
+  cannot be read.
+- `timeout`: no answer arrived within `deadline_ms`. `answer` is `{}`.
+
+An answer that arrives before the run reaches the join is recorded on the
+operation, and the join reads it when the run arrives. After a timeout, the run
+holds its return until the operation it owns settles. A late answer settles the
+operation but does not change the outcome. Under `"remaining":"cancel"`, the
+engine also marks the unfinished operation for cancellation.
+
 Callable dependencies declare `selection`: `exact` uses the captured artifact
 hash; `catalog` resolves the named binding at root admission. A catalog allowlist
 may constrain acceptable full artifact hashes; an empty allowlist permits the
