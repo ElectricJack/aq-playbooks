@@ -628,7 +628,10 @@ fn refresh_run(s: &mut State, id: &str) -> Result<()> {
         r.status,
         RunStatus::Finishing | RunStatus::Cancelling | RunStatus::Blocked
     ) {
-        let root = &s.runs[&r.root];
+        // A live run's root is live: a cohort leaves only as a whole.
+        let root = s.runs.get(&r.root).ok_or_else(|| {
+            crate::Error::Conflict(format!("root {} of a live run is missing", r.root))
+        })?;
         let end = crate::deadline(
             root.admitted_at_ms,
             s.artifacts[&root.artifact]

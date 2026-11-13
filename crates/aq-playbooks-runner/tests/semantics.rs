@@ -75,7 +75,44 @@ fn artifact(
     .unwrap()
 }
 fn engine() -> Engine<MemoryStorage> {
-    Engine::new(MemoryStorage::default(), "test", "incarnation-1").unwrap()
+    Engine::new(MemoryStorage::retaining_settled(), "test", "incarnation-1").unwrap()
+}
+/// A finished run as its cohort left the State (spec 0003: settled cohorts
+/// leave in the commit that settles them). Asserts that it has left.
+fn settled(e: &Engine<MemoryStorage>, id: &str) -> Run {
+    assert!(
+        !e.snapshot().unwrap().runs.contains_key(id),
+        "{id} is still live"
+    );
+    e.store
+        .settled_run(&e.namespace, id)
+        .unwrap_or_else(|| panic!("{id} is not in history"))
+}
+/// Every public inspection item of `kind` (live state plus history).
+fn inspected(e: &Engine<MemoryStorage>, kind: InspectionKind, run: Option<&str>) -> Vec<Value> {
+    let mut items = vec![];
+    let mut after = None;
+    loop {
+        let page = e
+            .inspect(&InspectionQuery {
+                kind,
+                run: run.map(String::from),
+                after,
+                limit: 1000,
+            })
+            .unwrap();
+        items.extend(page.items);
+        match page.next {
+            Some(next) => after = Some(next),
+            None => return items,
+        }
+    }
+}
+/// A run's public projection, live or in history.
+fn inspected_run(e: &Engine<MemoryStorage>, id: &str) -> Value {
+    let runs = inspected(e, InspectionKind::Runs, Some(id));
+    assert_eq!(runs.len(), 1, "run {id}");
+    runs.into_iter().next().unwrap()
 }
 fn install(e: &Engine<MemoryStorage>, a: Artifact, binding: &str) -> String {
     let d = a.digest.clone();
@@ -223,14 +260,23 @@ fn event_before_wait_restart_stale_revision_and_backlog_deadline() {
     e.release().unwrap();
     let resumed = Engine::new(e.store.clone(), "test", "incarnation-2").unwrap();
     resumed.advance(&id, 0).unwrap();
-    resumed.advance(&id, 150).unwrap();
-    resumed.advance(&id, 151).unwrap();
-    let s = resumed.snapshot().unwrap();
-    assert_eq!(s.runs[&id].outcome.as_deref(), Some("ok"));
+    // The wait has its winner; the run finishes on its next step and leaves.
     assert_eq!(
-        s.waits.values().next().unwrap().winner.as_deref(),
+        resumed
+            .snapshot()
+            .unwrap()
+            .waits
+            .values()
+            .next()
+            .unwrap()
+            .winner
+            .as_deref(),
         Some(accepted.key.as_str())
     );
+    resumed.advance(&id, 150).unwrap();
+    assert!(matches!(resumed.advance(&id, 151), Err(Error::NotFound(_))));
+    assert_eq!(settled(&resumed, &id).outcome.as_deref(), Some("ok"));
+    assert!(resumed.snapshot().unwrap().waits.is_empty());
 }
 #[test]
 fn expiry_wins_over_late_event_and_identity_conflicts() {
@@ -243,10 +289,9 @@ fn expiry_wins_over_late_event_and_identity_conflicts() {
     e.admit_event("host", event("late", 2), 101).unwrap();
     e.advance(&id, 110).unwrap();
     e.advance(&id, 111).unwrap();
-    assert_eq!(
-        e.snapshot().unwrap().runs[&id].outcome.as_deref(),
-        Some("error")
-    );
+    // The finished run has left the State; history has its outcome.
+    assert!(!e.snapshot().unwrap().runs.contains_key(&id));
+    assert_eq!(inspected_run(&e, &id)["outcome"], "error");
     let mut changed = event("late", 3);
     assert!(matches!(
         e.admit_event("host", changed.clone(), 112),
@@ -306,9 +351,10 @@ fn durable_intent_replay_keeps_id_business_retry_creates_new_id() {
     e.advance(&id, 10).unwrap();
     assert_eq!(e.snapshot().unwrap().intents.len(), 1);
     e.drive(&mut host, 11, 30).unwrap();
-    let s = e.snapshot().unwrap();
-    assert_eq!(s.runs[&id].outcome.as_deref(), Some("ok"));
-    assert_eq!(s.intents.len(), 2);
+    // The run and both operations have left the State as history.
+    assert_eq!(settled(&e, &id).outcome.as_deref(), Some("ok"));
+    assert!(e.snapshot().unwrap().intents.is_empty());
+    assert_eq!(inspected(&e, InspectionKind::Effects, Some(&id)).len(), 2);
     assert_eq!(host.dispatched[0], first);
     assert_eq!(host.dispatched[1], first);
     assert_ne!(host.dispatched[1], host.dispatched[2]);
@@ -410,11 +456,10 @@ fn all_three_child_modes_are_atomic_and_independent_cancellation_survives() {
         }
         let mut host = FakeHost::default();
         e.drive(&mut host, 2, 20).unwrap();
-        assert!(e.snapshot().unwrap().runs[&id].status.terminal());
-        assert_eq!(
-            e.snapshot().unwrap().runs[&child].status,
-            RunStatus::Completed
-        );
+        // Parent and child settled together and left as one cohort.
+        assert!(settled(&e, &id).status.terminal());
+        assert_eq!(settled(&e, &child).status, RunStatus::Completed);
+        assert_eq!(e.store.settled_cohorts("test").len(), 1);
     }
 }
 #[test]
@@ -593,10 +638,7 @@ fn owned_operation_join_uses_exact_pinned_completion_and_retained_admission() {
     e.admit_event("host", async_event(&c, "right-contract"), 20)
         .unwrap();
     e.drive(&mut host, 20, 20).unwrap();
-    assert_eq!(
-        e.snapshot().unwrap().runs[&id].outcome.as_deref(),
-        Some("ok")
-    );
+    assert_eq!(settled(&e, &id).outcome.as_deref(), Some("ok"));
 }
 #[test]
 fn timeout_fallback_waits_for_truthful_owned_operation_cancellation() {
@@ -632,10 +674,7 @@ fn timeout_fallback_waits_for_truthful_owned_operation_cancellation() {
     let c = async_artifact().1;
     e.admit_event("host", async_event(&c, "late"), 110).unwrap();
     e.drive(&mut host, 110, 20).unwrap();
-    assert_eq!(
-        e.snapshot().unwrap().runs[&id].outcome.as_deref(),
-        Some("error")
-    );
+    assert_eq!(settled(&e, &id).outcome.as_deref(), Some("error"));
 }
 
 #[test]
@@ -658,20 +697,20 @@ fn exhausted_step_budget_finishes_once_without_reentering_error_graph() {
         ..Default::default()
     };
     e.drive(&mut host, 0, 20).unwrap();
-    let before = e.snapshot().unwrap();
-    assert_eq!(before.runs[&id].status, RunStatus::Failed);
+    assert_eq!(settled(&e, &id).status, RunStatus::Failed);
+    let before = inspected(&e, InspectionKind::Receipts, Some(&id));
     assert_eq!(
         before
-            .receipts
             .iter()
-            .filter(|r| r.kind == "engine_failure")
+            .filter(|r| r["kind"] == "engine_failure")
             .count(),
         1
     );
+    // The failed run has left; it is never re-entered.
     for _ in 0..10 {
-        assert!(!e.advance(&id, 1).unwrap());
+        assert!(matches!(e.advance(&id, 1), Err(Error::NotFound(_))));
     }
-    assert_eq!(before.receipts.len(), e.snapshot().unwrap().receipts.len());
+    assert_eq!(before, inspected(&e, InspectionKind::Receipts, Some(&id)));
 }
 
 #[test]
@@ -693,9 +732,10 @@ fn history_budget_stops_without_disposing_existing_records() {
         .unwrap();
     e.advance(&id, 0).unwrap();
     let s = e.snapshot().unwrap();
-    assert_eq!(s.runs[&id].status, RunStatus::Failed);
+    let run = settled(&e, &id);
+    assert_eq!(run.status, RunStatus::Failed);
     assert!(s.artifacts.contains_key(&digest));
-    assert!(s.runs[&id].reason.as_ref().unwrap().contains("history"));
+    assert!(run.reason.as_ref().unwrap().contains("history"));
 }
 
 #[test]
@@ -757,12 +797,12 @@ fn operation_join_deadline_uses_ingress_time_even_when_processing_is_late() {
         e.admit_event("host", async_event(&c, "completion"), accepted_at)
             .unwrap();
         e.drive(&mut host, 150, 30).unwrap();
-        let s = e.snapshot().unwrap();
-        assert_eq!(s.runs[&id].outcome.as_deref(), Some(expected));
-        let branch = s
+        assert_eq!(settled(&e, &id).outcome.as_deref(), Some(expected));
+        let branch = e.store.settled_cohorts("test")[0]
             .receipts
             .iter()
             .find(|r| r.step == "join" && r.kind == "branch")
+            .cloned()
             .unwrap();
         assert_eq!(
             branch.detail["outcome"],
@@ -815,13 +855,11 @@ fn missing_dependency_destination_is_durably_blocked_then_resumes_exact_bytes() 
     assert_eq!(e.fanout(&disposition.key, 1, 1).unwrap(), 1);
     let mut host = FakeHost::default();
     e.drive(&mut host, 1, 30).unwrap();
-    assert!(
-        e.snapshot()
-            .unwrap()
-            .runs
-            .values()
-            .all(|r| r.status == RunStatus::Completed)
-    );
+    // The event's run and its child completed and left as history.
+    assert!(e.snapshot().unwrap().runs.is_empty());
+    let runs = inspected(&e, InspectionKind::Runs, None);
+    assert_eq!(runs.len(), 2);
+    assert!(runs.iter().all(|r| r["status"] == "completed"));
 }
 
 #[test]
@@ -896,11 +934,11 @@ fn iteration_failure_policy_skips_or_stops_without_resetting_captured_membership
             ..Default::default()
         };
         e.drive(&mut host, 0, 50).unwrap();
-        let state = e.snapshot().unwrap();
-        assert_eq!(state.runs[&id].outcome.as_deref(), Some(expected));
+        let run = settled(&e, &id);
+        assert_eq!(run.outcome.as_deref(), Some(expected));
         assert_eq!(host.dispatched.len(), calls);
-        assert!(state.runs[&id].loops.is_empty());
-        assert!(!state.runs[&id].variables.contains_key("item"));
+        assert!(run.loops.is_empty());
+        assert!(!run.variables.contains_key("item"));
     }
 }
 
@@ -952,10 +990,7 @@ fn command_deadline_refuses_unissued_effect_and_preserves_issued_uncertainty() {
     e.dispatch_next(&mut host, 100).unwrap();
     assert!(host.dispatched.is_empty());
     e.drive(&mut host, 100, 10).unwrap();
-    assert_eq!(
-        e.snapshot().unwrap().runs[&first].outcome.as_deref(),
-        Some("error")
-    );
+    assert_eq!(settled(&e, &first).outcome.as_deref(), Some("error"));
     let second = e
         .admit("invoke", "main", Value::Null, authority(), 200)
         .unwrap();
@@ -1120,20 +1155,24 @@ fn retry_allowances_are_scoped_to_full_loop_invocation_paths() {
         )]),
         ..Default::default()
     };
-    for now in [0, 10, 20] {
+    for now in [0, 10] {
         e.drive(&mut host, now, 50).unwrap();
     }
-    let state = e.snapshot().unwrap();
-    assert_eq!(state.runs[&id].outcome.as_deref(), Some("ok"));
+    // Both items have reserved their iteration while the run is live; the
+    // budget leaves with the cohort.
+    assert_eq!(e.snapshot().unwrap().budgets[&id].iterations, 2);
+    e.drive(&mut host, 20, 50).unwrap();
+    let run = settled(&e, &id);
+    assert_eq!(run.outcome.as_deref(), Some("ok"));
     assert_eq!(host.dispatched.len(), 4);
-    assert_eq!(state.runs[&id].attempts.len(), 2);
-    assert!(state.runs[&id].attempts.values().all(|count| *count == 2));
-    assert_eq!(state.budgets[&id].iterations, 2);
+    assert_eq!(run.attempts.len(), 2);
+    assert!(run.attempts.values().all(|count| *count == 2));
+    assert!(!e.snapshot().unwrap().budgets.contains_key(&id));
 }
 
 #[test]
 fn bounded_driver_uses_persisted_fair_scope_queue_and_noop_does_not_commit() {
-    let store = MemoryStorage::default();
+    let store = MemoryStorage::retaining_settled();
     let e = Engine::new(store.clone(), "fair", "one").unwrap();
     for scope in ["alpha", "beta"] {
         let mut a = artifact(
@@ -1164,13 +1203,16 @@ fn bounded_driver_uses_persisted_fair_scope_queue_and_noop_does_not_commit() {
     assert_eq!(metrics.queue_latency.total_us, 10_000);
     assert_eq!(metrics.queue_latency.max_us, 5_000);
     let s = e.snapshot().unwrap();
-    let terminal_scopes = s
-        .runs
-        .values()
+    // The two finished runs (one per scope) have left as history.
+    let terminal_scopes = store
+        .settled_cohorts("fair")
+        .iter()
+        .flat_map(|c| &c.runs)
         .filter(|r| r.status.terminal())
         .map(|r| r.authority.scope.clone())
         .collect::<BTreeSet<_>>();
     assert_eq!(terminal_scopes, set(&["alpha", "beta"]));
+    assert_eq!(s.runs.len(), 4);
     assert!(s.indexes.ready_tokens.len() == 4);
     e.release().unwrap();
     let resumed = Engine::new(store.clone(), "fair", "two").unwrap();
@@ -1235,10 +1277,10 @@ fn activation_controls_separate_calls_events_and_current_execution() {
     e.set_activation_controls("waiter", ActivationControls::default(), 2)
         .unwrap();
     e.drive(&mut FakeHost::default(), 2, 10).unwrap();
-    assert_ne!(
-        e.snapshot().unwrap().runs[&id].reason.as_deref(),
-        Some("execution authority revoked")
-    );
+    // Re-enabled, the run received the retained event and finished.
+    let run = settled(&e, &id);
+    assert_ne!(run.reason.as_deref(), Some("execution authority revoked"));
+    assert_eq!(run.outcome.as_deref(), Some("ok"));
 }
 
 #[test]
@@ -1272,9 +1314,14 @@ fn gc_preserves_bound_transitive_closure_then_collects_terminal_cohorts_in_pages
         .admit("root", "main", Value::Null, authority(), 0)
         .unwrap();
     e.drive(&mut FakeHost::default(), 0, 50).unwrap();
-    assert_eq!(e.snapshot().unwrap().runs.len(), 3);
+    // The three-run cohort left the State when it settled, without GC.
+    let state = e.snapshot().unwrap();
+    assert!(state.runs.is_empty());
+    assert_eq!(e.store.settled_cohorts("test")[0].runs.len(), 3);
+    assert_eq!(inspected(&e, InspectionKind::Runs, None).len(), 3);
+    // GC still pages over what is left and keeps the bound closure.
     for _ in 0..3 {
-        e.collect_garbage(100, 1).unwrap();
+        assert_eq!(e.collect_garbage(100, 1).unwrap().runs, 0);
     }
     let state = e.snapshot().unwrap();
     assert!(state.runs.is_empty());
@@ -1367,11 +1414,20 @@ fn unsafe_recovery_requires_audited_request_and_preserves_original_authority() {
         }],
     );
     e.recover(&mut host, 2).unwrap();
+    assert!(e.snapshot().unwrap().recovery_requests[&request].consumed);
     e.drive(&mut host, 2, 10).unwrap();
-    let s = e.snapshot().unwrap();
-    assert_eq!(s.runs[&id].outcome.as_deref(), Some("ok"));
-    assert_eq!(s.intents[&intent.id].authority, authority());
-    assert!(s.recovery_requests[&request].consumed);
+    assert_eq!(settled(&e, &id).outcome.as_deref(), Some("ok"));
+    let cohort = &e.store.settled_cohorts("test")[0];
+    let settled_intent = cohort.intents.iter().find(|i| i.id == intent.id).unwrap();
+    assert_eq!(settled_intent.authority, authority());
+    assert!(
+        cohort
+            .receipts
+            .iter()
+            .any(|r| r.kind == "authorized_recovery")
+    );
+    // The consumed request left with its operation.
+    assert!(e.snapshot().unwrap().recovery_requests.is_empty());
 }
 
 #[test]
@@ -1408,11 +1464,16 @@ fn pruned_general_wait_history_refuses_registration_and_captured_replay_horizon_
         .unwrap();
     e.drive(&mut FakeHost::default(), 2001, 10).unwrap();
     let s = e.snapshot().unwrap();
-    assert_eq!(s.runs[&id].outcome.as_deref(), Some("error"));
+    assert_eq!(settled(&e, &id).outcome.as_deref(), Some("error"));
     assert!(s.waits.is_empty());
-    assert!(s.receipts.iter().any(|r| r.run == id
-        && r.kind == "error"
-        && r.detail.to_string().contains("history expired")));
+    assert!(
+        e.store.settled_cohorts("test")[0]
+            .receipts
+            .iter()
+            .any(|r| r.run == id
+                && r.kind == "error"
+                && r.detail.to_string().contains("history expired"))
+    );
 }
 
 struct CrashOnCancel {
@@ -1487,13 +1548,11 @@ fn cancellation_dispatch_crashes_reconcile_owner_before_same_key_delivery_retry(
             .insert("test.command".into(), vec![CancellationResult::Confirmed]);
         e.dispatch_next(&mut host.host, 2).unwrap();
         e.drive(&mut host.host, 2, 10).unwrap();
-        let state = e.snapshot().unwrap();
-        assert_eq!(state.runs[&id].status, RunStatus::Cancelled);
+        assert_eq!(settled(&e, &id).status, RunStatus::Cancelled);
         assert_eq!(host.host.dispatched.len(), 1);
-        assert_eq!(
-            host.keys,
-            vec![cancellation_key(&state.intents[&intent.id]).unwrap()]
-        );
+        let cohort = &e.store.settled_cohorts("test")[0];
+        let cancelled = cohort.intents.iter().find(|i| i.id == intent.id).unwrap();
+        assert_eq!(host.keys, vec![cancellation_key(cancelled).unwrap()]);
     }
 }
 
@@ -1536,10 +1595,7 @@ fn gc_preserves_possible_async_completion_while_lost_admission_handle_is_unknown
     );
     e.recover(&mut host, 4001).unwrap();
     e.drive(&mut host, 4001, 20).unwrap();
-    assert_eq!(
-        e.snapshot().unwrap().runs[&id].outcome.as_deref(),
-        Some("ok")
-    );
+    assert_eq!(settled(&e, &id).outcome.as_deref(), Some("ok"));
 }
 
 #[test]
@@ -1574,10 +1630,7 @@ fn producer_epoch_compaction_keeps_history_fences_for_existing_invocations() {
             .is_empty()
     );
     e.drive(&mut FakeHost::default(), 2001, 10).unwrap();
-    assert_eq!(
-        e.snapshot().unwrap().runs[&id].outcome.as_deref(),
-        Some("error")
-    );
+    assert_eq!(settled(&e, &id).outcome.as_deref(), Some("error"));
 }
 
 fn secret_input_artifact() -> Artifact {
@@ -1749,10 +1802,7 @@ fn confirmed_async_admission_recovery_resumes_accepted_branch_before_completion(
     let event = async_event(&completion, "confirmed-after-recovery");
     resumed.admit_event("host", event.clone(), 3).unwrap();
     resumed.drive(&mut host, 3, 20).unwrap();
-    assert_eq!(
-        resumed.snapshot().unwrap().runs[&run].outcome.as_deref(),
-        Some("ok")
-    );
+    assert_eq!(settled(&resumed, &run).outcome.as_deref(), Some("ok"));
     assert!(resumed.admit_event("host", event, 4).unwrap().duplicate);
     assert_eq!(host.dispatched.len(), 1);
 }
@@ -1787,9 +1837,6 @@ fn accepted_recovery_does_not_uncancel_a_run_or_bypass_revoked_authority() {
     host.cancellation_responses
         .insert("test.command".into(), vec![CancellationResult::Confirmed]);
     e.drive(&mut host, 3, 10).unwrap();
-    assert_eq!(
-        e.snapshot().unwrap().runs[&run].status,
-        RunStatus::Cancelled
-    );
+    assert_eq!(settled(&e, &run).status, RunStatus::Cancelled);
     assert_eq!(host.dispatched.len(), 1);
 }

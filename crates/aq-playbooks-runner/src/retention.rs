@@ -13,7 +13,9 @@
 //! request is taken); the history-or-expiry rule cannot judge them, so they
 //! are not fenced here.
 use crate::lazy::{LazyMap, LazySeq};
-use crate::{Error, Intent, IntentStatus, Result, Run, State, StorageError};
+use crate::{
+    Error, Intent, IntentStatus, Receipt, Result, Run, SettledCohort, State, StorageError,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -450,6 +452,234 @@ pub(crate) fn check_removals(
         }
     }
     Ok(removals)
+}
+/// At most this many settled cohorts leave the State in one commit.
+pub const COHORTS_PER_COMMIT: usize = 50;
+/// What one commit moved out of the State.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct CommitReport {
+    pub cohorts: usize,
+    pub runs: usize,
+    pub receipts: usize,
+    pub events: usize,
+    pub admissions: usize,
+    pub deferred: usize,
+    pub drained: usize,
+    pub more: bool,
+}
+/// The roots this commit touched: the roots of its dirty runs and operations.
+/// Call before `indexes::sync`, which clears the dirty sets. O(dirty).
+pub(crate) fn candidate_roots(s: &State) -> BTreeSet<String> {
+    let run_root = |run: &str| {
+        s.runs
+            .get(run)
+            .map(|r| r.root.clone())
+            .or_else(|| s.indexes.run_roots.get(run).cloned())
+    };
+    let mut roots = BTreeSet::new();
+    for id in &s.indexes.dirty_runs {
+        roots.extend(run_root(id));
+    }
+    for id in &s.indexes.dirty_intents {
+        let root = s
+            .intents
+            .get(id)
+            .and_then(|i| run_root(&i.run))
+            .or_else(|| s.indexes.intent_roots.get(id).cloned());
+        roots.extend(root);
+    }
+    roots
+}
+/// Whether the cohort of `root` is settled: it has members, none of them is
+/// active and none of its operations is unsettled (the root indexes after
+/// `indexes::sync`). O(1) index lookups.
+fn cohort_settled(s: &State, root: &str) -> bool {
+    let nonempty = |ids: Option<&BTreeSet<String>>| ids.is_some_and(|ids| !ids.is_empty());
+    nonempty(s.indexes.root_members.get(root))
+        && !nonempty(s.indexes.root_active.get(root))
+        && !nonempty(s.indexes.root_effects.get(root))
+}
+/// Remove every settled cohort among `candidates` (at most `limit`) from the
+/// State and hand each to storage as history (`State::settled`). A settled
+/// candidate beyond `limit` sets `report.more`.
+pub(crate) fn settle(
+    s: &mut State,
+    candidates: BTreeSet<String>,
+    limit: usize,
+    report: &mut CommitReport,
+) -> Result<()> {
+    let mut removed = 0;
+    for root in candidates {
+        if !cohort_settled(s, &root) {
+            continue;
+        }
+        if removed >= limit {
+            report.more = true;
+            break;
+        }
+        let cohort = remove_cohort(s, &root)?;
+        removed += 1;
+        report.cohorts += 1;
+        report.runs += cohort.runs.len();
+        report.receipts += cohort.receipts.len();
+        s.settled.push(cohort);
+    }
+    Ok(())
+}
+/// Take the receipts at `offsets` (positions in `s.receipts`) out of the
+/// State, compact the positional sequence and rebuild the receipt offset
+/// indexes. O(live receipts).
+fn take_receipts(s: &mut State, offsets: &BTreeSet<usize>) -> Vec<Receipt> {
+    if offsets.is_empty() {
+        return vec![];
+    }
+    let taken: Vec<Receipt> = offsets
+        .iter()
+        .filter_map(|&offset| s.receipts.get(offset).cloned())
+        .collect();
+    let mut position = 0;
+    s.receipts.retain(|_| {
+        let keep = !offsets.contains(&position);
+        position += 1;
+        keep
+    });
+    s.indexes.receipts.clear();
+    s.indexes.all_receipts.clear();
+    let live: Vec<(String, u64)> = s
+        .receipts
+        .iter()
+        .map(|r| (r.run.clone(), r.sequence))
+        .collect();
+    for (offset, (run, sequence)) in live.into_iter().enumerate() {
+        s.indexes
+            .receipts
+            .entry(run)
+            .or_default()
+            .insert(sequence, offset);
+        s.indexes.all_receipts.insert(sequence, offset);
+    }
+    taken
+}
+/// Offsets of the receipts owned by `run`, checked against the receipt.
+fn receipt_offsets(s: &State, run: &str) -> Vec<usize> {
+    s.indexes
+        .receipts
+        .get(run)
+        .into_iter()
+        .flat_map(|offsets| offsets.values().copied())
+        .filter(|&offset| s.receipts.get(offset).is_some_and(|r| r.run == run))
+        .collect()
+}
+/// Remove the cohort of `root` from the State: its runs, operations, their
+/// recovery requests, waits, receipts and budget. Its runs and operations
+/// are marked dirty, so the next `indexes::sync` drops their index entries.
+/// O(cohort) plus O(live receipts) for compaction and O(live waits).
+pub(crate) fn remove_cohort(s: &mut State, root: &str) -> Result<SettledCohort> {
+    let members: Vec<String> = s
+        .indexes
+        .root_members
+        .get(root)
+        .map(|ids| ids.iter().cloned().collect())
+        .unwrap_or_default();
+    let intent_ids: Vec<String> = s
+        .indexes
+        .root_intents
+        .get(root)
+        .map(|ids| ids.iter().cloned().collect())
+        .unwrap_or_default();
+    let mut offsets = BTreeSet::new();
+    let mut finished_at_ms = None;
+    for id in &members {
+        offsets.extend(receipt_offsets(s, id));
+        let terminal = s
+            .runs
+            .get(id)
+            .and_then(|r| r.terminal_sequence)
+            .and_then(|sequence| s.indexes.all_receipts.get(&sequence).copied())
+            .and_then(|offset| s.receipts.get(offset));
+        if let Some(receipt) = terminal {
+            finished_at_ms = finished_at_ms.max(Some(receipt.at_ms));
+        }
+    }
+    let mut runs = vec![];
+    for id in &members {
+        if let Some(run) = s.runs.remove(id) {
+            runs.push(run);
+        }
+        crate::indexes::mark_run(s, id);
+    }
+    let mut intents = vec![];
+    for id in &intent_ids {
+        if let Some(intent) = s.intents.remove(id) {
+            intents.push(intent);
+        }
+        crate::indexes::mark_intent(s, id);
+    }
+    if !intent_ids.is_empty() && !s.recovery_requests.is_empty() {
+        let ids: BTreeSet<&String> = intent_ids.iter().collect();
+        s.recovery_requests
+            .retain(|_, request| !ids.contains(&request.intent));
+    }
+    if !s.waits.is_empty() {
+        let ids: BTreeSet<&String> = members.iter().collect();
+        s.waits.retain(|_, wait| !ids.contains(&wait.run));
+    }
+    let receipts = take_receipts(s, &offsets);
+    s.budgets.remove(root);
+    let finished_at_ms = finished_at_ms
+        .or_else(|| receipts.iter().map(|r| r.at_ms).max())
+        .or(s.retention.clock_ms)
+        .unwrap_or(0);
+    Ok(SettledCohort {
+        root: root.into(),
+        finished_at_ms,
+        runs,
+        intents,
+        receipts,
+    })
+}
+/// Move the receipts owned by `owner`, which belongs to no cohort (`"admin"`,
+/// `"event:<key>"`), out of the State as a cohort of root `owner` with no
+/// runs. `None` when it owns none. O(its receipts) plus compaction.
+pub(crate) fn move_unowned_receipts(s: &mut State, owner: &str) -> Result<Option<SettledCohort>> {
+    let offsets: BTreeSet<usize> = receipt_offsets(s, owner).into_iter().collect();
+    if offsets.is_empty() {
+        return Ok(None);
+    }
+    let receipts = take_receipts(s, &offsets);
+    let finished_at_ms = receipts
+        .iter()
+        .map(|r| r.at_ms)
+        .max()
+        .or(s.retention.clock_ms)
+        .unwrap_or(0);
+    Ok(Some(SettledCohort {
+        root: owner.into(),
+        finished_at_ms,
+        runs: vec![],
+        intents: vec![],
+        receipts,
+    }))
+}
+/// The retention work of every commit that changes the State, after its
+/// indexes are synchronized: move the clock to the commit's host time, remove
+/// the settled cohorts among `candidates` (see [`candidate_roots`]), and move
+/// `"admin"` receipts to history.
+pub(crate) fn finish_commit(
+    s: &mut State,
+    now_ms: Option<i64>,
+    candidates: BTreeSet<String>,
+) -> Result<CommitReport> {
+    let mut report = CommitReport::default();
+    if let Some(now_ms) = now_ms {
+        advance_clock(s, now_ms);
+    }
+    settle(s, candidates, COHORTS_PER_COMMIT, &mut report)?;
+    if let Some(cohort) = move_unowned_receipts(s, "admin")? {
+        report.receipts += cohort.receipts.len();
+        s.settled.push(cohort);
+    }
+    Ok(report)
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GcReport {

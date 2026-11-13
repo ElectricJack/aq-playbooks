@@ -700,10 +700,24 @@ fn main() {
             let wal_med = median(&mut wal);
             let wal_max = wal.iter().copied().max().unwrap_or(0);
             let state = e.snapshot().unwrap();
+            // A finished run has left the State (spec 0003): read its
+            // public projection from run history.
             let status = state
                 .runs
                 .get(&id)
-                .map(|r| format!("{:?}/{:?}", r.status, r.outcome));
+                .map(|r| format!("{:?}/{:?}", r.status, r.outcome))
+                .or_else(|| {
+                    e.inspect(&InspectionQuery {
+                        kind: InspectionKind::Runs,
+                        run: Some(id.clone()),
+                        after: None,
+                        limit: 1,
+                    })
+                    .unwrap()
+                    .items
+                    .first()
+                    .map(|r| format!("history:{}/{}", r["status"], r["outcome"]))
+                });
             let completed = state
                 .runs
                 .values()

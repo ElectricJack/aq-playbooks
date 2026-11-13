@@ -1062,3 +1062,85 @@ fn full_commit_reads_only_created_identities_from_disposal_tombstones() {
         assert_eq!(store.load(&ns).unwrap().revision, revision, "{label}");
     }
 }
+
+// --- Task 5: a settled cohort leaves the record in the commit that settles it
+
+fn count(sql: &str, ns: &str, id: &str) -> i64 {
+    support::client()
+        .query_one(sql, &[&ns, &id])
+        .unwrap()
+        .get(0)
+}
+#[test]
+fn finished_run_leaves_protected_snapshot_and_projections_and_writes_no_tombstone() {
+    for (format, store) in both() {
+        let ns = support::namespace("leaves");
+        let e = Engine::new(store, &ns, "w").unwrap();
+        let a = support::artifact("a");
+        let digest = a.digest.clone();
+        e.install(a).unwrap();
+        let authority = Authority {
+            actor: "synthetic-test".into(),
+            scope: "project".into(),
+            capabilities: Default::default(),
+        };
+        e.activate_at("a", &digest, authority.clone(), 0).unwrap();
+        let id = e.admit("a", "main", Value::Null, authority, 1).unwrap();
+        // Live first: the projections hold the run.
+        if format == "f2" {
+            assert_eq!(
+                count(
+                    "SELECT count(*) FROM aq_playbooks.inspection_rows WHERE namespace=$1 AND run_id=$2",
+                    &ns,
+                    &id
+                ),
+                2,
+                "{format}: run and admitted receipt projected while live"
+            );
+        }
+        assert!(e.advance(&id, 2).unwrap());
+        let state = e.store.load(&ns).unwrap().state;
+        assert!(state.runs.is_empty(), "{format}");
+        assert!(
+            state.receipts.is_empty() && state.budgets.is_empty(),
+            "{format}"
+        );
+        if format == "f2" {
+            assert_eq!(
+                count(
+                    "SELECT count(*) FROM aq_playbooks.inspection_rows WHERE namespace=$1 AND (run_id=$2 OR item_key=$2)",
+                    &ns,
+                    &id
+                ),
+                0,
+                "{format}: inspection_rows"
+            );
+            assert_eq!(
+                count(
+                    "SELECT count(*) FROM aq_playbooks.runtime_index WHERE namespace=$1 AND (item_key=$2 OR item_key LIKE '%' || $2)",
+                    &ns,
+                    &id
+                ),
+                0,
+                "{format}: runtime_index"
+            );
+        }
+        assert_eq!(
+            count(
+                "SELECT count(*) FROM aq_playbooks.run_history WHERE namespace=$1 AND kind='runs' AND item_key=$2",
+                &ns,
+                &id
+            ),
+            1,
+            "{format}: run history row"
+        );
+        assert_eq!(tombstone_rows(&ns), 0, "{format}: disposal tombstones");
+        let runs = e.inspect(&runs_query()).unwrap();
+        assert_eq!(runs.items.len(), 1, "{format}");
+        assert_eq!(runs.items[0]["status"], "completed", "{format}");
+        assert!(
+            matches!(e.advance(&id, 3), Err(Error::NotFound(_))),
+            "{format}"
+        );
+    }
+}

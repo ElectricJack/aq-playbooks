@@ -273,7 +273,7 @@ macro_rules! quiet {
 impl Pair {
     fn new(r: RecordStorage) -> Self {
         let mut p = Self {
-            m: Engine::new(MemoryStorage::default(), NS, "owner").unwrap(),
+            m: Engine::new(MemoryStorage::retaining_settled(), NS, "owner").unwrap(),
             r: Engine::new(r, NS, "owner").unwrap(),
             steps: 0,
         };
@@ -322,6 +322,26 @@ impl Pair {
                 );
             }
             panic!("step {}: canonical state differs after {step}", self.steps);
+        }
+        // Settled cohorts leave both States: the history (and so every
+        // inspection page over live state plus history) is the same too.
+        for kind in [
+            InspectionKind::Runs,
+            InspectionKind::Effects,
+            InspectionKind::Receipts,
+        ] {
+            let query = InspectionQuery {
+                kind,
+                run: None,
+                after: None,
+                limit: 1000,
+            };
+            assert_eq!(
+                self.m.inspect(&query).unwrap().items,
+                self.r.inspect(&query).unwrap().items,
+                "step {}: {kind:?} inspection after {step}",
+                self.steps
+            );
         }
         let counts = quota_counts(&m.state).unwrap();
         if self.r.store.stats.transitions.load(Ordering::Relaxed) > 0 {
@@ -556,6 +576,9 @@ fn transition_reference_equivalence() {
     scenario(&mut p);
     let transitions = stats.transitions.load(Ordering::Relaxed) - before;
     assert!(transitions > 100, "bounded path exercised: {transitions}");
+    // Cohorts settled and left through the bounded path (history compared
+    // at every step by `check`).
+    assert!(p.m.store.settled_cohorts(NS).len() > 1);
     // A steady-state event admission performs no full load and no full commit.
     let (loads, commits) = (
         stats.full_loads.load(Ordering::Relaxed),

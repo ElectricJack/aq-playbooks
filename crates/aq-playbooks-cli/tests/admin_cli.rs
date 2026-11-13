@@ -275,6 +275,35 @@ fn protected_admin_lifecycle_control_recovery_rotation_and_paged_inspection() {
         ],
         Some(&keys_b),
     );
+    // Cancel waits on the unresolved operation; once the host settles it, a
+    // second cancel finishes the run, which leaves the State. The view reads
+    // it from run history, and a later command for it is not found.
+    let view = f.ok(&["cancel", &run], Some(&keys_b));
+    assert_eq!(view["runs"][0]["status"], "cancelling");
+    let store =
+        PostgresStorage::connect_protected(&f.database, read_keyring(&keys_b).unwrap()).unwrap();
+    let e = Engine::new(store, &f.namespace, "test-host-settle").unwrap();
+    e.record_result(
+        &intent,
+        DispatchResult::Rejected {
+            reason: "private-host-detail".into(),
+        },
+        2,
+    )
+    .unwrap();
+    e.release().unwrap();
+    drop(e);
+    let view = f.ok(&["cancel", &run], Some(&keys_b));
+    assert_eq!(view["runs"][0]["id"], run.as_str());
+    assert_eq!(view["runs"][0]["status"], "cancelled");
+    assert!(!view["receipts"].as_array().unwrap().is_empty());
+    let state = PostgresStorage::connect_protected(&f.database, read_keyring(&keys_b).unwrap())
+        .unwrap()
+        .load(&f.namespace)
+        .unwrap()
+        .state;
+    assert!(!state.runs.contains_key(&run));
+    assert!(!f.call(&["cancel", &run], Some(&keys_b)).status.success());
 }
 #[test]
 fn key_file_permissions_and_invalid_configuration_fail_closed() {

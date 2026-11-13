@@ -5,14 +5,14 @@ use aq_playbooks_cli::{
     fake_host::{Episode, FakeHost, Observation, Subject},
     pilots,
 };
-use aq_playbooks_runner::{Engine, IntentStatus, MemoryStorage, RunStatus};
+use aq_playbooks_runner::{Engine, Error, Intent, IntentStatus, MemoryStorage, Run, RunStatus};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
 fn setup(name: &str) -> (Engine<MemoryStorage>, FakeHost, String) {
     let scenario = pilots::scenario(name).unwrap();
     let engine = Engine::new(
-        MemoryStorage::default(),
+        MemoryStorage::retaining_settled(),
         format!("host-{name}"),
         "runtime-1",
     )
@@ -91,7 +91,13 @@ fn drive_with_hook(
         let mut changed = false;
         let ids: Vec<_> = engine.snapshot().unwrap().runs.keys().cloned().collect();
         for id in ids {
-            changed |= engine.advance(&id, now).unwrap();
+            // An earlier advance in this pass may have settled the cohort
+            // of `id`, which then left the State.
+            match engine.advance(&id, now) {
+                Ok(progress) => changed |= progress,
+                Err(Error::NotFound(_)) => {}
+                Err(error) => panic!("advance {id}: {error}"),
+            }
         }
         for intent in engine
             .snapshot()
@@ -122,6 +128,23 @@ fn drive_with_hook(
         }
     }
     panic!("pilot exceeded integration transition bound");
+}
+
+/// A finished root's run as its cohort left the State (asserting it left).
+fn settled(engine: &Engine<MemoryStorage>, id: &str) -> Run {
+    assert!(
+        !engine.snapshot().unwrap().runs.contains_key(id),
+        "{id} is live"
+    );
+    engine.store.settled_run(&engine.namespace, id).unwrap()
+}
+/// Every run and operation that has left the State with a settled cohort.
+fn settled_items(engine: &Engine<MemoryStorage>) -> (Vec<Run>, Vec<Intent>) {
+    let cohorts = engine.store.settled_cohorts(&engine.namespace);
+    (
+        cohorts.iter().flat_map(|c| c.runs.clone()).collect(),
+        cohorts.iter().flat_map(|c| c.intents.clone()).collect(),
+    )
 }
 
 fn complete(
@@ -160,19 +183,17 @@ fn complete(
 fn routing_uses_authorized_assessment_and_host_revision_preconditions() {
     let (engine, mut host, root) = setup("routing");
     drive(&engine, &mut host, 0, false, true);
-    let state = engine.snapshot().unwrap();
-    assert_eq!(state.runs[&root].outcome.as_deref(), Some("success"));
+    assert_eq!(settled(&engine, &root).outcome.as_deref(), Some("success"));
     assert_eq!(host.subjects["candidate-1"], 2);
-    let change = state
-        .intents
-        .values()
+    let (_, intents) = settled_items(&engine);
+    let change = intents
+        .iter()
         .find(|intent| intent.command.name == "work.change")
         .unwrap();
     assert_eq!(change.input["value"], "permitted-default");
     assert!(
-        state
-            .intents
-            .values()
+        intents
+            .iter()
             .any(|intent| intent.command.name == "judgment.request")
     );
 }
@@ -184,10 +205,7 @@ fn watcher_reconciles_host_attested_observation_and_recovers_atomic_notification
     host.record_evaluation("evaluation-1", "snapshot-1", &findings)
         .unwrap();
     drive(&engine, &mut host, 0, false, false);
-    assert_eq!(
-        engine.snapshot().unwrap().runs[&root].outcome.as_deref(),
-        Some("success")
-    );
+    assert_eq!(settled(&engine, &root).outcome.as_deref(), Some("success"));
     assert!(host.episodes["project-health/stuck-work"].active);
     assert_eq!(host.outbox.len(), 1);
     host.deliver_notifications(1, false).unwrap();
@@ -234,10 +252,7 @@ fn watcher_partial_positive_scan_keeps_unseen_episode_open() {
     )
     .unwrap();
     drive(&engine, &mut host, 0, false, false);
-    assert_eq!(
-        engine.snapshot().unwrap().runs[&root].outcome.as_deref(),
-        Some("success")
-    );
+    assert_eq!(settled(&engine, &root).outcome.as_deref(), Some("success"));
     assert!(host.episodes["project-health/stuck-work"].active);
     assert!(host.episodes["project-health/unseen"].active);
     assert_eq!(host.episodes["project-health/unseen"].revision, 3);
@@ -257,12 +272,15 @@ fn coding_admission_and_completed_review_with_changes_cannot_publish() {
     assert!(host.candidates.is_empty());
     complete(&engine, &mut host, "review", "changes_requested", 2);
     drive(&engine, &mut host, 2, true, false);
-    let state = engine.snapshot().unwrap();
-    assert_eq!(state.runs[&root].outcome.as_deref(), Some("escalated"));
+    assert_eq!(
+        settled(&engine, &root).outcome.as_deref(),
+        Some("escalated")
+    );
+    let (_, intents) = settled_items(&engine);
+    assert!(!intents.is_empty());
     assert!(
-        state
-            .intents
-            .values()
+        intents
+            .iter()
             .all(|intent| intent.command.name != "candidate.publish")
     );
     assert_eq!(host.subjects["main"], 1);
@@ -276,12 +294,12 @@ fn coding_requires_explicit_accepted_review_and_exact_check_before_independent_f
     drive(&engine, &mut host, 1, true, false);
     complete(&engine, &mut host, "review", "accepted", 2);
     drive(&engine, &mut host, 2, true, false);
-    let state = engine.snapshot().unwrap();
-    assert_eq!(state.runs[&root].outcome.as_deref(), Some("success"));
+    assert_eq!(settled(&engine, &root).outcome.as_deref(), Some("success"));
     assert_eq!(host.subjects["main"], 2);
     assert!(!host.evidence.is_empty());
     assert_eq!(host.messages.len(), 1);
-    assert!(state.runs.values().any(|run| run.origin.is_some()
+    let (runs, _) = settled_items(&engine);
+    assert!(runs.iter().any(|run| run.origin.is_some()
         && run.parent.is_none()
         && run.status == RunStatus::Completed));
     assert!(
@@ -328,8 +346,8 @@ fn coding_real_publication_conflict_observes_new_base_repairs_and_checks_new_can
     );
     complete(&engine, &mut host, "repair", "accepted", 3);
     drive(&engine, &mut host, 3, true, false);
-    let state = engine.snapshot().unwrap();
-    assert_eq!(state.runs[&root].outcome.as_deref(), Some("success"));
+    assert_eq!(settled(&engine, &root).outcome.as_deref(), Some("success"));
+    let (_, intents) = settled_items(&engine);
     assert_eq!(host.subjects["main"], 3);
     assert_eq!(host.candidates.len(), 2);
     assert_eq!(
@@ -349,9 +367,8 @@ fn coding_real_publication_conflict_observes_new_base_repairs_and_checks_new_can
         2
     );
     assert_eq!(
-        state
-            .intents
-            .values()
+        intents
+            .iter()
             .filter(|intent| intent.command.name == "candidate.publish")
             .count(),
         2
@@ -375,17 +392,27 @@ fn report_deadline_cancels_owned_author_and_late_completion_keeps_one_message() 
     assert_eq!(host.messages.len(), 1);
     let author = host.work.values().next().unwrap().clone();
     assert!(author.cancelled);
+    // The fallback finished the root; its cohort, with the cancelled author
+    // operation, has left the State.
+    assert_eq!(settled(&engine, &root).outcome.as_deref(), Some("success"));
+    let (_, intents) = settled_items(&engine);
+    assert!(
+        intents
+            .iter()
+            .filter(|intent| intent.command.name == "work.ensure")
+            .any(|intent| intent.status == IntentStatus::Cancelled && intent.cancel_requested)
+    );
     complete(&engine, &mut host, "supervisor_authoring", "accepted", 2000);
     drive(&engine, &mut host, 2000, false, false);
     assert_eq!(host.messages.len(), 1);
+    // The late completion finds no operation (spec 0003 ruling: a late
+    // result for a cancelled operation that left is not found); nothing is
+    // revived and history is unchanged.
     let state = engine.snapshot().unwrap();
-    assert_eq!(state.runs[&root].outcome.as_deref(), Some("success"));
-    assert!(
-        state
-            .intents
-            .values()
-            .filter(|intent| intent.command.name == "work.ensure")
-            .any(|intent| !intent.late_results.is_empty())
+    assert!(state.runs.is_empty() && state.intents.is_empty());
+    assert_eq!(
+        serde_json::to_value(settled_items(&engine).1).unwrap(),
+        serde_json::to_value(&intents).unwrap()
     );
 }
 

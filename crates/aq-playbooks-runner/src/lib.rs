@@ -443,9 +443,30 @@ impl<S: Storage> Engine<S> {
         now_ms: Option<i64>,
         f: impl FnOnce(&mut State) -> Result<(T, bool)>,
     ) -> Result<T> {
+        self.transaction_report_at(now_ms, f)
+            .map(|(value, _)| value)
+    }
+    /// One commit, and what its retention work moved out of the State. When
+    /// the plan changes the State, both paths run `candidate_roots`,
+    /// `indexes::sync`, `finish_commit` (clock, settled cohorts, admin
+    /// receipts) and `indexes::sync` again, so a cohort leaves in the commit
+    /// that settles it.
+    fn transaction_report_at<T>(
+        &self,
+        now_ms: Option<i64>,
+        f: impl FnOnce(&mut State) -> Result<(T, bool)>,
+    ) -> Result<(T, retention::CommitReport)> {
+        fn finish(state: &mut State, now_ms: Option<i64>) -> Result<retention::CommitReport> {
+            let candidates = retention::candidate_roots(state);
+            indexes::sync(state)?;
+            let report = retention::finish_commit(state, now_ms, candidates)?;
+            indexes::sync(state)?;
+            Ok(report)
+        }
         let protection = self.store.protection_available();
         let mut f = Some(f);
         let mut result = None;
+        let mut report = retention::CommitReport::default();
         let config = &self.config;
         let metrics = &self.metrics;
         let mut plan = |state: &mut State| -> Result<bool> {
@@ -459,10 +480,7 @@ impl<S: Storage> Engine<S> {
             let (value, changed) = evaluated?;
             result = Some(value);
             if changed {
-                indexes::sync(state)?;
-                if let Some(now_ms) = now_ms {
-                    retention::advance_clock(state, now_ms);
-                }
+                report = finish(state, now_ms)?;
             }
             Ok(changed)
         };
@@ -481,7 +499,9 @@ impl<S: Storage> Engine<S> {
         if outcome != TransitionOutcome::Unsupported {
             self.metrics
                 .record_time(metrics::Timing::Commit, started.elapsed());
-            return result.ok_or_else(|| Error::Conflict("transition plan did not run".into()));
+            let value =
+                result.ok_or_else(|| Error::Conflict("transition plan did not run".into()))?;
+            return Ok((value, report));
         }
         let f = f.ok_or_else(|| Error::Conflict("unsupported transition ran the plan".into()))?;
         let started = std::time::Instant::now();
@@ -499,12 +519,9 @@ impl<S: Storage> Engine<S> {
             .record_time(metrics::Timing::Transition, started.elapsed());
         let (result, changed) = evaluated?;
         if !changed {
-            return Ok(result);
+            return Ok((result, retention::CommitReport::default()));
         }
-        indexes::sync(&mut v.state)?;
-        if let Some(now_ms) = now_ms {
-            retention::advance_clock(&mut v.state, now_ms);
-        }
+        let report = finish(&mut v.state, now_ms)?;
         check_quota(&self.config, &quota_counts(&v.state)?)?;
         let started = std::time::Instant::now();
         let committed =
@@ -513,7 +530,7 @@ impl<S: Storage> Engine<S> {
         self.metrics
             .record_time(metrics::Timing::Commit, started.elapsed());
         committed?;
-        Ok(result)
+        Ok((result, report))
     }
     pub fn install(&self, artifact: Artifact) -> Result<()> {
         artifact.verify()?;
@@ -528,14 +545,17 @@ impl<S: Storage> Engine<S> {
         })
     }
     pub fn activate(&self, binding: &str, artifact: &str, authority: Authority) -> Result<()> {
-        let now_ms = self
-            .store
-            .load(&self.namespace)?
-            .state
+        let state = self.store.load(&self.namespace)?.state;
+        let derived = state
             .receipts
             .last()
             .map(|receipt| receipt.at_ms)
             .unwrap_or(0);
+        // Finished work leaves with its receipts; the clock still dates it.
+        let now_ms = state
+            .retention
+            .clock_ms
+            .map_or(derived, |clock| clock.max(derived));
         // A derived time, not host time: the clock does not move.
         self.activate_with(binding, artifact, authority, now_ms, None)
     }
@@ -763,8 +783,15 @@ impl<S: Storage> Engine<S> {
                     }
                     let mut ctx = EvalContext::new();
                     ctx.insert("event".into(), EvalValue::Known(event.payload.clone()));
-                    let destination_key =
-                        digest(&(&key, &binding, activation.revision, &trigger.id))?;
+                    // The acceptance sequence keeps the run ids of an event
+                    // accepted again after its window apart (SC-7).
+                    let destination_key = digest(&(
+                        &key,
+                        s.sequence + 1,
+                        &binding,
+                        activation.revision,
+                        &trigger.id,
+                    ))?;
                     let input = match known_expr(&trigger.input, &ctx).and_then(|input| {
                         a.content.playbook.entries[&trigger.entry]
                             .input
@@ -1671,7 +1698,10 @@ fn advance_inner(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
         return Ok(());
     }
     let own_limits = &s.artifacts[&r.artifact].content.playbook.limits;
-    let root_run = &s.runs[&r.root];
+    let root_run = s
+        .runs
+        .get(&r.root)
+        .ok_or_else(|| Error::Conflict(format!("root {} of a live run is missing", r.root)))?;
     let root_limits = &s.artifacts[&root_run.artifact].content.playbook.limits;
     if now.saturating_sub(root_run.admitted_at_ms) >= root_limits.max_duration_ms as i64
         || now.saturating_sub(r.admitted_at_ms) > own_limits.max_duration_ms as i64
@@ -1718,9 +1748,15 @@ fn advance_inner(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
     }
     let a = s.artifacts[&r.artifact].clone();
     let limits = &a.content.playbook.limits;
-    let root = &s.runs[&r.root];
+    let root = s
+        .runs
+        .get(&r.root)
+        .ok_or_else(|| Error::Conflict(format!("root {} of a live run is missing", r.root)))?;
     let root_limits = &s.artifacts[&root.artifact].content.playbook.limits;
-    let budget = s.budgets.get_mut(&r.root).unwrap();
+    let budget = s
+        .budgets
+        .get_mut(&r.root)
+        .ok_or_else(|| Error::Conflict(format!("budget of root {} is missing", r.root)))?;
     if budget.visits >= root_limits.max_step_visits || r.visits >= limits.max_step_visits {
         return Err(Error::Exhausted("step visits".into()));
     }
@@ -2026,7 +2062,10 @@ fn advance_inner(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
             if r.depth + 1 > root_limits.max_depth || r.depth + 1 > limits.max_depth {
                 return Err(Error::Exhausted("child depth".into()));
             }
-            let budget = s.budgets.get_mut(&r.root).unwrap();
+            let budget = s
+                .budgets
+                .get_mut(&r.root)
+                .ok_or_else(|| Error::Conflict(format!("budget of root {} is missing", r.root)))?;
             if budget.children >= root_limits.max_children
                 || s.runs
                     .values()
@@ -2192,14 +2231,20 @@ fn deadline(now: i64, duration: u64) -> Result<i64> {
         .ok_or_else(|| Error::Refused("deadline overflow".into()))
 }
 fn reserve_iteration(s: &mut State, r: &Run, limits: &Limits) -> Result<()> {
-    let root = &s.runs[&r.root];
+    let root = s
+        .runs
+        .get(&r.root)
+        .ok_or_else(|| Error::Conflict(format!("root {} of a live run is missing", r.root)))?;
     let bound = s.artifacts[&root.artifact]
         .content
         .playbook
         .limits
         .max_iterations
         .min(limits.max_iterations);
-    let b = s.budgets.get_mut(&r.root).unwrap();
+    let b = s
+        .budgets
+        .get_mut(&r.root)
+        .ok_or_else(|| Error::Conflict(format!("budget of root {} is missing", r.root)))?;
     if b.iterations >= bound {
         return Err(Error::Exhausted("iterations".into()));
     }
@@ -2253,7 +2298,10 @@ fn finish(
     indexes::wake_dependents(s, &r.id);
 }
 fn settled(s: &State, r: &Run) -> bool {
-    r.children.iter().all(|id| s.runs[id].status.terminal())
+    // A child absent from the State has left with its settled cohort.
+    r.children
+        .iter()
+        .all(|id| s.runs.get(id).is_none_or(|c| c.status.terminal()))
         && match indexes::root_open_intents(s, &r.root) {
             Some(open) => !open.iter().any(|id| s.intents[id].run == r.id),
             None => s.intents.values().filter(|i| i.run == r.id).all(|i| {
@@ -2374,7 +2422,11 @@ fn poll_pending(s: &mut State, r: &mut Run, pending: Pending, now: i64) -> Resul
             }
         }
         Pending::Child { child, bind } => {
-            let c = s.runs[&child].clone();
+            let c = s
+                .runs
+                .get(&child)
+                .ok_or_else(|| Error::NotFound(child.clone()))?
+                .clone();
             if c.status.terminal() {
                 let outcome = c.outcome.unwrap_or_else(|| {
                     match c.status {
