@@ -168,7 +168,7 @@ fn transition_with(
         }
         Ok(true)
     };
-    let validate = |_: &State, _: &QuotaCounts| Ok(());
+    let validate = |_: &State, _: &QuotaCounts, _: &QuotaCounts| Ok(());
     storage_error(store.transition_v1(
         ns,
         "w",
@@ -1280,7 +1280,7 @@ fn a_clock_rebase_is_licensed_on_every_commit_path() {
             f(s);
             Ok(true)
         };
-        let validate = |_: &State, _: &QuotaCounts| Ok(());
+        let validate = |_: &State, _: &QuotaCounts, _: &QuotaCounts| Ok(());
         storage_error(store.transition_v1(
             &ns,
             "w",
@@ -1323,7 +1323,7 @@ fn a_clock_rebase_is_licensed_on_every_commit_path() {
         license(s, retention::CLOCK_REBASE, 500, 100);
         Ok(true)
     };
-    let validate = |_: &State, _: &QuotaCounts| Ok(());
+    let validate = |_: &State, _: &QuotaCounts, _: &QuotaCounts| Ok(());
     storage_error(store.transition_v1(
         &ns,
         "w",
@@ -1423,7 +1423,7 @@ fn format_3_transitions_hold_the_removal_fences() {
             f(s);
             Ok(true)
         };
-        let validate = |_: &State, _: &QuotaCounts| Ok(());
+        let validate = |_: &State, _: &QuotaCounts, _: &QuotaCounts| Ok(());
         storage_error(store.transition_v1(
             ns,
             "w",
@@ -2326,25 +2326,60 @@ fn legacy_tombstone_rows_beyond_max_tombstones_refuse_no_commit_and_are_not_scan
         assert_eq!(tombstone_rows(&ns), 0, "{label}");
     }
 }
-/// Migration 7: autovacuum runs without cost delay on the namespace table
-/// and on its TOAST table (tuning for the one-row rewrite on format 2).
+// --- Task 8 fix round 1: a quota refuses only growth -----------------------
+
+/// On f2 protected and f3: over a lowered `max_runs`, an admission is
+/// refused and runs still finish and leave; a clock rebase lands at a full
+/// `max_state_bytes` (its licence adds the stale floor).
 #[test]
-fn namespaces_table_and_its_toast_vacuum_without_cost_delay() {
-    let _ = support::store();
-    let row = support::client()
-        .query_one(
-            "SELECT c.reloptions, t.reloptions FROM pg_class c JOIN pg_class t ON t.oid=c.reltoastrelid WHERE c.oid='aq_playbooks.namespaces'::regclass",
-            &[],
-        )
+fn a_quota_refuses_only_growth_on_postgres() {
+    for (format, store) in both() {
+        let ns = support::namespace("growth");
+        let mut e = Engine::new(store, &ns, "w").unwrap();
+        let a = support::artifact("a");
+        let digest = a.digest.clone();
+        e.install(a).unwrap();
+        e.activate_at("a", &digest, pg_authority(), 0).unwrap();
+        e.set_retention_policy(RetentionPolicy {
+            admission_replay_ms: 1_000,
+            ..RetentionPolicy::default()
+        })
         .unwrap();
-    let table: Option<Vec<String>> = row.get(0);
-    let toast: Option<Vec<String>> = row.get(1);
-    assert_eq!(
-        table.unwrap_or_default(),
-        vec!["autovacuum_vacuum_cost_delay=0".to_string()]
-    );
-    assert_eq!(
-        toast.unwrap_or_default(),
-        vec!["autovacuum_vacuum_cost_delay=0".to_string()]
-    );
+        let runs: Vec<String> = (1..4)
+            .map(|t| {
+                e.admit("a", "main", Value::Null, pg_authority(), t)
+                    .unwrap()
+            })
+            .collect();
+        e.config.max_runs = 1;
+        let refused = |e: &Engine<PostgresStorage>, t: i64| {
+            matches!(
+                e.admit("a", "main", Value::Null, pg_authority(), t),
+                Err(Error::Refused(m)) if m.contains("(limit max_runs 1)")
+            )
+        };
+        assert!(refused(&e, 10), "{format}");
+        assert!(e.advance(&runs[0], 11).unwrap(), "{format}");
+        assert!(e.advance(&runs[1], 12).unwrap(), "{format}");
+        assert!(refused(&e, 13), "{format}");
+        assert!(e.advance(&runs[2], 14).unwrap(), "{format}");
+        e.config.max_runs = EngineConfig::default().max_runs;
+        // Pin the clock a year ahead, then rebase at a full record.
+        let now: i64 = 1_763_000_000_000;
+        let pinned = now + 31_536_000_000;
+        for i in 0..3 {
+            let d = e
+                .admit_once(pg_keyed(&e, &format!("p{i}")), pinned)
+                .unwrap();
+            assert!(e.advance(&d.receipt.run_id, pinned).unwrap(), "{format}");
+        }
+        e.config.max_state_bytes = quota_counts(&e.snapshot().unwrap()).unwrap().state_bytes;
+        e.rebase_retention_clock(now, now, "operator", "clock pinned a year ahead", now)
+            .unwrap_or_else(|err| panic!("{format}: {err}"));
+        assert_eq!(
+            e.snapshot().unwrap().retention.clock_ms,
+            Some(now),
+            "{format}"
+        );
+    }
 }

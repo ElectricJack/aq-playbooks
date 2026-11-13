@@ -42,42 +42,70 @@ pub struct TransitionRequest<'a> {
     pub operation: &'static str,
     /// Runs the engine transition on the bound State; returns whether it changed.
     pub plan: &'a mut dyn FnMut(&mut State) -> Result<bool>,
-    /// Shared quota validation, given the exact post-transition counts.
-    pub validate: &'a dyn Fn(&State, &QuotaCounts) -> Result<()>,
+    /// Shared quota validation, given the exact counts of the stored
+    /// revision before the transition, then after it.
+    pub validate: &'a dyn Fn(&State, &QuotaCounts, &QuotaCounts) -> Result<()>,
 }
 
-/// Refuse a commit whose counts exceed a quota. The State holds only work in
-/// progress and the replay windows (finished runs leave as history), so the
-/// refusal names each full quota by what it counts and its limit. A
-/// namespace written before that change also counts the finished runs it
-/// still holds until they are drained.
-pub fn check_quota(config: &EngineConfig, c: &QuotaCounts) -> Result<()> {
+/// Whether some count of `next` is over its limit (whatever it was before).
+/// A commit for which this is false passes [`check_quota`] whatever the
+/// previous counts.
+pub fn over_quota(config: &EngineConfig, next: &QuotaCounts) -> bool {
+    next.runs > config.max_runs
+        || next.events > config.max_events
+        || next.queued_destinations > config.max_queued_destinations
+        || next.receipts > config.max_receipts
+        || next.state_bytes > config.max_state_bytes
+}
+/// Refuse a commit that grows a count past its limit: a quota refuses a
+/// count only when it is over its limit after the commit and higher than
+/// before it. A commit that leaves a count unchanged or lower passes that
+/// count, even when the namespace is already over the limit (a lowered
+/// limit, finished runs of a namespace written before spec 0003, a pinned
+/// clock that filled the record), so the work that frees it can land.
+///
+/// The State holds work in progress and the replay windows (finished runs
+/// leave as history, which counts toward nothing). The refusal names each
+/// quota the commit would grow past its limit, what it counts, the count it
+/// would reach and the limit.
+pub fn check_quota(
+    config: &EngineConfig,
+    previous: &QuotaCounts,
+    next: &QuotaCounts,
+) -> Result<()> {
+    let grows = |next: usize, previous: usize, limit: usize| next > limit && next > previous;
+    let (p, c) = (previous, next);
     let full: Vec<String> = [
-        (c.runs > config.max_runs).then(|| {
+        grows(c.runs, p.runs, config.max_runs).then(|| {
             format!(
-                "{} runs in progress (limit max_runs {})",
+                "{} runs in the record (in progress, or finished and not yet moved to history) (limit max_runs {})",
                 c.runs, config.max_runs
             )
         }),
-        (c.events > config.max_events).then(|| {
+        grows(c.events, p.events, config.max_events).then(|| {
             format!(
                 "{} events awaiting delivery or inside their replay window (limit max_events {})",
                 c.events, config.max_events
             )
         }),
-        (c.queued_destinations > config.max_queued_destinations).then(|| {
+        grows(
+            c.queued_destinations,
+            p.queued_destinations,
+            config.max_queued_destinations,
+        )
+        .then(|| {
             format!(
                 "{} event deliveries queued for runs not yet admitted (limit max_queued_destinations {})",
                 c.queued_destinations, config.max_queued_destinations
             )
         }),
-        (c.receipts > config.max_receipts).then(|| {
+        grows(c.receipts, p.receipts, config.max_receipts).then(|| {
             format!(
-                "{} receipts: those of runs in progress and keyed admissions inside their replay window (limit max_receipts {})",
+                "{} receipts: those of runs in the record, and keyed admission receipts inside their replay window or kept while their run is live (limit max_receipts {})",
                 c.receipts, config.max_receipts
             )
         }),
-        (c.state_bytes > config.max_state_bytes).then(|| {
+        grows(c.state_bytes, p.state_bytes, config.max_state_bytes).then(|| {
             format!(
                 "a state record of {} bytes: work in progress and replay windows (limit max_state_bytes {})",
                 c.state_bytes, config.max_state_bytes
@@ -1031,7 +1059,7 @@ impl Storage for RecordStorage {
         source.check()?;
         crate::history::check_unrecorded(&ns.history, &crate::history::patch_live_keys(&patch)?)?;
         let accounting = stage(&ns.data, &ns.accounting, &patch)?;
-        (request.validate)(&state, &accounting.counts())?;
+        (request.validate)(&state, &ns.accounting.counts(), &accounting.counts())?;
         verify_keyed_admissions(&ns.data, &patch)?;
         verify_patch_removals(&ns.data, &patch, &state)?;
         source.check()?;

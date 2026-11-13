@@ -523,7 +523,7 @@ fn record_storage_refuses_live_and_history_conflicts() {
             s.sequence += 1;
             Ok(true)
         };
-        let validate = |_: &State, _: &QuotaCounts| Ok(());
+        let validate = |_: &State, _: &QuotaCounts, _: &QuotaCounts| Ok(());
         store.transition_v1(
             "t",
             "w",
@@ -1623,7 +1623,7 @@ fn record_storage_transitions_hold_the_removal_fences() {
             f(s);
             Ok(true)
         };
-        let validate = |_: &State, _: &QuotaCounts| Ok(());
+        let validate = |_: &State, _: &QuotaCounts, _: &QuotaCounts| Ok(());
         store
             .transition_v1(
                 ns,
@@ -4903,7 +4903,7 @@ fn a_quota_refusal_names_what_is_full() {
     );
     assert_eq!(
         runs,
-        "namespace quota exhausted: this commit would hold 3 runs in progress (limit max_runs 2)"
+        "namespace quota exhausted: this commit would hold 3 runs in the record (in progress, or finished and not yet moved to history) (limit max_runs 2)"
     );
     // Two finished keyed runs leave two window receipts; the third
     // admission holds them, its own receipt and its run's receipt.
@@ -4917,7 +4917,7 @@ fn a_quota_refusal_names_what_is_full() {
     );
     assert_eq!(
         receipts,
-        "namespace quota exhausted: this commit would hold 4 receipts: those of runs in progress and keyed admissions inside their replay window (limit max_receipts 3)"
+        "namespace quota exhausted: this commit would hold 4 receipts: those of runs in the record, and keyed admission receipts inside their replay window or kept while their run is live (limit max_receipts 3)"
     );
     let bytes = refusal(
         EngineConfig {
@@ -4998,7 +4998,7 @@ fn a_legacy_namespace_at_its_run_quota_still_commits_the_work_that_drains_it() {
     assert_eq!(quota_counts(&s).unwrap().runs, e.config.max_runs);
     assert!(matches!(
         e.admit("a", "main", Value::Null, authority(), 2),
-        Err(Error::Refused(m)) if m.ends_with("53 runs in progress (limit max_runs 52)")
+        Err(Error::Refused(m)) if m.contains("53 runs in the record")
     ));
     // The live run finishes and leaves at the quota.
     assert!(e.advance(&live, 3).unwrap());
@@ -5010,4 +5010,107 @@ fn a_legacy_namespace_at_its_run_quota_still_commits_the_work_that_drains_it() {
     e.admit("a", "main", Value::Null, authority(), 1_001)
         .unwrap();
     assert_eq!(e.snapshot().unwrap().runs.len(), 2);
+}
+
+// --- Task 8 fix round 1: a quota refuses only growth
+
+/// Review I2(a): a pinned clock fills the record with entries that never
+/// drop; the licensed rebase that recovers it lands at a full
+/// `max_state_bytes`, though its licence adds bytes (the stale floor).
+#[test]
+fn a_clock_rebase_lands_at_a_full_state_record() {
+    let mut e = ret_engine();
+    e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 1_000,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    // Real epoch milliseconds: the pin has as many digits as `now`, so the
+    // capped expiries do not shrink the record.
+    let now: i64 = 1_763_000_000_000;
+    let pinned = now + 31_536_000_000;
+    for i in 0..3 {
+        let d = e.admit_once(keyed(&e, &format!("p{i}")), pinned).unwrap();
+        assert!(e.advance(&d.receipt.run_id, pinned).unwrap());
+    }
+    let s = e.snapshot().unwrap();
+    assert_eq!(s.keyed_admissions.len(), 3);
+    e.config.max_state_bytes = quota_counts(&s).unwrap().state_bytes;
+    e.rebase_retention_clock(now, now, "operator", "clock pinned a year ahead", now)
+        .unwrap();
+    let s = e.snapshot().unwrap();
+    assert_eq!(s.retention.clock_ms, Some(now));
+    // The record is over its limit by the licence's bytes: new work that
+    // grows it is refused, saying so.
+    assert!(matches!(
+        e.admit("a", "main", Value::Null, authority(), now + 1),
+        Err(Error::Refused(m)) if m.contains("state record of")
+    ));
+}
+/// Review I2(b): an operator lowers `max_runs` below the live count. New
+/// work is refused, but every commit that does not add a run lands: runs
+/// finish and leave, a run is cancelled, an event completes a waiting run,
+/// and a window drop goes through.
+#[test]
+fn over_a_lowered_limit_commits_that_do_not_grow_the_count_land() {
+    let mut e = ret_engine();
+    install(&e, wait_artifact(), "waiter");
+    e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 1_000,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    for i in 0..2 {
+        let d = e.admit_once(keyed(&e, &format!("k{i}")), i).unwrap();
+        e.advance(&d.receipt.run_id, i).unwrap();
+    }
+    let waiter = e
+        .admit("waiter", "main", Value::Null, authority(), 2)
+        .unwrap();
+    e.advance(&waiter, 2).unwrap();
+    let a1 = e.admit("a", "main", Value::Null, authority(), 3).unwrap();
+    let a2 = e.admit("a", "main", Value::Null, authority(), 4).unwrap();
+    let a3 = e.admit("a", "main", Value::Null, authority(), 5).unwrap();
+    let live = |e: &Engine<MemoryStorage>| quota_counts(&e.snapshot().unwrap()).unwrap();
+    assert_eq!(live(&e).runs, 4);
+    e.config.max_runs = 1;
+    let refused = |e: &Engine<MemoryStorage>, t: i64| {
+        matches!(
+            e.admit("a", "main", Value::Null, authority(), t),
+            Err(Error::Refused(m)) if m.contains("(limit max_runs 1)")
+        )
+    };
+    assert!(refused(&e, 10));
+    // A run finishes and leaves.
+    assert!(e.advance(&a1, 11).unwrap());
+    // A run is cancelled.
+    e.cancel(&a2, 12).unwrap();
+    // An event completes the waiting run.
+    e.admit_event("host", event("done", 2), 13).unwrap();
+    for _ in 0..3 {
+        if e.snapshot().unwrap().runs.contains_key(&waiter) {
+            assert!(e.advance(&waiter, 14).unwrap());
+        }
+    }
+    assert_eq!(runs_page(&e, Some(&waiter))[0]["outcome"], "ok");
+    let s = e.snapshot().unwrap();
+    assert!(!s.runs.contains_key(&waiter) && !s.runs.contains_key(&a1));
+    let counts = live(&e);
+    assert_eq!(counts.runs, 2, "{counts:?}");
+    assert!(refused(&e, 15));
+    // Receipts over a lowered limit too: the commit that finishes a run
+    // and drops the passed keyed window lands (still over, but fewer).
+    e.config.max_receipts = 1;
+    let before = live(&e).receipts;
+    assert!(before > 1, "{before}");
+    assert!(e.advance(&a3, 2_000).unwrap());
+    assert!(live(&e).receipts < before);
+    assert!(!e.snapshot().unwrap().keyed_admissions.contains_key("k0"));
+    // Review M1: the count is of runs in the record, not only in progress.
+    assert!(matches!(
+        e.admit("a", "main", Value::Null, authority(), 2_001),
+        Err(Error::Refused(m)) if m.contains(
+            "2 runs in the record (in progress, or finished and not yet moved to history) (limit max_runs 1)"
+        )
+    ));
 }

@@ -364,27 +364,50 @@ server must:
 
 ## Quotas count live work
 
-Spec §4. `EngineConfig`'s quotas count what the namespace record holds,
-after the commit being checked. Finished runs leave the record as history
-rows, which count toward no quota. So:
+Spec §4. `EngineConfig`'s quotas count what the namespace record holds.
+Finished runs leave the record as history rows, which count toward no
+quota. So:
 
 | Quota | Counts |
 | --- | --- |
-| `max_runs` | runs in progress |
-| `max_events` | events awaiting delivery, and events inside their replay window |
+| `max_runs` | runs in the record: in progress, or finished in a cohort still in progress (a finished child of a live root, a finished root with an unsettled operation); on a namespace written before this change, also the finished runs awaiting the drain |
+| `max_events` | events awaiting delivery, and events inside their replay window (or kept while a live run needs them) |
 | `max_queued_destinations` | event deliveries queued for runs not yet admitted |
-| `max_receipts` | the receipts of runs in progress, plus keyed admission receipts inside their replay window |
+| `max_receipts` | the receipts of the runs in the record, plus keyed admission receipts inside their replay window or kept past it while their run is live. A live keyed run counts twice: its keyed admission receipt and its own receipts |
 | `max_state_bytes` | the canonical State: work in progress plus the window entries |
 
-The complete path (`quota_counts(&State)`) and the format 3 transition path
-(the maintained `Accounting`) count the same; `transition_equivalence`
-compares both, and a refusal on each, at every step.
+**A quota refuses only growth.** A commit is refused for a quota only when
+that count is over its limit after the commit *and* higher than before it.
+A commit that leaves a count unchanged or lower always passes that count,
+even when the namespace is already over the limit: an operator lowered the
+limit, a namespace written before this change still holds finished runs, or
+a pinned clock filled the record with entries that never dropped. So the
+work that frees a full namespace always lands: a run finishes or is
+cancelled and leaves, an event completes a waiting run, a window entry
+drops. New work that adds to a full count is refused. A step of a live run
+that adds a receipt without finishing it is growth too, so it is refused
+while `max_receipts` is over its limit.
 
-A refusal names each full quota, what it counts, the count the commit would
-have reached, and the limit, for example:
+The two licensed admin commits (`rebase_retention_clock`,
+`lower_stale_floor`) change nothing but what their licence names (the
+removal fences hold them to that), so the bytes they add (the stale floor
+on a first rebase) are exempt from `max_state_bytes`. That is what lets a
+rebase land at a full record (tested:
+`a_clock_rebase_lands_at_a_full_state_record`).
+
+The complete path (`quota_counts(&State)`) needs the counts before the
+commit only when a count is over its limit after it; it then loads the
+stored revision once more. The format 3 transition path compares the
+maintained `Accounting` before and after the patch. Both count the same:
+`transition_equivalence` compares the maintained counts with `quota_counts`
+at every step (including a clock rebase, a window drop and a deferral), and
+compares the two paths' results, refusals included, at the quota steps.
+
+A refusal names each quota the commit would grow past its limit, what it
+counts, the count the commit would reach and the limit, for example:
 
 ```text
-namespace quota exhausted: this commit would hold 3 runs in progress (limit max_runs 2)
+namespace quota exhausted: this commit would hold 3 runs in the record (in progress, or finished and not yet moved to history) (limit max_runs 2)
 ```
 
 Nothing has to be collected to free a quota: runs leave when they finish and
@@ -392,10 +415,9 @@ window entries when their window passes. To make room sooner, finish or
 cancel runs in progress, or raise the limit.
 
 **A namespace written before this change** still holds the runs that
-finished before the upgrade, and counts them as runs in progress, until the
-drain moves them out (Task 9). At its old quota such a namespace refuses new
-work, but still commits the work that frees it: a run in progress finishes
-and leaves, and `collect_garbage` removes finished runs (tested:
+finished before the upgrade, and counts them, until the drain moves them
+out (Task 9). Such a namespace refuses new work while it is over a quota,
+but still commits the work that frees it (tested:
 `a_legacy_namespace_at_its_run_quota_still_commits_the_work_that_drains_it`).
 
 **`max_tombstones` and `terminal_run_ms`** are accepted in a stored policy
@@ -411,7 +433,7 @@ number of tombstones it holds:
   moves the GC clock, as on the format 3 bounded path. Rows written before
   this change are drained by Task 9 and never refuse a commit.
 
-## PostgreSQL storage tuning (migration 7)
+## PostgreSQL: on-disk size of the namespace table
 
 On protected format 2 every transition rewrites the namespace's one wide,
 encrypted row. Ciphertext does not compress, so each commit writes a new
@@ -428,11 +450,25 @@ and does not grow with the number of runs. At benchmark pace (about 1,500
 commits a minute, a 124 KB record) that is a few hundred MB; at aq-server's
 pace (tens of commits a minute) a few MB.
 
-Migration 7 (`0007_namespaces_autovacuum.sql`) sets
-`autovacuum_vacuum_cost_delay = 0` on `aq_playbooks.namespaces` and on its
-TOAST table (`toast.autovacuum_vacuum_cost_delay = 0`), so each vacuum pass
-of that table finishes in one go. It is tuning only: it shortens the vacuum
-time term. `autovacuum_naptime` is server-wide and left to the operator. No
-other table is changed. The role that applies the migrations owns the table
-(it created it), which is all the setting needs; it takes a
-`SHARE UPDATE EXCLUSIVE` lock and does not block commits.
+**Optional operator tuning** (no migration sets it; it needs ownership of
+the table):
+
+```sql
+ALTER TABLE aq_playbooks.namespaces SET (
+    autovacuum_vacuum_cost_delay = 0,
+    toast.autovacuum_vacuum_cost_delay = 0
+);
+```
+
+It makes each vacuum pass of that table finish in one go, which shortens
+only the vacuum-time term. **It did not measurably change the size.** At
+200 runs (10 s per run, 10-minute windows, protected format 2, default
+autovacuum with a one-minute naptime) the table was 224.4 MB with the
+setting, against 201.8 MB without it (one run each; 170.5 MB against
+145–152 MB after the next vacuum pass). Autovacuum made one pass per naptime
+either way: the naptime dominates. `autovacuum_naptime` is server-wide and
+left to the operator.
+
+The structural remedy on record is to compress the snapshot before
+encrypting it on protected format 2. That shrinks the record bytes, the
+write volume per transition and this plateau together.

@@ -23,7 +23,8 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 pub use storage::{MemoryStorage, Storage, StorageError, VersionedState};
 pub use transition::{
-    QuotaCounts, RecordStorage, TransitionOutcome, TransitionRequest, check_quota, quota_counts,
+    QuotaCounts, RecordStorage, TransitionOutcome, TransitionRequest, check_quota, over_quota,
+    quota_counts,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -110,6 +111,20 @@ pub struct DeadlineAdjustment {
 enum Finish {
     Host(Option<i64>),
     Licensed,
+}
+/// The counts a commit's quota check judges. A licensed admin commit (clock
+/// rebase, floor lowering) changes nothing but what its licence names (the
+/// removal fences hold it to that), so every byte it adds is its licence's:
+/// it is exempt from `max_state_bytes` for them. It adds no run, event or
+/// receipt.
+fn quota_inputs(mode: Finish, previous: &QuotaCounts, next: &QuotaCounts) -> QuotaCounts {
+    match mode {
+        Finish::Licensed => QuotaCounts {
+            state_bytes: next.state_bytes.min(previous.state_bytes),
+            ..*next
+        },
+        Finish::Host(_) => *next,
+    }
 }
 /// Of the windows in `policy`, the smallest (at least 1 ms).
 fn smallest_window(policy: &RetentionPolicy) -> i64 {
@@ -848,7 +863,9 @@ impl<S: Storage> Engine<S> {
             }
             Ok(changed)
         };
-        let validate = |_: &State, counts: &QuotaCounts| check_quota(config, counts);
+        let validate = |_: &State, previous: &QuotaCounts, next: &QuotaCounts| {
+            check_quota(config, previous, &quota_inputs(now_ms, previous, next))
+        };
         let started = std::time::Instant::now();
         let outcome = self.store.transition_v1(
             &self.namespace,
@@ -886,7 +903,17 @@ impl<S: Storage> Engine<S> {
             return Ok((result, retention::CommitReport::default()));
         }
         let report = finish(&mut v.state, now_ms)?;
-        check_quota(&self.config, &quota_counts(&v.state)?)?;
+        let next = quota_counts(&v.state)?;
+        if over_quota(&self.config, &next) {
+            // Only a commit over a limit needs the counts before it (one
+            // more load and serialization, on this path only).
+            let previous = self.stored_counts(v.revision)?;
+            check_quota(
+                &self.config,
+                &previous,
+                &quota_inputs(now_ms, &previous, &next),
+            )?;
+        }
         let started = std::time::Instant::now();
         let committed =
             self.store
@@ -895,6 +922,19 @@ impl<S: Storage> Engine<S> {
             .record_time(metrics::Timing::Commit, started.elapsed());
         committed?;
         Ok((result, report))
+    }
+    /// Quota counts of the stored revision `revision`, as the plan saw it.
+    /// If the namespace has moved on, the zero counts: the strict check,
+    /// and the commit's compare-and-swap would fail anyway.
+    fn stored_counts(&self, revision: u64) -> Result<QuotaCounts> {
+        let mut stored = self.store.load(&self.namespace)?;
+        if stored.revision != revision {
+            return Ok(QuotaCounts::default());
+        }
+        if !stored.state.indexes.initialized {
+            indexes::rebuild(&mut stored.state)?;
+        }
+        quota_counts(&stored.state)
     }
     pub fn install(&self, artifact: Artifact) -> Result<()> {
         artifact.verify()?;

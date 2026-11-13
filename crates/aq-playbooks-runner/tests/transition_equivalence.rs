@@ -591,6 +591,64 @@ fn scenario(p: &mut Pair) {
         authority("a"),
         i64::MIN
     ));
+    // The clock is pinned at i64::MAX. Rebase it, then a window drop and a
+    // deferral (a keyed receipt whose run is still live) on both paths.
+    both!(p, |e| e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 1_000,
+        ..RetentionPolicy::default()
+    }));
+    let rebased = both!(p, |e| e.rebase_retention_clock(
+        30_000,
+        30_000,
+        "operator",
+        "pinned at i64::MAX",
+        30_000
+    ));
+    assert!(rebased.starts_with("Ok("), "{rebased}");
+    let keyed = |binding: &str, key: &str, p: &Pair| KeyedAdmissionRequest {
+        key: key.into(),
+        binding: binding.into(),
+        expected_activation_revision: p.m.snapshot().unwrap().bindings[binding].revision,
+        entry: "main".into(),
+        input: Value::Null,
+        authority: authority("a"),
+    };
+    for i in 0..3 {
+        let request = keyed("a", &format!("after-rebase-{i}"), p);
+        both!(p, |e| e.admit_once(request.clone(), 30_000 + i));
+    }
+    let held = keyed("child", "held", p);
+    both!(p, |e| e.admit_once(held.clone(), 30_003));
+    both!(p, |e| e.drive(&mut host(), 30_010, 64));
+    let request = keyed("a", "after-window", p);
+    both!(p, |e| e.admit_once(request.clone(), 31_500));
+    let s = p.m.snapshot().unwrap();
+    assert!(
+        !s.keyed_admissions.contains_key("after-rebase-0"),
+        "dropped"
+    );
+    assert!(s.keyed_admissions.contains_key("held"), "deferred");
+    // A quota refuses only growth, on both paths: over a lowered run limit
+    // a commit that finishes a run lands, an admission is refused.
+    let live = quota_counts(&s).unwrap().runs;
+    assert!(live >= 2, "{live}");
+    for config in [&mut p.m.config, &mut p.r.config] {
+        config.max_runs = live - 2;
+    }
+    let refused = both!(p, |e| e.admit(
+        "a",
+        "main",
+        Value::Null,
+        authority("a"),
+        31_600
+    ));
+    assert!(refused.contains("namespace quota exhausted"), "{refused}");
+    let landed = both!(p, |e| e.drive(&mut host(), 31_700, 64));
+    assert!(landed.starts_with("Ok("), "{landed}");
+    assert!(quota_counts(&p.m.snapshot().unwrap()).unwrap().runs < live);
+    for config in [&mut p.m.config, &mut p.r.config] {
+        *config = EngineConfig::default();
+    }
 }
 
 #[test]

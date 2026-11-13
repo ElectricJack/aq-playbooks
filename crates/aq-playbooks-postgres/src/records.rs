@@ -514,7 +514,7 @@ impl PostgresStorage {
             rebase,
         )?;
         let live_keys = aq_playbooks_runner::history::patch_live_keys(&patch)?;
-        (request.validate)(&state, &staged.accounting.counts())?;
+        (request.validate)(&state, &accounting.counts(), &staged.accounting.counts())?;
         source.check()?;
         let heavy = !fallbacks.is_empty()
             || rebase
