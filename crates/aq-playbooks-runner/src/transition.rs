@@ -389,6 +389,8 @@ impl RecordSource for TxSource {
     ) -> std::result::Result<Vec<(TreeKey, Vec<u8>)>, String> {
         use std::ops::Bound::{Excluded, Unbounded};
         let Some(c) = self.container(path)? else {
+            // An empty page costs one read, as an absent record does.
+            self.stats.record_reads.fetch_add(1, Ordering::Relaxed);
             return Ok(Vec::new());
         };
         let rows: Vec<_> = match after {

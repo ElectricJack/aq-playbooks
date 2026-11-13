@@ -693,7 +693,36 @@ impl<S: Storage> Engine<S> {
         epoch: u64,
         now_ms: i64,
     ) -> Result<EventDisposition> {
-        let result = self.transaction_at(Some(now_ms), |s| {
+        // An expired event that nothing holds is accepted as new; it leaves in
+        // a commit of its own first (see `admit_once`).
+        let mut result = Err(Error::Conflict("event changed during admission".into()));
+        for _ in 0..2 {
+            match self.admit_event_commit(authenticated_producer, &event, epoch, now_ms) {
+                Ok(None) => continue,
+                Ok(Some(disposition)) => result = Ok(disposition),
+                Err(error) => result = Err(error),
+            }
+            break;
+        }
+        self.metrics.admission(
+            &result,
+            result
+                .as_ref()
+                .is_ok_and(|disposition| disposition.duplicate),
+        );
+        result
+    }
+    /// One commit of [`Self::admit_event_in_epoch`]: `None` when it only
+    /// removed the expired event of the key.
+    fn admit_event_commit(
+        &self,
+        authenticated_producer: &str,
+        event: &EventEnvelope,
+        epoch: u64,
+        now_ms: i64,
+    ) -> Result<Option<EventDisposition>> {
+        let event = event.clone();
+        self.transaction_at(Some(now_ms), |s| {
             if s.retention
                 .producer_epochs
                 .get(authenticated_producer)
@@ -721,26 +750,32 @@ impl<S: Storage> Engine<S> {
                 return Err(Error::Refused("forged producer identity".into()));
             }
             if let Some(old) = s.events.get(&key) {
-                if s.retention
-                    .event_expires_at_ms
-                    .get(&key)
-                    .is_some_and(|expiry| now_ms > *expiry)
+                let start = retention::window_start(s, now_ms);
+                if retention::event_expiry(s, &key)
+                    .is_some_and(|expiry| retention::expired(expiry, Some(start)))
                 {
-                    return Err(Error::Refused(
-                        "event replay horizon expired; explicit new replay identity required"
-                            .into(),
-                    ));
+                    // Held (SC-9), or a forged producer: it stays, refused.
+                    if event.producer != authenticated_producer
+                        || !retention::event_droppable(s, &key, start)?
+                    {
+                        return Err(Error::Refused(
+                            "event replay horizon expired; explicit new replay identity required"
+                                .into(),
+                        ));
+                    }
+                    retention::forget_event(s, &key)?;
+                    return Ok(None);
                 }
                 if old.digest != content {
                     return Err(Error::Conflict(
                         "event identity reused with changed content".into(),
                     ));
                 }
-                return Ok(EventDisposition {
+                return Ok(Some(EventDisposition {
                     key,
                     duplicate: true,
                     destinations: old.destinations.len(),
-                });
+                }));
             }
             let contract = find_event(s, &event.contract)?;
             if !contract.trusted_producers.contains(authenticated_producer)
@@ -870,30 +905,32 @@ impl<S: Storage> Engine<S> {
                 },
             );
             s.retention.event_epochs.insert(key.clone(), epoch);
-            s.retention.event_expires_at_ms.insert(
-                key.clone(),
-                deadline(
-                    now_ms,
-                    s.retention
-                        .policy
-                        .event_replay_ms
-                        .max(contract.retention_ms),
-                )?,
+            let window_ms = s
+                .retention
+                .policy
+                .event_replay_ms
+                .max(contract.retention_ms);
+            // From the later of host time and clock; a clock already near the
+            // end of time saturates rather than refusing the event.
+            let expires_at_ms = deadline(now_ms, window_ms)?.max(
+                retention::window_start(s, now_ms)
+                    .saturating_add(i64::try_from(window_ms).unwrap_or(i64::MAX)),
+            );
+            s.retention
+                .event_expires_at_ms
+                .insert(key.clone(), expires_at_ms);
+            retention::window_insert(
+                s,
+                expires_at_ms,
+                format!("{}{key}", retention::WINDOW_EVENT),
             );
             indexes::index_event(s, &key)?;
-            Ok(EventDisposition {
+            Ok(Some(EventDisposition {
                 key,
                 duplicate: false,
                 destinations: count,
-            })
-        });
-        self.metrics.admission(
-            &result,
-            result
-                .as_ref()
-                .is_ok_and(|disposition| disposition.duplicate),
-        );
-        result
+            }))
+        })
     }
     pub fn fanout(&self, event_key: &str, limit: usize, now_ms: i64) -> Result<usize> {
         self.transaction_at(Some(now_ms), |s| {

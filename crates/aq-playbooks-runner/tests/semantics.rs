@@ -1430,9 +1430,11 @@ fn unsafe_recovery_requires_audited_request_and_preserves_original_authority() {
     assert!(e.snapshot().unwrap().recovery_requests.is_empty());
 }
 
+/// Spec 0003 (NR-1): a wait registered after its event's window has passed
+/// is no longer refused; it takes its timeout edge. The event's captured
+/// replay horizon (the contract's 1_000 ms) still outlives a shorter policy.
 #[test]
-fn pruned_general_wait_history_refuses_registration_and_captured_replay_horizon_survives_policy_change()
- {
+fn expired_general_wait_history_times_out_and_captured_replay_horizon_survives_policy_change() {
     let e = engine();
     install(&e, wait_artifact(), "waiter");
     e.set_retention_policy(RetentionPolicy {
@@ -1444,7 +1446,7 @@ fn pruned_general_wait_history_refuses_registration_and_captured_replay_horizon_
     })
     .unwrap();
     let envelope = event("history", 2);
-    e.admit_event("host", envelope.clone(), 0).unwrap();
+    let first = e.admit_event("host", envelope.clone(), 0).unwrap();
     e.set_retention_policy(RetentionPolicy {
         event_replay_ms: 1,
         terminal_run_ms: 1,
@@ -1453,27 +1455,24 @@ fn pruned_general_wait_history_refuses_registration_and_captured_replay_horizon_
         ..RetentionPolicy::default()
     })
     .unwrap();
-    assert!(e.admit_event("host", envelope, 1001).is_err());
-    for _ in 0..10 {
-        if !e.collect_garbage(2000, 1).unwrap().more {
-            break;
-        }
-    }
+    assert!(
+        e.admit_event("host", envelope.clone(), 999)
+            .unwrap()
+            .duplicate
+    );
+    // After its window the key is forgotten: the same event is new.
+    assert!(!e.admit_event("host", envelope, 1001).unwrap().duplicate);
     let id = e
         .admit("waiter", "main", Value::Null, authority(), 2001)
         .unwrap();
-    e.drive(&mut FakeHost::default(), 2001, 10).unwrap();
     let s = e.snapshot().unwrap();
+    assert!(!s.events.contains_key(&first.key));
+    assert!(s.retention.expired_correlations.is_empty());
+    e.drive(&mut FakeHost::default(), 2001, 10).unwrap();
+    assert_eq!(e.snapshot().unwrap().runs[&id].status, RunStatus::Waiting);
+    e.drive(&mut FakeHost::default(), 2102, 10).unwrap();
     assert_eq!(settled(&e, &id).outcome.as_deref(), Some("error"));
-    assert!(s.waits.is_empty());
-    assert!(
-        e.store.settled_cohorts("test")[0]
-            .receipts
-            .iter()
-            .any(|r| r.run == id
-                && r.kind == "error"
-                && r.detail.to_string().contains("history expired"))
-    );
+    assert!(e.snapshot().unwrap().waits.is_empty());
 }
 
 struct CrashOnCancel {
@@ -1598,8 +1597,11 @@ fn gc_preserves_possible_async_completion_while_lost_admission_handle_is_unknown
     assert_eq!(settled(&e, &id).outcome.as_deref(), Some("ok"));
 }
 
+/// Spec 0003 (NR-1): the event leaves at its window without a correlation
+/// fence, so retiring the producer epoch keeps none, and the invocation's
+/// late wait takes its timeout edge.
 #[test]
-fn producer_epoch_compaction_keeps_history_fences_for_existing_invocations() {
+fn producer_epoch_retirement_leaves_a_wait_after_an_expired_event_to_time_out() {
     let e = engine();
     install(&e, wait_artifact(), "waiter");
     e.set_retention_policy(RetentionPolicy {
@@ -1622,14 +1624,12 @@ fn producer_epoch_compaction_keeps_history_fences_for_existing_invocations() {
     }
     e.advance_producer_epoch("host", 1, "operator", "delivery horizon retired", 2000)
         .unwrap();
-    assert!(
-        !e.snapshot()
-            .unwrap()
-            .retention
-            .expired_correlations
-            .is_empty()
-    );
+    let s = e.snapshot().unwrap();
+    assert!(s.events.is_empty());
+    assert!(s.retention.expired_correlations.is_empty() && s.retention.event_tombstones.is_empty());
     e.drive(&mut FakeHost::default(), 2001, 10).unwrap();
+    assert_eq!(e.snapshot().unwrap().runs[&id].status, RunStatus::Waiting);
+    e.drive(&mut FakeHost::default(), 2102, 10).unwrap();
     assert_eq!(settled(&e, &id).outcome.as_deref(), Some("error"));
 }
 

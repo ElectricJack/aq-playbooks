@@ -661,10 +661,259 @@ pub(crate) fn move_unowned_receipts(s: &mut State, owner: &str) -> Result<Option
         receipts,
     }))
 }
+/// At most this many window entries are examined (dropped or deferred) by
+/// one commit, oldest expiry first.
+pub const WINDOW_DROPS_PER_COMMIT: usize = 64;
+/// The time a window entry written now counts from: the later of the
+/// commit's host time and the clock, so a backwards host time never
+/// shortens a window.
+pub(crate) fn window_start(s: &State, now_ms: i64) -> i64 {
+    s.retention
+        .clock_ms
+        .map_or(now_ms, |clock| clock.max(now_ms))
+}
+/// Keep `member` (`WINDOW_EVENT` or `WINDOW_ADMISSION` plus its key) in
+/// expiry order under `expires_at_ms`.
+pub(crate) fn window_insert(s: &mut State, expires_at_ms: i64, member: String) {
+    s.retention
+        .expiry
+        .entry(expires_at_ms)
+        .or_default()
+        .insert(member);
+}
+fn window_remove(s: &mut State, expires_at_ms: i64, member: &str) {
+    let Some(members) = s.retention.expiry.get_mut(&expires_at_ms) else {
+        return;
+    };
+    members.remove(member);
+    if members.is_empty() {
+        s.retention.expiry.remove(&expires_at_ms);
+    }
+}
+/// Whether the keyed admission receipt `key` may leave at `clock`: its
+/// window has passed and its run is no longer live (SC-10).
+pub(crate) fn admission_droppable(s: &State, key: &str, clock: i64) -> bool {
+    s.keyed_admissions.get(key).is_some_and(|receipt| {
+        admission_expiry(s, key).is_some_and(|at| at <= clock)
+            && !s.runs.contains_key(&receipt.run_id)
+    })
+}
+/// Remove the keyed admission receipt `key` ahead of its drop, with its
+/// expiry record and window member. A receipt is never replaced in place, so
+/// an expired key admitted again leaves in a commit of its own first.
+pub(crate) fn forget_admission(s: &mut State, key: &str) {
+    let at = admission_expiry(s, key);
+    remove_admission(s, key);
+    if let Some(at) = at {
+        window_remove(s, at, &format!("{WINDOW_ADMISSION}{key}"));
+    }
+}
+fn remove_admission(s: &mut State, key: &str) {
+    s.keyed_admissions.remove(key);
+    s.retention.admission_expires_at_ms.remove(key);
+}
+/// Whether an event is still needed past its window (SC-9): a live waiter on
+/// one of its correlation keys, a queued destination that its input does not
+/// block, or an uncertain completion of its contract and scope.
+pub(crate) fn event_held(s: &State, key: &str) -> Result<bool> {
+    let Some(event) = s.events.get(key) else {
+        return Ok(false);
+    };
+    if event.destinations.iter().any(|d| d.run.is_none()) {
+        let owner = format!("event:{key}");
+        let blocked: BTreeSet<String> = receipt_offsets(s, &owner)
+            .into_iter()
+            .filter_map(|offset| s.receipts.get(offset))
+            .filter(|r| {
+                r.kind == "destination_blocked"
+                    && r.detail.get("blocked_kind").and_then(|v| v.as_str()) == Some("input")
+            })
+            .filter_map(|r| r.detail.get("destination").and_then(|v| v.as_str()))
+            .map(String::from)
+            .collect();
+        if event
+            .destinations
+            .iter()
+            .any(|d| d.run.is_none() && !blocked.contains(&d.key))
+        {
+            return Ok(true);
+        }
+    }
+    let live = |target: &String| {
+        if let Some(intent) = target.strip_prefix("intent:") {
+            s.intents
+                .get(intent)
+                .is_some_and(|i| !intent_settled(&i.status))
+        } else {
+            s.runs.get(target).is_some_and(|r| !r.status.terminal())
+        }
+    };
+    let waited = s.indexes.event_memberships.get(key).is_some_and(|keys| {
+        keys.iter().any(|k| {
+            s.indexes
+                .waiters
+                .get(k)
+                .is_some_and(|targets| targets.iter().any(live))
+        })
+    });
+    if waited {
+        return Ok(true);
+    }
+    let contract = crate::indexes::trigger_key(&event.envelope.contract, &event.envelope.scope)?;
+    Ok(s.indexes
+        .uncertain_completion_contracts
+        .get(&contract)
+        .is_some_and(|intents| !intents.is_empty()))
+}
+/// Whether event `key` may leave at `clock`: its window has passed and
+/// nothing holds it.
+pub(crate) fn event_droppable(s: &State, key: &str, clock: i64) -> Result<bool> {
+    Ok(event_expiry(s, key).is_some_and(|at| at <= clock) && !event_held(s, key)?)
+}
+/// Remove event `key` ahead of its drop, with its window member (see
+/// [`forget_admission`]).
+pub(crate) fn forget_event(s: &mut State, key: &str) -> Result<()> {
+    let at = event_expiry(s, key);
+    remove_event(s, key, &mut CommitReport::default())?;
+    if let Some(at) = at {
+        window_remove(s, at, &format!("{WINDOW_EVENT}{key}"));
+    }
+    Ok(())
+}
+/// Remove event `key`, its epoch, expiry, correlation memberships and index
+/// entries; its `event:<key>` receipts go to history.
+fn remove_event(s: &mut State, key: &str, report: &mut CommitReport) -> Result<()> {
+    let Some(event) = s.events.remove(key) else {
+        return Ok(());
+    };
+    s.retention.event_epochs.remove(key);
+    s.retention.event_expires_at_ms.remove(key);
+    if let Some(keys) = s.indexes.event_memberships.remove(key) {
+        for k in keys {
+            let Some(events) = s.indexes.events.get_mut(&k) else {
+                continue;
+            };
+            if events.get(&event.sequence).is_some_and(|id| id == key) {
+                events.remove(&event.sequence);
+            } else {
+                events.retain(|_, id| id != key);
+            }
+            if events.is_empty() {
+                s.indexes.events.remove(&k);
+            }
+        }
+    }
+    if let Some(cohort) = move_unowned_receipts(s, &format!("event:{key}"))? {
+        report.receipts += cohort.receipts.len();
+        s.settled.push(cohort);
+    }
+    report.events += 1;
+    Ok(())
+}
+/// Drop the window entries whose expiry the clock has reached, oldest first,
+/// examining at most `limit` members. An entry still needed is deferred: a
+/// keyed receipt of a live run by the admission window, an event (see
+/// [`event_held`]) by its own window, both from the clock, so it neither
+/// leaves early nor blocks the entries behind it. Finding the oldest entry
+/// is one ordered lookup; the work is O(members examined). A commit without
+/// a clock drops nothing.
+pub(crate) fn drop_expired(s: &mut State, limit: usize, report: &mut CommitReport) -> Result<()> {
+    let Some(clock) = s.retention.clock_ms else {
+        return Ok(());
+    };
+    window_step();
+    let mut slot = s.retention.expiry.next_key_by_one::<i64>(None);
+    for _ in 0..limit {
+        let Some(at) = slot.filter(|at| *at <= clock) else {
+            break;
+        };
+        let members = s.retention.expiry.get_mut(&at);
+        let member = members.and_then(|members| members.pop_first());
+        if s.retention.expiry.get(&at).is_none_or(BTreeSet::is_empty) {
+            s.retention.expiry.remove(&at);
+            // Deferred entries go after the clock, so nothing is added
+            // behind this cursor.
+            window_step();
+            slot = s.retention.expiry.next_key_by_one(Some(&at));
+        }
+        let Some(member) = member else {
+            continue;
+        };
+        window_step();
+        if let Some(key) = member.strip_prefix(WINDOW_ADMISSION) {
+            drop_admission(s, key, clock, report);
+        } else if let Some(key) = member.strip_prefix(WINDOW_EVENT) {
+            drop_event(s, key, clock, report)?;
+        }
+    }
+    Ok(())
+}
+#[cfg(test)]
+thread_local! {
+    /// Ordered expiry lookups and members examined by `drop_expired`.
+    static WINDOW_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+fn window_step() {
+    #[cfg(test)]
+    WINDOW_STEPS.with(|steps| steps.set(steps.get() + 1));
+}
+fn drop_admission(s: &mut State, key: &str, clock: i64, report: &mut CommitReport) {
+    let member = || format!("{WINDOW_ADMISSION}{key}");
+    let Some(run_id) = s.keyed_admissions.get(key).map(|r| r.run_id.clone()) else {
+        return;
+    };
+    let Some(at) = admission_expiry(s, key) else {
+        return;
+    };
+    if at > clock {
+        // Its expiry moved later: keep it in order there.
+        window_insert(s, at, member());
+        return;
+    }
+    if s.runs.contains_key(&run_id) {
+        let next = clock.saturating_add(window(s.retention.policy.admission_replay_ms));
+        s.retention.admission_expires_at_ms.insert(key.into(), next);
+        window_insert(s, next, member());
+        report.deferred += 1;
+        return;
+    }
+    remove_admission(s, key);
+    report.admissions += 1;
+}
+fn drop_event(s: &mut State, key: &str, clock: i64, report: &mut CommitReport) -> Result<()> {
+    let member = || format!("{WINDOW_EVENT}{key}");
+    let Some(accepted_at_ms) = s.events.get(key).map(|e| e.accepted_at_ms) else {
+        return Ok(());
+    };
+    let Some(at) = event_expiry(s, key) else {
+        return Ok(());
+    };
+    if at > clock {
+        window_insert(s, at, member());
+        return Ok(());
+    }
+    if event_held(s, key)? {
+        // Its own window (`max(event_replay_ms, contract.retention_ms)`).
+        let own = s
+            .retention
+            .event_expires_at_ms
+            .get(key)
+            .map(|expiry| expiry.saturating_sub(accepted_at_ms))
+            .unwrap_or_else(|| window(s.retention.policy.event_replay_ms))
+            .max(1);
+        let next = clock.saturating_add(own);
+        s.retention.event_expires_at_ms.insert(key.into(), next);
+        window_insert(s, next, member());
+        report.deferred += 1;
+        return Ok(());
+    }
+    remove_event(s, key, report)
+}
 /// The retention work of every commit that changes the State, after its
 /// indexes are synchronized: move the clock to the commit's host time, remove
-/// the settled cohorts among `candidates` (see [`candidate_roots`]), and move
-/// `"admin"` receipts to history.
+/// the settled cohorts among `candidates` (see [`candidate_roots`]), drop
+/// expired window entries ([`drop_expired`]) and move `"admin"` receipts to
+/// history. The clock step and the drop need host time.
 pub(crate) fn finish_commit(
     s: &mut State,
     now_ms: Option<i64>,
@@ -675,6 +924,9 @@ pub(crate) fn finish_commit(
         advance_clock(s, now_ms);
     }
     settle(s, candidates, COHORTS_PER_COMMIT, &mut report)?;
+    if now_ms.is_some() {
+        drop_expired(s, WINDOW_DROPS_PER_COMMIT, &mut report)?;
+    }
     if let Some(cohort) = move_unowned_receipts(s, "admin")? {
         report.receipts += cohort.receipts.len();
         s.settled.push(cohort);
@@ -1063,4 +1315,73 @@ pub(crate) fn gc(s: &mut State, now: i64, limit: usize) -> Result<GcReport> {
         s.indexes.all_receipts.insert(r.sequence, i);
     }
     Ok(report)
+}
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use crate::KeyedAdmissionReceipt;
+    /// A plain (format 2) State at clock 1_000 with `due` expired keyed
+    /// receipts (each its own expiry) and `kept` unexpired ones.
+    fn state(kept: usize, due: usize) -> State {
+        let mut s = State::default();
+        s.retention.clock_ms = Some(1_000);
+        let expiries = (0..due)
+            .map(|i| 500 + i as i64)
+            .chain((0..kept).map(|i| 2_000 + i as i64));
+        for (i, at) in expiries.enumerate() {
+            let key = format!("k-{i:05}");
+            s.keyed_admissions.insert(
+                key.clone(),
+                KeyedAdmissionReceipt {
+                    key: key.clone(),
+                    request_digest: "digest".into(),
+                    run_id: format!("run-{i}"),
+                    activation_revision: 1,
+                    catalog_revision: 1,
+                    accepted_at_ms: 0,
+                },
+            );
+            s.retention.admission_expires_at_ms.insert(key.clone(), at);
+            window_insert(&mut s, at, format!("{WINDOW_ADMISSION}{key}"));
+        }
+        s
+    }
+    fn steps(kept: usize, due: usize) -> (usize, CommitReport) {
+        let mut s = state(kept, due);
+        let mut report = CommitReport::default();
+        WINDOW_STEPS.with(|steps| steps.set(0));
+        drop_expired(&mut s, WINDOW_DROPS_PER_COMMIT, &mut report).unwrap();
+        assert_eq!(s.keyed_admissions.len(), kept + due - report.admissions);
+        (WINDOW_STEPS.with(std::cell::Cell::get), report)
+    }
+    #[test]
+    fn window_work_on_a_plain_state_depends_on_entries_dropped_not_on_entries_kept() {
+        // Nothing expired: one ordered lookup, however many entries are kept.
+        assert_eq!(steps(10, 0).0, 1);
+        assert_eq!(steps(10_000, 0).0, 1);
+        // k dropped: one lookup, then one member and one lookup per entry.
+        for k in [1, 8, 64] {
+            let (work, report) = steps(10_000, k);
+            assert_eq!((work, report.admissions), (1 + 2 * k, k), "k = {k}");
+        }
+        // More than 64 due: still 64.
+        let (work, report) = steps(10_000, 200);
+        assert_eq!((work, report.admissions), (1 + 2 * 64, 64));
+    }
+    #[test]
+    fn a_member_behind_its_items_expiry_moves_to_it() {
+        let mut s = state(0, 1);
+        // The record says 2_000; the member is still at 500.
+        s.retention
+            .admission_expires_at_ms
+            .insert("k-00000".into(), 2_000);
+        let mut report = CommitReport::default();
+        drop_expired(&mut s, WINDOW_DROPS_PER_COMMIT, &mut report).unwrap();
+        assert_eq!(report, CommitReport::default());
+        assert!(s.keyed_admissions.contains_key("k-00000"));
+        assert_eq!(
+            s.retention.expiry.into_plain(),
+            BTreeMap::from([(2_000, BTreeSet::from(["k:k-00000".to_string()]))])
+        );
+    }
 }

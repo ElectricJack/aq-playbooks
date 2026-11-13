@@ -1395,3 +1395,146 @@ fn a_finished_runs_inspection_is_identical_before_and_after_removal_on_postgres(
         assert_eq!(pages(&e), live, "{format}");
     }
 }
+
+// --- Task 6: window entries dropped 64 per commit --------------------------
+
+fn pg_keyed(e: &Engine<PostgresStorage>, key: &str) -> KeyedAdmissionRequest {
+    KeyedAdmissionRequest {
+        key: key.into(),
+        binding: "a".into(),
+        expected_activation_revision: e.snapshot().unwrap().bindings["a"].revision,
+        entry: "main".into(),
+        input: Value::Null,
+        authority: pg_authority(),
+    }
+}
+fn pg_event_contract() -> aq_playbooks_model::EventContract {
+    use aq_playbooks_model::*;
+    EventContract {
+        sensitive_payload_fields: Default::default(),
+        name: "test.signal".into(),
+        version: "1".into(),
+        payload: Schema::Null,
+        trusted_producers: ["host".to_string()].into(),
+        scopes: ["project".to_string()].into(),
+        correlation_fields: ["invocation".to_string()].into(),
+        subject_field: None,
+        revision_field: None,
+        max_payload_bytes: 1024,
+        retention_ms: 1_000,
+    }
+}
+fn pg_event(id: &str) -> aq_playbooks_model::EventEnvelope {
+    let c = pg_event_contract();
+    aq_playbooks_model::EventEnvelope {
+        producer: "host".into(),
+        event_id: id.into(),
+        contract: aq_playbooks_model::ContractRef {
+            name: c.name.clone(),
+            fingerprint: c.fingerprint().unwrap(),
+        },
+        scope: "project".into(),
+        correlation: BTreeMap::from([("invocation".into(), id.into())]),
+        subject: None,
+        revision: None,
+        causation: None,
+        occurred_at_ms: None,
+        observed_at_ms: None,
+        payload: Value::Null,
+    }
+}
+/// The 64-drop script on f2 protected and f3: 65 finished keyed runs with a
+/// 1 s window and one event with a 1 s window, then one admission past them.
+/// The dropping commit passes the removal fence on f2 and stays on the
+/// bounded path on f3; an expired key admitted again leaves first and is
+/// new; no tombstone row is written.
+#[test]
+fn window_drop_on_postgres_is_incremental_on_f3_and_fenced_on_f2() {
+    for (format, store) in both() {
+        let ns = support::namespace("window");
+        let e = Engine::new(store, &ns, "w").unwrap();
+        let mut content = support::artifact("a").content;
+        content
+            .registry
+            .events
+            .insert("test.signal".into(), pg_event_contract());
+        let a = aq_playbooks_model::Artifact::seal(content).unwrap();
+        let digest = a.digest.clone();
+        e.install(a).unwrap();
+        e.activate_at("a", &digest, pg_authority(), 0).unwrap();
+        e.set_retention_policy(RetentionPolicy {
+            admission_replay_ms: 1_000,
+            event_replay_ms: 1,
+            ..RetentionPolicy::default()
+        })
+        .unwrap();
+        e.admit_event("host", pg_event("e1"), 0).unwrap();
+        for i in 0..65 {
+            let d = e.admit_once(pg_keyed(&e, &format!("k-{i:03}")), i).unwrap();
+            e.advance(&d.receipt.run_id, i).unwrap();
+        }
+        let s = e.snapshot().unwrap();
+        assert_eq!(
+            (s.keyed_admissions.len(), s.events.len()),
+            (65, 1),
+            "{format}"
+        );
+        e.store.reset_transition_stats();
+        e.admit_once(pg_keyed(&e, "k-new"), 2_000).unwrap();
+        let s = e.snapshot().unwrap();
+        // The event (1_000) and k-000..k-062 (1_000..1_062): 64, oldest first.
+        assert!(s.events.is_empty(), "{format}");
+        assert_eq!(
+            s.keyed_admissions.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "k-063".to_string(),
+                "k-064".to_string(),
+                "k-new".to_string()
+            ],
+            "{format}"
+        );
+        assert!(
+            s.retention.event_epochs.is_empty()
+                && s.retention.event_expires_at_ms.is_empty()
+                && s.indexes.events.is_empty()
+                && s.indexes.event_memberships.is_empty(),
+            "{format}"
+        );
+        assert_eq!(
+            s.retention.expiry.keys().copied().collect::<Vec<_>>(),
+            vec![1_063, 1_064, 3_000],
+            "{format}"
+        );
+        assert!(
+            s.retention.event_tombstones.is_empty() && s.retention.expired_correlations.is_empty(),
+            "{format}"
+        );
+        let stats = e.store.transition_stats();
+        if format == "f3" {
+            assert_eq!((stats.incremental, stats.heavy), (1, 0), "{format}");
+        }
+        // An expired key admitted again: its receipt leaves in a commit of
+        // its own, then the key is new (and the drop takes k-064's sibling).
+        let again = e.admit_once(pg_keyed(&e, "k-064"), 2_001).unwrap();
+        assert!(!again.duplicate, "{format}");
+        let s = e.snapshot().unwrap();
+        assert_eq!(
+            s.keyed_admissions.keys().cloned().collect::<Vec<_>>(),
+            vec!["k-064".to_string(), "k-new".to_string()],
+            "{format}"
+        );
+        assert_eq!(s.keyed_admissions["k-064"], again.receipt, "{format}");
+        if format == "f3" {
+            let stats = e.store.transition_stats();
+            assert_eq!((stats.incremental, stats.heavy), (3, 0), "{format}");
+        }
+        // A redelivered event after its window is new.
+        assert!(
+            !e.admit_event("host", pg_event("e1"), 2_002)
+                .unwrap()
+                .duplicate
+        );
+        assert_eq!(e.snapshot().unwrap().events.len(), 1, "{format}");
+        assert_eq!(tombstone_rows(&ns), 0, "{format}");
+    }
+}
