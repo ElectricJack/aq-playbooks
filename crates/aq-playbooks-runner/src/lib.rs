@@ -3712,23 +3712,14 @@ impl<S: Storage> Engine<S> {
             Ok(())
         })
     }
+    /// Store `policy`. Its windows must be positive. `max_tombstones` and
+    /// `terminal_run_ms` are stored as given and never read: finished runs
+    /// leave the State as history, and no tombstone is written for them.
     pub fn set_retention_policy(&self, policy: RetentionPolicy) -> Result<()> {
-        if policy.event_replay_ms == 0
-            || policy.terminal_run_ms == 0
-            || policy.audit_ms == 0
-            || policy.max_tombstones == 0
-            || policy.admission_replay_ms == 0
-        {
-            return Err(Error::Refused(
-                "retention horizons and tombstone quota must be positive".into(),
-            ));
+        if policy.event_replay_ms == 0 || policy.admission_replay_ms == 0 || policy.audit_ms == 0 {
+            return Err(Error::Refused("retention windows must be positive".into()));
         }
         self.transaction_at(None, |s| {
-            if policy.max_tombstones < s.retention.event_tombstones.len() {
-                return Err(Error::Refused(
-                    "retention policy cannot evict existing replay tombstones".into(),
-                ));
-            }
             s.retention.policy = policy;
             Ok(())
         })

@@ -53,6 +53,10 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (4, include_str!("../migrations/0004_catalog_inspection.sql")),
     (5, include_str!("../migrations/0005_transition_records.sql")),
     (6, include_str!("../migrations/0006_run_history.sql")),
+    (
+        7,
+        include_str!("../migrations/0007_namespaces_autovacuum.sql"),
+    ),
 ];
 #[cfg(all(test, feature = "postgres-tests"))]
 const WRITE_MARKER_SQL: &str = "SELECT set_config('aq_playbooks.writer_namespace',$1,true),set_config('aq_playbooks.writer_format','2',true)";

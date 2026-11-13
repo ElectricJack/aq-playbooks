@@ -4752,3 +4752,262 @@ fn a_driven_join_at_the_pinned_time_is_capped_by_its_declared_deadline() {
         Some(Pending::Join { deadline, .. }) if deadline == 10_100
     ));
 }
+
+// --- Task 8: quotas count live work
+
+#[test]
+fn max_runs_counts_live_runs_only() {
+    let e = Engine::with_config(
+        MemoryStorage::retaining_settled(),
+        "test",
+        "i-1",
+        EngineConfig {
+            max_runs: 2,
+            ..EngineConfig::default()
+        },
+    )
+    .unwrap();
+    install(
+        &e,
+        artifact(
+            "a",
+            "done",
+            BTreeMap::from([("done".into(), ret("ok"))]),
+            Registry::default(),
+            BTreeMap::new(),
+        ),
+        "a",
+    );
+    for t in 0..5 {
+        let id = e.admit("a", "main", Value::Null, authority(), t).unwrap();
+        e.advance(&id, t).unwrap();
+    }
+    e.admit("a", "main", Value::Null, authority(), 10).unwrap();
+    e.admit("a", "main", Value::Null, authority(), 11).unwrap();
+    assert!(
+        matches!(e.admit("a", "main", Value::Null, authority(), 12), Err(Error::Refused(m)) if m.contains("quota"))
+    );
+}
+#[test]
+fn max_receipts_counts_the_window_and_frees_when_it_passes() {
+    let e = Engine::with_config(
+        MemoryStorage::retaining_settled(),
+        "test",
+        "i-1",
+        EngineConfig {
+            // Deviation from the brief (10): the ten window receipts plus
+            // the receipt of the run each keyed admission starts.
+            max_receipts: 11,
+            ..EngineConfig::default()
+        },
+    )
+    .unwrap();
+    install(
+        &e,
+        artifact(
+            "a",
+            "done",
+            BTreeMap::from([("done".into(), ret("ok"))]),
+            Registry::default(),
+            BTreeMap::new(),
+        ),
+        "a",
+    );
+    e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 1_000,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    for i in 0..10 {
+        let d = e.admit_once(keyed(&e, &format!("k{i}")), i).unwrap();
+        e.advance(&d.receipt.run_id, i).unwrap();
+    }
+    assert!(
+        matches!(e.admit_once(keyed(&e, "k10"), 10), Err(Error::Refused(m)) if m.contains("quota"))
+    );
+    assert!(!e.admit_once(keyed(&e, "k10"), 2_000).unwrap().duplicate);
+}
+#[test]
+fn max_tombstones_and_terminal_run_ms_are_accepted_and_ignored() {
+    let e = engine();
+    e.set_retention_policy(RetentionPolicy {
+        max_tombstones: 0,
+        terminal_run_ms: 0,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    assert_eq!(e.snapshot().unwrap().retention.policy.max_tombstones, 0);
+}
+#[test]
+fn retention_windows_must_be_positive() {
+    let e = engine();
+    for policy in [
+        RetentionPolicy {
+            event_replay_ms: 0,
+            ..RetentionPolicy::default()
+        },
+        RetentionPolicy {
+            admission_replay_ms: 0,
+            ..RetentionPolicy::default()
+        },
+        RetentionPolicy {
+            audit_ms: 0,
+            ..RetentionPolicy::default()
+        },
+    ] {
+        assert!(
+            matches!(e.set_retention_policy(policy), Err(Error::Refused(m)) if m == "retention windows must be positive")
+        );
+    }
+}
+/// A refusal names the quota that is full, what it counts and its limit, in
+/// the counts the refused commit would have held; it writes nothing.
+#[test]
+fn a_quota_refusal_names_what_is_full() {
+    type Step = dyn Fn(&Engine<MemoryStorage>, i64) -> Result<()>;
+    let refusal = |config: EngineConfig, fill: usize, step: &Step| {
+        let mut e = engine();
+        install(&e, done_artifact(), "a");
+        e.set_retention_policy(RetentionPolicy {
+            admission_replay_ms: 1_000,
+            ..RetentionPolicy::default()
+        })
+        .unwrap();
+        for t in 0..fill {
+            step(&e, t as i64).unwrap();
+        }
+        e.config = config;
+        let before = e.store.load("test").unwrap().revision;
+        let message = match step(&e, fill as i64) {
+            Err(Error::Refused(m)) => m,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(e.store.load("test").unwrap().revision, before);
+        message
+    };
+    let admit = |e: &Engine<MemoryStorage>, t: i64| {
+        e.admit("a", "main", Value::Null, authority(), t)
+            .map(|_| ())
+    };
+    let admit_keyed = |e: &Engine<MemoryStorage>, t: i64| {
+        let d = e.admit_once(keyed(e, &format!("k{t}")), t)?;
+        e.advance(&d.receipt.run_id, t).map(|_| ())
+    };
+    let runs = refusal(
+        EngineConfig {
+            max_runs: 2,
+            ..EngineConfig::default()
+        },
+        2,
+        &admit,
+    );
+    assert_eq!(
+        runs,
+        "namespace quota exhausted: this commit would hold 3 runs in progress (limit max_runs 2)"
+    );
+    // Two finished keyed runs leave two window receipts; the third
+    // admission holds them, its own receipt and its run's receipt.
+    let receipts = refusal(
+        EngineConfig {
+            max_receipts: 3,
+            ..EngineConfig::default()
+        },
+        2,
+        &admit_keyed,
+    );
+    assert_eq!(
+        receipts,
+        "namespace quota exhausted: this commit would hold 4 receipts: those of runs in progress and keyed admissions inside their replay window (limit max_receipts 3)"
+    );
+    let bytes = refusal(
+        EngineConfig {
+            max_state_bytes: 1,
+            ..EngineConfig::default()
+        },
+        0,
+        &admit,
+    );
+    assert!(
+        bytes.starts_with("namespace quota exhausted: this commit would hold a state record of ")
+            && bytes
+                .ends_with(" bytes: work in progress and replay windows (limit max_state_bytes 1)"),
+        "{bytes}"
+    );
+    for message in [runs, receipts, bytes] {
+        for advice in ["GC", "garbage", "epoch", "tombstone"] {
+            assert!(!message.contains(advice), "{message}");
+        }
+    }
+}
+/// Event tombstones written by legacy GC beyond `max_tombstones` neither
+/// stop a later GC nor a policy change: the tombstone quota is ignored.
+#[test]
+fn legacy_tombstones_beyond_max_tombstones_stop_neither_gc_nor_policy_changes() {
+    let e = engine();
+    install(&e, wait_artifact(), "waiter");
+    let policy = RetentionPolicy {
+        event_replay_ms: 1,
+        max_tombstones: 1,
+        ..RetentionPolicy::default()
+    };
+    e.set_retention_policy(policy.clone()).unwrap();
+    for i in 0..3 {
+        e.admit_event("host", event(&format!("old-{i}"), 1), 0)
+            .unwrap();
+    }
+    assert_eq!(e.collect_garbage(2_000, 10).unwrap().events, 3);
+    assert_eq!(e.snapshot().unwrap().retention.event_tombstones.len(), 3);
+    e.set_retention_policy(policy).unwrap();
+}
+/// A namespace written before this change holds finished runs. They count
+/// toward `max_runs` until they leave (the drain of Task 9; here, GC by
+/// `audit_ms`, with `terminal_run_ms` ignored). At its quota such a
+/// namespace refuses new work, saying what is full, and still commits the
+/// work that frees it: a live run finishes and leaves, and GC moves the
+/// finished runs out.
+#[test]
+fn a_legacy_namespace_at_its_run_quota_still_commits_the_work_that_drains_it() {
+    let legacy = 51;
+    let e = Engine::with_config(
+        MemoryStorage::retaining_settled(),
+        "test",
+        "i-1",
+        EngineConfig {
+            max_runs: legacy + 1,
+            ..EngineConfig::default()
+        },
+    )
+    .unwrap();
+    install(&e, done_artifact(), "a");
+    e.set_retention_policy(RetentionPolicy {
+        terminal_run_ms: u64::MAX,
+        audit_ms: 1,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    let live = e.admit("a", "main", Value::Null, authority(), 1).unwrap();
+    let mut s = e.snapshot().unwrap();
+    for i in 0..legacy {
+        let id = format!("old-{i:03}");
+        s.runs.insert(id.clone(), completed_run(&id));
+        s.sequence += 1;
+        s.receipts.push(audit(s.sequence, &id));
+    }
+    s.indexes.initialized = false;
+    overwrite(&e.store, "i-1", &s);
+    assert_eq!(quota_counts(&s).unwrap().runs, e.config.max_runs);
+    assert!(matches!(
+        e.admit("a", "main", Value::Null, authority(), 2),
+        Err(Error::Refused(m)) if m.ends_with("53 runs in progress (limit max_runs 52)")
+    ));
+    // The live run finishes and leaves at the quota.
+    assert!(e.advance(&live, 3).unwrap());
+    assert_eq!(e.snapshot().unwrap().runs.len(), legacy);
+    // GC moves the finished runs out at the quota, by audit_ms.
+    e.admit("a", "main", Value::Null, authority(), 4).unwrap();
+    assert_eq!(e.collect_garbage(1_000, 1_000).unwrap().runs, legacy);
+    assert_eq!(e.snapshot().unwrap().runs.len(), 1);
+    e.admit("a", "main", Value::Null, authority(), 1_001)
+        .unwrap();
+    assert_eq!(e.snapshot().unwrap().runs.len(), 2);
+}

@@ -361,3 +361,78 @@ server must:
 - check `to_ms` (and the floor) against PostgreSQL `now()` before calling,
   and refuse when they disagree beyond the slack;
 - require explicit confirmation, and offer the dry run first.
+
+## Quotas count live work
+
+Spec §4. `EngineConfig`'s quotas count what the namespace record holds,
+after the commit being checked. Finished runs leave the record as history
+rows, which count toward no quota. So:
+
+| Quota | Counts |
+| --- | --- |
+| `max_runs` | runs in progress |
+| `max_events` | events awaiting delivery, and events inside their replay window |
+| `max_queued_destinations` | event deliveries queued for runs not yet admitted |
+| `max_receipts` | the receipts of runs in progress, plus keyed admission receipts inside their replay window |
+| `max_state_bytes` | the canonical State: work in progress plus the window entries |
+
+The complete path (`quota_counts(&State)`) and the format 3 transition path
+(the maintained `Accounting`) count the same; `transition_equivalence`
+compares both, and a refusal on each, at every step.
+
+A refusal names each full quota, what it counts, the count the commit would
+have reached, and the limit, for example:
+
+```text
+namespace quota exhausted: this commit would hold 3 runs in progress (limit max_runs 2)
+```
+
+Nothing has to be collected to free a quota: runs leave when they finish and
+window entries when their window passes. To make room sooner, finish or
+cancel runs in progress, or raise the limit.
+
+**A namespace written before this change** still holds the runs that
+finished before the upgrade, and counts them as runs in progress, until the
+drain moves them out (Task 9). At its old quota such a namespace refuses new
+work, but still commits the work that frees it: a run in progress finishes
+and leaves, and `collect_garbage` removes finished runs (tested:
+`a_legacy_namespace_at_its_run_quota_still_commits_the_work_that_drains_it`).
+
+**`max_tombstones` and `terminal_run_ms`** are accepted in a stored policy
+(any value, `0` included) and never read. `set_retention_policy` refuses
+only a zero window (`event_replay_ms`, `admission_replay_ms` or `audit_ms`):
+"retention windows must be positive". Nothing refuses a commit for the
+number of tombstones it holds:
+
+- GC no longer refuses for the event tombstone or correlation fence count,
+  and the age of a finished root it may collect is `audit_ms` alone;
+- PostgreSQL no longer counts `disposal_tombstones` rows on a full commit.
+  Its cutoff deletes over those rows (`collect`) run only in a commit that
+  moves the GC clock, as on the format 3 bounded path. Rows written before
+  this change are drained by Task 9 and never refuse a commit.
+
+## PostgreSQL storage tuning (migration 7)
+
+On protected format 2 every transition rewrites the namespace's one wide,
+encrypted row. Ciphertext does not compress, so each commit writes a new
+TOAST value the size of the record and leaves the old one dead. TOAST space
+is reclaimed only by vacuum, which makes it reusable without shrinking the
+file. The on-disk size of `aq_playbooks.namespaces` is therefore a plateau
+of roughly
+
+```text
+commit rate × record size × (autovacuum naptime + vacuum time)
+```
+
+and does not grow with the number of runs. At benchmark pace (about 1,500
+commits a minute, a 124 KB record) that is a few hundred MB; at aq-server's
+pace (tens of commits a minute) a few MB.
+
+Migration 7 (`0007_namespaces_autovacuum.sql`) sets
+`autovacuum_vacuum_cost_delay = 0` on `aq_playbooks.namespaces` and on its
+TOAST table (`toast.autovacuum_vacuum_cost_delay = 0`), so each vacuum pass
+of that table finishes in one go. It is tuning only: it shortens the vacuum
+time term. `autovacuum_naptime` is server-wide and left to the operator. No
+other table is changed. The role that applies the migrations owns the table
+(it created it), which is all the setting needs; it takes a
+`SHARE UPDATE EXCLUSIVE` lock and does not block commits.

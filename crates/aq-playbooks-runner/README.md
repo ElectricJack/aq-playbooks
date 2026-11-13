@@ -69,12 +69,15 @@ completion matching remains pinned after that step has continued. Invalid result
 block only the affected operation and retain a safe diagnostic.
 
 `EngineConfig` bounds namespace runs, events, queued destinations, receipts and
-bytes. Artifacts bound payloads, visits, nested iterations, history, duration,
+bytes. They count what the record holds: work in progress and the replay
+windows (finished runs leave as history, which counts toward no quota).
+Artifacts bound payloads, visits, nested iterations, history, duration,
 children, depth and concurrent work. Execution-budget exhaustion settles owned
-work and fails once. Quota refusal preserves existing obligations.
+work and fails once. Quota refusal preserves existing obligations and names the
+quota that is full.
 
-`RetentionPolicy` declares event replay, terminal-run and audit horizons plus a
-bounded tombstone quota. Bounded GC pages persist their scan cursor, preserve
+`RetentionPolicy` declares event replay, keyed admission and audit windows. Its
+`terminal_run_ms` and `max_tombstones` are accepted and ignored. Bounded GC pages persist their scan cursor, preserve
 unsettled cohorts and transitive artifact closures, and record disposal. Replay
 identities become tombstones rather than reusable IDs. Explicit monotonic producer
 epoch retirement fences old requests and permits bounded tombstone compaction.

@@ -389,8 +389,12 @@ fn native_same_scope_recovery_head_rotates_and_unchanged_history_rows_are_not_re
     assert_eq!(client().query_one("SELECT count(*) FROM aq_playbooks.runtime_index WHERE namespace=$1 AND kind='effect:recovery'",&[&n]).unwrap().get::<_,i64>(0),1);
 }
 
+/// `max_tombstones` is accepted and ignored: a commit writing more disposal
+/// tombstone rows than it allows is not refused (before spec 0003 this test
+/// asserted that refusal). Expired unreferenced artifact metadata is still
+/// collected by the commits that move the GC clock.
 #[test]
-fn disposal_quota_refuses_atomically_and_expired_unreferenced_artifact_metadata_is_collected() {
+fn max_tombstones_is_ignored_and_expired_unreferenced_artifact_metadata_is_collected() {
     let n = namespace("gc-quota");
     let first = artifact(&n);
     let second = artifact(&format!("{n}-second"));
@@ -414,17 +418,10 @@ fn disposal_quota_refuses_atomically_and_expired_unreferenced_artifact_metadata_
         key: second.digest.clone(),
         at_ms: 100,
     });
-    assert!(
-        s.compare_and_swap(&n, "owner", 1, &next)
-            .unwrap_err()
-            .to_string()
-            .contains("quota")
-    );
-    assert_same(&s.load(&n).unwrap().state, &original);
-    next.retention.policy.max_tombstones = 10;
     next.retention.policy.audit_ms = 1;
     next.retention.last_gc_at_ms = Some(100);
     s.compare_and_swap(&n, "owner", 1, &next).unwrap();
+    assert_same(&s.load(&n).unwrap().state, &next);
     assert_eq!(
         client()
             .query_one(

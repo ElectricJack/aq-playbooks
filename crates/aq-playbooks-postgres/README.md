@@ -79,8 +79,9 @@ expiry. Only a recorded increase in the producer's replay epoch permits removal 
 that epoch's native event tombstones; stale delivery epochs remain refused. The
 injected monotonic GC clock and audit horizon permit compaction of settled
 run/operation disposal metadata and unreferenced artifact payload/catalog metadata.
-Shared artifact installation and disposal serialize on digest locks. Tombstone
-quota pressure refuses the transaction without deleting work. Artifact addresses
+Shared artifact installation and disposal serialize on digest locks. The
+disposal tombstone rows are not counted (`max_tombstones` is ignored), and their
+cutoff deletes run only in a commit that moves the GC clock. Artifact addresses
 remain content verified, including a byte digest while their disposal tombstone is
 retained.
 

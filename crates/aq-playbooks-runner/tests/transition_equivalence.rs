@@ -517,6 +517,31 @@ fn scenario(p: &mut Pair) {
     both!(p, |e| e.admit_once(request(Value::Null), 300));
     both!(p, |e| e.admit_once(request(Value::Null), 301));
     both!(p, |e| e.admit_once(request(json!(1)), 302));
+    // Quotas count what the record holds: live work plus the window. The
+    // maintained accounting refuses where the complete path does, with the
+    // same counts in the same words (`check` compares the results).
+    let counts = quota_counts(&p.m.snapshot().unwrap()).unwrap();
+    assert!(counts.receipts > 0 && !p.m.snapshot().unwrap().keyed_admissions.is_empty());
+    for (receipts, bytes) in [
+        (counts.receipts + 1, usize::MAX),
+        (usize::MAX, counts.state_bytes),
+    ] {
+        for config in [&mut p.m.config, &mut p.r.config] {
+            config.max_receipts = receipts;
+            config.max_state_bytes = bytes;
+        }
+        let refused = both!(p, |e| e.admit_once(
+            KeyedAdmissionRequest {
+                key: "request-two".into(),
+                ..request(Value::Null)
+            },
+            303
+        ));
+        assert!(refused.contains("namespace quota exhausted"), "{refused}");
+    }
+    for config in [&mut p.m.config, &mut p.r.config] {
+        *config = EngineConfig::default();
+    }
     // Producer epochs and expiry through retention.
     both!(p, |e| e
         .advance_producer_epoch("d10", 1, "operator", "rotate", 400));

@@ -46,17 +46,54 @@ pub struct TransitionRequest<'a> {
     pub validate: &'a dyn Fn(&State, &QuotaCounts) -> Result<()>,
 }
 
-const QUOTA_REFUSAL: &str = "namespace retention/admission quota exhausted";
+/// Refuse a commit whose counts exceed a quota. The State holds only work in
+/// progress and the replay windows (finished runs leave as history), so the
+/// refusal names each full quota by what it counts and its limit. A
+/// namespace written before that change also counts the finished runs it
+/// still holds until they are drained.
 pub fn check_quota(config: &EngineConfig, c: &QuotaCounts) -> Result<()> {
-    if c.runs > config.max_runs
-        || c.events > config.max_events
-        || c.queued_destinations > config.max_queued_destinations
-        || c.receipts > config.max_receipts
-        || c.state_bytes > config.max_state_bytes
-    {
-        return Err(Error::Refused(QUOTA_REFUSAL.into()));
+    let full: Vec<String> = [
+        (c.runs > config.max_runs).then(|| {
+            format!(
+                "{} runs in progress (limit max_runs {})",
+                c.runs, config.max_runs
+            )
+        }),
+        (c.events > config.max_events).then(|| {
+            format!(
+                "{} events awaiting delivery or inside their replay window (limit max_events {})",
+                c.events, config.max_events
+            )
+        }),
+        (c.queued_destinations > config.max_queued_destinations).then(|| {
+            format!(
+                "{} event deliveries queued for runs not yet admitted (limit max_queued_destinations {})",
+                c.queued_destinations, config.max_queued_destinations
+            )
+        }),
+        (c.receipts > config.max_receipts).then(|| {
+            format!(
+                "{} receipts: those of runs in progress and keyed admissions inside their replay window (limit max_receipts {})",
+                c.receipts, config.max_receipts
+            )
+        }),
+        (c.state_bytes > config.max_state_bytes).then(|| {
+            format!(
+                "a state record of {} bytes: work in progress and replay windows (limit max_state_bytes {})",
+                c.state_bytes, config.max_state_bytes
+            )
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if full.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    Err(Error::Refused(format!(
+        "namespace quota exhausted: this commit would hold {}",
+        full.join("; ")
+    )))
 }
 pub fn queued_destinations(event: &AcceptedEvent) -> usize {
     event

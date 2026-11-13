@@ -343,20 +343,71 @@ pub(crate) fn check_licensed_header(
     fn same<T: Serialize>(a: &T, b: &T) -> bool {
         matches!((serde_json::to_vec(a), serde_json::to_vec(b)), (Ok(a), Ok(b)) if a == b)
     }
-    let (p, n) = (&previous.retention, &next.retention);
-    let unchanged = same(&p.policy, &n.policy)
-        && p.producer_epochs == n.producer_epochs
-        && p.last_gc_at_ms == n.last_gc_at_ms
-        && p.gc_cursor == n.gc_cursor
-        && p.artifact_disposals == n.artifact_disposals
-        && previous.catalog_revision == next.catalog_revision
-        && previous.catalog_history_at_ms == next.catalog_history_at_ms
-        && previous.execution_denied == next.execution_denied
-        && previous.authority_revocations == next.authority_revocations
-        && same(&previous.catalog_history, &next.catalog_history)
-        && same(&previous.bindings, &next.bindings)
-        && same(&previous.recovery_requests, &next.recovery_requests)
-        && same(&previous.artifacts, &next.artifacts);
+    // Every field is named (no `..`): a field added to `State` or
+    // `RetentionState` does not compile here until someone decides whether a
+    // licence may change it. `_` marks a field this comparison does not
+    // judge, with the reason.
+    let State {
+        // Containers: removals are judged per key by `check_removals`, which
+        // a licence does not relax; their content (and waits and budgets,
+        // live sub-records) any commit may change, so a licence adds nothing.
+        keyed_admissions: _,
+        runs: _,
+        receipts: _,
+        intents: _,
+        waits: _,
+        events: _,
+        budgets: _,
+        // Derived from the State and rebuilt by `indexes::sync`.
+        indexes: _,
+        // Judged by `check_licence` (it must increase).
+        sequence: _,
+        // Not stored.
+        protection_available: _,
+        settled: _,
+        catalog_history,
+        catalog_history_at_ms,
+        retention,
+        execution_denied,
+        authority_revocations,
+        recovery_requests,
+        artifacts,
+        bindings,
+        catalog_revision,
+    } = previous;
+    let RetentionState {
+        // Retained-history containers and the window: fenced per key
+        // (`check_removals`, `check_expiry_record`), not here.
+        event_epochs: _,
+        event_expires_at_ms: _,
+        expired_correlations: _,
+        event_tombstones: _,
+        disposals: _,
+        expiry: _,
+        admission_expires_at_ms: _,
+        // What a licence names: judged by `check_licence`.
+        clock_ms: _,
+        stale_floor_ms: _,
+        last_gc_at_ms,
+        policy,
+        producer_epochs,
+        artifact_disposals,
+        gc_cursor,
+    } = retention;
+    let (n, r) = (next, &next.retention);
+    let unchanged = same(policy, &r.policy)
+        && *producer_epochs == r.producer_epochs
+        && *last_gc_at_ms == r.last_gc_at_ms
+        && *gc_cursor == r.gc_cursor
+        && *artifact_disposals == r.artifact_disposals
+        && *catalog_revision == n.catalog_revision
+        && *catalog_history_at_ms == n.catalog_history_at_ms
+        && *execution_denied == n.execution_denied
+        && *authority_revocations == n.authority_revocations
+        && same(catalog_history, &n.catalog_history)
+        && same(bindings, &n.bindings)
+        && same(recovery_requests, &n.recovery_requests)
+        && same(artifacts, &n.artifacts);
     if unchanged {
         Ok(())
     } else {
@@ -1390,7 +1441,7 @@ pub(crate) fn gc(s: &mut State, now: i64, limit: usize) -> Result<GcReport> {
                     .get(&root)
                     .copied()
                     .unwrap_or(i64::MAX)
-                    > cutoff(p.terminal_run_ms.max(p.audit_ms));
+                    > cutoff(p.audit_ms);
                 if active || unsettled || recent {
                     report.preserved += 1;
                     continue;
@@ -1508,30 +1559,6 @@ pub(crate) fn gc(s: &mut State, now: i64, limit: usize) -> Result<GcReport> {
                     .get(&e.envelope.producer)
                     .copied()
                     .unwrap_or(0);
-                if epoch == current && s.retention.event_tombstones.len() >= p.max_tombstones {
-                    return Err(Error::Refused(
-                        "replay tombstone quota reached; retire producer epoch before GC".into(),
-                    ));
-                }
-                let new_correlations = s
-                    .indexes
-                    .event_memberships
-                    .get(&id)
-                    .map(|keys| {
-                        keys.iter()
-                            .filter(|key| !s.retention.expired_correlations.contains_key(*key))
-                            .count()
-                    })
-                    .unwrap_or(0);
-                if epoch == current
-                    && s.retention
-                        .expired_correlations
-                        .len()
-                        .saturating_add(new_correlations)
-                        > p.max_tombstones.saturating_mul(64)
-                {
-                    return Err(Error::Refused("correlation history fence quota reached; settle retained invocations before epoch compaction".into()));
-                }
                 let e = s.events.remove(&id).unwrap();
                 s.retention.event_epochs.remove(&id);
                 s.retention.event_expires_at_ms.remove(&id);

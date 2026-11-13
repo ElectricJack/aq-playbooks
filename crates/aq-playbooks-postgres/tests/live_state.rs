@@ -2280,3 +2280,71 @@ fn a_pinned_clock_is_rebased_on_postgres() {
         );
     }
 }
+
+// --- Task 8: quotas count live work; max_tombstones is ignored -------------
+
+/// Legacy disposal tombstone rows beyond `max_tombstones` refuse no full
+/// commit, and a full commit that does not move the GC clock leaves them in
+/// place (no tombstone count, no cutoff deletes). The commit that moves the
+/// GC clock still runs the cutoff deletes. On f2 protected, f2 plain and f3.
+#[test]
+fn legacy_tombstone_rows_beyond_max_tombstones_refuse_no_commit_and_are_not_scanned() {
+    for (label, store) in [
+        ("f2", support::protected()),
+        ("f2_plain", support::store()),
+        ("f3", support::records()),
+    ] {
+        let ns = support::namespace(label);
+        store.acquire(&ns, "w").unwrap();
+        let mut state = State::default();
+        state.retention.policy.max_tombstones = 1;
+        state.retention.policy.audit_ms = 1;
+        state.retention.last_gc_at_ms = Some(10);
+        let base = store.compare_and_swap(&ns, "w", 0, &state).unwrap();
+        // 1,000 legacy run tombstone rows (no inspection row: the cutoff
+        // delete would take them), written as the namespace writer.
+        let mut c = support::client();
+        let mut tx = c.transaction().unwrap();
+        let format = if label == "f3" { "3" } else { "2" };
+        tx.query_one(
+            "SELECT set_config('aq_playbooks.writer_namespace',$1,true),set_config('aq_playbooks.writer_format',$2,true)",
+            &[&ns, &format],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO aq_playbooks.disposal_tombstones(namespace,kind,identity,content_digest,disposed_at_ms) SELECT $1,'run','legacy-'||i,NULL,1 FROM generate_series(1,1000) i",
+            &[&ns],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let mut next = state.clone();
+        next.runs.insert("run-new".into(), completed_run("run-new"));
+        let revision = store.compare_and_swap(&ns, "w", base, &next).unwrap();
+        assert_eq!(tombstone_rows(&ns), 1_000, "{label}");
+        next.retention.last_gc_at_ms = Some(20);
+        store.compare_and_swap(&ns, "w", revision, &next).unwrap();
+        assert_eq!(tombstone_rows(&ns), 0, "{label}");
+    }
+}
+/// Migration 7: autovacuum runs without cost delay on the namespace table
+/// and on its TOAST table (tuning for the one-row rewrite on format 2).
+#[test]
+fn namespaces_table_and_its_toast_vacuum_without_cost_delay() {
+    let _ = support::store();
+    let row = support::client()
+        .query_one(
+            "SELECT c.reloptions, t.reloptions FROM pg_class c JOIN pg_class t ON t.oid=c.reltoastrelid WHERE c.oid='aq_playbooks.namespaces'::regclass",
+            &[],
+        )
+        .unwrap();
+    let table: Option<Vec<String>> = row.get(0);
+    let toast: Option<Vec<String>> = row.get(1);
+    assert_eq!(
+        table.unwrap_or_default(),
+        vec!["autovacuum_vacuum_cost_delay=0".to_string()]
+    );
+    assert_eq!(
+        toast.unwrap_or_default(),
+        vec!["autovacuum_vacuum_cost_delay=0".to_string()]
+    );
+}

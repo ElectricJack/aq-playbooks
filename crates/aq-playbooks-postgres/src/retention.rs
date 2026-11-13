@@ -74,7 +74,12 @@ pub(crate) fn verify_and_record(
         .filter(|id| !next.retention.event_tombstones.contains_key(*id))
         .collect();
     forget_event_tombstones(tx, namespace, &retired)?;
-    collect(tx, namespace, next)?;
+    // The cutoff deletes scan the namespace's tombstone rows: run them only
+    // in a commit that moves the GC clock (a GC), as the format 3 bounded
+    // path does, not on every full commit.
+    if next.retention.last_gc_at_ms != previous.retention.last_gc_at_ms {
+        collect(tx, namespace, next)?;
+    }
     // Only identities this commit creates can collide with a tombstone.
     let mut kinds: Vec<&str> = vec![];
     let mut ids: Vec<&String> = vec![];
@@ -176,18 +181,8 @@ pub(crate) fn verify_and_record(
             record(tx, namespace, "artifact", id, Some(&hash_bytes(&bytes)), at)?;
         }
     }
-    let count: i64 = tx
-        .query_one(
-            "SELECT count(*) FROM aq_playbooks.disposal_tombstones WHERE namespace=$1",
-            &[&namespace],
-        )
-        .map_err(backend)?
-        .get(0);
-    if count as u64 > next.retention.policy.max_tombstones as u64 {
-        return Err(backend(
-            "durable disposal tombstone quota reached; GC refused without deleting work",
-        ));
-    }
+    // No tombstone count: `max_tombstones` is accepted and ignored, and
+    // legacy rows beyond it (drained later) never refuse a commit.
     Ok(())
 }
 /// Delete the tombstone rows of event tombstones the State no longer holds.
