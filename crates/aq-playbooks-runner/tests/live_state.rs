@@ -1111,6 +1111,74 @@ fn rebase_refusal_cases() -> Vec<Case> {
             Box::new(|n| n.retention.stale_floor_ms = Some(50)),
         ),
         (
+            "review probe C2: a rebase that also sets both windows to 1 and caps to 101",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                n.retention.policy.admission_replay_ms = 1;
+                n.retention.policy.event_replay_ms = 1;
+                n.retention.admission_expires_at_ms.insert("k".into(), 101);
+                n.retention.event_expires_at_ms.insert("ev".into(), 101);
+            }),
+        ),
+        (
+            "rebase that also changes the policy",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                n.retention.policy.audit_ms += 1;
+            }),
+        ),
+        (
+            "rebase that also installs an artifact",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                let extra = n.artifacts.values().next().unwrap().clone();
+                let mut content = extra.content.clone();
+                content.compiler = "another".into();
+                let a = Artifact::seal(content).unwrap();
+                n.artifacts.insert(a.digest.clone(), a);
+            }),
+        ),
+        (
+            "rebase that also changes a producer epoch",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                n.retention.producer_epochs.insert("host".into(), 1);
+            }),
+        ),
+        (
+            "rebase that also moves the catalog",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                n.catalog_revision += 1;
+            }),
+        ),
+        (
+            "rebase that also changes the catalog history",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                n.catalog_history_at_ms.insert(99, 1);
+            }),
+        ),
+        (
+            "rebase that also changes an event's contract to shrink its cap",
+            shortened,
+            Box::new(|n| {
+                rebased(n);
+                let mut e = n.events.get("ev-long").unwrap().clone();
+                e.envelope.contract.name = "test.other".into();
+                n.events.insert("ev-long".into(), e);
+                n.retention
+                    .event_expires_at_ms
+                    .insert("ev-long".into(), 3_100);
+            }),
+        ),
+        (
             "rebase raises the floor past its target",
             floor,
             Box::new(|n| {
@@ -1170,6 +1238,14 @@ fn after_rebase_refusal_cases() -> Vec<Case> {
                 n.retention.stale_floor_ms = Some(40);
                 n.retention.clock_ms = Some(200);
                 license(n, retention::STALE_FLOOR_LOWERED, 50, 40);
+            }),
+        ),
+        (
+            "floor lowering that also changes the policy",
+            licence,
+            Box::new(|n| {
+                n.retention.policy.admission_replay_ms = 1;
+                floor_lowered(n);
             }),
         ),
         (
@@ -4118,6 +4194,15 @@ fn pinned_clock_is_rebased_and_normal_operation_resumes<S: Storage>(e: &Engine<S
             .unwrap()
             .duplicate
     );
+    // Round 3: after an ordinary commit, a key still inside its (capped)
+    // window is still remembered.
+    e.admit("a", "main", Value::Null, authority(), t2 + 500)
+        .unwrap();
+    assert!(
+        e.admit_once_at(keyed_on(e, "pin-0"), Some(t1), t2 + 999)
+            .unwrap()
+            .duplicate
+    );
     // An event inside its contract window is still a duplicate.
     assert!(
         e.admit_event("host", correlated_event("pin-e", "inv-pin"), t2 + 10)
@@ -4342,6 +4427,27 @@ fn a_wait_registered_at_the_pinned_time_times_out_after_the_rebase() {
         .find(|r| r.kind == retention::CLOCK_REBASE)
         .unwrap();
     assert_eq!(rebase.detail["capped_deadlines"], 4);
+    // N2 (round 3): each capped value with its original, for audit.
+    let adjustment =
+        |run: &str, kind: &str, item: &str, original_ms: i64, capped_ms: i64| DeadlineAdjustment {
+            run: run.into(),
+            kind: kind.into(),
+            item: item.into(),
+            original_ms,
+            capped_ms,
+        };
+    let mut expected = vec![
+        adjustment(&waiter, "duration_basis", &waiter, pinned, t2),
+        adjustment(&waiter, "wait", &wait.id, pinned + 100, t2 + 100),
+        adjustment(&invoke, "duration_basis", &invoke, pinned, t2),
+        adjustment(&invoke, "operation", &intent.id, pinned + 100, t2 + 100),
+    ];
+    expected.sort_by(|a, b| (&a.run, &a.kind).cmp(&(&b.run, &b.kind)));
+    let mut got = report.adjustments.clone();
+    got.sort_by(|a, b| (&a.run, &a.kind).cmp(&(&b.run, &b.kind)));
+    assert_eq!(got, expected);
+    assert_eq!(report.adjustments_not_listed, 0);
+    assert_eq!(rebase.detail["adjustments"], json!(report.adjustments));
     assert_eq!(rebase.detail["adjusted_runs"], json!(report.adjusted_runs));
     assert_eq!(rebase.detail["needs_operator_action"], json!([]));
     // Before its deadline the wait still waits; after it, it times out, the
@@ -4518,5 +4624,131 @@ fn a_join_set_at_the_pinned_time_is_capped_by_its_declared_deadline() {
     assert!(matches!(
         e.snapshot().unwrap().runs[&run].pending,
         Some(Pending::Join { deadline, .. }) if deadline == 15_000
+    ));
+}
+/// The owned-operation join fixture of `semantics.rs`.
+fn async_artifact() -> (Artifact, EventContract) {
+    let admission = Schema::object(BTreeMap::from([("handle".into(), Schema::string(256))]));
+    let completion = Schema::object(BTreeMap::from([
+        (
+            "outcome".into(),
+            Schema::String {
+                max_length: 10,
+                values: set(&["ok", "retry"]),
+            },
+        ),
+        ("output".into(), Schema::Null),
+    ]));
+    let mut ev = event_contract();
+    ev.name = "async.completed".into();
+    ev.payload = completion.clone();
+    ev.correlation_fields = set(&["operation"]);
+    ev.subject_field = None;
+    ev.revision_field = None;
+    let mut c = command(Recovery::Reconcilable);
+    c.cancellation = true;
+    c.outcomes.insert("accepted".into(), admission);
+    c.asynchronous = Some(AsyncContract {
+        completion_event: ev.name.clone(),
+        completion,
+        correlation_field: "operation".into(),
+        reconciliation_command: "operation.get".into(),
+    });
+    let mut get = command(Recovery::Observation);
+    get.name = "operation.get".into();
+    get.effect = Effect::Observation;
+    let a = artifact(
+        "async",
+        "invoke",
+        BTreeMap::from([
+            (
+                "invoke".into(),
+                Step {
+                    op: Operation::Invoke {
+                        command: ContractRef {
+                            name: c.name.clone(),
+                            fingerprint: c.fingerprint().unwrap(),
+                        },
+                        input: Expr::literal(Value::Null),
+                        bind: "handle".into(),
+                        retry: None,
+                    },
+                    edges: edges(&[("accepted", "join"), ("ok", "ok"), ("retry", "error")]),
+                    on_error: Some("error".into()),
+                },
+            ),
+            (
+                "join".into(),
+                Step {
+                    op: Operation::Join {
+                        member_keys: vec![],
+                        members: vec![Expr::reference("handle")],
+                        mode: JoinMode::All,
+                        accepted_outcomes: set(&["ok"]),
+                        deadline_ms: 100,
+                        remaining: RemainingPolicy::Cancel,
+                        bind: "joined".into(),
+                    },
+                    edges: edges(&[
+                        ("completed", "ok"),
+                        ("no_match", "error"),
+                        ("timeout", "fallback"),
+                    ]),
+                    on_error: Some("error".into()),
+                },
+            ),
+            ("ok".into(), ret("ok")),
+            ("error".into(), ret("error")),
+            ("fallback".into(), ret("error")),
+        ]),
+        Registry {
+            commands: BTreeMap::from([(c.name.clone(), c), (get.name.clone(), get)]),
+            events: BTreeMap::from([(ev.name.clone(), ev.clone())]),
+        },
+        BTreeMap::new(),
+    );
+    (a, ev)
+}
+/// N4 (round 3): a join driven at the pinned time (an accepted operation,
+/// then `Join` with a 100 ms deadline) is capped at the target plus that
+/// deadline.
+#[test]
+fn a_driven_join_at_the_pinned_time_is_capped_by_its_declared_deadline() {
+    let e = ret_engine();
+    let (a, _) = async_artifact();
+    install(&e, a, "async");
+    e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 1_000,
+        event_replay_ms: 1,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    let pinned: i64 = 1_000_000_000;
+    let id = e
+        .admit("async", "main", Value::Null, authority(), pinned)
+        .unwrap();
+    let mut host = FakeHost {
+        responses: BTreeMap::from([(
+            "test.command".into(),
+            vec![DispatchResult::Accepted {
+                handle: "server-operation".into(),
+            }],
+        )]),
+        ..Default::default()
+    };
+    e.drive(&mut host, pinned, 10).unwrap();
+    let s = e.snapshot().unwrap();
+    assert_eq!(s.runs[&id].step, "join");
+    assert!(matches!(
+        s.runs[&id].pending,
+        Some(Pending::Join { deadline, .. }) if deadline == pinned + 100
+    ));
+    let report = e
+        .rebase_retention_clock(10_000, 9_000, "ops", "pinned clock", 10_000)
+        .unwrap();
+    assert!(report.adjusted_runs.contains(&id));
+    assert!(matches!(
+        e.snapshot().unwrap().runs[&id].pending,
+        Some(Pending::Join { deadline, .. }) if deadline == 10_100
     ));
 }

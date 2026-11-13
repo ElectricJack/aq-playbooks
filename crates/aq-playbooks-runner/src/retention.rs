@@ -300,6 +300,7 @@ fn check_licence(
         }
         return check_floor_unchanged(previous, next);
     };
+    check_licensed_header(previous, next)?;
     let (Licence::Rebase { sequence, .. } | Licence::FloorLowered { sequence, .. }) = licence;
     if sequence <= previous.sequence || sequence > next.sequence {
         return Err(refuse(REFUSE_LICENCE));
@@ -330,6 +331,38 @@ fn check_licence(
     }
     Ok(())
 }
+/// In a licensed commit every header field the licence does not name is
+/// unchanged: the retention policy, producer epochs, GC state and artifact
+/// disposals, the artifacts, bindings, catalog revision and history,
+/// execution denials, authority revocations and recovery requests. (The
+/// clock, the floor and the sequence are judged by [`check_licence`].)
+pub(crate) fn check_licensed_header(
+    previous: &State,
+    next: &State,
+) -> std::result::Result<(), StorageError> {
+    fn same<T: Serialize>(a: &T, b: &T) -> bool {
+        matches!((serde_json::to_vec(a), serde_json::to_vec(b)), (Ok(a), Ok(b)) if a == b)
+    }
+    let (p, n) = (&previous.retention, &next.retention);
+    let unchanged = same(&p.policy, &n.policy)
+        && p.producer_epochs == n.producer_epochs
+        && p.last_gc_at_ms == n.last_gc_at_ms
+        && p.gc_cursor == n.gc_cursor
+        && p.artifact_disposals == n.artifact_disposals
+        && previous.catalog_revision == next.catalog_revision
+        && previous.catalog_history_at_ms == next.catalog_history_at_ms
+        && previous.execution_denied == next.execution_denied
+        && previous.authority_revocations == next.authority_revocations
+        && same(&previous.catalog_history, &next.catalog_history)
+        && same(&previous.bindings, &next.bindings)
+        && same(&previous.recovery_requests, &next.recovery_requests)
+        && same(&previous.artifacts, &next.artifacts);
+    if unchanged {
+        Ok(())
+    } else {
+        Err(refuse(REFUSE_LICENCE))
+    }
+}
 /// Without a licence the stale floor never changes (a format 3 bounded
 /// commit never carries one).
 pub fn check_floor_unchanged(
@@ -343,9 +376,12 @@ pub fn check_floor_unchanged(
 }
 /// [`check_expiry_change`] for record `key` of `window`, against `next`. In
 /// a commit with a licence the only allowed change is a rebase cap: a
-/// recorded expiry lowered to exactly [`rebase_cap`], with the clock at the
-/// rebase's `to_ms`.
+/// recorded expiry lowered to exactly [`rebase_cap`] computed from
+/// `previous` (its policy, artifacts and the stored event), with the clock
+/// at the rebase's `to_ms`. `previous` needs its header and, for an event,
+/// that event's stored record.
 pub(crate) fn check_expiry_record(
+    previous: &State,
     next: &State,
     window: Window,
     key: &str,
@@ -358,7 +394,7 @@ pub(crate) fn check_expiry_record(
                 return Err(refuse(REFUSE_LICENCE));
             }
             let capped = matches!((old, new), (Some(old), Some(new))
-                if new < old && new == rebase_cap(next, window, key, to_ms));
+                if new < old && new == rebase_cap(previous, window, key, to_ms));
             return if capped {
                 Ok(())
             } else {
@@ -395,12 +431,12 @@ fn check_expiry_records(previous: &State, next: &State) -> std::result::Result<(
         for (key, at) in old {
             let after = new.get(key).copied();
             if after != Some(*at) {
-                check_expiry_record(next, window, key, Some(*at), after)?;
+                check_expiry_record(previous, next, window, key, Some(*at), after)?;
             }
         }
         for (key, at) in new {
             if !old.contains_key(key) {
-                check_expiry_record(next, window, key, None, Some(*at))?;
+                check_expiry_record(previous, next, window, key, None, Some(*at))?;
             }
         }
     }

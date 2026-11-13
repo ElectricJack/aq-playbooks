@@ -536,8 +536,14 @@ fn verify_patch_removals(data: &RecordData, patch: &StatePatch, next: &State) ->
     let at = |field: &str, bytes: &[u8]| -> Result<i64> {
         serde_json::from_slice(bytes).map_err(|e| backend(format!("{field} record: {e}")))
     };
-    // A licensed admin commit adds no run, operation, event or keyed receipt.
-    if crate::retention::licence(next)?.is_some() {
+    // A licensed admin commit changes no header field its licence does not
+    // name, and adds no run, operation, event or keyed receipt. Its caps are
+    // computed from the stored header and the stored events.
+    let licensed = crate::retention::licence(next)?.is_some();
+    let mut caps = State::default();
+    if licensed {
+        caps = header_state(&data.header)?;
+        crate::retention::check_licensed_header(&caps, next)?;
         for (path, change) in &patch.changes {
             let field = field_name(path)?;
             if !FENCED.contains(&field) {
@@ -554,6 +560,24 @@ fn verify_patch_removals(data: &RecordData, patch: &StatePatch, next: &State) ->
             };
             if added {
                 return Err(backend(crate::retention::REFUSE_LICENCE));
+            }
+        }
+        if let Some(stored) = data.container("events") {
+            for (path, change) in &patch.changes {
+                if field_name(path)? != "retention.event_expires_at_ms" {
+                    continue;
+                }
+                let keys: Vec<&TreeKey> = match change {
+                    ContainerChange::Entries(rows) => rows.iter().map(|(k, _)| k).collect(),
+                    ContainerChange::Replace(rows) => rows.iter().map(|(k, _)| k).collect(),
+                };
+                for key in keys {
+                    if let (TreeKey::Str(id), Some(bytes)) = (key, stored.get(key)) {
+                        let event: crate::AcceptedEvent = serde_json::from_slice(bytes)
+                            .map_err(|e| backend(format!("events record: {e}")))?;
+                        caps.events.insert(id.clone(), event);
+                    }
+                }
             }
         }
     }
@@ -594,7 +618,7 @@ fn verify_patch_removals(data: &RecordData, patch: &StatePatch, next: &State) ->
                 let before = before.map(|b| at(field, b)).transpose()?;
                 let after = after.map(|b| at(field, b)).transpose()?;
                 if before != after {
-                    crate::retention::check_expiry_record(next, window, id, before, after)?;
+                    crate::retention::check_expiry_record(&caps, next, window, id, before, after)?;
                 }
             }
         } else if field == "receipts" {

@@ -198,6 +198,34 @@ refused unless all of these hold:
   correct clock before the pin.
 - An actor and a reason, both present and bounded.
 
+**`now_ms` must be right.** Like every commit, the rebase trusts the host
+time it is given, and the fence cannot know real time. A rebase with a wrong
+`now_ms` (say 0) is accepted if the clock is far enough ahead of it. It then
+moves the clock to that time and caps every window from there, far behind
+real time. The engine checks only what it can see without scanning the
+record: the raised floor must still be at most the target, so a host time
+earlier than an earlier rebase's floor (less the slack) is refused. The rest
+is the host's job:
+
+- the server takes `now_ms` from its own clock and cross-checks it, and
+  `to_ms`, against PostgreSQL `now()` (see "When aq-server exposes these
+  operations");
+- the machine running the CLI must have an NTP-synced clock;
+- run the dry run first and read the old clock, the new clock and the
+  counts.
+
+### A clock ahead by less than the smallest window
+
+That clock cannot be rebased, and it does not need to be. No honest request
+is refused as stale, because the cut-off stays behind real time. Entries
+expire at most that gap late. Wait it out: as real time passes the bad host
+time, the clock is correct again.
+
+Timers registered by commits at the bad host time (waits, joins, retries,
+operation deadlines, run durations) fire up to that gap late, which is less
+than the smallest window (up to 1 day with the default event window). Cancel
+(`aq-playbooks cancel <run>`) or reconcile any run whose late timer matters.
+
 ### What the rebase does
 
 1. It sets the retention clock to `to_ms`.
@@ -235,7 +263,11 @@ refused unless all of these hold:
 5. It writes a `retention_clock_rebased` admin receipt. The receipt holds
    `from_ms`, `to_ms`, `stale_floor_ms`, the capped counts, `adjusted_runs`,
    `needs_operator_action`, `actor`, `reason`, and the host time as `at_ms`.
-   The report returns the same.
+   For audit it also lists each capped timer (`adjustments`: run, kind,
+   item, original and capped value), at most 1,000 of them; the rest are
+   counted in `adjustments_not_listed`. That is how a run's history row,
+   which shows `admitted_at_ms = to_ms` next to receipts dated at the bad
+   time, can be traced back. The report returns the same.
 
 The commit does nothing else. It carries no host time, so nothing settles
 and nothing is dropped in it. Its cost is one pass over the expiry order
@@ -270,6 +302,14 @@ transition that carries a licence takes the complete path.
   and changes no expiry.
 - **Neither** adds or removes a run, operation, event or keyed receipt, or
   removes an audit receipt.
+- **Neither** changes any header field its licence does not name: the
+  retention policy, producer epochs, GC state, artifact disposals,
+  artifacts, bindings, the catalog revision and history, execution denials,
+  authority revocations or recovery requests.
+- **Caps are computed from the stored state.** The policy, the installed
+  contracts and the stored event are those before the commit, so a licensed
+  commit cannot shrink a cap by changing the policy, a contract, or an
+  event's contract reference.
 
 So a receipt for another clock or floor, a receipt left in the live State,
 a replayed receipt, or a licensed commit that also does other work is

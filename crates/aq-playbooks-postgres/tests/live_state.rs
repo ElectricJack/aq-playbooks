@@ -1056,6 +1056,74 @@ fn rebase_refusal_cases() -> Vec<Case> {
             Box::new(|n| n.retention.stale_floor_ms = Some(50)),
         ),
         (
+            "review probe C2: a rebase that also sets both windows to 1 and caps to 101",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                n.retention.policy.admission_replay_ms = 1;
+                n.retention.policy.event_replay_ms = 1;
+                n.retention.admission_expires_at_ms.insert("k".into(), 101);
+                n.retention.event_expires_at_ms.insert("ev".into(), 101);
+            }),
+        ),
+        (
+            "rebase that also changes the policy",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                n.retention.policy.audit_ms += 1;
+            }),
+        ),
+        (
+            "rebase that also installs an artifact",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                let extra = n.artifacts.values().next().unwrap().clone();
+                let mut content = extra.content.clone();
+                content.compiler = "another".into();
+                let a = aq_playbooks_model::Artifact::seal(content).unwrap();
+                n.artifacts.insert(a.digest.clone(), a);
+            }),
+        ),
+        (
+            "rebase that also changes a producer epoch",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                n.retention.producer_epochs.insert("host".into(), 1);
+            }),
+        ),
+        (
+            "rebase that also moves the catalog",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                n.catalog_revision += 1;
+            }),
+        ),
+        (
+            "rebase that also changes the catalog history",
+            licence,
+            Box::new(|n| {
+                rebased(n);
+                n.catalog_history_at_ms.insert(99, 1);
+            }),
+        ),
+        (
+            "rebase that also changes an event's contract to shrink its cap",
+            shortened,
+            Box::new(|n| {
+                rebased(n);
+                let mut e = n.events.get("ev-long").unwrap().clone();
+                e.envelope.contract.name = "test.other".into();
+                n.events.insert("ev-long".into(), e);
+                n.retention
+                    .event_expires_at_ms
+                    .insert("ev-long".into(), 3_100);
+            }),
+        ),
+        (
             "rebase raises the floor past its target",
             floor,
             Box::new(|n| {
@@ -1115,6 +1183,14 @@ fn after_rebase_refusal_cases() -> Vec<Case> {
                 n.retention.stale_floor_ms = Some(40);
                 n.retention.clock_ms = Some(200);
                 license(n, retention::STALE_FLOOR_LOWERED, 50, 40);
+            }),
+        ),
+        (
+            "floor lowering that also changes the policy",
+            licence,
+            Box::new(|n| {
+                n.retention.policy.admission_replay_ms = 1;
+                floor_lowered(n);
             }),
         ),
         (

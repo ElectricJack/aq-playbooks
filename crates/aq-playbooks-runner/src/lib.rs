@@ -85,6 +85,24 @@ pub struct ClockRebaseReport {
     /// could not be found (an inconsistent State): left as they are, for the
     /// operator to cancel.
     pub needs_operator_action: Vec<String>,
+    /// Each capped timer with its original value, for audit: at most
+    /// [`REBASE_ADJUSTMENTS_LISTED`]; the rest are only counted.
+    pub adjustments: Vec<DeadlineAdjustment>,
+    pub adjustments_not_listed: usize,
+}
+/// At most this many [`DeadlineAdjustment`]s are listed in a rebase report
+/// and its receipt.
+pub const REBASE_ADJUSTMENTS_LISTED: usize = 1_000;
+/// One timer a clock rebase capped: of `run`, its `kind`
+/// (`duration_basis`, `wait`, `join`, `retry`, `operation`) on `item` (the
+/// run, wait or operation id), from `original_ms` to `capped_ms`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeadlineAdjustment {
+    pub run: String,
+    pub kind: String,
+    pub item: String,
+    pub original_ms: i64,
+    pub capped_ms: i64,
 }
 /// How a commit ends: with a host time (`None` for commits without one), or
 /// as a licensed admin commit.
@@ -160,6 +178,8 @@ fn rebase_plan(
         capped_deadlines: deadlines.capped,
         adjusted_runs: deadlines.adjusted.into_iter().collect(),
         needs_operator_action: deadlines.unknown.into_iter().collect(),
+        adjustments_not_listed: deadlines.capped - deadlines.adjustments.len(),
+        adjustments: deadlines.adjustments,
     })
 }
 #[derive(Default)]
@@ -167,6 +187,22 @@ struct RebasedDeadlines {
     capped: usize,
     adjusted: BTreeSet<String>,
     unknown: BTreeSet<String>,
+    adjustments: Vec<DeadlineAdjustment>,
+}
+impl RebasedDeadlines {
+    /// Count one capped timer, and list it while the list has room.
+    fn record(&mut self, run: &str, kind: &str, item: &str, original_ms: i64, capped_ms: i64) {
+        self.capped += 1;
+        if self.adjustments.len() < REBASE_ADJUSTMENTS_LISTED {
+            self.adjustments.push(DeadlineAdjustment {
+                run: run.into(),
+                kind: kind.into(),
+                item: item.into(),
+                original_ms,
+                capped_ms,
+            });
+        }
+    }
 }
 /// Cap every live run's timers that lie beyond `to_ms` plus their declared
 /// duration at that value: a run's duration basis (`admitted_at_ms`, for
@@ -191,13 +227,14 @@ fn rebase_deadlines(s: &mut State, to_ms: i64) -> Result<RebasedDeadlines> {
         let step = playbook
             .and_then(|p| p.steps.get(&r.step))
             .map(|step| &step.op);
-        let mut capped = 0;
+        // (kind, item, original, capped) of this run's capped timers.
+        let mut capped: Vec<(&str, String, i64, i64)> = vec![];
         let mut unknown = false;
         // The duration basis: `admitted_at_ms + limits.max_duration_ms`.
         if r.admitted_at_ms > to_ms {
             if playbook.is_some() {
+                capped.push(("duration_basis", id.clone(), r.admitted_at_ms, to_ms));
                 r.admitted_at_ms = to_ms;
-                capped += 1;
             } else {
                 unknown = true;
             }
@@ -207,8 +244,8 @@ fn rebase_deadlines(s: &mut State, to_ms: i64) -> Result<RebasedDeadlines> {
             Some(Pending::Join { deadline, .. }) if *deadline > to_ms => match step {
                 Some(Operation::Join { deadline_ms, .. }) => {
                     if *deadline > cap(*deadline_ms) {
+                        capped.push(("join", id.clone(), *deadline, cap(*deadline_ms)));
                         *deadline = cap(*deadline_ms);
-                        capped += 1;
                     }
                 }
                 _ => unknown = true,
@@ -219,8 +256,8 @@ fn rebase_deadlines(s: &mut State, to_ms: i64) -> Result<RebasedDeadlines> {
                     ..
                 }) => {
                     if *deadline > cap(policy.backoff_ms) {
+                        capped.push(("retry", id.clone(), *deadline, cap(policy.backoff_ms)));
                         *deadline = cap(policy.backoff_ms);
-                        capped += 1;
                     }
                 }
                 _ => unknown = true,
@@ -240,9 +277,9 @@ fn rebase_deadlines(s: &mut State, to_ms: i64) -> Result<RebasedDeadlines> {
                 });
             match declared {
                 Some(duration) if w.deadline > cap(duration) => {
+                    capped.push(("wait", wait_id.clone(), w.deadline, cap(duration)));
                     w.deadline = cap(duration);
                     s.waits.insert(wait_id, w);
-                    capped += 1;
                 }
                 Some(_) => {}
                 None => unknown = true,
@@ -251,8 +288,10 @@ fn rebase_deadlines(s: &mut State, to_ms: i64) -> Result<RebasedDeadlines> {
         if unknown {
             out.unknown.insert(id.clone());
         }
-        if capped > 0 {
-            out.capped += capped;
+        if !capped.is_empty() {
+            for (kind, item, original_ms, capped_ms) in capped {
+                out.record(&id, kind, &item, original_ms, capped_ms);
+            }
             s.runs.insert(id.clone(), r);
             indexes::mark_run(s, &id);
             out.adjusted.insert(id);
@@ -265,12 +304,12 @@ fn rebase_deadlines(s: &mut State, to_ms: i64) -> Result<RebasedDeadlines> {
         };
         let limit = cap(i.command.deadline_ms);
         if i.deadline_at_ms > limit {
-            i.deadline_at_ms = limit;
             let run = i.run.clone();
+            out.record(&run, "operation", &id, i.deadline_at_ms, limit);
+            i.deadline_at_ms = limit;
             s.intents.insert(id.clone(), i);
             indexes::mark_intent(s, &id);
             indexes::mark_run(s, &run);
-            out.capped += 1;
             out.adjusted.insert(run);
         }
     }
@@ -3732,7 +3771,7 @@ impl<S: Storage> Engine<S> {
                 "retention",
                 now_ms,
                 retention::CLOCK_REBASE,
-                json!({"from_ms":report.from_ms,"to_ms":report.to_ms,"stale_floor_ms":report.stale_floor_ms,"capped_events":report.capped_events,"capped_admissions":report.capped_admissions,"capped_deadlines":report.capped_deadlines,"adjusted_runs":report.adjusted_runs,"needs_operator_action":report.needs_operator_action,"actor":actor,"reason":reason}),
+                json!({"from_ms":report.from_ms,"to_ms":report.to_ms,"stale_floor_ms":report.stale_floor_ms,"capped_events":report.capped_events,"capped_admissions":report.capped_admissions,"capped_deadlines":report.capped_deadlines,"adjusted_runs":report.adjusted_runs,"needs_operator_action":report.needs_operator_action,"adjustments":report.adjustments,"adjustments_not_listed":report.adjustments_not_listed,"actor":actor,"reason":reason}),
             );
             Ok(report)
         })
