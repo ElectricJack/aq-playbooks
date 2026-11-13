@@ -42,6 +42,16 @@ pub enum Error {
     Exhausted(String),
 }
 pub type Result<T> = std::result::Result<T, Error>;
+const INVARIANT: &str = "engine invariant violated: ";
+/// An engine fault (a record the State's own invariants guarantee is
+/// missing). It fails the commit; `advance` never turns it into a playbook
+/// error branch.
+pub(crate) fn invariant(what: String) -> Error {
+    Error::Conflict(format!("{INVARIANT}{what}"))
+}
+fn is_invariant(error: &Error) -> bool {
+    matches!(error, Error::Conflict(m) if m.starts_with(INVARIANT))
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Authority {
     pub actor: String,
@@ -373,6 +383,9 @@ impl<S: Storage> Engine<S> {
             if !s.indexes.initialized {
                 indexes::rebuild(s)?;
             }
+            // A State from before `root_intents` (pre-D10): cohort removal
+            // needs every operation there, so fill it once.
+            indexes::backfill_root_intents(s);
             Ok(())
         })?;
         Ok(e)
@@ -783,8 +796,11 @@ impl<S: Storage> Engine<S> {
                     }
                     let mut ctx = EvalContext::new();
                     ctx.insert("event".into(), EvalValue::Known(event.payload.clone()));
-                    // The acceptance sequence keeps the run ids of an event
-                    // accepted again after its window apart (SC-7).
+                    // The first sequence number this acceptance assigns (the
+                    // event's own, or its first blocked-destination
+                    // receipt's) keeps the run ids of an event accepted again
+                    // after its window apart (SC-7). Stored destinations keep
+                    // their keys, so existing run ids are unchanged.
                     let destination_key = digest(&(
                         &key,
                         s.sequence + 1,
@@ -1302,13 +1318,15 @@ impl<S: Storage> Engine<S> {
             if item.is_none() && !has_effect {
                 break;
             }
-            let (effect_turn, queued_ms) = self.transaction_at(Some(now_ms), |s| {
+            let mut advancing = false;
+            let turn = self.transaction_at(Some(now_ms), |s| {
                 if has_effect && (s.indexes.dispatch_turn || item.is_none()) {
                     s.indexes.dispatch_turn = false;
                     Ok((true, None))
-                } else if let Some(item) = item {
+                } else if let Some(item) = item.clone() {
                     let mut queued_ms = None;
                     if s.indexes.ready_tokens.contains_key(&item.key) {
+                        advancing = true;
                         s.indexes.scope_cursor = Some(item.scope);
                         indexes::unqueue(s, &item.key);
                         let elapsed = s
@@ -1325,7 +1343,34 @@ impl<S: Storage> Engine<S> {
                 } else {
                     Ok((false, None))
                 }
-            })?;
+            });
+            let (effect_turn, queued_ms) = match turn {
+                Ok(turn) => turn,
+                Err(error) => {
+                    // A run whose step cannot commit (for example a cohort
+                    // whose settling commit is refused) must not hold the
+                    // head of its queue: it moves behind the other ready
+                    // runs, and the error still reaches the host. Lost
+                    // ownership and write races are not the run's fault.
+                    if advancing
+                        && let Some(item) = &item
+                        && !matches!(
+                            error,
+                            Error::Storage(StorageError::Conflict | StorageError::Ownership)
+                        )
+                    {
+                        let _ = self.transaction_at(Some(now_ms), |s| {
+                            if s.indexes.ready_tokens.contains_key(&item.key) {
+                                indexes::unqueue(s, &item.key);
+                                indexes::wake(s, &item.key);
+                                s.indexes.scope_cursor = Some(item.scope.clone());
+                            }
+                            Ok(())
+                        });
+                    }
+                    return Err(error);
+                }
+            };
             if let Some(elapsed) = queued_ms {
                 self.metrics.record_queue(elapsed);
             }
@@ -1610,6 +1655,9 @@ fn advance(s: &mut State, id: &str, now: i64) -> Result<bool> {
     let original = r.clone();
     let result = advance_inner(s, &mut r, now);
     if let Err(error) = result {
+        if is_invariant(&error) {
+            return Err(error);
+        }
         *s = checkpoint;
         r = original;
         let message = error.to_string();
@@ -1671,7 +1719,7 @@ fn advance_inner(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
         return Ok(());
     }
     if r.status == RunStatus::Finishing {
-        if settled(s, r) {
+        if settled(s, r)? {
             if r.pending_failure {
                 finish(s, r, RunStatus::Failed, None, None, now);
             } else {
@@ -1701,7 +1749,7 @@ fn advance_inner(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
     let root_run = s
         .runs
         .get(&r.root)
-        .ok_or_else(|| Error::Conflict(format!("root {} of a live run is missing", r.root)))?;
+        .ok_or_else(|| invariant(format!("root {} of run {} is missing", r.root, r.id)))?;
     let root_limits = &s.artifacts[&root_run.artifact].content.playbook.limits;
     if now.saturating_sub(root_run.admitted_at_ms) >= root_limits.max_duration_ms as i64
         || now.saturating_sub(r.admitted_at_ms) > own_limits.max_duration_ms as i64
@@ -1751,12 +1799,12 @@ fn advance_inner(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
     let root = s
         .runs
         .get(&r.root)
-        .ok_or_else(|| Error::Conflict(format!("root {} of a live run is missing", r.root)))?;
+        .ok_or_else(|| invariant(format!("root {} of run {} is missing", r.root, r.id)))?;
     let root_limits = &s.artifacts[&root.artifact].content.playbook.limits;
     let budget = s
         .budgets
         .get_mut(&r.root)
-        .ok_or_else(|| Error::Conflict(format!("budget of root {} is missing", r.root)))?;
+        .ok_or_else(|| invariant(format!("budget of root {} is missing", r.root)))?;
     if budget.visits >= root_limits.max_step_visits || r.visits >= limits.max_step_visits {
         return Err(Error::Exhausted("step visits".into()));
     }
@@ -2065,7 +2113,7 @@ fn advance_inner(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
             let budget = s
                 .budgets
                 .get_mut(&r.root)
-                .ok_or_else(|| Error::Conflict(format!("budget of root {} is missing", r.root)))?;
+                .ok_or_else(|| invariant(format!("budget of root {} is missing", r.root)))?;
             if budget.children >= root_limits.max_children
                 || s.runs
                     .values()
@@ -2213,7 +2261,7 @@ fn advance_inner(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
                 &output,
                 limits.max_payload_bytes.min(root_limits.max_payload_bytes),
             )?;
-            if settled(s, r) {
+            if settled(s, r)? {
                 finish(s, r, RunStatus::Completed, Some(outcome), Some(output), now);
             } else {
                 r.pending_return = Some((outcome, output));
@@ -2234,7 +2282,7 @@ fn reserve_iteration(s: &mut State, r: &Run, limits: &Limits) -> Result<()> {
     let root = s
         .runs
         .get(&r.root)
-        .ok_or_else(|| Error::Conflict(format!("root {} of a live run is missing", r.root)))?;
+        .ok_or_else(|| invariant(format!("root {} of run {} is missing", r.root, r.id)))?;
     let bound = s.artifacts[&root.artifact]
         .content
         .playbook
@@ -2244,7 +2292,7 @@ fn reserve_iteration(s: &mut State, r: &Run, limits: &Limits) -> Result<()> {
     let b = s
         .budgets
         .get_mut(&r.root)
-        .ok_or_else(|| Error::Conflict(format!("budget of root {} is missing", r.root)))?;
+        .ok_or_else(|| invariant(format!("budget of root {} is missing", r.root)))?;
     if b.iterations >= bound {
         return Err(Error::Exhausted("iterations".into()));
     }
@@ -2297,20 +2345,26 @@ fn finish(
     r.terminal_sequence = Some(s.sequence);
     indexes::wake_dependents(s, &r.id);
 }
-fn settled(s: &State, r: &Run) -> bool {
-    // A child absent from the State has left with its settled cohort.
-    r.children
-        .iter()
-        .all(|id| s.runs.get(id).is_none_or(|c| c.status.terminal()))
-        && match indexes::root_open_intents(s, &r.root) {
-            Some(open) => !open.iter().any(|id| s.intents[id].run == r.id),
-            None => s.intents.values().filter(|i| i.run == r.id).all(|i| {
-                matches!(
-                    i.status,
-                    IntentStatus::Completed | IntentStatus::Rejected | IntentStatus::Cancelled
-                )
-            }),
+fn settled(s: &State, r: &Run) -> Result<bool> {
+    // A cohort leaves only as a whole: a live run's children are live.
+    for id in &r.children {
+        let child = s
+            .runs
+            .get(id)
+            .ok_or_else(|| invariant(format!("child {id} of run {} is missing", r.id)))?;
+        if !child.status.terminal() {
+            return Ok(false);
         }
+    }
+    Ok(match indexes::root_open_intents(s, &r.root) {
+        Some(open) => !open.iter().any(|id| s.intents[id].run == r.id),
+        None => s.intents.values().filter(|i| i.run == r.id).all(|i| {
+            matches!(
+                i.status,
+                IntentStatus::Completed | IntentStatus::Rejected | IntentStatus::Cancelled
+            )
+        }),
+    })
 }
 fn poll_pending(s: &mut State, r: &mut Run, pending: Pending, now: i64) -> Result<()> {
     let step = s.artifacts[&r.artifact].content.playbook.steps[&r.step].clone();
@@ -2425,7 +2479,7 @@ fn poll_pending(s: &mut State, r: &mut Run, pending: Pending, now: i64) -> Resul
             let c = s
                 .runs
                 .get(&child)
-                .ok_or_else(|| Error::NotFound(child.clone()))?
+                .ok_or_else(|| invariant(format!("child {child} of run {} is missing", r.id)))?
                 .clone();
             if c.status.terminal() {
                 let outcome = c.outcome.unwrap_or_else(|| {
@@ -2757,7 +2811,7 @@ fn request_cancel(s: &mut State, id: &str, now: i64) -> Result<()> {
     Ok(())
 }
 fn settle_cancel(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
-    if settled(s, r) {
+    if settled(s, r)? {
         finish(s, r, RunStatus::Cancelled, None, None, now);
     } else if s.intents.values().any(|i| {
         i.run == r.id
@@ -3076,7 +3130,7 @@ fn fail_run(s: &mut State, r: &mut Run, reason: String, now: i64) -> Result<()> 
         "engine_failure",
         json!({"reason":reason}),
     );
-    if settled(s, r) {
+    if settled(s, r)? {
         finish(s, r, RunStatus::Failed, None, None, now);
     } else {
         r.status = RunStatus::Finishing;

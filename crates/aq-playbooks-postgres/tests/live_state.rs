@@ -1144,3 +1144,254 @@ fn finished_run_leaves_protected_snapshot_and_projections_and_writes_no_tombston
         );
     }
 }
+
+// --- Task 5 fix round 1 ---------------------------------------------------
+
+fn pg_authority() -> Authority {
+    Authority {
+        actor: "synthetic-test".into(),
+        scope: "project".into(),
+        capabilities: Default::default(),
+    }
+}
+fn pg_command() -> aq_playbooks_model::CommandContract {
+    use aq_playbooks_model::*;
+    CommandContract {
+        name: "test.command".into(),
+        version: "1".into(),
+        input: Schema::Null,
+        outcomes: BTreeMap::from([("ok".into(), Schema::Null)]),
+        capabilities: Default::default(),
+        scopes: ["project".to_string()].into(),
+        effect: Effect::Mutation,
+        recovery: Recovery::KeyedIdempotent,
+        asynchronous: None,
+        cancellation: false,
+        public_result_fields: Default::default(),
+        sensitive_input_fields: Default::default(),
+        sensitive_output_fields: Default::default(),
+        max_payload_bytes: 1024,
+        deadline_ms: 100_000,
+    }
+}
+/// `label`'s fixture with `steps` from `start`.
+fn steps_artifact(
+    label: &str,
+    start: &str,
+    steps: Vec<(&str, aq_playbooks_model::Step)>,
+    dependencies: BTreeMap<String, aq_playbooks_model::CallableDependency>,
+) -> aq_playbooks_model::Artifact {
+    let mut content = support::artifact(label).content;
+    content.playbook.entries.get_mut("main").unwrap().start = start.into();
+    content.playbook.steps = steps.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    let c = pg_command();
+    content.registry.commands.insert(c.name.clone(), c);
+    content.dependencies = dependencies;
+    aq_playbooks_model::Artifact::seal(content).unwrap()
+}
+fn ret_ok() -> aq_playbooks_model::Step {
+    support::artifact("a").content.playbook.steps["return"].clone()
+}
+/// invoke `test.command`, then return ok.
+fn pg_invoke_artifact() -> aq_playbooks_model::Artifact {
+    use aq_playbooks_model::*;
+    let c = pg_command();
+    steps_artifact(
+        "invoke",
+        "invoke",
+        vec![
+            (
+                "invoke",
+                Step {
+                    op: Operation::Invoke {
+                        command: ContractRef {
+                            name: c.name.clone(),
+                            fingerprint: c.fingerprint().unwrap(),
+                        },
+                        input: Expr::literal(Value::Null),
+                        bind: "result".into(),
+                        retry: None,
+                    },
+                    edges: BTreeMap::from([("ok".into(), "return".into())]),
+                    on_error: Some("return".into()),
+                },
+            ),
+            ("return", ret_ok()),
+        ],
+        BTreeMap::new(),
+    )
+}
+fn ok_host() -> FakeHost {
+    FakeHost {
+        responses: BTreeMap::from([(
+            "test.command".into(),
+            vec![
+                DispatchResult::Completed {
+                    outcome: "ok".into(),
+                    output: Value::Null,
+                },
+                DispatchResult::Completed {
+                    outcome: "ok".into(),
+                    output: Value::Null,
+                },
+            ],
+        )]),
+        ..Default::default()
+    }
+}
+/// C1 on PostgreSQL: a namespace stored by the pre-D10 engine (no
+/// `root_intents`, no backfill flag) is backfilled when it is opened, on
+/// protected format 2 and on format 3; the pre-upgrade run finishes with its
+/// earlier operation in its history and a later run progresses.
+#[test]
+fn pre_d10_namespace_is_backfilled_on_open_on_postgres() {
+    for (format, store) in both() {
+        let ns = support::namespace("pre_d10");
+        let e = Engine::new(store, &ns, "w").unwrap();
+        let a = pg_invoke_artifact();
+        e.install(a.clone()).unwrap();
+        e.activate_at("invoke", &a.digest, pg_authority(), 0)
+            .unwrap();
+        let mut host = ok_host();
+        let old = e
+            .admit("invoke", "main", Value::Null, pg_authority(), 0)
+            .unwrap();
+        e.advance(&old, 0).unwrap();
+        e.dispatch_next(&mut host, 0).unwrap();
+        let v = e.store.load(&ns).unwrap();
+        let intent = v.state.intents.values().next().unwrap().clone();
+        assert_eq!(intent.status, IntentStatus::Completed, "{format}");
+        // The State as the vendored engine stored it.
+        let mut value = serde_json::to_value(&v.state).unwrap();
+        let indexes = value["indexes"].as_object_mut().unwrap();
+        indexes.remove("root_intents");
+        indexes.remove("root_intents_complete");
+        let legacy: State = serde_json::from_value(value).unwrap();
+        assert!(legacy.indexes.root_intents.is_empty() && !legacy.indexes.root_intents_complete);
+        e.store
+            .compare_and_swap(&ns, "w", v.revision, &legacy)
+            .unwrap();
+        let store = e.store;
+        store.release(&ns, "w").unwrap();
+        let e = Engine::new(store, &ns, "w2").unwrap();
+        let s = e.store.load(&ns).unwrap().state;
+        assert!(s.indexes.root_intents_complete, "{format}");
+        assert!(
+            s.indexes.root_intents[&old].contains(&intent.id),
+            "{format}"
+        );
+        let new = e
+            .admit("invoke", "main", Value::Null, pg_authority(), 1)
+            .unwrap();
+        for _ in 0..10 {
+            e.drive(&mut host, 1, 20).unwrap();
+        }
+        let s = e.store.load(&ns).unwrap().state;
+        assert!(s.runs.is_empty() && s.intents.is_empty(), "{format}");
+        let effects = e
+            .inspect(&InspectionQuery {
+                kind: InspectionKind::Effects,
+                run: Some(old.clone()),
+                after: None,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(effects.items.len(), 1, "{format}");
+        assert_eq!(effects.items[0]["id"], intent.id.as_str(), "{format}");
+        for id in [&old, &new] {
+            let runs = e
+                .inspect(&InspectionQuery {
+                    kind: InspectionKind::Runs,
+                    run: Some(id.clone()),
+                    after: None,
+                    limit: 10,
+                })
+                .unwrap();
+            assert_eq!(runs.items[0]["outcome"], "ok", "{format} {id}");
+        }
+    }
+}
+/// M4 on PostgreSQL: a finished root's inspection items are byte-for-byte
+/// the same while its cohort waits for an independent child and after the
+/// cohort has left as `run_history` rows (format 2 pages through jsonb).
+#[test]
+fn a_finished_runs_inspection_is_identical_before_and_after_removal_on_postgres() {
+    use aq_playbooks_model::*;
+    for (format, store) in both() {
+        let ns = support::namespace("same_items");
+        let e = Engine::new(store, &ns, "w").unwrap();
+        let child = pg_invoke_artifact();
+        let parent = steps_artifact(
+            "parent",
+            "call",
+            vec![
+                (
+                    "call",
+                    Step {
+                        op: Operation::Call {
+                            dependency: "child".into(),
+                            entry: "main".into(),
+                            input: Expr::literal(Value::Null),
+                            mode: CallMode::Independent,
+                            bind: "handle".into(),
+                        },
+                        edges: BTreeMap::from([("started".into(), "return".into())]),
+                        on_error: Some("return".into()),
+                    },
+                ),
+                ("return", ret_ok()),
+            ],
+            BTreeMap::from([(
+                "child".into(),
+                CallableDependency {
+                    selection: DependencySelection::Exact,
+                    binding: "child".into(),
+                    artifact: child.digest.clone(),
+                    interfaces: child.content.playbook.entries.clone(),
+                    capabilities: Default::default(),
+                    scope: "project".into(),
+                    dependencies: Default::default(),
+                },
+            )]),
+        );
+        e.install(child).unwrap();
+        e.install(parent.clone()).unwrap();
+        e.activate_at("parent", &parent.digest, pg_authority(), 0)
+            .unwrap();
+        let root = e
+            .admit("parent", "main", Value::Null, pg_authority(), 0)
+            .unwrap();
+        e.advance(&root, 0).unwrap();
+        e.advance(&root, 0).unwrap();
+        let s = e.store.load(&ns).unwrap().state;
+        assert!(
+            s.runs[&root].status.terminal() && s.runs.len() == 2,
+            "{format}"
+        );
+        let pages = |e: &Engine<PostgresStorage>| -> Vec<Vec<u8>> {
+            [
+                InspectionKind::Runs,
+                InspectionKind::Effects,
+                InspectionKind::Receipts,
+            ]
+            .into_iter()
+            .map(|kind| {
+                let page = e
+                    .inspect(&InspectionQuery {
+                        kind,
+                        run: Some(root.clone()),
+                        after: None,
+                        limit: 1000,
+                    })
+                    .unwrap();
+                serde_json::to_vec(&page.items).unwrap()
+            })
+            .collect()
+        };
+        let live = pages(&e);
+        e.drive(&mut ok_host(), 1, 20).unwrap();
+        assert!(e.store.load(&ns).unwrap().state.runs.is_empty(), "{format}");
+        assert!(history_rows(&ns) > 0, "{format}");
+        assert_eq!(pages(&e), live, "{format}");
+    }
+}

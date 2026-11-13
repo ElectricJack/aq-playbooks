@@ -117,6 +117,11 @@ pub struct RuntimeIndexes {
     pub triggers: BTreeMap<String, BTreeSet<String>>,
     pub activation_triggers: BTreeMap<String, Vec<String>>,
     pub initialized: bool,
+    /// `root_intents` holds every live operation. False in a State written
+    /// before the index existed (pre-D10); `Engine::new` then backfills it
+    /// once. Cohort removal takes a cohort's operations from it.
+    #[serde(default)]
+    pub root_intents_complete: bool,
 }
 pub fn correlation_key(
     contract: &ContractRef,
@@ -604,7 +609,7 @@ fn refresh_run(s: &mut State, id: &str) -> Result<()> {
             None => {}
         },
         RunStatus::Finishing | RunStatus::Cancelling => {
-            if crate::settled(s, &r) {
+            if crate::settled(s, &r)? {
                 wake(s, id)
             } else {
                 for child in &r.children {
@@ -629,9 +634,10 @@ fn refresh_run(s: &mut State, id: &str) -> Result<()> {
         RunStatus::Finishing | RunStatus::Cancelling | RunStatus::Blocked
     ) {
         // A live run's root is live: a cohort leaves only as a whole.
-        let root = s.runs.get(&r.root).ok_or_else(|| {
-            crate::Error::Conflict(format!("root {} of a live run is missing", r.root))
-        })?;
+        let root = s
+            .runs
+            .get(&r.root)
+            .ok_or_else(|| crate::invariant(format!("root {} of run {id} is missing", r.root)))?;
         let end = crate::deadline(
             root.admitted_at_ms,
             s.artifacts[&root.artifact]
@@ -903,7 +909,42 @@ pub(crate) fn rebuild(s: &mut State) -> Result<()> {
     }
     sync(s)?;
     s.indexes.initialized = true;
+    s.indexes.root_intents_complete = true;
     Ok(())
+}
+/// Once per namespace written before `root_intents` existed (pre-D10, whose
+/// indexes are otherwise initialized): put every live operation into
+/// `root_intents` under its root and set `root_intents_complete`. One pass
+/// over live operations; operations of a run without a known root are left
+/// out (they cannot belong to a cohort). Returns whether it ran.
+pub(crate) fn backfill_root_intents(s: &mut State) -> bool {
+    if !s.indexes.initialized || s.indexes.root_intents_complete {
+        return false;
+    }
+    let roots: Vec<(String, String)> = s
+        .intents
+        .values()
+        .filter_map(|i| {
+            s.runs
+                .get(&i.run)
+                .map(|r| r.root.clone())
+                .or_else(|| s.indexes.run_roots.get(&i.run).cloned())
+                .or_else(|| s.indexes.intent_roots.get(&i.id).cloned())
+                .map(|root| (i.id.clone(), root))
+        })
+        .collect();
+    for (id, root) in roots {
+        if !s
+            .indexes
+            .root_intents
+            .get(&root)
+            .is_some_and(|ids| ids.contains(&id))
+        {
+            s.indexes.root_intents.entry(root).or_default().insert(id);
+        }
+    }
+    s.indexes.root_intents_complete = true;
+    true
 }
 
 fn remove_lazy_member(map: &mut LazyMap<String, BTreeSet<String>>, key: &str, member: &str) {

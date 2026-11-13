@@ -1859,3 +1859,412 @@ fn settling_one_cohort_does_not_scan_other_live_runs() {
         .collect();
     assert!(many_scanned.is_subset(&allowed), "{many_scanned:?}");
 }
+
+// --- Task 5 fix round 1 ---------------------------------------------------
+
+/// `RuntimeIndexes` fields of the engine that aq-server vendors
+/// (`vendor/aq-playbooks-0173673`, pre-D10): no `root_intents` and no
+/// backfill flag.
+const VENDORED_INDEX_FIELDS: &[&str] = &[
+    "ready",
+    "ready_tokens",
+    "scope_cursor",
+    "dispatch_turn",
+    "effect_cursor",
+    "effect_item_cursor",
+    "root_members",
+    "root_active",
+    "root_effects",
+    "root_last_activity",
+    "run_roots",
+    "intent_roots",
+    "effects",
+    "effect_memberships",
+    "timers",
+    "due",
+    "run_timer",
+    "events",
+    "event_memberships",
+    "waiters",
+    "run_subscriptions",
+    "dependents",
+    "run_dependencies",
+    "completion_ready",
+    "uncertain_completion_contracts",
+    "uncertain_contract_membership",
+    "dirty_runs",
+    "dirty_intents",
+    "runs",
+    "receipts",
+    "all_receipts",
+    "triggers",
+    "activation_triggers",
+    "initialized",
+];
+/// `state` as a pre-D10 engine stored it: the index fields D10 and this task
+/// added are absent, so they decode with their defaults.
+fn vendored_shape(state: &State) -> State {
+    let mut value = serde_json::to_value(state).unwrap();
+    let indexes = value["indexes"].as_object_mut().unwrap();
+    indexes.retain(|field, _| VENDORED_INDEX_FIELDS.contains(&field.as_str()));
+    let fields: BTreeSet<&str> = indexes.keys().map(String::as_str).collect();
+    assert_eq!(fields, VENDORED_INDEX_FIELDS.iter().copied().collect());
+    serde_json::from_value(value).unwrap()
+}
+fn completed_host() -> FakeHost {
+    FakeHost {
+        responses: BTreeMap::from([(
+            "test.command".into(),
+            vec![
+                DispatchResult::Completed {
+                    outcome: "ok".into(),
+                    output: Value::Null,
+                },
+                DispatchResult::Completed {
+                    outcome: "ok".into(),
+                    output: Value::Null,
+                },
+            ],
+        )]),
+        ..Default::default()
+    }
+}
+/// An invoke run whose operation has completed while the run is still live
+/// (waiting to take its `ok` edge), on `e`.
+fn run_with_completed_operation<S: Storage>(
+    e: &Engine<S>,
+    host: &mut FakeHost,
+) -> (String, String) {
+    let id = e
+        .admit("invoke", "main", Value::Null, authority(), 0)
+        .unwrap();
+    e.advance(&id, 0).unwrap();
+    e.dispatch_next(host, 0).unwrap();
+    let s = e.snapshot().unwrap();
+    let intent = s.intents.values().next().unwrap().clone();
+    assert_eq!(intent.status, IntentStatus::Completed);
+    assert!(!s.runs[&id].status.terminal());
+    (id, intent.id)
+}
+/// Store `state` over the namespace's current State (direct CAS).
+fn overwrite<S: Storage>(store: &S, owner: &str, state: &State) {
+    let revision = store.load("test").unwrap().revision;
+    store
+        .compare_and_swap("test", owner, revision, state)
+        .unwrap();
+}
+/// C1: a namespace written by the pre-D10 engine has no `root_intents`.
+/// Opening it backfills the index once, so a pre-upgrade run with an earlier
+/// completed operation finishes, leaves with that operation in its history,
+/// and a run admitted afterwards progresses.
+fn pre_d10_namespace_is_backfilled_on_open<S: Storage + Clone>(store: S) {
+    let e = Engine::new(store.clone(), "test", "incarnation-1").unwrap();
+    install_on(
+        &e,
+        invoke_artifact(command(Recovery::KeyedIdempotent), None),
+        "invoke",
+    );
+    let mut host = completed_host();
+    let (old, intent) = run_with_completed_operation(&e, &mut host);
+    let legacy = vendored_shape(&e.snapshot().unwrap());
+    assert!(legacy.indexes.initialized && legacy.indexes.root_intents.is_empty());
+    assert!(!legacy.indexes.root_intents_complete);
+    overwrite(&e.store, "incarnation-1", &legacy);
+    e.release().unwrap();
+    let e = Engine::new(store, "test", "incarnation-2").unwrap();
+    let s = e.snapshot().unwrap();
+    assert!(s.indexes.root_intents_complete);
+    assert!(s.indexes.root_intents[&old].contains(&intent));
+    let new = e
+        .admit("invoke", "main", Value::Null, authority(), 1)
+        .unwrap();
+    for _ in 0..10 {
+        e.drive(&mut host, 1, 20).unwrap();
+    }
+    let s = e.snapshot().unwrap();
+    assert!(
+        s.runs.is_empty() && s.intents.is_empty(),
+        "{:?}",
+        s.runs.keys().collect::<Vec<_>>()
+    );
+    let effects = inspect_all(&e, InspectionKind::Effects, Some(&old));
+    assert_eq!(effects.len(), 1);
+    assert_eq!(effects[0]["id"], intent.as_str());
+    assert_eq!(effects[0]["status"], "completed");
+    for id in [&old, &new] {
+        let runs = inspect_all(&e, InspectionKind::Runs, Some(id));
+        assert_eq!(runs[0]["outcome"], "ok", "{id}");
+    }
+}
+#[test]
+fn memory_storage_pre_d10_namespace_is_backfilled_on_open() {
+    pre_d10_namespace_is_backfilled_on_open(MemoryStorage::retaining_settled());
+}
+#[test]
+fn record_storage_pre_d10_namespace_is_backfilled_on_open() {
+    pre_d10_namespace_is_backfilled_on_open(RecordStorage::new());
+}
+/// The backfill runs once: the flag is stored, and a second open does not
+/// read the operations again (format 3 record reads of `intents`).
+#[test]
+fn root_intents_backfill_runs_once() {
+    let store = RecordStorage::new();
+    let e = Engine::new(store.clone(), "test", "incarnation-1").unwrap();
+    install_on(
+        &e,
+        invoke_artifact(command(Recovery::KeyedIdempotent), None),
+        "invoke",
+    );
+    let mut host = completed_host();
+    run_with_completed_operation(&e, &mut host);
+    overwrite(
+        &e.store,
+        "incarnation-1",
+        &vendored_shape(&e.snapshot().unwrap()),
+    );
+    e.release().unwrap();
+    let scanned = |store: &RecordStorage| {
+        store
+            .stats
+            .fallbacks()
+            .iter()
+            .filter(|f| f.starts_with("intents "))
+            .count()
+    };
+    let before = scanned(&store);
+    let e = Engine::new(store.clone(), "test", "incarnation-2").unwrap();
+    let first = scanned(&store) - before;
+    assert_eq!(first, 1, "the backfill reads the operations once");
+    e.release().unwrap();
+    let e = Engine::new(store.clone(), "test", "incarnation-3").unwrap();
+    assert_eq!(scanned(&store) - before, first, "the second open does not");
+    assert!(e.snapshot().unwrap().indexes.root_intents_complete);
+    // A new namespace is complete from its first rebuild.
+    let fresh = Engine::new(MemoryStorage::default(), "fresh", "w").unwrap();
+    assert!(fresh.snapshot().unwrap().indexes.root_intents_complete);
+}
+/// Ruling 2: a cohort whose settling commit is refused does not wedge the
+/// ready queue. The refusal reaches the host (`drive` returns it) and the
+/// failing run moves behind the others, so unrelated runs still progress.
+#[test]
+fn an_unsettleable_cohort_does_not_stop_unrelated_runs() {
+    let e = engine();
+    install(
+        &e,
+        invoke_artifact(command(Recovery::KeyedIdempotent), None),
+        "invoke",
+    );
+    install(&e, done_artifact(), "a");
+    let mut host = completed_host();
+    let (stuck, _) = run_with_completed_operation(&e, &mut host);
+    // Break the index behind the engine's back (flag kept), so the commit
+    // that finishes `stuck` is refused by the removal fence.
+    let mut broken = e.snapshot().unwrap();
+    broken.indexes.root_intents.clear();
+    overwrite(&e.store, "incarnation-1", &broken);
+    // Drive until the finishing commit of `stuck` is refused: `stuck` is
+    // then at the head of the ready queue.
+    let refused = (0..5).find_map(|_| e.drive(&mut host, 5, 20).err());
+    assert!(
+        matches!(&refused, Some(Error::Storage(StorageError::Backend(m))) if m == "unresolved run obligations cannot be disposed"),
+        "{refused:?}"
+    );
+    let unrelated: Vec<String> = (0..3)
+        .map(|i| {
+            e.admit("a", "main", Value::Null, authority(), 1 + i)
+                .unwrap()
+        })
+        .collect();
+    let mut refusals = 0;
+    for _ in 0..20 {
+        match e.drive(&mut host, 5, 20) {
+            Ok(_) => {}
+            Err(Error::Storage(StorageError::Backend(m))) => {
+                assert_eq!(m, "unresolved run obligations cannot be disposed");
+                refusals += 1;
+            }
+            Err(other) => panic!("{other}"),
+        }
+    }
+    assert!(refusals > 0, "the refusal surfaces to the host");
+    let s = e.snapshot().unwrap();
+    assert!(
+        s.runs.contains_key(&stuck),
+        "the unsettleable run stays live"
+    );
+    for id in &unrelated {
+        assert!(!s.runs.contains_key(id), "{id} progressed and left");
+        assert_eq!(runs_page(&e, Some(id))[0]["outcome"], "ok");
+    }
+}
+/// Ruling 3 (M5): a run whose root has gone is an engine fault. The commit
+/// fails with an internal error; the run is not sent down its playbook's
+/// error branch and nothing is written.
+#[test]
+fn a_missing_root_fails_the_commit_instead_of_taking_an_error_branch() {
+    let e = engine();
+    let child = wait_artifact();
+    e.install(child.clone()).unwrap();
+    install(&e, parent_artifact(&child, CallMode::Independent), "parent");
+    let root = e
+        .admit("parent", "main", Value::Null, authority(), 0)
+        .unwrap();
+    e.advance(&root, 0).unwrap();
+    e.advance(&root, 0).unwrap();
+    let mut s = e.snapshot().unwrap();
+    assert!(s.runs[&root].status.terminal());
+    let member = s.runs.keys().find(|id| **id != root).unwrap().clone();
+    // Remove only the root, with its history (the fence allows it: the
+    // independent member is not its owned child).
+    let run = s.runs.remove(&root).unwrap();
+    let receipts: Vec<Receipt> = s
+        .receipts
+        .iter()
+        .filter(|r| r.run == root)
+        .cloned()
+        .collect();
+    s.receipts.retain(|r| r.run != root);
+    s.indexes.receipts.clear();
+    s.indexes.all_receipts.clear();
+    for (offset, r) in s.receipts.clone().iter().enumerate() {
+        s.indexes
+            .receipts
+            .entry(r.run.clone())
+            .or_default()
+            .insert(r.sequence, offset);
+        s.indexes.all_receipts.insert(r.sequence, offset);
+    }
+    s.settled.push(SettledCohort {
+        root: root.clone(),
+        finished_at_ms: 0,
+        runs: vec![run],
+        intents: vec![],
+        receipts,
+    });
+    overwrite(&e.store, "incarnation-1", &s);
+    let before = e.store.load("test").unwrap();
+    let refused = e.advance(&member, 1);
+    assert!(
+        matches!(&refused, Err(Error::Conflict(m)) if m.starts_with("engine invariant violated")),
+        "{refused:?}"
+    );
+    let after = e.store.load("test").unwrap();
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(
+        after.state.runs[&member].step,
+        before.state.runs[&member].step
+    );
+    assert!(after.state.receipts.iter().all(|r| r.kind != "error"));
+}
+fn trigger_artifact() -> Artifact {
+    let c = event_contract();
+    let mut a = done_artifact().content;
+    a.registry.events.insert(c.name.clone(), c.clone());
+    a.playbook.triggers.push(Trigger {
+        id: "on-completed".into(),
+        event: ContractRef {
+            name: c.name.clone(),
+            fingerprint: c.fingerprint().unwrap(),
+        },
+        entry: "main".into(),
+        input: Expr::literal(Value::Null),
+    });
+    Artifact::seal(a).unwrap()
+}
+fn event_run_id(id: &str) -> bool {
+    id.strip_prefix("event-sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    })
+}
+/// SC-7: an event accepted again after its window gets new destination,
+/// run (and so child and operation) ids, in the same `event-sha256:` form;
+/// the first run's history stays and the second run commits beside it.
+#[test]
+fn an_event_accepted_again_after_its_window_gets_new_run_ids() {
+    let e = engine();
+    install(&e, trigger_artifact(), "trigger");
+    e.set_retention_policy(RetentionPolicy {
+        event_replay_ms: 1,
+        terminal_run_ms: 1,
+        audit_ms: 1,
+        max_tombstones: 10,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    let first = e.admit_event("host", event("again", 2), 0).unwrap();
+    assert_eq!(e.fanout(&first.key, 10, 0).unwrap(), 1);
+    e.drive(&mut FakeHost::default(), 0, 20).unwrap();
+    let first_run = runs_page(&e, None)[0]["id"].as_str().unwrap().to_string();
+    // The window passes: GC drops the event; the legacy fences it leaves
+    // (tombstone, correlation fences) go too, as Task 6 will not write them.
+    while e.collect_garbage(2_000, 100).unwrap().more {}
+    let mut s = e.snapshot().unwrap();
+    assert!(!s.events.contains_key(&first.key));
+    s.retention.event_tombstones.clear();
+    s.retention.expired_correlations.clear();
+    overwrite(&e.store, "incarnation-1", &s);
+    let second = e.admit_event("host", event("again", 2), 2_001).unwrap();
+    assert_eq!(second.key, first.key);
+    assert!(!second.duplicate);
+    assert_eq!(e.fanout(&second.key, 10, 2_001).unwrap(), 1);
+    e.drive(&mut FakeHost::default(), 2_001, 20).unwrap();
+    let ids: Vec<String> = runs_page(&e, None)
+        .iter()
+        .map(|r| r["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert!(ids.contains(&first_run));
+    assert!(ids.iter().all(|id| event_run_id(id)), "{ids:?}");
+    assert!(e.snapshot().unwrap().runs.is_empty());
+}
+/// SC-7, existing data: a destination stored before the change keeps its
+/// key, and its run id is `event-<that key>`.
+#[test]
+fn a_stored_destination_keeps_its_key_and_run_id() {
+    let e = engine();
+    install(&e, trigger_artifact(), "trigger");
+    let accepted = e.admit_event("host", event("stored", 2), 0).unwrap();
+    let mut s = e.snapshot().unwrap();
+    let revision = s.bindings["trigger"].revision;
+    let legacy = digest(&(&accepted.key, "trigger", revision, "on-completed")).unwrap();
+    s.events.get_mut(&accepted.key).unwrap().destinations[0].key = legacy.clone();
+    overwrite(&e.store, "incarnation-1", &s);
+    assert_eq!(e.fanout(&accepted.key, 10, 1).unwrap(), 1);
+    let id = format!("event-{legacy}");
+    assert!(event_run_id(&id));
+    assert!(e.snapshot().unwrap().runs.contains_key(&id));
+}
+/// M4: a finished run's inspection items are byte-for-byte the same while it
+/// is still live (its cohort waits for an independent child) and after its
+/// cohort has left as history.
+#[test]
+fn a_finished_runs_inspection_is_identical_before_and_after_removal() {
+    let e = engine();
+    let child = wait_artifact();
+    e.install(child.clone()).unwrap();
+    install(&e, parent_artifact(&child, CallMode::Independent), "parent");
+    let root = e
+        .admit("parent", "main", Value::Null, authority(), 0)
+        .unwrap();
+    e.drive(&mut FakeHost::default(), 0, 20).unwrap();
+    assert!(e.snapshot().unwrap().runs[&root].status.terminal());
+    let pages = |e: &Engine<MemoryStorage>| -> Vec<Vec<u8>> {
+        [
+            InspectionKind::Runs,
+            InspectionKind::Effects,
+            InspectionKind::Receipts,
+        ]
+        .into_iter()
+        .map(|kind| serde_json::to_vec(&inspect_all(e, kind, Some(&root))).unwrap())
+        .collect()
+    };
+    let live = pages(&e);
+    assert!(live[2].len() > 2, "the root has receipts");
+    e.admit_event("host", event("e1", 2), 5).unwrap();
+    e.drive(&mut FakeHost::default(), 5, 20).unwrap();
+    assert!(e.snapshot().unwrap().runs.is_empty());
+    assert_eq!(pages(&e), live);
+}

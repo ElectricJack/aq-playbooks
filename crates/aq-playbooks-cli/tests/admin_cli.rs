@@ -304,6 +304,14 @@ fn protected_admin_lifecycle_control_recovery_rotation_and_paged_inspection() {
         .state;
     assert!(!state.runs.contains_key(&run));
     assert!(!f.call(&["cancel", &run], Some(&keys_b)).status.success());
+    // Recovery for its operation, which left with it, says so.
+    let refused = f.call(
+        &["reconcile", &run, "--request", request.to_str().unwrap()],
+        Some(&keys_b),
+    );
+    assert!(!refused.status.success());
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(message.contains("finished with its run"), "{message}");
 }
 #[test]
 fn key_file_permissions_and_invalid_configuration_fail_closed() {

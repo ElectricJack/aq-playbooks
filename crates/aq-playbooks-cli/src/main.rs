@@ -616,6 +616,24 @@ fn execute(cli: Cli) -> Result<()> {
                 let e = engine(&store)?;
                 if let Some(run) = run {
                     let state = e.snapshot()?;
+                    if !state.intents.contains_key(&request.intent) {
+                        // An operation that left with its finished run is
+                        // in history: it is settled, nothing to recover.
+                        let finished = e
+                            .inspect(&InspectionQuery {
+                                kind: InspectionKind::Effects,
+                                run: Some(run.clone()),
+                                after: None,
+                                limit: 1000,
+                            })?
+                            .items
+                            .iter()
+                            .any(|item| item["id"] == request.intent.as_str());
+                        anyhow::ensure!(
+                            !finished,
+                            "recovery intent has finished with its run; nothing to recover"
+                        );
+                    }
                     anyhow::ensure!(
                         state
                             .intents
