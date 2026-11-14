@@ -192,10 +192,14 @@ fn delta(previous: Vec<Value>, next: Vec<Value>, keys: &[&str]) -> (Vec<Value>, 
 }
 /// Delete the runtime-index rows of receipts named in `$2` (kind, run,
 /// sequence as `item_key`) by sequence, whatever key they are stored under;
-/// a row named with `keep` survives under exactly that key. One
-/// parameterized lookup of `runtime_correlated_sequence` per named row (the
-/// `OFFSET 0` keeps the planner from turning it into a join over the
-/// namespace's rows), then a delete by tuple id.
+/// a row named with `keep` survives under exactly that key. With planner
+/// statistics this is one lookup of `runtime_correlated_sequence` per named
+/// row, then a delete by tuple id: the `OFFSET 0` keeps the planner from
+/// flattening the lookup into a hash join over a scan of the namespace's
+/// rows, which it otherwise prefers on small and mid-sized tables. Without
+/// statistics it may still answer each lookup by a primary-key prefix scan
+/// (no query shape avoids that), which is why opening the storage analyzes
+/// tables that have none (`analyze_unanalyzed`).
 pub(crate) const RECEIPT_ROWS_BY_SEQUENCE_DELETE: &str = "DELETE FROM aq_playbooks.runtime_index WHERE ctid=ANY(ARRAY(SELECT r.ctid FROM jsonb_to_recordset($2) AS d(kind text,lookup_key text,item_key text,keep boolean) CROSS JOIN LATERAL (SELECT old.ctid FROM aq_playbooks.runtime_index old WHERE old.namespace=$1 AND old.kind=d.kind AND old.lookup_key=d.lookup_key AND old.sequence=d.item_key::bigint AND (NOT d.keep OR old.item_key<>d.item_key) OFFSET 0) r))";
 pub(crate) fn sync(
     tx: &mut ObservedTransaction<'_>,

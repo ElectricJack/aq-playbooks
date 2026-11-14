@@ -121,8 +121,57 @@ fn check_name(name: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// The engine's tables that have never been analyzed (`reltuples` is
+/// negative), as a fresh `pg_restore` leaves them: PostgreSQL 17 restores no
+/// planner statistics, and without them the planner may answer an indexed
+/// lookup by a prefix scan (the drain's receipt-row delete then reads every
+/// receipt row of the namespace per named row). Each gets one `ANALYZE` of
+/// its own, outside any commit, before the first commit. A table that has
+/// statistics is not touched, so this costs one catalog query after the
+/// first connection. `ANALYZE` takes SHARE UPDATE EXCLUSIVE, which blocks no
+/// reader or writer, and reads a bounded sample. It is best effort: a role
+/// that may not analyze a table it does not own gets a server warning and
+/// the table is skipped; any error (a statement or lock timeout, say) is
+/// reported on stderr, value-free, and ignored. Autovacuum analyzes such a
+/// table later anyway.
+fn analyze_unanalyzed(client: &mut Client) {
+    let tables: Vec<String> = match client.query(
+        "SELECT c.relname FROM pg_class c WHERE c.relnamespace='aq_playbooks'::regnamespace AND c.relkind IN ('r','p') AND c.reltuples<0 ORDER BY c.relname",
+        &[],
+    ) {
+        Ok(rows) => rows.iter().map(|row| row.get(0)).collect(),
+        Err(error) => {
+            eprintln!("aq-playbooks: could not list tables without statistics: {error}");
+            return;
+        }
+    };
+    for table in tables {
+        // `relname` comes from the catalog of our own schema; quoted anyway.
+        let statement = format!("ANALYZE aq_playbooks.\"{}\"", table.replace('"', "\"\""));
+        if let Err(error) = client.batch_execute(&statement) {
+            eprintln!("aq-playbooks: ANALYZE aq_playbooks.{table} skipped: {error}");
+            continue;
+        }
+        // A role without the right gets only a server warning: say so.
+        let skipped = client
+            .query_one(
+                "SELECT reltuples<0 FROM pg_class WHERE relnamespace='aq_playbooks'::regnamespace AND relname=$1",
+                &[&table],
+            )
+            .map(|row| row.get::<_, bool>(0))
+            .unwrap_or(false);
+        if skipped {
+            eprintln!(
+                "aq-playbooks: ANALYZE aq_playbooks.{table} skipped (this role may not analyze it); run ANALYZE as its owner"
+            );
+        }
+    }
+}
+
 impl PostgresStorage {
-    /// Connects and transactionally applies the crate-owned schema migrations.
+    /// Connects and transactionally applies the crate-owned schema migrations,
+    /// then analyzes the engine's tables that have no planner statistics yet
+    /// (see [`analyze_unanalyzed`]).
     /// Credentials are never included in adapter error messages. This convenience
     /// constructor uses NoTls; use `from_client` with a host-configured TLS client
     /// for remote production databases requiring transport encryption.
@@ -191,6 +240,7 @@ impl PostgresStorage {
             .map_err(backend)?;
         }
         tx.commit().map_err(backend)?;
+        analyze_unanalyzed(&mut client);
         Ok(Self {
             connection: Mutex::new(Connection {
                 client,

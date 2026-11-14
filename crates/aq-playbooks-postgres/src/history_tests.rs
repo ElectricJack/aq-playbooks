@@ -284,12 +284,22 @@ fn no_sequential_scan(plan: &Value, problems: &mut Vec<String>) {
 /// runtime index's `(namespace, kind, lookup_key, sequence, item_key)`
 /// index once per row it names, then deletes by tuple id: no scan of the
 /// namespace's receipt rows, on a namespace holding 4,000 receipts with
-/// planner statistics.
+/// planner statistics, in a database of its own (the plan must not depend
+/// on what other tests left in the tables).
 #[test]
 fn receipt_rows_are_deleted_by_sequence_through_an_index() {
+    let db = format!("receipt_plan_{}", std::process::id());
+    client()
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {db}"))
+        .unwrap();
+    client()
+        .batch_execute(&format!("CREATE DATABASE {db}"))
+        .unwrap();
+    let url = format!("{} dbname={db}", database());
+    let client = || postgres::Client::connect(&url, postgres::NoTls).unwrap();
     let (ns, store) = (
         namespace("receipt_plan"),
-        PostgresStorage::connect(&database()).unwrap(),
+        PostgresStorage::connect(&url).unwrap(),
     );
     store.acquire(&ns, "w").unwrap();
     let mut state = State::default();
@@ -335,4 +345,9 @@ fn receipt_rows_are_deleted_by_sequence_through_an_index() {
         assert!(plan.contains("Tid Scan"), "{plan}");
         assert!(!plan.contains("Seq Scan on runtime_index"), "{plan}");
     }
+    drop(store);
+    drop(c);
+    super::catalog_tests::support::client()
+        .batch_execute(&format!("DROP DATABASE {db} WITH (FORCE)"))
+        .unwrap();
 }
