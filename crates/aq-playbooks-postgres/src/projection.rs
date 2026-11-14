@@ -183,12 +183,15 @@ fn native_rows(state: &State) -> NativeRows<'_> {
             None,
         ));
     }
+    // Receipt rows are keyed by the receipt's sequence, its stable identity:
+    // a commit that compacts `receipts` (a cohort leaving) moves receipts to
+    // new positions but changes none of their rows.
     for (run, receipts) in &idx.receipts {
         for (seq, offset) in receipts {
             rows.push(borrowed_record(
                 "receipt",
                 run,
-                offset.to_string(),
+                receipt_item_key(*seq),
                 "",
                 *seq,
                 state.receipts.get(*offset).map(|r| r.at_ms),
@@ -199,13 +202,25 @@ fn native_rows(state: &State) -> NativeRows<'_> {
         rows.push(borrowed_record(
             "all_receipt",
             "",
-            offset.to_string(),
+            receipt_item_key(*seq),
             "",
             *seq,
             state.receipts.get(*offset).map(|r| r.at_ms),
         ));
     }
     rows
+}
+/// The `item_key` of a receipt's runtime-index rows: its sequence, 20
+/// zero-padded digits. An engine before this keyed them by the receipt's
+/// position in the record (an unpadded number, never 20 digits), so the two
+/// keyings never collide; such rows are deleted by sequence when their
+/// receipt leaves ([`crate::indexes::sync`]).
+pub(crate) fn receipt_item_key(sequence: u64) -> String {
+    format!("{sequence:020}")
+}
+/// Whether `kind` is a receipt kind of the runtime index.
+pub(crate) fn receipt_kind(kind: &str) -> bool {
+    matches!(kind, "receipt" | "all_receipt")
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]

@@ -53,6 +53,8 @@ pub enum IndexQuery {
         after: Option<String>,
         limit: usize,
     },
+    /// Receipts after `after_sequence`, of one run or of all. Each item's
+    /// `key` is the receipt's sequence as 20 zero-padded digits.
     Receipts {
         run: Option<String>,
         after_sequence: u64,
@@ -353,7 +355,9 @@ impl RuntimeIndexes {
                         .take(limit)
                     {
                         items.push(IndexItem {
-                            key: offset.to_string(),
+                            // The receipt's sequence (its stable identity),
+                            // never its position in the record.
+                            key: format!("{seq:020}"),
                             scope: String::new(),
                             sequence: *seq,
                             at_ms: state.receipts.get(*offset).map(|r| r.at_ms),

@@ -280,3 +280,59 @@ fn no_sequential_scan(plan: &Value, problems: &mut Vec<String>) {
         no_sequential_scan(child, problems);
     }
 }
+/// The delete of receipt rows by sequence (`indexes::sync`) reads the
+/// runtime index's `(namespace, kind, lookup_key, sequence, item_key)`
+/// index once per row it names, then deletes by tuple id: no scan of the
+/// namespace's receipt rows, on a namespace holding 4,000 receipts with
+/// planner statistics.
+#[test]
+fn receipt_rows_are_deleted_by_sequence_through_an_index() {
+    let (ns, store) = (
+        namespace("receipt_plan"),
+        PostgresStorage::connect(&database()).unwrap(),
+    );
+    store.acquire(&ns, "w").unwrap();
+    let mut state = State::default();
+    for sequence in 1..=4_000u64 {
+        let run = format!("run-{}", sequence % 4);
+        state.receipts.push(Receipt {
+            sequence,
+            run: run.clone(),
+            step: "s".into(),
+            at_ms: 1,
+            kind: "admitted".into(),
+            detail: json!({}),
+        });
+        let offset = state.receipts.len() - 1;
+        state
+            .indexes
+            .receipts
+            .entry(run)
+            .or_default()
+            .insert(sequence, offset);
+        state.indexes.all_receipts.insert(sequence, offset);
+    }
+    store.compare_and_swap(&ns, "w", 0, &state).unwrap();
+    let mut c = client();
+    c.batch_execute("ANALYZE aq_playbooks.runtime_index")
+        .unwrap();
+    for (kind, lookup) in [("all_receipt", ""), ("receipt", "run-1")] {
+        let rows = json!([{"kind":kind,"lookup_key":lookup,"item_key":"00000000000000000005","keep":false}]);
+        let plan: Vec<String> = c
+            .query(
+                &format!(
+                    "EXPLAIN {}",
+                    crate::indexes::RECEIPT_ROWS_BY_SEQUENCE_DELETE
+                ),
+                &[&ns, &rows],
+            )
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        let plan = plan.join("\n");
+        assert!(plan.contains("runtime_correlated_sequence"), "{plan}");
+        assert!(plan.contains("Tid Scan"), "{plan}");
+        assert!(!plan.contains("Seq Scan on runtime_index"), "{plan}");
+    }
+}
