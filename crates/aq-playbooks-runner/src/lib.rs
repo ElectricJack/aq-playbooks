@@ -3765,6 +3765,7 @@ impl<S: Storage> Engine<S> {
             || policy.replay_evictions_per_commit == 0
             || policy.history_trim_per_commit == 0
             || policy.gc_page_limit == 0
+            || policy.settle_cohorts_per_commit == 0
         {
             return Err(Error::Refused(
                 "per-commit retention bounds must be positive".into(),

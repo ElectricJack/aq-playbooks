@@ -7499,14 +7499,15 @@ fn per_commit_bounds_are_policy_fields_read_from_the_stored_policy() {
             p.replay_evictions_per_commit,
             p.history_trim_per_commit,
             p.gc_page_limit,
+            p.settle_cohorts_per_commit,
         )
     };
-    assert_eq!(bounds(&defaults), (64, 64, 64, 1_000));
+    assert_eq!(bounds(&defaults), (64, 64, 64, 1_000, 50));
     let decoded: RetentionPolicy = serde_json::from_value(
         json!({"event_replay_ms":1,"terminal_run_ms":1,"audit_ms":1,"max_tombstones":1}),
     )
     .unwrap();
-    assert_eq!(bounds(&decoded), (64, 64, 64, 1_000));
+    assert_eq!(bounds(&decoded), (64, 64, 64, 1_000, 50));
     // The window drop: 10 expired keyed receipts, 3 per commit.
     let e = ret_engine();
     e.set_retention_policy(RetentionPolicy {
@@ -7585,6 +7586,10 @@ fn per_commit_bounds_are_policy_fields_read_from_the_stored_policy() {
         },
         RetentionPolicy {
             gc_page_limit: 0,
+            ..RetentionPolicy::default()
+        },
+        RetentionPolicy {
+            settle_cohorts_per_commit: 0,
             ..RetentionPolicy::default()
         },
     ] {
@@ -7881,4 +7886,99 @@ fn a_handle_found_after_the_hold_lapsed_resolves_by_the_deadline_and_recovery_pa
     assert_eq!(host.reconciliations.len(), 2);
     let runs = inspect_all(&e, InspectionKind::Runs, Some(&run));
     assert_eq!(runs[0]["outcome"], "ok", "{runs:?}");
+}
+/// Review M1 (fix round 1): a lapsing hold re-judges the events it held in
+/// batches of `window_drops_per_commit` per commit (10 here), not all in
+/// the commit that lapses it; the remainder continues in later commits
+/// (`more` set meanwhile). 25 events held while the handle was lost join
+/// the eviction order 10, 10, 5.
+#[test]
+fn a_lapsing_hold_rejudges_its_events_in_bounded_batches() {
+    let e = keep_engine(1_000);
+    e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 600_000,
+        event_replay_ms: 10_000,
+        replay_keep: 1_000,
+        window_drops_per_commit: 10,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    let (a, completion) = async_artifact();
+    install(&e, a, "async");
+    e.admit("async", "main", Value::Null, authority(), 0)
+        .unwrap();
+    e.drive(&mut FakeHost::default(), 0, 10).unwrap();
+    let held: Vec<String> = (0..25)
+        .map(|i| {
+            let envelope = EventEnvelope {
+                correlation: BTreeMap::from([("operation".into(), format!("op-{i}"))]),
+                ..async_event(&completion, &format!("held-{i:02}"))
+            };
+            e.admit_event("host", envelope, 500 + i).unwrap().key
+        })
+        .collect();
+    let in_order = |e: &Engine<MemoryStorage>| {
+        let s = e.snapshot().unwrap();
+        let members = order_members(&s);
+        held.iter()
+            .filter(|k| members.contains(&format!("e:{k}")))
+            .count()
+    };
+    assert_eq!(in_order(&e), 0);
+    let mut joined = vec![];
+    let mut more = vec![];
+    for t in 0..4 {
+        let report = e.collect_garbage(10_100 + t, 10).unwrap();
+        joined.push(in_order(&e));
+        more.push(report.more);
+    }
+    assert_eq!(joined, [10, 20, 25, 25]);
+    assert_eq!(more[..2], [true, true]);
+    assert!(!more[3]);
+    assert!(e.snapshot().unwrap().retention.rejudge.is_empty());
+}
+/// The batched re-judge restarts from the earliest change: two operations
+/// of one contract lost their handles (dispatched at 0 and 1, lapsing at
+/// 10,100 and 10,101). The first lapse starts judging the 30 events both
+/// held (still held by the second); the second lapse, a commit later,
+/// re-judges them from the start, so every one of them joins the order.
+#[test]
+fn a_second_lapse_rejudges_from_the_earliest_change() {
+    let e = keep_engine(1_000);
+    e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 600_000,
+        event_replay_ms: 10_000,
+        replay_keep: 1_000,
+        window_drops_per_commit: 10,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    let (a, completion) = async_artifact();
+    install(&e, a, "async");
+    for t in 0..2 {
+        e.admit("async", "main", Value::Null, authority(), t)
+            .unwrap();
+        e.drive(&mut FakeHost::default(), t, 10).unwrap();
+    }
+    let held: Vec<String> = (0..30)
+        .map(|i| {
+            let envelope = EventEnvelope {
+                correlation: BTreeMap::from([("operation".into(), format!("op-{i}"))]),
+                ..async_event(&completion, &format!("held-{i:02}"))
+            };
+            e.admit_event("host", envelope, 500 + i).unwrap().key
+        })
+        .collect();
+    let in_order = |e: &Engine<MemoryStorage>| {
+        let members = order_members(&e.snapshot().unwrap());
+        held.iter()
+            .filter(|k| members.contains(&format!("e:{k}")))
+            .count()
+    };
+    let mut joined = vec![];
+    for t in 0..5 {
+        e.collect_garbage(10_100 + t, 10).unwrap();
+        joined.push(in_order(&e));
+    }
+    assert_eq!(joined, [0, 10, 20, 30, 30]);
 }

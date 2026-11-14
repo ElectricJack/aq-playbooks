@@ -76,6 +76,14 @@ pub struct RetentionPolicy {
     /// Positive.
     #[serde(default = "default_gc_page_limit")]
     pub gc_page_limit: usize,
+    /// At most this many cohorts that settle in a commit leave the State in
+    /// it ([`settle`]); the rest re-arm the drain, which takes them in later
+    /// commits. Positive.
+    #[serde(default = "default_settle_cohorts")]
+    pub settle_cohorts_per_commit: usize,
+}
+fn default_settle_cohorts() -> usize {
+    COHORTS_PER_COMMIT
 }
 fn default_window_drops() -> usize {
     WINDOW_DROPS_PER_COMMIT
@@ -128,6 +136,7 @@ impl Default for RetentionPolicy {
             replay_evictions_per_commit: default_replay_evictions(),
             history_trim_per_commit: default_history_trim(),
             gc_page_limit: default_gc_page_limit(),
+            settle_cohorts_per_commit: default_settle_cohorts(),
         }
     }
 }
@@ -189,6 +198,14 @@ pub struct RetentionState {
     /// then runs.
     #[serde(default)]
     pub drain: DrainState,
+    /// Events still to be judged again because the uncertain operations of
+    /// their contract and scope changed (a hold through an uncertain
+    /// completion began, ended or lapsed): by contract key, the acceptance
+    /// sequence after which [`rejoin`] continues. It judges at most
+    /// `policy.window_drops_per_commit` of them per commit. Empty (and not
+    /// written) when nothing is pending.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rejudge: BTreeMap<String, u64>,
 }
 /// Progress of the drain ([`drain_step`]), stored with the State so a
 /// restart continues where it stopped.
@@ -564,12 +581,14 @@ pub(crate) fn check_licensed_header(
         producer_epochs,
         artifact_disposals,
         gc_cursor,
-        // A licensed commit drains nothing.
+        // A licensed commit drains nothing and judges no event again.
         drain,
+        rejudge,
     } = retention;
     let (n, r) = (next, &next.retention);
     let unchanged = same(policy, &r.policy)
         && *drain == r.drain
+        && *rejudge == r.rejudge
         && *producer_epochs == r.producer_epochs
         && *last_gc_at_ms == r.last_gc_at_ms
         && *gc_cursor == r.gc_cursor
@@ -906,7 +925,8 @@ pub(crate) fn check_removals(
     }
     Ok(())
 }
-/// At most this many settled cohorts leave the State in one commit.
+/// The default of `RetentionPolicy::settle_cohorts_per_commit`: settled
+/// cohorts that leave the State in one commit.
 pub const COHORTS_PER_COMMIT: usize = 50;
 /// What one commit moved out of the State.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -1693,7 +1713,7 @@ pub struct ReplayTouched {
 /// after its dispatch, so only those are judged again (from
 /// `indexes.contract_events` by sequence): a dispatch judges none, the
 /// binding of its handle those that arrived during the host call.
-pub(crate) fn rejoin(s: &mut State) -> Result<()> {
+pub(crate) fn rejoin(s: &mut State, report: &mut CommitReport) -> Result<()> {
     let runs: Vec<String> = s
         .settled
         .iter()
@@ -1717,18 +1737,62 @@ pub(crate) fn rejoin(s: &mut State) -> Result<()> {
             events.extend(ids.values().cloned());
         }
     }
-    // Events an older engine accepted that the drain has not judged yet
-    // are left to it: it judges them a bounded number per commit, so no
-    // change of a contract's uncertain operations judges them all at once.
-    let drain = &s.retention.drain;
+    // A change of a contract's uncertain operations queues its events after
+    // the earliest dispatch concerned; at most `window_drops_per_commit` of
+    // the queued events are judged per commit, the rest in later commits
+    // (an unjudged event that has become held is taken out of the order by
+    // `evict` rather than evicted; one that has become unheld waits outside
+    // it, or leaves by its window). Events an older engine accepted that the
+    // drain has not judged yet are left to it.
     for (key, after) in touched.contract_keys {
-        if let Some(ids) = s.indexes.contract_events.get(&key) {
-            events.extend(
-                ids.range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
-                    .filter(|(sequence, id)| !drain.event_pending(id, **sequence))
-                    .map(|(_, id)| id.clone()),
-            );
+        let entry = s.retention.rejudge.entry(key).or_insert(after);
+        *entry = (*entry).min(after);
+    }
+    let mut budget = s.retention.policy.window_drops_per_commit;
+    let drain = &s.retention.drain;
+    let mut progress = vec![];
+    for (key, after) in &s.retention.rejudge {
+        if budget == 0 {
+            break;
         }
+        let batch: Vec<(u64, String)> = s
+            .indexes
+            .contract_events
+            .get(key)
+            .into_iter()
+            .flat_map(|ids| {
+                ids.range((
+                    std::ops::Bound::Excluded(*after),
+                    std::ops::Bound::Unbounded,
+                ))
+            })
+            .filter(|(sequence, id)| !drain.event_pending(id, **sequence))
+            .take(budget)
+            .map(|(sequence, id)| (*sequence, id.clone()))
+            .collect();
+        budget -= batch.len();
+        // A batch shorter than the budget reached the contract's last
+        // event: done. A full one continues after its last event.
+        let next = if budget > 0 {
+            None
+        } else {
+            batch.last().map(|(sequence, _)| *sequence)
+        };
+        progress.push((key.clone(), next));
+        events.extend(batch.into_iter().map(|(_, id)| id));
+    }
+    for (key, next) in progress {
+        match next {
+            Some(cursor) => {
+                s.retention.rejudge.insert(key, cursor);
+            }
+            None => {
+                s.retention.rejudge.remove(&key);
+            }
+        }
+    }
+    if !s.retention.rejudge.is_empty() {
+        report.more = true;
     }
     for key in events {
         let Some(order) = s.events.get(&key).map(event_order_key) else {
@@ -1977,13 +2041,14 @@ pub(crate) fn finish_commit(
     if let Some(now_ms) = now_ms {
         advance_clock(s, now_ms);
     }
-    settle(s, candidates, COHORTS_PER_COMMIT, &mut report)?;
+    let settle_bound = s.retention.policy.settle_cohorts_per_commit;
+    settle(s, candidates, settle_bound, &mut report)?;
     drain_step(s, started, &mut report)?;
     if !s.retention.drain.done {
         report.more = true;
     }
     lapse_holds(s)?;
-    rejoin(s)?;
+    rejoin(s, &mut report)?;
     if now_ms.is_some() {
         let drops = s.retention.policy.window_drops_per_commit;
         drop_expired(s, drops, &mut report)?;
@@ -2675,6 +2740,38 @@ mod window_tests {
     /// The brief's unit test (Review Focus 2): a commit with more settled
     /// candidates than `COHORTS_PER_COMMIT` re-arms the drain's cohort scan,
     /// which then moves the rest, so none is stranded.
+    #[test]
+    fn the_settle_bound_comes_from_the_policy() {
+        assert_eq!(RetentionPolicy::default().settle_cohorts_per_commit, 50);
+        let mut s = settled_cohorts(20);
+        s.retention.policy.settle_cohorts_per_commit = 7;
+        s.retention.drain = DrainState {
+            done: true,
+            roots_done: true,
+            phase: DRAIN_DONE,
+            ..DrainState::default()
+        };
+        let candidates: BTreeSet<String> = s.runs.keys().cloned().collect();
+        let started = s.sequence;
+        let report = finish_commit(&mut s, None, candidates, started).unwrap();
+        // 7 settled by the commit; the re-armed drain takes its own bound
+        // (50, less the 7) of the rest in the same commit.
+        assert_eq!((report.cohorts, s.runs.len()), (20, 0));
+        let mut s = settled_cohorts(20);
+        s.retention.policy.settle_cohorts_per_commit = 7;
+        s.retention.policy.drain_cohorts_per_commit = 7;
+        s.retention.drain = DrainState {
+            done: true,
+            roots_done: true,
+            phase: DRAIN_DONE,
+            ..DrainState::default()
+        };
+        let candidates: BTreeSet<String> = s.runs.keys().cloned().collect();
+        let started = s.sequence;
+        let report = finish_commit(&mut s, None, candidates, started).unwrap();
+        assert_eq!((report.cohorts, s.runs.len()), (7, 13));
+        assert!(report.more);
+    }
     #[test]
     fn settle_cap_rearms_the_drain() {
         let mut s = settled_cohorts(60);
