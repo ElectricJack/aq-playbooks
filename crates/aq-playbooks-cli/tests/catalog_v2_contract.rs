@@ -4,6 +4,9 @@
 #[allow(dead_code)]
 #[path = "support/fake_host.rs"]
 mod fake_host;
+#[allow(dead_code)]
+#[path = "support/schemas.rs"]
+mod schemas;
 use aq_playbooks_cli::catalog;
 use aq_playbooks_model::{Registry, canonical_bytes, digest, hash_bytes};
 use serde_json::{Value, json};
@@ -52,9 +55,9 @@ fn catalog_v2_manifest_schemas_and_fixtures_are_pinned() {
         event.payload.validate_definition().unwrap();
         assert_eq!(
             event.trusted_producers,
-            catalog::strings(&["aq.host.bridge@1"])
+            schemas::strings(&["aq.host.bridge@1"])
         );
-        assert_eq!(event.correlation_fields, catalog::strings(&["operation"]));
+        assert_eq!(event.correlation_fields, schemas::strings(&["operation"]));
     }
     for name in ["judgment.request", "check.request"] {
         let command = &registry.commands[name];
@@ -62,7 +65,7 @@ fn catalog_v2_manifest_schemas_and_fixtures_are_pinned() {
         assert!(command.asynchronous.is_some());
         assert_eq!(
             command.capabilities,
-            catalog::strings(&[&format!("{name}.v2")]),
+            schemas::strings(&[&format!("{name}.v2")]),
             "2.0.0 effects need a new grant, never an inherited 1.0.0 capability"
         );
     }

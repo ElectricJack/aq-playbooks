@@ -1,5 +1,6 @@
 //! The pilots' own tests. They were its module's unit tests while the pilots
 //! were part of the CLI's library; `tests/host_pilots.rs` runs them, once.
+use crate::pilots::schemas::*;
 use crate::pilots::*;
 use aq_playbooks_cli::catalog::*;
 use aq_playbooks_model::*;

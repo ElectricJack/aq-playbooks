@@ -22,13 +22,13 @@ cargo run -p aq-playbooks-cli -- commands list
 cargo run -p aq-playbooks-cli -- examples --output .local/examples
 cd .local/examples/notify-when-ready
 cargo run -p aq-playbooks-cli -- check
-cargo run -p aq-playbooks-cli -- try cases/still-waiting.json
+cargo run -p aq-playbooks-cli -- try cases/still-no-description.json
 cargo run -p aq-playbooks-cli -- compare
 ```
 
 Build into the checkout's own `target/` (leave `CARGO_TARGET_DIR` unset; in AQ, each slot keeps its own `target/`). The workspace dev/test profile keeps disk growth bounded: workspace crates get `line-tables-only` debuginfo (backtraces still report file:line), dependencies get none, and incremental compilation is off. Opt back in for a debugging session with `CARGO_INCREMENTAL=1` or `CARGO_PROFILE_DEV_DEBUG=2`.
 
-`examples` writes the worked authoring workspaces of `docs/authoring/examples`: a document, the files the host places beside it, the finished draft, its cases, the previously active artifact, and documents the agent cannot turn into steps with the `ask` or `unable` it runs for them. The authoring tools run only with a workspace's root as the current directory. `tests/authoring_examples.rs` runs them on every example.
+`examples` writes the worked authoring workspaces of `crates/aq-playbooks-compiler/authoring-examples`: a document, the files the host places beside it, the finished draft, its cases, the previously active artifact, and documents the agent cannot turn into steps with the `ask` or `unable` it runs for them. The authoring tools run only with a workspace's root as the current directory. `tests/authoring_examples.rs` runs them on every example.
 
 `commands` and `events` support `list` and `describe`; in a workspace they read its `catalog.json`. Run `--help` for exact arguments.
 

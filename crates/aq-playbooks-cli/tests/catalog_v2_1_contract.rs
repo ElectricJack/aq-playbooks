@@ -4,6 +4,9 @@
 #[allow(dead_code)]
 #[path = "support/fake_host.rs"]
 mod fake_host;
+#[allow(dead_code)]
+#[path = "support/schemas.rs"]
+mod schemas;
 use aq_playbooks_cli::catalog;
 use aq_playbooks_model::{Registry, digest, hash_bytes};
 use serde_json::{Value, json};
@@ -37,7 +40,7 @@ fn catalog_v2_1_manifest_schemas_and_fixtures_are_pinned() {
     // The effect is unchanged, so the existing grant still authorizes it.
     assert_eq!(
         prepare.capabilities,
-        catalog::strings(&["candidate.prepare"])
+        schemas::strings(&["candidate.prepare"])
     );
     assert!(prepare.public_result_fields.contains("source"));
     // The prepared source has exactly the check.request input source shape.

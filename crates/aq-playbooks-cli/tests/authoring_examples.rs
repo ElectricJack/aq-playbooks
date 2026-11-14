@@ -1,12 +1,14 @@
-//! The worked authoring examples in `docs/authoring/examples`, which an
-//! authoring agent reads and imitates. Each one is written out by
+//! The worked authoring examples (`crates/aq-playbooks-compiler/
+//! authoring-examples`), which an authoring agent reads and imitates. Each one is written out by
 //! `aq-playbooks examples` and run with the real tools from its root, as an
 //! agent runs them: `check` is clean, every case passes under `try`, `seal`
 //! writes an artifact that verifies, `compare` reports the kind of change the
 //! example shows, and `save` writes the outcome. Each document variant under
 //! `stuck/` writes exactly the outcome it shows. So the examples cannot rot.
+use aq_playbooks_cli::catalog::catalog_v2_2;
 use aq_playbooks_compiler::docs::example_files;
-use aq_playbooks_model::Artifact;
+use aq_playbooks_compiler::draft::{SourceRecord, retain_registry};
+use aq_playbooks_model::{Artifact, Registry};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -19,10 +21,13 @@ use std::{
 /// Each example, the change `compare` reports against its
 /// `previous.artifact.json`, and the most steps its draft has.
 const EXAMPLES: [(&str, &str, usize); 2] = [
-    ("escalate-on-judgment", "presentation", 12),
-    ("notify-when-ready", "executable", 9),
+    ("escalate-on-judgment", "presentation", 13),
+    ("notify-when-ready", "executable", 10),
 ];
-const ON_DISK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/authoring/examples");
+const ON_DISK: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../aq-playbooks-compiler/authoring-examples"
+);
 
 struct Dir(PathBuf);
 impl Drop for Dir {
@@ -89,6 +94,18 @@ fn every_worked_example_checks_saves_and_its_cases_pass() {
             .unwrap()
             .len();
         assert!(steps <= max_steps, "{name} has {steps} steps");
+
+        // The catalog is the one the host places: catalog 2.2.0 kept to what
+        // the record allows.
+        let record: SourceRecord =
+            serde_json::from_value(json_file(&root.join("record.json"))).unwrap();
+        let catalog: Registry =
+            serde_json::from_value(json_file(&root.join("catalog.json"))).unwrap();
+        let (kept, _) = retain_registry(&catalog_v2_2(), &record.commands, &record.events).unwrap();
+        assert_eq!(
+            catalog, kept,
+            "{name}: catalog.json is not catalog 2.2.0 as the record keeps it"
+        );
 
         // Every case passes, and is named after its file.
         let mut cases: Vec<String> = fs::read_dir(root.join("cases"))
@@ -190,7 +207,7 @@ fn each_stuck_document_writes_the_outcome_it_shows() {
     assert_eq!(shown, BTreeSet::from(["ask".into(), "unable".into()]));
 }
 
-/// `example_files()` is every file under `docs/authoring/examples`, byte for
+/// `example_files()` is every file under `crates/aq-playbooks-compiler/authoring-examples`, byte for
 /// byte, and the documents are written as a person writes them: no
 /// identifiers, no code.
 #[test]

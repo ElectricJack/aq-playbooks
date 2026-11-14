@@ -2,6 +2,9 @@
 #[allow(dead_code)]
 #[path = "support/fake_host.rs"]
 mod fake_host;
+#[allow(dead_code)]
+#[path = "support/schemas.rs"]
+mod schemas;
 use aq_playbooks_cli::catalog;
 use aq_playbooks_model::{Effect, Recovery, Registry, canonical_bytes, digest};
 use serde_json::{Value, json};
@@ -18,11 +21,11 @@ fn published_catalog_manifest_schemas_and_fixtures_are_pinned() {
         manifest["fingerprint"],
         digest(&(manifest["version"].as_str().unwrap(), &registry)).unwrap()
     );
-    assert_eq!(manifest["context_views"], json!(catalog::CONTEXT_VIEWS));
-    assert_eq!(manifest["work_kinds"], json!(catalog::WORK_KINDS));
+    assert_eq!(manifest["context_views"], json!(schemas::CONTEXT_VIEWS));
+    assert_eq!(manifest["work_kinds"], json!(schemas::WORK_KINDS));
     assert_eq!(
         manifest["work_change_variants"],
-        json!(catalog::CHANGE_VARIANTS)
+        json!(schemas::CHANGE_VARIANTS)
     );
     assert_eq!(registry.commands.len(), 12);
     assert!(registry.events.len() <= 16);
@@ -59,9 +62,9 @@ fn published_catalog_manifest_schemas_and_fixtures_are_pinned() {
         event.payload.validate_definition().unwrap();
         assert_eq!(
             event.trusted_producers,
-            catalog::strings(&["aq.host.bridge@1"])
+            schemas::strings(&["aq.host.bridge@1"])
         );
-        assert_eq!(event.correlation_fields, catalog::strings(&["operation"]));
+        assert_eq!(event.correlation_fields, schemas::strings(&["operation"]));
     }
     let fixtures: Value =
         serde_json::from_str(include_str!("../../../contracts/aq-host/fixtures.json")).unwrap();

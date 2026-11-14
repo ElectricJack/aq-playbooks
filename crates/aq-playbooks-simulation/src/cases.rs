@@ -59,9 +59,14 @@ pub const CASES_TRANSITION_BUDGET: usize = 40_000;
 const MAX_CASE_ROUNDS: usize = 256;
 
 /// The outcome file the authoring agent's `save`, `ask` and `unable` write,
-/// relative to the workspace, and the most bytes it may have.
+/// relative to the workspace, and the most bytes it may have: 4 MiB. A
+/// saved outcome holds the draft and every case, and a case spells out each
+/// call with its whole input, so 40 routing cases and their draft come to
+/// about 0.6 MiB (`a_forty_case_routing_save_fits_the_outcome_bound` in the
+/// CLI's tests). A host reads at most this many bytes, plus one to notice a
+/// longer file.
 pub const OUTCOME_FILE: &str = "out/outcome.json";
-pub const MAX_OUTCOME_BYTES: usize = 1_048_576;
+pub const MAX_OUTCOME_BYTES: usize = 4_194_304;
 pub const MAX_QUESTION_BYTES: usize = 4096;
 pub const MAX_REASON_BYTES: usize = 4096;
 /// One question names at most this many sentences.

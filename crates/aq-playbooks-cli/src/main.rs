@@ -20,7 +20,7 @@ mod authoring;
 #[command(
     name = "aq-playbooks",
     version,
-    about = "Compile, simulate, and inspect bounded policy workflows"
+    about = "Author, check, inspect and administer bounded policy workflows"
 )]
 struct Cli {
     #[command(subcommand)]

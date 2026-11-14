@@ -1,8 +1,13 @@
 //! The agent's authoring tools, run as the binary in a temporary workspace
 //! holding the routing draft and catalog 2.2.0.
-use aq_playbooks_cli::catalog::{catalog_v2_2, strings};
+#[allow(dead_code)]
+#[path = "support/schemas.rs"]
+mod schemas;
+use aq_playbooks_cli::catalog::catalog_v2_2;
 use aq_playbooks_compiler::draft::{SourceRecord, retain_registry};
 use aq_playbooks_model::{EvalContext, EvalLimits, EvalValue, Expr, eval};
+use aq_playbooks_simulation::{MAX_CASES, MAX_OUTCOME_BYTES};
+use schemas::strings;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -276,7 +281,7 @@ fn check_try_compare_save_on_a_workspace() {
         .map(|c| c["name"].as_str().unwrap())
         .collect();
     assert_eq!(names, ["bugfix", "chore", "design", "docs", "feature"]);
-    assert!(bytes.len() <= 1_048_576);
+    assert!(bytes.len() <= MAX_OUTCOME_BYTES);
     // Saving again writes the same file.
     let (ok, _) = json_of(d, &["save"]);
     assert!(ok);
@@ -616,4 +621,36 @@ fn a_cases_entry_that_is_not_a_directory_is_reported() {
             .contains("holds 0 case files"),
         "{refused:#}"
     );
+}
+
+/// The largest save an agent can make for the routing document: the
+/// routing draft and 40 cases, each spelling out every call with its whole
+/// input, fits the outcome bound.
+#[test]
+fn a_forty_case_routing_save_fits_the_outcome_bound() {
+    let ws = workspace("forty");
+    let d = &ws.0;
+    fs::remove_dir_all(d.join("cases")).unwrap();
+    let rows = [
+        ("chore", "low", "simple-high"),
+        ("feature", "low", "standard-high"),
+        ("design", "low", "complex-high"),
+        ("bugfix", "medium", "standard-high"),
+        ("docs", "low", "standard-high"),
+    ];
+    for n in 0..MAX_CASES {
+        let (kind, risk, level) = rows[n % rows.len()];
+        let name = format!("case-{n:02}");
+        write(
+            d,
+            &format!("cases/{name}.json"),
+            &routing_case(&name, kind, risk, level),
+        );
+    }
+    let (ok, saved) = json_of(d, &["save"]);
+    assert!(ok, "{saved:#}");
+    assert_eq!(saved["cases"].as_array().unwrap().len(), MAX_CASES);
+    let bytes = fs::read(d.join("out/outcome.json")).unwrap().len();
+    println!("40 routing cases and the draft: {bytes} bytes");
+    assert!(bytes <= MAX_OUTCOME_BYTES, "{bytes}");
 }

@@ -10,7 +10,7 @@
 //! refused, and a file is checked again after it is opened.
 //!
 //! Outcome. `save`, `ask` and `unable` each write only `out/outcome.json`
-//! (at most 1 MiB), whole, and nothing else. Running one again with the same
+//! (at most `MAX_OUTCOME_BYTES`, 4 MiB), whole, and nothing else. Running one again with the same
 //! inputs writes the same bytes. The outcome is data the host checks again,
 //! never an instruction.
 use anyhow::{Context, Result, anyhow, bail};

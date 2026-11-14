@@ -1,6 +1,6 @@
 ---
 name: aq-playbook-author
-description: Translate project policy into bounded aq-playbooks proposals, validate and simulate them, and package immutable artifacts. Use for authoring this engine's workflows, not general AQ administration.
+description: Translate project policy into aq-playbooks drafts, check them, try them against cases, and save them for the host to seal. Use for authoring this engine's workflows, not general AQ administration.
 ---
 
 Read the repository's `docs/specs/0002-implementation.md` and model `FORMAT.md` for the executable format. Use `aq-playbooks --help` for the actual installed CLI. Before writing a draft, write the worked workspaces with `aq-playbooks examples --output DIR` and read them: each holds a document, the draft made from it, its cases, and what to run (`ask` or `unable`) when a document cannot be turned into steps.

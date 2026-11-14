@@ -1,77 +1,7 @@
 //! Versioned AQ host contracts, shared by the authoring tools, the test pilots
-//! and production adapters.
+//! and production adapters. The schema builders the tests write contracts
+//! with live in `tests/support/schemas.rs`.
 use aq_playbooks_model::*;
-use std::collections::BTreeSet;
-
-pub fn strings(items: &[&str]) -> BTreeSet<String> {
-    items.iter().map(|s| (*s).into()).collect()
-}
-pub fn object(fields: &[(&str, Schema)]) -> Schema {
-    Schema::object(fields.iter().cloned().map(|(k, v)| (k.into(), v)).collect())
-}
-pub fn enumeration(values: &[&str]) -> Schema {
-    Schema::String {
-        max_length: 128,
-        values: strings(values),
-    }
-}
-pub fn text() -> Schema {
-    Schema::string(4096)
-}
-pub fn revision() -> Schema {
-    Schema::Integer {
-        minimum: 0,
-        maximum: i64::MAX,
-    }
-}
-pub fn subject() -> Schema {
-    object(&[("id", text()), ("revision", revision())])
-}
-pub fn result() -> Schema {
-    object(&[("reference", text()), ("subject", subject())])
-}
-pub fn work_result() -> Schema {
-    object(&[
-        ("reference", text()),
-        ("subject", subject()),
-        (
-            "disposition",
-            enumeration(&["accepted", "changes_requested", "failed"]),
-        ),
-    ])
-}
-pub fn list(item: Schema) -> Schema {
-    Schema::Array {
-        items: Box::new(item),
-        max_items: 100,
-    }
-}
-pub const CONTEXT_VIEWS: &[&str] = &[
-    "work",
-    "project",
-    "execution_options",
-    "evidence",
-    "health_observations",
-];
-pub const WORK_KINDS: &[&str] = &[
-    "implementation",
-    "investigation",
-    "planning",
-    "review",
-    "repair",
-    "supervisor_authoring",
-    "spec_ingestion",
-    "fidelity_review",
-    "onboarding",
-];
-pub const CHANGE_VARIANTS: &[&str] = &[
-    "requirements",
-    "priority",
-    "dependencies",
-    "execution_constraints",
-    "hold",
-    "release_hold",
-];
 
 /// Exact executable schema bundle shared with revision-pinned production hosts.
 pub const VERSION: &str = "1.0.0";

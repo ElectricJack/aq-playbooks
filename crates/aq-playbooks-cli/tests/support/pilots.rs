@@ -1,6 +1,9 @@
 //! Reusable, compiled pilot workflows with deterministic fake-host scenarios,
 //! for tests only. Their artifacts' bytes are pinned by
 //! `tests/host_pilots.rs` (`the_coding_pilot_keeps_its_pinned_bytes`).
+#[allow(dead_code)]
+#[path = "schemas.rs"]
+pub mod schemas;
 use aq_playbooks_cli::{
     catalog::*,
     simulation::{Action, Scenario, Start},
@@ -8,6 +11,7 @@ use aq_playbooks_cli::{
 use aq_playbooks_compiler::{COMPILER_VERSION, CompileInput, Proposal, compile};
 use aq_playbooks_model::*;
 use aq_playbooks_runner::{Authority, DispatchResult};
+use schemas::*;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 pub const NAMES: &[&str] = &["coding", "watcher", "report"];

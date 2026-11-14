@@ -1,9 +1,13 @@
 //! Host catalog 2.2.0 conformance: 2.1.0 byte-identical, plus task facts
 //! (`work.read`), routes (`work.route`), structured judgments
 //! (`judgment.assess`, `aq.judgment.assessed`) and `aq.work.route_needed`.
-use aq_playbooks_cli::catalog::{self, enumeration, object, result, strings, subject, text};
+#[allow(dead_code)]
+#[path = "support/schemas.rs"]
+mod schemas;
+use aq_playbooks_cli::catalog;
 use aq_playbooks_compiler::draft::{SourceRecord, Workspace, check, seal};
 use aq_playbooks_model::*;
+use schemas::{enumeration, object, result, strings, subject, text};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
