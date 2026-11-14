@@ -26,37 +26,21 @@ fn offline_cli_round_trip_and_invalid_input_exit() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // `validate`, `compile` and `diff` took a whole CompileInput; the
+    // authoring tools (`check`, `seal`, `compare`, tests/authoring_cli.rs)
+    // replace them, and they are refused now.
     let proposal = dir.join("routing.proposal.json");
-    let compiled = dir.join("compiled.json");
-    let output = cli(&["validate", proposal.to_str().unwrap()]);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    let output = cli(&[
-        "compile",
-        proposal.to_str().unwrap(),
-        "--output",
-        compiled.to_str().unwrap(),
-    ]);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        fs::read(&compiled).unwrap(),
-        fs::read(dir.join("routing.artifact.json")).unwrap()
-    );
-    let output = cli(&[
-        "diff",
-        compiled.to_str().unwrap(),
-        compiled.to_str().unwrap(),
-    ]);
-    assert!(output.status.success());
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(value["kind"], "identical");
+    for args in [
+        &["validate", proposal.to_str().unwrap()][..],
+        &["compile", proposal.to_str().unwrap(), "--output", "x.json"],
+        &[
+            "diff",
+            proposal.to_str().unwrap(),
+            proposal.to_str().unwrap(),
+        ],
+    ] {
+        assert!(!cli(args).status.success(), "{args:?}");
+    }
     let output = cli(&[
         "simulate",
         dir.join("report.scenario.json").to_str().unwrap(),
@@ -80,15 +64,6 @@ fn offline_cli_round_trip_and_invalid_input_exit() {
             .as_array()
             .unwrap()
             .is_empty()
-    );
-    let mut value: serde_json::Value =
-        serde_json::from_slice(&fs::read(&proposal).unwrap()).unwrap();
-    value["proposal"]["playbook"]["entries"]["main"]["start"] = "nowhere".into();
-    fs::write(&proposal, serde_json::to_vec(&value).unwrap()).unwrap();
-    assert!(
-        !cli(&["validate", proposal.to_str().unwrap()])
-            .status
-            .success()
     );
     fs::remove_dir_all(dir).unwrap();
 }

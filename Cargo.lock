@@ -134,6 +134,7 @@ name = "aq-playbooks-simulation"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "aq-playbooks-compiler",
  "aq-playbooks-model",
  "aq-playbooks-runner",
  "serde",

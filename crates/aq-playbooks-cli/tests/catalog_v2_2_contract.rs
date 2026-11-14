@@ -1842,6 +1842,7 @@ fn the_routing_draft_routes_as_the_document_says() {
         ),
     ];
     assert!(rows.len() >= 16);
+    the_rows_run_as_cases(&rows);
     for (name, task, want) in &rows {
         let r = route_for(task);
         let codes: Vec<&str> = r["reasons"]
@@ -2009,4 +2010,83 @@ fn the_routing_draft_uses_a_small_part_of_the_cost_bounds() {
         "{size:?}"
     );
     assert!(size.scope * 10 < MAX_DRAFT_SCOPE, "{size:?}");
+}
+
+/// The same rows as authoring cases, run by the simulation library on the
+/// sealed draft from the trigger event. The runtime writes, as `work.route`'s
+/// input, exactly the route the expressions evaluate to: an `assessed`
+/// answer reaches `route` through the named join, and a failed judgment
+/// takes `assume`.
+fn the_rows_run_as_cases(rows: &[(&str, Task, Expected)]) {
+    use aq_playbooks_simulation::{
+        Case, CaseReturn, CaseStart, Expectation, ExpectedCall, run_case,
+    };
+    let artifact = seal(&routing_workspace()).unwrap_or_else(|d| panic!("{d:#?}"));
+    let subject = json!({"id": "task-1", "revision": 3});
+    for (name, task, want) in rows {
+        let facts = json!({"kind": task.filed_kind, "title": "A task", "description": "",
+            "origin": "owner", "level_hint": task.hint, "charged_failures": task.failures,
+            "ended_attempts": task.failures, "route": "none"});
+        let judgment = match task.labels {
+            Some([kind, risk]) => CaseReturn::Answer {
+                outcome: "assessed".into(),
+                output: json!({"reference": "judgment:op-1", "subject": subject,
+                    "labels": [kind, risk], "flags": task.flags, "rationale": "Because.",
+                    "provenance": fixtures()["assessed_guarantee"]["assessed"]["provenance"]}),
+            },
+            None => CaseReturn::Answer {
+                outcome: "failed".into(),
+                output: json!({"reference": "judgment:op-1", "subject": subject,
+                    "reason": "provider_unavailable"}),
+            },
+        };
+        let case = Case {
+            name: name.to_string(),
+            situation: name.to_string(),
+            start: CaseStart::Event {
+                event: "aq.work.route_needed".into(),
+                payload: json!({"subject": subject}),
+            },
+            returns: BTreeMap::from([
+                (
+                    "work.read".to_string(),
+                    vec![CaseReturn::Answer {
+                        outcome: "observed".into(),
+                        output: json!({"reference": "task-1@3", "subject": subject, "facts": facts}),
+                    }],
+                ),
+                ("judgment.assess".to_string(), vec![judgment]),
+                (
+                    "work.route".to_string(),
+                    vec![CaseReturn::Answer {
+                        outcome: "routed".into(),
+                        output: json!({"reference": "route-1", "subject": subject,
+                            "harnesses": [], "providers": [], "prefer": []}),
+                    }],
+                ),
+            ]),
+            expect: Expectation {
+                outcome: "routed".into(),
+                calls: vec![ExpectedCall {
+                    command: "work.route".into(),
+                    input: json!({"level": want.level, "harnesses": want.harnesses,
+                        "providers": [], "prefer": want.prefer, "hold": want.hold}),
+                }],
+            },
+        };
+        let report = run_case(&artifact, &case).unwrap();
+        assert!(report.passed, "{name}: {report:#?}");
+        let route = report
+            .calls
+            .iter()
+            .find(|c| c.command == "work.route")
+            .unwrap();
+        let step = if task.labels.is_some() {
+            "route"
+        } else {
+            "assume"
+        };
+        assert_eq!(route.step, step, "{name}");
+        assert_eq!(route.input, route_for(task), "{name}");
+    }
 }

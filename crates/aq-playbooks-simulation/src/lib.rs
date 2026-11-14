@@ -1,3 +1,9 @@
+//! Offline simulation of sealed playbooks, for the authoring tools and for a
+//! host that re-runs an author's cases: scripted [`Scenario`]s, and
+//! [`cases`], which record every command call with its input.
+pub mod cases;
+pub use cases::*;
+
 use aq_playbooks_model::{Artifact, CommandContract, EventEnvelope};
 use aq_playbooks_runner::{
     Authority, DispatchResult, Engine, Host, InspectionKind, InspectionQuery, Intent,

@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, bail};
 use aq_playbooks_cli::{catalog, pilots, simulation};
-use aq_playbooks_compiler::{CompileInput, compile, semantic_diff, validate};
 use aq_playbooks_model::{Artifact, Registry, canonical_bytes};
 use aq_playbooks_postgres::PostgresStorage;
 use aq_playbooks_runner::{
@@ -15,6 +14,7 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+mod authoring;
 
 #[derive(Parser)]
 #[command(
@@ -28,19 +28,8 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Validate and package an exact source/proposal/catalog bundle.
-    Compile {
-        input: PathBuf,
-        #[arg(short, long)]
-        output: PathBuf,
-    },
-    Validate {
-        input: PathBuf,
-    },
-    Diff {
-        before: PathBuf,
-        after: PathBuf,
-    },
+    #[command(flatten)]
+    Authoring(authoring::Authoring),
     Artifact {
         #[command(subcommand)]
         action: ArtifactAction,
@@ -358,6 +347,9 @@ fn choose<T: Serialize>(
     }
 }
 fn catalog_file(path: Option<PathBuf>) -> Result<Registry> {
+    if let Some(registry) = authoring::workspace_registry(path.as_deref())? {
+        return Ok(registry);
+    }
     path.map(|p| read(&p))
         .unwrap_or_else(|| Ok(catalog::catalog()))
 }
@@ -369,32 +361,7 @@ fn main() {
 }
 fn execute(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Compile { input, output } => {
-            let input: CompileInput = read(&input)?;
-            match compile(&input) {
-                Ok(a) => {
-                    fs::write(output, canonical_bytes(&a)?)?;
-                    print(
-                        &json!({"artifact":a.digest,"executable_fingerprint":a.executable_fingerprint}),
-                    )
-                }
-                Err(d) => {
-                    print(&d)?;
-                    bail!("compilation refused")
-                }
-            }
-        }
-        Command::Validate { input } => {
-            let d = validate(&read(&input)?);
-            print(&d)?;
-            if !d.is_empty() {
-                bail!("proposal is not valid")
-            };
-            Ok(())
-        }
-        Command::Diff { before, after } => {
-            print(&semantic_diff(&artifact(&before)?, &artifact(&after)?)?)
-        }
+        Command::Authoring(command) => authoring::run(command),
         Command::Artifact {
             action: ArtifactAction::Inspect { path },
         } => print(&artifact(&path)?),
