@@ -12,6 +12,9 @@ extern crate self as aq_playbooks_postgres;
 mod catalog;
 #[cfg(all(test, feature = "postgres-tests"))]
 mod catalog_tests;
+mod history;
+#[cfg(all(test, feature = "postgres-tests"))]
+mod history_tests;
 mod indexes;
 mod profiling;
 mod projection;
@@ -49,10 +52,17 @@ const MIGRATIONS: &[(i32, &str)] = &[
     ),
     (4, include_str!("../migrations/0004_catalog_inspection.sql")),
     (5, include_str!("../migrations/0005_transition_records.sql")),
+    (6, include_str!("../migrations/0006_run_history.sql")),
+    (7, include_str!("../migrations/0007_run_history_trim.sql")),
 ];
 #[cfg(all(test, feature = "postgres-tests"))]
 const WRITE_MARKER_SQL: &str = "SELECT set_config('aq_playbooks.writer_namespace',$1,true),set_config('aq_playbooks.writer_format','2',true)";
 use records::MARKER_SQL as WRITE_MARKER_FORMAT_SQL;
+/// One format 2 inspection page over live rows and history. Each branch has
+/// its own `ORDER BY item_key LIMIT`, so PostgreSQL merges two ordered index
+/// scans (Merge Append) instead of sorting every matching history row: the
+/// cost of a page does not grow with the number of finished runs.
+pub(crate) const INSPECT_SQL: &str = "SELECT item_key,public_value FROM ((SELECT item_key,public_value FROM aq_playbooks.inspection_rows WHERE namespace=$1 AND kind=$2 AND ($3::text IS NULL OR run_id=$3) AND ($4::text IS NULL OR item_key>$4) ORDER BY item_key LIMIT $5) UNION ALL (SELECT item_key,public_value FROM aq_playbooks.run_history WHERE namespace=$1 AND kind=$2 AND ($3::text IS NULL OR run_id=$3) AND ($4::text IS NULL OR item_key>$4) ORDER BY item_key LIMIT $5)) u ORDER BY item_key LIMIT $5";
 const MIGRATION_LOCK: i64 = 0x4151504c41594d47;
 
 struct Lease {
@@ -294,6 +304,58 @@ impl PostgresStorage {
 }
 
 impl Storage for PostgresStorage {
+    fn persists_history(&self) -> bool {
+        true
+    }
+    fn history_page(
+        &self,
+        namespace: &str,
+        query: &aq_playbooks_runner::InspectionQuery,
+    ) -> Result<Vec<aq_playbooks_runner::HistoryItem>, StorageError> {
+        check_name(namespace)?;
+        query.validate()?;
+        let mut conn = self.connection()?;
+        let mut tx = ObservedTransaction::new(
+            conn.client.transaction().map_err(backend)?,
+            self.profiling.clone(),
+            "history_page",
+        );
+        let items = history::page(&mut tx, namespace, query)?;
+        tx.commit().map_err(backend)?;
+        Ok(items)
+    }
+    /// An ordinary indexed delete by finish time, by the lease owner.
+    fn delete_history(
+        &self,
+        namespace: &str,
+        owner: &str,
+        before_ms: i64,
+    ) -> Result<u64, StorageError> {
+        check_name(namespace)?;
+        let mut conn = self.connection()?;
+        let lease = conn
+            .leases
+            .get(namespace)
+            .filter(|l| l.owner == owner)
+            .ok_or(StorageError::Ownership)?;
+        let incarnation = lease.incarnation;
+        let format = lease.format.to_string();
+        let mut tx = ObservedTransaction::new(
+            conn.client.transaction().map_err(backend)?,
+            self.profiling.clone(),
+            "delete_history",
+        );
+        tx.query_one(WRITE_MARKER_FORMAT_SQL, &[&namespace, &format])
+            .map_err(backend)?;
+        if !records::owns_lock(&mut tx, namespace)? {
+            return Err(StorageError::Ownership);
+        }
+        let row = tx.query_opt("SELECT revision,owner,incarnation,owner_backend_pid=pg_backend_pid() FROM aq_playbooks.namespaces WHERE namespace=$1", &[&namespace]).map_err(backend)?.ok_or(StorageError::Ownership)?;
+        records::owns_row(&row, owner, incarnation)?;
+        let deleted = history::delete_before(&mut tx, namespace, before_ms)?;
+        tx.commit().map_err(backend)?;
+        Ok(deleted)
+    }
     fn inspect_catalog(
         &self,
         namespace: &str,
@@ -357,8 +419,10 @@ impl Storage for PostgresStorage {
             let mut tx = ObservedTransaction::new(tx, self.profiling.clone(), "inspect");
             let artifacts = self.read_artifacts(&mut tx, namespace, false)?;
             let state = records::assemble(&mut tx, namespace, row.get(3), artifacts)?;
+            // Read after the State: an item that left it is found here.
+            let history = history::page(&mut tx, namespace, query)?;
             tx.commit().map_err(backend)?;
-            return Ok(records::inspect(&state, query, revision));
+            return Ok(records::inspect(&state, query, revision, history));
         }
         if !row.get::<_, bool>(1) {
             return Err(backend(
@@ -366,7 +430,21 @@ impl Storage for PostgresStorage {
             ));
         }
         let limit = (query.limit + 1) as i64;
-        let rows=tx.query("SELECT item_key,public_value FROM aq_playbooks.inspection_rows WHERE namespace=$1 AND kind=$2 AND ($3::text IS NULL OR run_id=$3) AND ($4::text IS NULL OR item_key>$4) ORDER BY item_key LIMIT $5",&[&namespace,&query.kind.key(),&query.run,&query.after,&limit]).map_err(backend)?;
+        // Live rows and history in one statement (one snapshot). No commit
+        // leaves a key in both (`check_not_live`, `check_unrecorded`), so the
+        // page needs no de-duplication.
+        let rows = tx
+            .query(
+                INSPECT_SQL,
+                &[
+                    &namespace,
+                    &query.kind.key(),
+                    &query.run,
+                    &query.after,
+                    &limit,
+                ],
+            )
+            .map_err(backend)?;
         let more = rows.len() > query.limit;
         let selected: Vec<_> = rows.into_iter().take(query.limit).collect();
         let next = if more {
@@ -585,12 +663,7 @@ impl PostgresStorage {
             return Err(StorageError::Ownership);
         }
         let row = tx.query_opt("SELECT revision,owner,incarnation,owner_backend_pid=pg_backend_pid(),snapshot,protection_key_id,protection_nonce,encrypted_snapshot,indexes_materialized,catalog_projected_revision,catalog_metadata_revision,catalog_supported,catalog_definition_count,catalog_activation_count,catalog_actual_definition_count,catalog_actual_activation_count,writer_format,state_header FROM aq_playbooks.namespaces WHERE namespace=$1 FOR UPDATE", &[&namespace]).map_err(backend)?.ok_or(StorageError::Ownership)?;
-        if row.get::<_, Option<String>>(1).as_deref() != Some(owner)
-            || row.get::<_, i64>(2) != incarnation
-            || row.get::<_, Option<bool>>(3) != Some(true)
-        {
-            return Err(StorageError::Ownership);
-        }
+        records::owns_row(&row, owner, incarnation)?;
         if row.get::<_, i64>(0) != expected {
             return Err(StorageError::Conflict);
         }
@@ -628,8 +701,7 @@ impl PostgresStorage {
             previous
         };
         tx.phase("artifact_locks");
-        aq_playbooks_runner::retention::verify_artifact_removals(&previous, state)?;
-        aq_playbooks_runner::admission::verify_receipt_retention(&previous, state)?;
+        let removals = aq_playbooks_runner::retention::verify_removals(&previous, state)?;
         let addresses: std::collections::BTreeSet<_> = previous
             .artifacts
             .keys()
@@ -655,7 +727,20 @@ impl PostgresStorage {
             }
         }
         tx.phase("retention");
-        retention::verify_and_record(&mut tx, namespace, &previous, state)?;
+        retention::verify_and_record(&mut tx, namespace, &previous, state, &removals)?;
+        let items = aq_playbooks_runner::history_items(&state.settled);
+        aq_playbooks_runner::history::check_not_live(state, &items)?;
+        history::check_unrecorded(
+            &mut tx,
+            namespace,
+            &aq_playbooks_runner::history::new_live_keys(&previous, state),
+        )?;
+        history::insert(
+            &mut tx,
+            namespace,
+            &items,
+            state.retention.policy.history_keep,
+        )?;
         for (digest, artifact) in &state.artifacts {
             tx.phase("artifact_compare");
             // Previous bytes were freshly read, authenticated and fully verified

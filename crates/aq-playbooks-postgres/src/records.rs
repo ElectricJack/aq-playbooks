@@ -1,6 +1,7 @@
 //! Writer format 3 (D10, PB-04): bounded `transition_v1` over a record
 //! representation. The namespace row holds the State header (artifacts
-//! stripped; they stay in the artifact tables) and its exact [`Accounting`];
+//! stripped; they stay in the artifact tables) and its exact record counts
+//! ([`Accounting`]);
 //! every retained-history container record is one `state_records` row keyed by
 //! an order-preserving encoding of its typed key. A transition binds the
 //! header's lazy containers to the open row-locked transaction, runs the
@@ -13,9 +14,10 @@ use aq_playbooks_model::Artifact;
 use aq_playbooks_runner::lazy::{
     ContainerChange, ContainerPath, KeyKind, RecordSource, Shape, TreeKey, header_bytes,
 };
+use aq_playbooks_runner::retention::{self, Window};
 use aq_playbooks_runner::transition::{
-    Accounting, ContainerStats, StatePatch, TransitionOutcome, TransitionRequest, assemble_state,
-    bind_state, header_state, schema, take_patch,
+    Accounting, StatePatch, TransitionOutcome, TransitionRequest, assemble_state, bind_state,
+    header_state, schema, take_patch,
 };
 use aq_playbooks_runner::{Error, State, StorageError};
 use postgres::Statement;
@@ -90,29 +92,29 @@ pub(crate) fn accounting_json(a: &Accounting) -> Value {
     let fields: serde_json::Map<String, Value> = a
         .fields
         .iter()
-        .filter(|(_, s)| s.count > 0)
-        .map(|(f, s)| (f.to_string(), json!([s.count, s.pairs])))
+        .filter(|(_, count)| **count > 0)
+        .map(|(f, count)| (f.to_string(), json!(count)))
         .collect();
-    json!({"header_len":a.header_len,"queued_destinations":a.queued_destinations,"fields":fields})
+    json!({"header_len":a.header_len,"fields":fields})
 }
+/// Record counts from a namespace row. A row written before spec 0003's
+/// "no limits" holds `[count, bytes]` per field and a queued-destination
+/// count, which only served the removed quotas: the bytes and that count
+/// are ignored.
 pub(crate) fn accounting_from(value: &Value) -> Result<Accounting, StorageError> {
     let bad = || backend("invalid record accounting");
     let number = |v: &Value| v.as_u64().map(|n| n as usize).ok_or_else(bad);
     let mut fields = BTreeMap::new();
     for (name, stats) in value["fields"].as_object().ok_or_else(bad)? {
         let (name, _) = field(name).map_err(backend)?;
-        let pair = stats.as_array().filter(|p| p.len() == 2).ok_or_else(bad)?;
-        fields.insert(
-            name,
-            ContainerStats {
-                count: number(&pair[0])?,
-                pairs: number(&pair[1])?,
-            },
-        );
+        let count = match stats {
+            Value::Array(pair) if pair.len() == 2 => number(&pair[0])?,
+            other => number(other)?,
+        };
+        fields.insert(name, count);
     }
     Ok(Accounting {
         header_len: number(&value["header_len"])?,
-        queued_destinations: number(&value["queued_destinations"])?,
         fields,
     })
 }
@@ -148,9 +150,7 @@ pub(crate) fn export(state: &State) -> Result<Export, StorageError> {
             return Err(backend("nested record container"));
         }
         for (key, value) in rows {
-            accounting
-                .record(name, &key, None, Some(&value))
-                .map_err(storage)?;
+            accounting.record(name, false, true).map_err(storage)?;
             out.fields.push(name.to_string());
             out.keys.push(encode_key(&key));
             out.values.push(value);
@@ -387,12 +387,15 @@ impl Drop for Lent {
     }
 }
 
-const HISTORY_REMOVALS: &[&str] = &[
-    "events",
-    "runs",
-    "intents",
-    "retention.event_tombstones",
-    "retention.disposals",
+/// Deleting one of these records always takes the complete path, where
+/// `retention::verify_removals` checks it against the whole State.
+const HISTORY_REMOVALS: &[&str] = &["runs", "intents", "retention.disposals"];
+/// Window entries a bounded commit may delete, each with its expiry record:
+/// allowed only when the same patch deletes that record with an expiry the
+/// clock has reached.
+const WINDOWS: &[(&str, &str)] = &[
+    ("keyed_admissions", "retention.admission_expires_at_ms"),
+    ("events", "retention.event_expires_at_ms"),
 ];
 const IDENTITIES: &[(&str, &str)] = &[("events", "event"), ("runs", "run"), ("intents", "intent")];
 
@@ -430,12 +433,7 @@ impl PostgresStorage {
             return Err(StorageError::Ownership.into());
         }
         let row = tx.query_opt("SELECT revision,owner,incarnation,owner_backend_pid=pg_backend_pid(),writer_format,state_header,state_accounting,catalog_projected_revision,catalog_metadata_revision,catalog_definition_count,catalog_activation_count,catalog_actual_definition_count,catalog_actual_activation_count FROM aq_playbooks.namespaces WHERE namespace=$1 FOR UPDATE", &[&namespace]).map_err(backend)?.ok_or(StorageError::Ownership)?;
-        if row.get::<_, Option<String>>(1).as_deref() != Some(owner)
-            || row.get::<_, i64>(2) != incarnation
-            || row.get::<_, Option<bool>>(3) != Some(true)
-        {
-            return Err(StorageError::Ownership.into());
-        }
+        owns_row(&row, owner, incarnation)?;
         if row.get::<_, i32>("writer_format") != FORMAT {
             return Ok(TransitionOutcome::Unsupported);
         }
@@ -458,11 +456,7 @@ impl PostgresStorage {
             })),
             namespace: namespace.to_string(),
             statements,
-            counts: accounting
-                .fields
-                .iter()
-                .map(|(f, s)| (*f, s.count))
-                .collect(),
+            counts: accounting.fields.clone(),
             reads: Mutex::new(0),
             fallbacks: Mutex::new(vec![]),
             poison: Mutex::new(None),
@@ -473,16 +467,24 @@ impl PostgresStorage {
             return Ok(TransitionOutcome::Unsupported);
         }
         state.artifacts = artifacts.clone();
-        let outcome: Result<Option<(StatePatch, Vec<u8>)>, Error> = (|| {
+        type Planned = (StatePatch, Vec<u8>, BTreeSet<(Window, String)>);
+        let outcome: Result<Option<Planned>, Error> = (|| {
             let changed = (request.plan)(&mut state)?;
             source.check()?;
             if !changed {
                 return Ok(None);
             }
+            // Bound lookups, while the transaction is still lent.
+            aq_playbooks_runner::history::check_not_live(
+                &state,
+                &aq_playbooks_runner::history_items(&state.settled),
+            )?;
+            source.check()?;
             let patch = take_patch(&mut state)?;
+            let evicted = licensed_evictions(&source, &header, &patch, &state)?;
             let stripped = stripped_header(&mut state)?;
             source.check()?;
-            Ok(Some((patch, stripped)))
+            Ok(Some((patch, stripped, evicted)))
         })();
         let reads = *lock(&source.reads);
         let fallbacks = std::mem::take(&mut *lock(&source.fallbacks));
@@ -491,16 +493,29 @@ impl PostgresStorage {
             s.record_reads += reads;
             s.fallbacks.extend(fallbacks.iter().cloned());
         });
-        let Some((patch, stripped)) = outcome? else {
+        let Some((patch, stripped, evicted)) = outcome? else {
             self.count(|s| s.unchanged += 1);
             return Ok(TransitionOutcome::Unchanged);
         };
         let mut tx: ObservedTransaction<'_> = lent.reclaim()?;
         let previous = header_state(&header)?;
-        let staged = stage(&mut tx, namespace, &accounting, &patch)?;
-        (request.validate)(&state, &staged.accounting.counts())?;
+        // A commit with an admin licence (clock rebase, floor lowering)
+        // takes the complete path: only `verify_removals` judges a licence.
+        let rebase = aq_playbooks_runner::retention::carries_licence(&state);
+        let staged = stage(
+            &mut tx,
+            namespace,
+            &accounting,
+            &patch,
+            state.retention.clock_ms,
+            &state.retention.policy,
+            rebase,
+            &evicted,
+        )?;
+        let live_keys = aq_playbooks_runner::history::patch_live_keys(&patch)?;
         source.check()?;
         let heavy = !fallbacks.is_empty()
+            || rebase
             || staged.replaced
             || staged.history_removed
             || state.artifacts != artifacts
@@ -515,12 +530,14 @@ impl PostgresStorage {
         if heavy {
             let mut records = all_records(&mut tx, namespace)?;
             apply(&mut records, patch)?;
-            let next = assemble_state(&staged.full_header, |f| {
+            let mut next = assemble_state(&staged.full_header, |f| {
                 Ok(records
                     .remove(f)
                     .map(|c| c.into_iter().collect())
                     .unwrap_or_default())
             })?;
+            // `settled` is not in the header; `commit_state` writes it.
+            next.settled = std::mem::take(&mut state.settled);
             drop(tx);
             drop(lent);
             drop(conn);
@@ -542,6 +559,8 @@ impl PostgresStorage {
         if state.retention.last_gc_at_ms != previous.retention.last_gc_at_ms {
             crate::retention::collect(&mut tx, namespace, &state)?;
         }
+        let retired: Vec<&String> = staged.retired_event_tombstones.iter().collect();
+        crate::retention::forget_event_tombstones(&mut tx, namespace, &retired)?;
         if !staged.deleted_fields.is_empty() {
             tx.execute("DELETE FROM aq_playbooks.state_records r USING unnest($2::text[],$3::bytea[]) AS d(f,k) WHERE r.namespace=$1 AND r.field=d.f AND r.sort_key=d.k",&[&namespace,&staged.deleted_fields,&staged.deleted_keys]).map_err(backend)?;
         }
@@ -551,6 +570,13 @@ impl PostgresStorage {
             &staged.fields,
             &staged.keys,
             &staged.values,
+        )?;
+        crate::history::check_unrecorded(&mut tx, namespace, &live_keys)?;
+        crate::history::insert(
+            &mut tx,
+            namespace,
+            &aq_playbooks_runner::history_items(&state.settled),
+            state.retention.policy.history_keep,
         )?;
         let published = tx.execute("UPDATE aq_playbooks.namespaces SET state_header=$2,state_accounting=$3,revision=$4,catalog_projected_revision=$4,updated_at=clock_timestamp() WHERE namespace=$1 AND revision=$5",&[&namespace,&stripped,&accounting_json(&staged.accounting),&next,&expected]).map_err(backend)?;
         if published != 1 {
@@ -582,6 +608,22 @@ impl PostgresStorage {
         *lock(&self.stats) = TransitionStats::default();
     }
 }
+/// Columns 1..=3 of a namespace row read as
+/// `revision,owner,incarnation,owner_backend_pid=pg_backend_pid(),…`: this
+/// session's lease of `owner` at `incarnation`.
+pub(crate) fn owns_row(
+    row: &postgres::Row,
+    owner: &str,
+    incarnation: i64,
+) -> Result<(), StorageError> {
+    if row.get::<_, Option<String>>(1).as_deref() != Some(owner)
+        || row.get::<_, i64>(2) != incarnation
+        || row.get::<_, Option<bool>>(3) != Some(true)
+    {
+        return Err(StorageError::Ownership);
+    }
+    Ok(())
+}
 pub(crate) fn owns_lock(
     tx: &mut ObservedTransaction<'_>,
     namespace: &str,
@@ -592,9 +634,19 @@ pub(crate) fn owns_lock(
     Ok(tx.query_one("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid() AND classid::bigint=$1 AND objid::bigint=$2 AND objsubid=1 AND granted)", &[&high,&low]).map_err(backend)?.get(0))
 }
 
-/// Header-only invariants of `retention::verify_and_record` for a transition
-/// that removes no retained history and leaves artifacts unchanged.
+/// Header-only invariants of `retention::verify_and_record` and
+/// `retention::verify_removals` for a transition that removes no retained
+/// history (other than expired window entries, see `stage`) and leaves
+/// artifacts unchanged.
 fn verify_header(previous: &State, next: &State) -> Result<(), StorageError> {
+    if previous
+        .retention
+        .clock_ms
+        .is_some_and(|old| next.retention.clock_ms.is_none_or(|new| new < old))
+    {
+        return Err(backend(aq_playbooks_runner::retention::REFUSE_CLOCK));
+    }
+    aq_playbooks_runner::retention::check_floor_unchanged(previous, next)?;
     if next.sequence < previous.sequence {
         return Err(backend("namespace invocation sequence cannot decrease"));
     }
@@ -625,6 +677,8 @@ struct Staged {
     accounting: Accounting,
     replaced: bool,
     history_removed: bool,
+    /// Event tombstone records this patch deletes.
+    retired_event_tombstones: Vec<String>,
     created: Vec<(String, String)>,
     fields: Vec<String>,
     keys: Vec<Vec<u8>>,
@@ -632,19 +686,130 @@ struct Staged {
     deleted_fields: Vec<String>,
     deleted_keys: Vec<Vec<u8>>,
 }
-/// Exact accounting of the patch against the current records (one read of
-/// every touched key), plus the keyed admission immutability check.
+/// The evictions of a bounded commit ([`retention::check_evictions`]),
+/// judged while the transaction is still lent: the window entries the patch
+/// deletes, their stored records and expiries, and the order keys it adds,
+/// read one record each. A violation refuses the commit. A patch that
+/// replaces one of these containers whole licenses nothing here: it takes
+/// the complete path, where `verify_removals` judges it.
+fn licensed_evictions(
+    source: &PgSource,
+    header: &[u8],
+    patch: &StatePatch,
+    next: &State,
+) -> Result<BTreeSet<(Window, String)>, Error> {
+    const ITEMS: [&str; 2] = ["keyed_admissions", "events"];
+    const ORDER: &str = "retention.replay_order";
+    let get = |field: &'static str, key: &str| -> Result<Option<Vec<u8>>, StorageError> {
+        source
+            .get(&ContainerPath::field(field), &TreeKey::Str(key.to_string()))
+            .map_err(backend)
+    };
+    let mut previous = header_state(header)?;
+    let mut added = vec![];
+    let mut removed = false;
+    for (path, change) in &patch.changes {
+        let field = path.field;
+        if !ITEMS.contains(&field) && field != ORDER {
+            continue;
+        }
+        let ContainerChange::Entries(rows) = change else {
+            return Ok(BTreeSet::new());
+        };
+        for (key, new) in rows {
+            let TreeKey::Str(key) = key else {
+                return Err(backend(format!("{field}: unexpected record key")).into());
+            };
+            if field == ORDER {
+                if new.is_some() && get(ORDER, key)?.is_none() {
+                    added.push(key.clone());
+                }
+                continue;
+            }
+            if new.is_some() {
+                continue;
+            }
+            let Some(bytes) = get(field, key)? else {
+                continue;
+            };
+            removed = true;
+            let at = |expiry: &'static str| -> Result<Option<i64>, StorageError> {
+                get(expiry, key)?
+                    .map(|b| serde_json::from_slice(&b).map_err(backend))
+                    .transpose()
+            };
+            if field == "events" {
+                previous.events.insert(
+                    key.clone(),
+                    serde_json::from_slice(&bytes).map_err(backend)?,
+                );
+                if let Some(at) = at("retention.event_expires_at_ms")? {
+                    previous
+                        .retention
+                        .event_expires_at_ms
+                        .insert(key.clone(), at);
+                }
+            } else {
+                previous.keyed_admissions.insert(
+                    key.clone(),
+                    serde_json::from_slice(&bytes).map_err(backend)?,
+                );
+                if let Some(at) = at("retention.admission_expires_at_ms")? {
+                    previous
+                        .retention
+                        .admission_expires_at_ms
+                        .insert(key.clone(), at);
+                }
+            }
+        }
+    }
+    if !removed && added.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    Ok(retention::check_evictions(
+        &previous,
+        next,
+        &mut added.into_iter(),
+        &retention::Stored {
+            ordered: &|key| Ok(get(ORDER, key)?.is_some()),
+            memberships: &|key| {
+                get("indexes.event_memberships", key)?
+                    .map(|b| serde_json::from_slice(&b).map_err(backend))
+                    .transpose()
+            },
+            waiters: &|key| {
+                get("indexes.waiters", key)?
+                    .map(|b| serde_json::from_slice(&b).map_err(backend))
+                    .transpose()
+            },
+        },
+    )?)
+}
+/// Exact record counts of the patch against the current records (one read of
+/// every touched key), plus the keyed admission immutability check. A
+/// keyed admission or event deletion stays bounded only when the same patch
+/// deletes its expiry record with an expiry `clock_ms` has reached (and, for
+/// an event, writes no legacy tombstone for it); otherwise it sets
+/// `history_removed`, so the complete path runs `verify_removals`. In a
+/// commit that carries an admin licence (`rebase`), a lowered expiry is left
+/// to that path too (it is refused here otherwise).
+#[allow(clippy::too_many_arguments)]
 fn stage(
     tx: &mut ObservedTransaction<'_>,
     namespace: &str,
     accounting: &Accounting,
     patch: &StatePatch,
+    clock_ms: Option<i64>,
+    policy: &aq_playbooks_runner::RetentionPolicy,
+    rebase: bool,
+    evicted: &BTreeSet<(Window, String)>,
 ) -> Result<Staged, StorageError> {
     let mut staged = Staged {
         full_header: patch.header.clone(),
         accounting: accounting.clone(),
         replaced: false,
         history_removed: false,
+        retired_event_tombstones: vec![],
         created: vec![],
         fields: vec![],
         keys: vec![],
@@ -676,6 +841,15 @@ fn stage(
             old.insert((row.get(0), row.get(1)), row.get(2));
         }
     }
+    // Deleted records (field, key) with their old value, and the event
+    // tombstones this patch writes.
+    let mut deleted: BTreeMap<(&'static str, Vec<u8>), Vec<u8>> = BTreeMap::new();
+    let mut tombstoned: BTreeSet<Vec<u8>> = BTreeSet::new();
+    // Records written (field, key) and expiry records touched, with their
+    // stored and written values.
+    let mut written: BTreeMap<(&'static str, Vec<u8>), Vec<u8>> = BTreeMap::new();
+    type ExpiryChange = (&'static str, Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>);
+    let mut expiry_changes: Vec<ExpiryChange> = vec![];
     let mut replaced_old: BTreeMap<&'static str, BTreeMap<TreeKey, Vec<u8>>> = BTreeMap::new();
     for (path, change) in &patch.changes {
         let (name, _) = field(path.field).map_err(backend)?;
@@ -690,15 +864,48 @@ fn stage(
                     let before = old.get(&(name.to_string(), encoded.clone()));
                     staged
                         .accounting
-                        .record(name, key, before.map(Vec::as_slice), new.as_deref())
+                        .record(name, before.is_some(), new.is_some())
                         .map_err(storage)?;
-                    if name == "keyed_admissions" && before.is_some() && before != new.as_ref() {
+                    // Audit receipts are positional: overwriting or deleting
+                    // a stored one removes it, which the complete path judges.
+                    if name == "receipts" && before.is_some() {
+                        staged.history_removed = true;
+                    }
+                    if WINDOWS.iter().any(|(_, expiry)| *expiry == name) && before != new.as_ref() {
+                        expiry_changes.push((name, encoded.clone(), before.cloned(), new.clone()));
+                    }
+                    if let Some(value) = new {
+                        written.insert((name, encoded.clone()), value.clone());
+                    }
+                    // An accepted event's identity never changes.
+                    if name == "events"
+                        && let (Some(before), Some(new)) = (before, new)
+                        && before != new
+                    {
+                        let decode = |b: &[u8]| -> Result<
+                            aq_playbooks_runner::AcceptedEvent,
+                            StorageError,
+                        > {
+                            serde_json::from_slice(b).map_err(backend)
+                        };
+                        retention::check_event_change(&decode(before)?, &decode(new)?)?;
+                    }
+                    // A changed receipt is refused; a deleted one is a window
+                    // removal (see below).
+                    if name == "keyed_admissions"
+                        && new.is_some()
+                        && before.is_some()
+                        && before != new.as_ref()
+                    {
                         return Err(backend(
                             "immutable keyed admission receipt removed or changed",
                         ));
                     }
                     match new {
                         Some(value) => {
+                            if name == "retention.event_tombstones" {
+                                tombstoned.insert(encoded.clone());
+                            }
                             if before.is_none()
                                 && let Some((_, kind)) = IDENTITIES.iter().find(|(f, _)| *f == name)
                                 && let TreeKey::Str(id) = key
@@ -710,8 +917,16 @@ fn stage(
                             staged.values.push(value.clone());
                         }
                         None => {
-                            if before.is_some() && HISTORY_REMOVALS.contains(&name) {
-                                staged.history_removed = true;
+                            if let Some(before) = before {
+                                if HISTORY_REMOVALS.contains(&name) {
+                                    staged.history_removed = true;
+                                }
+                                if name == "retention.event_tombstones"
+                                    && let TreeKey::Str(id) = key
+                                {
+                                    staged.retired_event_tombstones.push(id.clone());
+                                }
+                                deleted.insert((name, encoded.clone()), before.clone());
                             }
                             staged.deleted_fields.push(name.to_string());
                             staged.deleted_keys.push(encoded);
@@ -728,26 +943,90 @@ fn stage(
                     replaced_old.insert(name, current);
                 }
                 let current = &replaced_old[name];
-                for (key, bytes) in current {
+                for _ in current {
                     staged
                         .accounting
-                        .record(name, key, Some(bytes), None)
+                        .record(name, true, false)
                         .map_err(storage)?;
                 }
-                for (key, bytes) in rows {
+                for _ in rows {
                     staged
                         .accounting
-                        .record(name, key, None, Some(bytes))
+                        .record(name, false, true)
                         .map_err(storage)?;
                 }
-                if name == "keyed_admissions" {
-                    let next: BTreeMap<_, _> = rows.iter().map(|(k, v)| (k, v)).collect();
-                    if current.iter().any(|(k, v)| next.get(k) != Some(&v)) {
-                        return Err(backend(
-                            "immutable keyed admission receipt removed or changed",
-                        ));
-                    }
+                // A replaced container takes the complete path, where removals
+                // are checked; a changed receipt is refused here.
+                if name == "keyed_admissions"
+                    && rows
+                        .iter()
+                        .any(|(k, v)| current.get(k).is_some_and(|before| before != v))
+                {
+                    return Err(backend(
+                        "immutable keyed admission receipt removed or changed",
+                    ));
                 }
+            }
+        }
+    }
+    // Expiry records (`retention::check_expiry_change`): judged here when the
+    // patch shows the item, otherwise on the complete path.
+    let window_ms = |item: &str| match item {
+        "events" => policy.event_replay_ms,
+        _ => policy.admission_replay_ms,
+    };
+    for (expiry, key, before, after) in expiry_changes {
+        let (item, _) = WINDOWS
+            .iter()
+            .find(|(_, e)| *e == expiry)
+            .expect("an expiry field");
+        let at = |bytes: &Option<Vec<u8>>| -> Result<Option<i64>, StorageError> {
+            bytes
+                .as_deref()
+                .map(|b| serde_json::from_slice(b).map_err(backend))
+                .transpose()
+        };
+        let (old, new) = (at(&before)?, at(&after)?);
+        match (old, new) {
+            (Some(before), Some(after)) if rebase && after < before => {
+                staged.history_removed = true
+            }
+            (Some(_), Some(_)) => {
+                aq_playbooks_runner::retention::check_expiry_change(old, new, true, None)?
+            }
+            (Some(_), None) if deleted.contains_key(&(*item, key.clone())) => {}
+            (None, Some(_)) if written.contains_key(&(*item, key.clone())) => {
+                let value: Value =
+                    serde_json::from_slice(&written[&(*item, key.clone())]).map_err(backend)?;
+                let fallback = value["accepted_at_ms"].as_i64().map(|accepted| {
+                    accepted.saturating_add(i64::try_from(window_ms(item)).unwrap_or(i64::MAX))
+                });
+                aq_playbooks_runner::retention::check_expiry_change(old, new, true, fallback)?
+            }
+            _ => staged.history_removed = true,
+        }
+    }
+    for (item, expiry) in WINDOWS {
+        for (field, key) in deleted.keys() {
+            if field != item {
+                continue;
+            }
+            let at: Option<i64> = deleted
+                .get(&(*expiry, key.clone()))
+                .and_then(|bytes| serde_json::from_slice(bytes).ok());
+            let expired =
+                at.is_some_and(|at| aq_playbooks_runner::retention::expired(at, clock_ms));
+            // An eviction the bounded fence licensed (`licensed_evictions`)
+            // stays bounded too.
+            let window = if *item == "events" {
+                Window::Event
+            } else {
+                Window::Admission
+            };
+            let licensed = std::str::from_utf8(key)
+                .is_ok_and(|key| evicted.contains(&(window, key.to_string())));
+            if !(expired || licensed) || (*item == "events" && tombstoned.contains(key)) {
+                staged.history_removed = true;
             }
         }
     }
@@ -811,11 +1090,7 @@ impl PostgresStorage {
             })),
             namespace: namespace.to_string(),
             statements,
-            counts: accounting
-                .fields
-                .iter()
-                .map(|(f, s)| (*f, s.count))
-                .collect(),
+            counts: accounting.fields.clone(),
             reads: Mutex::new(0),
             fallbacks: Mutex::new(vec![]),
             poison: Mutex::new(None),
@@ -841,11 +1116,14 @@ impl PostgresStorage {
         Ok(Some(page))
     }
 }
-/// Inspection page of a complete format 3 State (O(state); see D10 limits).
+/// Inspection page of a complete format 3 State (O(state); see D10 limits)
+/// merged with `history`, as `inspection::page_with_history` does: key order,
+/// and a key present in both is returned once (the live item).
 pub(crate) fn inspect(
     state: &State,
     query: &aq_playbooks_runner::InspectionQuery,
     revision: u64,
+    history: Vec<aq_playbooks_runner::HistoryItem>,
 ) -> aq_playbooks_runner::InspectionPage {
     let kind = query.kind.key();
     let mut rows: Vec<(String, Value)> = crate::projection::public_delta(&State::default(), state)
@@ -866,8 +1144,20 @@ pub(crate) fn inspect(
                 .is_none_or(|after| key.as_str() > after)
                 .then(|| (key, r["public_value"].clone()))
         })
+        .chain(
+            history
+                .into_iter()
+                .filter(|item| {
+                    item.kind == query.kind
+                        && query.run.as_ref().is_none_or(|run| &item.run == run)
+                        && query.after.as_ref().is_none_or(|after| &item.key > after)
+                })
+                .map(|item| (item.key, item.value)),
+        )
         .collect();
+    // Stable: for a key present in both, the live item stays first.
     rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows.dedup_by(|later, earlier| later.0 == earlier.0);
     let more = rows.len() > query.limit;
     rows.truncate(query.limit);
     aq_playbooks_runner::InspectionPage {
@@ -878,5 +1168,29 @@ pub(crate) fn inspect(
         },
         items: rows.into_iter().map(|r| r.1).collect(),
         revision,
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// A format 3 row written before the namespace limits were removed
+    /// holds `[count, bytes]` per container and a queued-destination count;
+    /// it decodes to the same record counts as a row written now.
+    #[test]
+    fn record_counts_decode_from_rows_written_before_and_after_no_limits() {
+        let before = json!({"header_len": 120, "queued_destinations": 3,
+            "fields": {"runs": [2, 900], "events": [5, 4000]}});
+        let after = json!({"header_len": 120, "fields": {"runs": 2, "events": 5}});
+        let (a, b) = (
+            accounting_from(&before).unwrap(),
+            accounting_from(&after).unwrap(),
+        );
+        assert_eq!(a, b);
+        assert_eq!(
+            (a.count("runs"), a.count("events"), a.header_len),
+            (2, 5, 120)
+        );
+        assert_eq!(accounting_json(&a), after);
+        assert!(accounting_from(&json!({"header_len": 1, "fields": {"runs": [1]}})).is_err());
     }
 }

@@ -102,6 +102,12 @@ pub struct RuntimeIndexes {
     pub run_timer: LazyMap<String, String>,
     pub events: LazyMap<String, BTreeMap<u64, String>>,
     pub event_memberships: LazyMap<String, Vec<String>>,
+    /// The events of each contract and scope (`trigger_key`) by acceptance
+    /// sequence, so a change of that contract's uncertain completions
+    /// re-judges the holds of the events accepted after the operation's
+    /// dispatch, and only those.
+    #[serde(default)]
+    pub contract_events: LazyMap<String, BTreeMap<u64, String>>,
     pub waiters: LazyMap<String, BTreeSet<String>>,
     pub run_subscriptions: LazyMap<String, Vec<String>>,
     pub dependents: LazyMap<String, BTreeSet<String>>,
@@ -117,6 +123,21 @@ pub struct RuntimeIndexes {
     pub triggers: BTreeMap<String, BTreeSet<String>>,
     pub activation_triggers: BTreeMap<String, Vec<String>>,
     pub initialized: bool,
+    /// `root_intents` holds every live operation. False in a State written
+    /// before the index existed (pre-D10); `Engine::new` then backfills it
+    /// once. Cohort removal takes a cohort's operations from it.
+    #[serde(default)]
+    pub root_intents_complete: bool,
+    /// `contract_events` holds every event. False in a State written before
+    /// the index existed; `Engine::new` then fills it once.
+    #[serde(default)]
+    pub contract_events_complete: bool,
+    /// Every dispatched live operation carries its dispatch sequence. False
+    /// in a State written before `Intent::dispatch_sequence` existed;
+    /// `Engine::new` then fills it once from each operation's own first
+    /// `dispatch` receipt.
+    #[serde(default)]
+    pub dispatch_sequences_complete: bool,
 }
 pub fn correlation_key(
     contract: &ContractRef,
@@ -415,6 +436,7 @@ pub(crate) fn timer(s: &mut State, t: TimerIndex) {
     s.indexes.timers.insert(t.key.clone(), t);
 }
 fn subscribe(s: &mut State, run: &str, key: String) {
+    s.replay_touched.wait_keys.insert(key.clone());
     s.indexes
         .waiters
         .entry(key.clone())
@@ -469,6 +491,50 @@ pub(crate) fn index_event(s: &mut State, id: &str) -> Result<()> {
         }
     }
     s.indexes.event_memberships.insert(id.into(), keys);
+    let contract = trigger_key(&e.envelope.contract, &e.envelope.scope)?;
+    s.indexes
+        .contract_events
+        .entry(contract)
+        .or_default()
+        .insert(e.sequence, id.into());
+    Ok(())
+}
+/// Take event `e` out of `contract_events`.
+pub(crate) fn unindex_contract_event(s: &mut State, e: &crate::AcceptedEvent) -> Result<()> {
+    let contract = trigger_key(&e.envelope.contract, &e.envelope.scope)?;
+    if let Some(events) = s.indexes.contract_events.get_mut(&contract) {
+        events.remove(&e.sequence);
+        if events.is_empty() {
+            s.indexes.contract_events.remove(&contract);
+        }
+    }
+    Ok(())
+}
+/// A State written before `contract_events` existed: fill it once from the
+/// events (one pass over them).
+pub(crate) fn backfill_contract_events(s: &mut State) -> Result<()> {
+    if !s.indexes.initialized || s.indexes.contract_events_complete {
+        return Ok(());
+    }
+    let events: Vec<(String, u64, String)> = s
+        .events
+        .iter()
+        .map(|(id, e)| {
+            Ok((
+                trigger_key(&e.envelope.contract, &e.envelope.scope)?,
+                e.sequence,
+                id.clone(),
+            ))
+        })
+        .collect::<Result<_>>()?;
+    for (contract, sequence, id) in events {
+        s.indexes
+            .contract_events
+            .entry(contract)
+            .or_default()
+            .insert(sequence, id);
+    }
+    s.indexes.contract_events_complete = true;
     Ok(())
 }
 pub(crate) fn index_activation(s: &mut State, binding: &str) -> Result<()> {
@@ -508,6 +574,7 @@ fn refresh_run(s: &mut State, id: &str) -> Result<()> {
     if let Some(keys) = s.indexes.run_subscriptions.remove(id) {
         for key in keys {
             remove_lazy_member(&mut s.indexes.waiters, &key, id);
+            s.replay_touched.wait_keys.insert(key);
         }
     }
     if let Some(ids) = s.indexes.run_dependencies.remove(id) {
@@ -604,7 +671,7 @@ fn refresh_run(s: &mut State, id: &str) -> Result<()> {
             None => {}
         },
         RunStatus::Finishing | RunStatus::Cancelling => {
-            if crate::settled(s, &r) {
+            if crate::settled(s, &r)? {
                 wake(s, id)
             } else {
                 for child in &r.children {
@@ -628,7 +695,11 @@ fn refresh_run(s: &mut State, id: &str) -> Result<()> {
         r.status,
         RunStatus::Finishing | RunStatus::Cancelling | RunStatus::Blocked
     ) {
-        let root = &s.runs[&r.root];
+        // A live run's root is live: a cohort leaves only as a whole.
+        let root = s
+            .runs
+            .get(&r.root)
+            .ok_or_else(|| crate::invariant(format!("root {} of run {id} is missing", r.root)))?;
         let end = crate::deadline(
             root.admitted_at_ms,
             s.artifacts[&root.artifact]
@@ -670,13 +741,38 @@ fn refresh_run(s: &mut State, id: &str) -> Result<()> {
     Ok(())
 }
 fn refresh_intent(s: &mut State, id: &str) -> Result<()> {
-    if let Some(key) = s.indexes.uncertain_contract_membership.remove(id) {
-        remove_member(&mut s.indexes.uncertain_completion_contracts, &key, id);
+    let was_uncertain = s.indexes.uncertain_contract_membership.remove(id);
+    if let Some(key) = &was_uncertain {
+        remove_member(&mut s.indexes.uncertain_completion_contracts, key, id);
     }
+    let result = refresh_intent_indexes(s, id);
+    // A hold through an uncertain completion begins or ends: the events of
+    // that contract and scope are judged again (`retention::rejoin`).
+    let is_uncertain = s.indexes.uncertain_contract_membership.get(id).cloned();
+    // An operation never dispatched holds nothing either way (a membership
+    // it loses here is one an older engine recorded): nothing to judge.
+    let after = match s.intents.get(id) {
+        Some(i) => i.dispatch_sequence,
+        // Gone from the State: every event (0).
+        None => Some(0),
+    };
+    if was_uncertain != is_uncertain
+        && let Some(after) = after
+    {
+        // Only events accepted after the dispatch can be its completion.
+        for key in was_uncertain.into_iter().chain(is_uncertain) {
+            let entry = s.replay_touched.contract_keys.entry(key).or_insert(after);
+            *entry = (*entry).min(after);
+        }
+    }
+    result
+}
+fn refresh_intent_indexes(s: &mut State, id: &str) -> Result<()> {
     let token = format!("intent:{id}");
     if let Some(keys) = s.indexes.run_subscriptions.remove(&token) {
         for key in keys {
             remove_lazy_member(&mut s.indexes.waiters, &key, &token);
+            s.replay_touched.wait_keys.insert(key);
         }
     }
     if let Some(memberships) = s.indexes.effect_memberships.remove(id) {
@@ -796,8 +892,7 @@ fn refresh_intent(s: &mut State, id: &str) -> Result<()> {
         );
     }
     if let Some(asynchronous) = &i.command.asynchronous
-        && i.handle.is_none()
-        && matches!(i.status, IntentStatus::Dispatched | IntentStatus::Unknown)
+        && uncertain(&i)
     {
         let event = &s.artifacts[&s.runs[&i.run].artifact]
             .content
@@ -836,6 +931,7 @@ fn refresh_intent(s: &mut State, id: &str) -> Result<()> {
             handle,
         )?;
         let token = format!("intent:{id}");
+        s.replay_touched.wait_keys.insert(key.clone());
         s.indexes
             .waiters
             .entry(key.clone())
@@ -853,6 +949,18 @@ fn refresh_intent(s: &mut State, id: &str) -> Result<()> {
     wake_dependents(s, id);
     mark_run(s, &i.run);
     Ok(())
+}
+/// Whether `i` (asynchronous) may still be completed by an event its handle
+/// does not name: it was dispatched, has no handle and is not settled. A
+/// recovery that prepares it again does not end that: the first issue may
+/// still answer. An operation never dispatched cannot be completed.
+pub(crate) fn uncertain(i: &crate::Intent) -> bool {
+    i.dispatch_sequence.is_some()
+        && i.handle.is_none()
+        && matches!(
+            i.status,
+            IntentStatus::Prepared | IntentStatus::Dispatched | IntentStatus::Unknown
+        )
 }
 pub(crate) fn sync(s: &mut State) -> Result<()> {
     let intents = std::mem::take(&mut s.indexes.dirty_intents);
@@ -900,7 +1008,86 @@ pub(crate) fn rebuild(s: &mut State) -> Result<()> {
     }
     sync(s)?;
     s.indexes.initialized = true;
+    s.indexes.root_intents_complete = true;
+    s.indexes.contract_events_complete = true;
     Ok(())
+}
+/// Once per namespace written before `root_intents` existed (pre-D10, whose
+/// indexes are otherwise initialized): put every live operation into
+/// `root_intents` under its root and set `root_intents_complete`. One pass
+/// over live operations; operations of a run without a known root are left
+/// out (they cannot belong to a cohort). Returns whether it ran.
+pub(crate) fn backfill_root_intents(s: &mut State) -> bool {
+    if !s.indexes.initialized || s.indexes.root_intents_complete {
+        return false;
+    }
+    let roots: Vec<(String, String)> = s
+        .intents
+        .values()
+        .filter_map(|i| {
+            s.runs
+                .get(&i.run)
+                .map(|r| r.root.clone())
+                .or_else(|| s.indexes.run_roots.get(&i.run).cloned())
+                .or_else(|| s.indexes.intent_roots.get(&i.id).cloned())
+                .map(|root| (i.id.clone(), root))
+        })
+        .collect();
+    for (id, root) in roots {
+        if !s
+            .indexes
+            .root_intents
+            .get(&root)
+            .is_some_and(|ids| ids.contains(&id))
+        {
+            s.indexes.root_intents.entry(root).or_default().insert(id);
+        }
+    }
+    s.indexes.root_intents_complete = true;
+    true
+}
+/// Once per namespace written before `Intent::dispatch_sequence` existed:
+/// give every live asynchronous operation without a handle that an older
+/// engine dispatched the sequence of its own first `dispatch` receipt (its
+/// run is live, so its receipts are in the record), so it holds only the
+/// events accepted after it. One without such a receipt was never
+/// dispatched and holds nothing. Each is marked, so the next sync records
+/// its uncertain membership by the current rule. One pass over live
+/// operations, plus each candidate's run receipts. Returns whether it ran.
+pub(crate) fn backfill_dispatch_sequences(s: &mut State) -> bool {
+    if !s.indexes.initialized || s.indexes.dispatch_sequences_complete {
+        return false;
+    }
+    let candidates: Vec<(String, String)> = s
+        .intents
+        .values()
+        .filter(|i| {
+            i.command.asynchronous.is_some() && i.handle.is_none() && i.dispatch_sequence.is_none()
+        })
+        .map(|i| (i.id.clone(), i.run.clone()))
+        .collect();
+    for (id, run) in candidates {
+        let first = s
+            .indexes
+            .receipts
+            .get(&run)
+            .into_iter()
+            .flat_map(|offsets| offsets.values().copied())
+            .filter_map(|offset| s.receipts.get(offset))
+            .filter(|r| {
+                r.run == run
+                    && r.kind == "dispatch"
+                    && r.detail.get("operation").and_then(|v| v.as_str()) == Some(id.as_str())
+            })
+            .map(|r| r.sequence)
+            .min();
+        if let Some(intent) = s.intents.get_mut(&id) {
+            intent.dispatch_sequence = first;
+        }
+        mark_intent(s, &id);
+    }
+    s.indexes.dispatch_sequences_complete = true;
+    true
 }
 
 fn remove_lazy_member(map: &mut LazyMap<String, BTreeSet<String>>, key: &str, member: &str) {

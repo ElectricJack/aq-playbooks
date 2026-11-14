@@ -1,10 +1,15 @@
 //! D10 (PB-04) deterministic transition-cost proof. The five-artifact PB-02
 //! fixture is seeded at histories 0/32/128/512 into the record backend (the
 //! shared `transition_v1` planner over keyed records) and a full-State
-//! MemoryStorage reference. Every timed operation runs on both; the complete
-//! canonical State, revision and maintained quota accounting are compared
-//! after each step, and the record backend's work counters must show zero
-//! full materialization, zero fallbacks and history-flat record work.
+//! MemoryStorage reference. Since spec 0003 a finished run leaves the State,
+//! so "history" is run history (settled cohorts written as history rows)
+//! next to the events still in their window. Every timed operation runs on
+//! both; the complete canonical State, revision, maintained record counts
+//! and inspection (live plus history) are compared after each step. The
+//! record backend's work counters must show zero full materialization and
+//! history-flat record work; admission and event ingress also take zero
+//! fallbacks, and the settling `dispatch` is a full commit exactly where the
+//! backend makes cohort removal one (format 3, SC-13).
 use aq_playbooks_model::*;
 use aq_playbooks_runner::{storage::*, transition::*, *};
 use serde_json::{Value, json};
@@ -181,11 +186,20 @@ fn base<S: Storage>(store: S) -> Engine<S> {
     install(&e, "parent", parent);
     e
 }
-fn seed<S: Storage>(store: S, namespace: &str, state: &State) -> Engine<S> {
+/// Seed `state` and its run history (`cohorts`, written as history rows by
+/// the seeding commit).
+fn seed<S: Storage>(
+    store: S,
+    namespace: &str,
+    state: &State,
+    cohorts: &[SettledCohort],
+) -> Engine<S> {
     store.acquire(namespace, "pb02-owner").unwrap();
     let revision = store.load(namespace).unwrap().revision;
+    let mut seeded = state.clone();
+    seeded.settled = cohorts.to_vec();
     store
-        .compare_and_swap(namespace, "pb02-owner", revision, state)
+        .compare_and_swap(namespace, "pb02-owner", revision, &seeded)
         .unwrap();
     Engine::new(store, namespace, "pb02-owner").unwrap()
 }
@@ -203,8 +217,11 @@ struct Work {
 trait Candidate: Storage {
     fn work(&self) -> Work;
     fn fallbacks(&self) -> Vec<String>;
-    /// Maintained accounting and header bytes, where the backend exposes them.
-    fn accounting(&self, namespace: &str) -> Option<(QuotaCounts, usize)>;
+    /// Maintained record counts and header bytes, where the backend exposes
+    /// them.
+    fn accounting(&self, namespace: &str) -> Option<(BTreeMap<&'static str, usize>, usize)>;
+    /// Whether removing a settled cohort is a full (heavy) commit here.
+    fn settling_commit_is_full(&self) -> bool;
 }
 impl Candidate for RecordStorage {
     fn work(&self) -> Work {
@@ -219,9 +236,13 @@ impl Candidate for RecordStorage {
     fn fallbacks(&self) -> Vec<String> {
         self.stats.fallbacks()
     }
-    fn accounting(&self, namespace: &str) -> Option<(QuotaCounts, usize)> {
+    fn accounting(&self, namespace: &str) -> Option<(BTreeMap<&'static str, usize>, usize)> {
         let a = RecordStorage::accounting(self, namespace).unwrap();
-        Some((a.counts(), a.header_len))
+        let counts = a.fields.into_iter().filter(|(_, n)| *n > 0).collect();
+        Some((counts, a.header_len))
+    }
+    fn settling_commit_is_full(&self) -> bool {
+        false
     }
 }
 
@@ -234,7 +255,7 @@ struct Cell {
 
 /// Full-State comparison against the reference after every step: revision
 /// and the complete serialized State (every container, record backend fully
-/// assembled). `exact` also checks canonical bytes and quota accounting.
+/// assembled). `exact` also checks canonical bytes and record counts.
 fn compare<C: Candidate>(
     ns: &str,
     m: &Engine<MemoryStorage>,
@@ -255,6 +276,23 @@ fn compare<C: Candidate>(
         }
         panic!("State differs after {step}");
     }
+    for kind in [
+        InspectionKind::Runs,
+        InspectionKind::Effects,
+        InspectionKind::Receipts,
+    ] {
+        let query = InspectionQuery {
+            kind,
+            run: None,
+            after: None,
+            limit: 1000,
+        };
+        assert_eq!(
+            m.store.inspect(ns, &query).unwrap().items,
+            r.store.inspect(ns, &query).unwrap().items,
+            "{kind:?} inspection after {step}"
+        );
+    }
     if exact {
         assert_eq!(
             canonical_bytes(&mv.state).unwrap(),
@@ -262,29 +300,41 @@ fn compare<C: Candidate>(
             "canonical State after {step}"
         );
         if let Some((counts, _)) = r.store.accounting(ns) {
-            assert_eq!(
-                counts,
-                quota_counts(&mv.state).unwrap(),
-                "maintained quota accounting after {step}"
-            );
+            let mut plain = mv.state.clone();
+            let expected: BTreeMap<&'static str, usize> = take_patch(&mut plain)
+                .unwrap()
+                .changes
+                .into_iter()
+                .filter_map(|(path, change)| match change {
+                    aq_playbooks_runner::lazy::ContainerChange::Replace(rows)
+                        if !rows.is_empty() =>
+                    {
+                        Some((path.field, rows.len()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(counts, expected, "maintained record counts after {step}");
         }
     }
 }
 
 fn measure<C: Candidate>(
-    state: &State,
+    (state, cohorts): &(State, Vec<SettledCohort>),
     ns: &str,
     candidate: C,
     samples: usize,
 ) -> BTreeMap<&'static str, Cell> {
-    let m = seed(MemoryStorage::default(), ns, state);
-    let r = seed(candidate, ns, state);
+    let m = seed(MemoryStorage::retaining_settled(), ns, state, cohorts);
+    let r = seed(candidate, ns, state, cohorts);
     compare(ns, &m, &r, "seed", true);
+    let full_settling = r.store.settling_commit_is_full();
     let mut cells: BTreeMap<&'static str, Cell> = BTreeMap::new();
     for i in 0..samples {
         for kind in ["admit", "event", "dispatch"] {
             let at = NOW + i as i64;
             let step = format!("{kind} {i} in {ns}");
+            let settled = m.store.settled_cohorts(ns).len();
             let reference = format!(
                 "{:?}",
                 match kind {
@@ -298,6 +348,7 @@ fn measure<C: Candidate>(
                 }
             );
             let before = r.store.work();
+            let fallbacks = r.store.fallbacks().len();
             let candidate = format!(
                 "{:?}",
                 match kind {
@@ -313,17 +364,36 @@ fn measure<C: Candidate>(
             let after = r.store.work();
             assert_eq!(reference, candidate, "result of {step}");
             assert!(reference.starts_with("Ok"), "{step}: {reference}");
-            // Zero full materialization and zero fallbacks during the op.
+            // The settling commits of this step (the drive finishes one run).
+            let settling = m.store.settled_cohorts(ns).len() - settled;
+            assert_eq!(settling, usize::from(kind == "dispatch"), "{step} settles");
+            // Zero full materialization; full commits only where cohort
+            // removal is one; zero fallbacks except when a cohort leaves
+            // (receipt compaction rewrites the positional sequence, SC-13).
             assert_eq!(after.full_loads, before.full_loads, "full load in {step}");
+            let full = if full_settling { settling } else { 0 };
             assert_eq!(
-                after.full_commits, before.full_commits,
-                "full commit in {step}"
+                after.full_commits - before.full_commits,
+                full,
+                "full commits in {step}"
             );
-            assert!(
-                after.transitions > before.transitions,
-                "{step} used the bounded transition path"
-            );
-            assert_eq!(r.store.fallbacks(), Vec::<String>::new(), "{step}");
+            if kind == "dispatch" {
+                assert!(
+                    after.transitions + after.full_commits
+                        > before.transitions + before.full_commits,
+                    "{step} committed"
+                );
+            } else {
+                assert!(
+                    after.transitions > before.transitions,
+                    "{step} used the bounded transition path"
+                );
+                assert_eq!(
+                    r.store.fallbacks()[fallbacks..].to_vec(),
+                    Vec::<String>::new(),
+                    "{step}"
+                );
+            }
             let cell = cells.entry(kind).or_default();
             cell.reads.push(after.record_reads - before.record_reads);
             if let Some((_, header_len)) = r.store.accounting(ns) {
@@ -335,11 +405,18 @@ fn measure<C: Candidate>(
     cells
 }
 
-/// History snapshots of the five-artifact fixture, grown through the record
-/// backend (bounded, and equivalent to the reference per
-/// runner tests/transition_equivalence.rs).
-fn histories(sizes: &[usize]) -> Vec<(usize, State)> {
-    let e = base(RecordStorage::new());
+/// History snapshots of the five-artifact fixture: `h` finished runs (now
+/// run history: their settled cohorts) and `h` events still in their window.
+/// Grown on the reference backend, which keeps the settled cohorts.
+fn histories(sizes: &[usize]) -> Vec<(usize, (State, Vec<SettledCohort>))> {
+    let e = base(MemoryStorage::retaining_settled());
+    // Task 8b: above the largest history, so every event stays remembered
+    // (none is evicted by count) and record work is measured against all.
+    e.set_retention_policy(RetentionPolicy {
+        replay_keep: 1_000,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
     let mut previous = 0;
     let mut out = vec![];
     for &h in sizes {
@@ -353,9 +430,11 @@ fn histories(sizes: &[usize]) -> Vec<(usize, State)> {
         }
         previous = h;
         let state = e.snapshot().unwrap();
+        let cohorts = e.store.settled_cohorts("seed");
         assert_eq!(state.artifacts.len(), 5);
-        assert!(state.events.len() >= h && state.runs.len() >= h);
-        out.push((h, state));
+        assert!(state.events.len() >= h && state.runs.is_empty());
+        assert_eq!(cohorts.len(), h);
+        out.push((h, (state, cohorts)));
     }
     out
 }
@@ -414,10 +493,10 @@ fn assert_flat(results: &BTreeMap<usize, BTreeMap<&'static str, Cell>>) {
 fn transition_cost_flat_with_history() {
     let results = histories(&HISTORY)
         .into_iter()
-        .map(|(h, state)| {
+        .map(|(h, seeded)| {
             (
                 h,
-                measure(&state, &format!("pb04-{h}"), RecordStorage::new(), SAMPLES),
+                measure(&seeded, &format!("pb04-{h}"), RecordStorage::new(), SAMPLES),
             )
         })
         .collect();
@@ -442,8 +521,11 @@ mod postgres {
         fn fallbacks(&self) -> Vec<String> {
             self.transition_stats().fallbacks
         }
-        fn accounting(&self, _: &str) -> Option<(QuotaCounts, usize)> {
+        fn accounting(&self, _: &str) -> Option<(BTreeMap<&'static str, usize>, usize)> {
             None
+        }
+        fn settling_commit_is_full(&self) -> bool {
+            true
         }
     }
     #[test]
@@ -453,9 +535,9 @@ mod postgres {
         let run = format!("{}_{}", std::process::id(), NOW);
         let results = histories(&[0, 32])
             .into_iter()
-            .map(|(h, state)| {
+            .map(|(h, seeded)| {
                 let store = PostgresStorage::connect_records(&config).unwrap();
-                (h, measure(&state, &format!("pb04_{run}_{h}"), store, 4))
+                (h, measure(&seeded, &format!("pb04_{run}_{h}"), store, 4))
             })
             .collect();
         assert_flat(&results);

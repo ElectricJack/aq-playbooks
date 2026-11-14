@@ -165,7 +165,8 @@ enum Command {
         #[command(flatten)]
         store: StoreArgs,
     },
-    /// Set explicit retention horizons and replay tombstone quota from a JSON policy.
+    /// Set explicit retention windows from a JSON policy (the deprecated
+    /// `max_tombstones` and `terminal_run_ms` are accepted and ignored).
     Retention {
         policy: PathBuf,
         #[command(flatten)]
@@ -179,6 +180,47 @@ enum Command {
         actor: String,
         #[arg(long)]
         reason: String,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Lower a retention clock that a far-future host time pinned (every
+    /// request with a request time is refused as stale while it is ahead).
+    /// Caps expiries and run timers written from the pin, records a stale
+    /// floor and an admin receipt. Run with --dry-run first; committing
+    /// needs --confirm-clock-rebase.
+    RebaseRetentionClock {
+        /// The corrected real time (ms): from now to a minute after it.
+        #[arg(long)]
+        to_ms: i64,
+        /// The last correct host time before the pin (ms, in the past): a
+        /// retry of a key the engine no longer remembers with a request time
+        /// at or before it is refused as stale.
+        #[arg(long)]
+        stale_floor_ms: i64,
+        #[arg(long)]
+        actor: String,
+        #[arg(long)]
+        reason: String,
+        /// Print what the rebase would change and commit nothing.
+        #[arg(long, conflicts_with = "confirm_clock_rebase")]
+        dry_run: bool,
+        #[arg(long, required_unless_present = "dry_run")]
+        confirm_clock_rebase: bool,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Lower a stale floor an earlier rebase set too high, accepting that
+    /// keys forgotten after the new floor may be re-admitted as new by a
+    /// retry with a request time in between. Needs --confirm-floor-lowering.
+    LowerStaleFloor {
+        #[arg(long)]
+        to_ms: i64,
+        #[arg(long)]
+        actor: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, required = true)]
+        confirm_floor_lowering: bool,
         #[command(flatten)]
         store: StoreArgs,
     },
@@ -290,6 +332,18 @@ fn engine(args: &StoreArgs) -> Result<Engine<PostgresStorage>> {
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
         ),
     )?)
+}
+/// Advance `run` until it makes no progress. A run whose cohort settled has
+/// left the State (it is in history), so `NotFound` also ends the loop.
+fn advance_until_settled(e: &Engine<PostgresStorage>, run: &str) -> Result<()> {
+    for _ in 0..1000 {
+        match e.advance(run, time()?) {
+            Ok(true) => {}
+            Ok(false) | Err(aq_playbooks_runner::Error::NotFound(_)) => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 fn choose<T: Serialize>(
     map: &std::collections::BTreeMap<String, T>,
@@ -424,12 +478,8 @@ fn execute(cli: Cli) -> Result<()> {
                 read::<Authority>(&authority)?,
                 time()?,
             )?;
-            for _ in 0..1000 {
-                if !e.advance(&id, time()?)? {
-                    break;
-                }
-            }
-            let view = simulation::inspect(&e.snapshot()?, Some(&id));
+            advance_until_settled(&e, &id)?;
+            let view = simulation::inspect(&e, Some(&id))?;
             e.release()?;
             print(&view)
         }
@@ -580,6 +630,43 @@ fn execute(cli: Cli) -> Result<()> {
             e.release()?;
             print(&json!({"producer":producer,"epoch":epoch}))
         }
+        Command::RebaseRetentionClock {
+            to_ms,
+            stale_floor_ms,
+            actor,
+            reason,
+            dry_run,
+            confirm_clock_rebase,
+            store,
+        } => {
+            anyhow::ensure!(
+                dry_run || confirm_clock_rebase,
+                "--confirm-clock-rebase or --dry-run required"
+            );
+            let e = engine(&store)?;
+            let report = if dry_run {
+                e.rebase_retention_clock_dry_run(to_ms, stale_floor_ms, &actor, &reason, time()?)
+            } else {
+                e.rebase_retention_clock(to_ms, stale_floor_ms, &actor, &reason, time()?)
+            };
+            e.release()?;
+            let report = report?;
+            print(&json!({"dry_run":dry_run,"report":report}))
+        }
+        Command::LowerStaleFloor {
+            to_ms,
+            actor,
+            reason,
+            confirm_floor_lowering,
+            store,
+        } => {
+            anyhow::ensure!(confirm_floor_lowering, "--confirm-floor-lowering required");
+            let e = engine(&store)?;
+            let lowered = e.lower_stale_floor(to_ms, &actor, &reason, time()?);
+            e.release()?;
+            let (from_ms, to_ms) = lowered?;
+            print(&json!({"from_ms":from_ms,"to_ms":to_ms}))
+        }
         Command::RotateKeys { store } => {
             anyhow::ensure!(
                 store.protection_keys.is_some(),
@@ -593,12 +680,8 @@ fn execute(cli: Cli) -> Result<()> {
         Command::Cancel { run, store } => {
             let e = engine(&store)?;
             e.cancel(&run, time()?)?;
-            for _ in 0..1000 {
-                if !e.advance(&run, time()?)? {
-                    break;
-                }
-            }
-            let view = simulation::inspect(&e.snapshot()?, Some(&run));
+            advance_until_settled(&e, &run)?;
+            let view = simulation::inspect(&e, Some(&run))?;
             e.release()?;
             print(&view)
         }
@@ -612,6 +695,24 @@ fn execute(cli: Cli) -> Result<()> {
                 let e = engine(&store)?;
                 if let Some(run) = run {
                     let state = e.snapshot()?;
+                    if !state.intents.contains_key(&request.intent) {
+                        // An operation that left with its finished run is
+                        // in history: it is settled, nothing to recover.
+                        let finished = e
+                            .inspect(&InspectionQuery {
+                                kind: InspectionKind::Effects,
+                                run: Some(run.clone()),
+                                after: None,
+                                limit: 1000,
+                            })?
+                            .items
+                            .iter()
+                            .any(|item| item["id"] == request.intent.as_str());
+                        anyhow::ensure!(
+                            !finished,
+                            "recovery intent has finished with its run; nothing to recover"
+                        );
+                    }
                     anyhow::ensure!(
                         state
                             .intents

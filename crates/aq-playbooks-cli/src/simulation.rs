@@ -1,5 +1,8 @@
 use aq_playbooks_model::{Artifact, CommandContract, EventEnvelope};
-use aq_playbooks_runner::{Authority, DispatchResult, Engine, Host, Intent, MemoryStorage, State};
+use aq_playbooks_runner::{
+    Authority, DispatchResult, Engine, Host, InspectionKind, InspectionQuery, Intent,
+    MemoryStorage, Storage,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
@@ -138,12 +141,24 @@ pub fn simulate(scenario: &Scenario) -> anyhow::Result<SimulationReport> {
                 engine.fanout(&accepted.key, 100, clock)?;
             }
             Action::Cancel { start, .. } => {
-                engine.cancel(
-                    roots
-                        .get(*start)
-                        .ok_or_else(|| anyhow::anyhow!("unknown start index"))?,
-                    clock,
-                )?;
+                let root = roots
+                    .get(*start)
+                    .ok_or_else(|| anyhow::anyhow!("unknown start index"))?;
+                match engine.cancel(root, clock) {
+                    // A start that already finished has left the State as
+                    // history: cancelling it is a no-op, as for a terminal run.
+                    Err(aq_playbooks_runner::Error::NotFound(_))
+                        if !engine
+                            .inspect(&InspectionQuery {
+                                kind: InspectionKind::Runs,
+                                run: Some(root.clone()),
+                                after: None,
+                                limit: 1,
+                            })?
+                            .items
+                            .is_empty() => {}
+                    result => result?,
+                }
             }
             Action::Recover { .. } => {
                 engine.recover(&mut host, clock)?;
@@ -165,19 +180,72 @@ pub fn simulate(scenario: &Scenario) -> anyhow::Result<SimulationReport> {
         .into(),
         transitions: used,
         roots,
-        inspection: inspect(&state, None),
+        inspection: inspect(&engine, None)?,
         invocations: host.invocations,
     })
 }
 
-/// Public inspection deliberately omits raw inputs, variables and command results.
-pub fn inspect(state: &State, run_id: Option<&str>) -> Value {
-    let rows = aq_playbooks_runner::inspection::rows(state);
-    let values = |kind| {
-        rows.iter()
-            .filter(|r| r.kind == kind && run_id.is_none_or(|id| r.run == id))
-            .map(|r| r.value.clone())
-            .collect::<Vec<_>>()
+/// Public inspection deliberately omits raw inputs, variables and command
+/// results. It reads through `Storage::inspect` (live state plus run
+/// history), so finished runs, which leave the State, are included.
+pub fn inspect<S: Storage>(engine: &Engine<S>, run_id: Option<&str>) -> anyhow::Result<Value> {
+    let values = |kind| -> anyhow::Result<Vec<Value>> {
+        let mut items = vec![];
+        let mut after = None;
+        loop {
+            let page = engine.inspect(&InspectionQuery {
+                kind,
+                run: run_id.map(String::from),
+                after,
+                limit: 1000,
+            })?;
+            items.extend(page.items);
+            match page.next {
+                Some(next) => after = Some(next),
+                None => return Ok(items),
+            }
+        }
     };
-    json!({"runs":values(aq_playbooks_runner::InspectionKind::Runs),"effects":values(aq_playbooks_runner::InspectionKind::Effects),"receipts":values(aq_playbooks_runner::InspectionKind::Receipts),"catalog_revision":state.catalog_revision})
+    let catalog_revision = engine.snapshot()?.catalog_revision;
+    Ok(
+        json!({"runs":values(InspectionKind::Runs)?,"effects":values(InspectionKind::Effects)?,"receipts":values(InspectionKind::Receipts)?,"catalog_revision":catalog_revision}),
+    )
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// A scripted cancel of a start that already finished (and left the
+    /// engine's State as history) is a no-op, not a failed simulation.
+    #[test]
+    fn cancelling_a_finished_start_is_a_no_op() {
+        let mut scenario = crate::pilots::scenario("routing").unwrap();
+        let clock = scenario
+            .actions
+            .iter()
+            .map(|action| match action {
+                Action::Tick { at_ms }
+                | Action::Event { at_ms, .. }
+                | Action::Cancel { at_ms, .. }
+                | Action::Recover { at_ms } => *at_ms,
+            })
+            .max()
+            .unwrap_or(0);
+        scenario.actions.push(Action::Cancel {
+            at_ms: clock + 1,
+            start: 0,
+        });
+        let report = simulate(&scenario).unwrap();
+        assert!(report.complete);
+        let root = &report.roots[0];
+        let runs = report.inspection["runs"].as_array().unwrap();
+        assert!(
+            runs.iter()
+                .any(|run| &run["id"] == root && run["outcome"] == "success")
+        );
+        scenario.actions.push(Action::Cancel {
+            at_ms: clock + 2,
+            start: 7,
+        });
+        assert!(simulate(&scenario).is_err(), "an unknown start still fails");
+    }
 }

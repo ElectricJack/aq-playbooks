@@ -126,6 +126,7 @@ fn published_replay_fixtures_retain_admission_and_reject_conflicting_reuse() {
             cancel_dispatched: false,
             late_results: vec![],
             completion_event: None,
+            dispatch_sequence: None,
             handle: None,
             result: None,
             reason: None,

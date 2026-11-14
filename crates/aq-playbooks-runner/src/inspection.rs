@@ -1,5 +1,5 @@
 //! Bounded public inspection projections. Full snapshots remain a privileged API.
-use crate::{Intent, Receipt, Run, State, StorageError};
+use crate::{HistoryItem, Intent, Receipt, Run, State, StorageError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -102,30 +102,39 @@ pub fn public_receipt(r: &Receipt) -> Value {
     json!({"sequence":r.sequence,"run":r.run,"step":r.step,"at_ms":r.at_ms,"kind":r.kind,"detail":detail})
 }
 
-pub fn rows(state: &State) -> Vec<InspectionRow> {
-    let mut rows =
-        Vec::with_capacity(state.runs.len() + state.intents.len() + state.receipts.len());
-    rows.extend(state.runs.values().map(|r| InspectionRow {
+pub(crate) fn run_row(r: &Run) -> InspectionRow {
+    InspectionRow {
         kind: InspectionKind::Runs,
         key: r.id.clone(),
         run: r.id.clone(),
         sequence: 0,
         value: public_run(r),
-    }));
-    rows.extend(state.intents.values().map(|i| InspectionRow {
+    }
+}
+pub(crate) fn intent_row(i: &Intent) -> InspectionRow {
+    InspectionRow {
         kind: InspectionKind::Effects,
         key: i.id.clone(),
         run: i.run.clone(),
         sequence: i.invocation,
         value: public_intent(i),
-    }));
-    rows.extend(state.receipts.iter().map(|r| InspectionRow {
+    }
+}
+pub(crate) fn receipt_row(r: &Receipt) -> InspectionRow {
+    InspectionRow {
         kind: InspectionKind::Receipts,
         key: format!("{:020}", r.sequence),
         run: r.run.clone(),
         sequence: r.sequence,
         value: public_receipt(r),
-    }));
+    }
+}
+pub fn rows(state: &State) -> Vec<InspectionRow> {
+    let mut rows =
+        Vec::with_capacity(state.runs.len() + state.intents.len() + state.receipts.len());
+    rows.extend(state.runs.values().map(run_row));
+    rows.extend(state.intents.values().map(intent_row));
+    rows.extend(state.receipts.iter().map(receipt_row));
     rows
 }
 pub fn page(
@@ -133,21 +142,43 @@ pub fn page(
     revision: u64,
     query: &InspectionQuery,
 ) -> Result<InspectionPage, StorageError> {
+    page_with_history(state, revision, query, vec![])
+}
+/// One page over the live state and `history` together, in key order. The
+/// caller reads history after the state: history only grows between the two
+/// reads, so an item that left the state is found in history, and an item seen
+/// in both is returned once (the live one).
+pub fn page_with_history(
+    state: &State,
+    revision: u64,
+    query: &InspectionQuery,
+    history: Vec<HistoryItem>,
+) -> Result<InspectionPage, StorageError> {
     query.validate()?;
+    let matches = |kind: InspectionKind, run: &String, key: &String| {
+        kind == query.kind
+            && query.run.as_ref().is_none_or(|id| run == id)
+            && query.after.as_ref().is_none_or(|cursor| key > cursor)
+    };
     let mut selected = rows(state)
         .into_iter()
-        .filter(|row| {
-            row.kind == query.kind
-                && query.run.as_ref().is_none_or(|id| &row.run == id)
-                && query.after.as_ref().is_none_or(|cursor| &row.key > cursor)
-        })
+        .filter(|row| matches(row.kind, &row.run, &row.key))
+        .map(|row| (row.key, row.value))
+        .chain(
+            history
+                .into_iter()
+                .filter(|item| matches(item.kind, &item.run, &item.key))
+                .map(|item| (item.key, item.value)),
+        )
         .collect::<Vec<_>>();
-    selected.sort_by(|a, b| a.key.cmp(&b.key));
+    // Stable: for a key present in both, the live item stays first.
+    selected.sort_by(|a, b| a.0.cmp(&b.0));
+    selected.dedup_by(|later, earlier| later.0 == earlier.0);
     let has_more = selected.len() > query.limit;
     selected.truncate(query.limit);
-    let next = has_more.then(|| selected.last().unwrap().key.clone());
+    let next = has_more.then(|| selected.last().unwrap().0.clone());
     Ok(InspectionPage {
-        items: selected.into_iter().map(|row| row.value).collect(),
+        items: selected.into_iter().map(|(_, value)| value).collect(),
         next,
         revision,
     })

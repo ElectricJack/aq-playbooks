@@ -389,8 +389,12 @@ fn native_same_scope_recovery_head_rotates_and_unchanged_history_rows_are_not_re
     assert_eq!(client().query_one("SELECT count(*) FROM aq_playbooks.runtime_index WHERE namespace=$1 AND kind='effect:recovery'",&[&n]).unwrap().get::<_,i64>(0),1);
 }
 
+/// `max_tombstones` is accepted and ignored: a commit writing more disposal
+/// tombstone rows than it allows is not refused (before spec 0003 this test
+/// asserted that refusal). Expired unreferenced artifact metadata is still
+/// collected by the commits that move the GC clock.
 #[test]
-fn disposal_quota_refuses_atomically_and_expired_unreferenced_artifact_metadata_is_collected() {
+fn max_tombstones_is_ignored_and_expired_unreferenced_artifact_metadata_is_collected() {
     let n = namespace("gc-quota");
     let first = artifact(&n);
     let second = artifact(&format!("{n}-second"));
@@ -414,17 +418,10 @@ fn disposal_quota_refuses_atomically_and_expired_unreferenced_artifact_metadata_
         key: second.digest.clone(),
         at_ms: 100,
     });
-    assert!(
-        s.compare_and_swap(&n, "owner", 1, &next)
-            .unwrap_err()
-            .to_string()
-            .contains("quota")
-    );
-    assert_same(&s.load(&n).unwrap().state, &original);
-    next.retention.policy.max_tombstones = 10;
     next.retention.policy.audit_ms = 1;
     next.retention.last_gc_at_ms = Some(100);
     s.compare_and_swap(&n, "owner", 1, &next).unwrap();
+    assert_same(&s.load(&n).unwrap().state, &next);
     assert_eq!(
         client()
             .query_one(
@@ -699,6 +696,7 @@ fn event_gc_replay_tombstones_survive_restart_and_explicit_new_epoch_has_new_ide
             terminal_run_ms: 1,
             audit_ms: 1,
             max_tombstones: 1,
+            ..retention::RetentionPolicy::default()
         })
         .unwrap();
     for epoch in 0..4 {
@@ -923,7 +921,7 @@ fn actual_engine_requires_protection_before_admission_and_encrypts_sensitive_dis
             self.dispatch(i)
         }
     }
-    {
+    let root = {
         let engine = Engine::new(protected("old", false), &n, "protected").unwrap();
         engine.install(artifact.clone()).unwrap();
         engine
@@ -933,33 +931,21 @@ fn actual_engine_requires_protection_before_admission_and_encrypts_sensitive_dis
             .admit("sensitive", "main", input, authority, 0)
             .unwrap();
         let mut host = SecretHost { calls: 0 };
-        engine.drive(&mut host, 0, 20).unwrap();
+        // Up to the step after the result is bound, so the protected values
+        // are still live (a finished run leaves the State; history holds
+        // public projections only).
+        engine.advance(&root, 0).unwrap();
+        engine.dispatch_next(&mut host, 0).unwrap();
+        engine.advance(&root, 0).unwrap();
         let state = engine.snapshot().unwrap();
-        assert_eq!(state.runs[&root].outcome.as_deref(), Some("ok"));
+        assert_eq!(state.runs[&root].step, "return");
         assert_eq!(host.calls, 1);
         assert_eq!(
             state.runs[&root].variables["private_result"]["secret"],
             "SYNTHETIC_PROTECTED_SENTINEL"
         );
-        let page = engine
-            .store
-            .inspect(
-                &n,
-                &InspectionQuery {
-                    kind: InspectionKind::Receipts,
-                    run: Some(root),
-                    after: None,
-                    limit: 100,
-                },
-            )
-            .unwrap();
-        assert!(!contains_secret(&serde_json::to_vec(&page).unwrap()));
-        assert!(
-            page.items
-                .iter()
-                .all(|receipt| receipt["detail"].get("input_digest").is_none())
-        );
-    }
+        root
+    };
     let restored = Engine::new(protected("old", false), &n, "reopened").unwrap();
     assert_eq!(
         restored
@@ -975,6 +961,35 @@ fn actual_engine_requires_protection_before_admission_and_encrypts_sensitive_dis
             .1["secret"],
         "SYNTHETIC_PROTECTED_SENTINEL"
     );
+    restored.drive(&mut SecretHost { calls: 0 }, 1, 20).unwrap();
+    assert!(restored.snapshot().unwrap().runs.is_empty());
+    let query = |kind| InspectionQuery {
+        kind,
+        run: Some(root.clone()),
+        after: None,
+        limit: 100,
+    };
+    let runs = restored
+        .store
+        .inspect(&n, &query(InspectionKind::Runs))
+        .unwrap();
+    assert_eq!(runs.items[0]["outcome"], "ok");
+    let page = restored
+        .store
+        .inspect(&n, &query(InspectionKind::Receipts))
+        .unwrap();
+    assert!(!page.items.is_empty());
+    assert!(!contains_secret(&serde_json::to_vec(&page).unwrap()));
+    assert!(
+        page.items
+            .iter()
+            .all(|receipt| receipt["detail"].get("input_digest").is_none())
+    );
+    let effects = restored
+        .store
+        .inspect(&n, &query(InspectionKind::Effects))
+        .unwrap();
+    assert!(!contains_secret(&serde_json::to_vec(&effects).unwrap()));
     assert!(store().load(&n).is_err());
 }
 

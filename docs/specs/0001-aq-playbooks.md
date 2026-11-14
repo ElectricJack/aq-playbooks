@@ -2,6 +2,7 @@
 
 **Status:** Draft with the agreed minimal command surface. As of 2026-11-12 the engine (model, compiler, runner, PostgreSQL store, CLI) is implemented and tested. The four AQ pilots (P17), including routing judgment, have run only against a fake host. aq-server embeds the runner and registers the twelve commands, with `judgment.request` and `check.request` unbound; its live stack loads an inspection-only artifact. Platform state: aq-server `docs/status.md`.  
 **Date:** 2026-10-30  
+**2026-11-13:** aligned with the rolling-records principle ([aq-server architecture 0006](../../../aq-server/docs/architecture/0006-records-are-rolling.md)) and [spec 0003](0003-live-state-only.md); implementation pending (P15, §§14, 17, T17 in §18, the default-limits decision in §20).  
 **Implementation language:** Rust  
 **Repository:** `aq-playbooks`
 
@@ -41,7 +42,7 @@ The initial AQ policy API contains twelve concrete commands. Spec ingestion, rev
 | P12 | Simulation exercises the same workflow semantics with fake effects and an injected clock. |
 | P13 | Normal execution requires no new deployed infrastructure beyond the host's persistence choice. |
 | P14 | The project owns its persistence schema and tests; it does not read AQ, aq-graph, aq-worker, or aq-git private state. |
-| P15 | Runtime cost is bounded by explicit queue, run, iteration, child, payload, and retention limits. |
+| P15 | Runtime cost is bounded by explicit queue, run, iteration, child, and payload limits on work in progress, and by deleting finished records; finished records never limit new work. |
 | P16 | Operators can explain a run's decisions, waits, child tree, pending effects, and required recovery. |
 | P17 | The initial AQ pilot covers coding/integration, routing judgment, a stuck-work watcher, and a supervisor report without requiring deployment or stream-processing features. |
 | P18 | Existing AQ v1 behavior and data are references rather than mandatory compatibility or migration targets. |
@@ -418,11 +419,11 @@ The private storage model contains immutable artifact blobs/manifests, callable/
 
 Store canonical artifact bytes once under their digest; searchable metadata is an index checked against those bytes. Run state is authoritative workflow state rather than a cache of external facts. Within a boundary, snapshot changes, receipts, waits, child records, and intents commit together.
 
-Retain artifacts and dependency closures referenced by active roots, children, independent starts, unresolved effects, and retained audit records. Retain event/result deduplication records long enough to cover the declared delivery/replay horizon. Quota pressure refuses admission or pauses progress with a clear reason; it cannot delete unresolved work to make room.
+Retain artifacts and dependency closures referenced by active roots, children, independent starts, unresolved effects, and kept history. Event/result deduplication records are a rolling set: the most recent `replay_keep` keys, each also forgotten when its window ends ([spec 0003](0003-live-state-only.md)). Nothing finished or remembered refuses admission or pauses progress; there are no namespace quotas. Deletion never removes unresolved work.
 
-Unsettled operation handles retain their completion/reconciliation records independently of ordinary event-history expiry. General event waits declare a supported correlation horizon, and admission refuses a wait whose required history cannot be retained or established. History expiry must not silently turn an already accepted operation completion into a permanent wait.
+Unsettled operation handles retain their completion/reconciliation records independently of ordinary event-history expiry. General event waits declare a supported correlation horizon; a wait registered after its event's window has passed times out instead of being refused. History expiry must not silently turn an already accepted operation completion into a permanent wait.
 
-Garbage collection follows explicit terminal/replay horizons and records disposal. Deduplication keys must not become reusable while their producers can still legitimately retry. Beyond the supported horizon, stale requests are rejected or require explicit new replay identities rather than silently executing again.
+Finished work leaves the engine's record in the commit that finishes it, and history is a rolling log of the most recent `history_keep` finished runs. No host has to call a collection step. A forgotten key is handled by time: a repeat whose request carries its producer time is refused as stale once that time is outside the window; a repeat without one is accepted as new. Hosts choose the window and `replay_keep` to cover their own retries.
 
 Backups capture the engine schema and its canonical artifact bytes consistently. The host owns backups for external evidence and domain stores. Restore must identify uncertain external effects and reconcile them; restoring a database does not restore the outside world to that moment.
 
@@ -486,7 +487,7 @@ Scenarios have bounded branching and include assumptions and trace limits. A sym
 
 Admission and wakeup use indexed type/scope/correlation lookups. Compiled artifacts and contract manifests have bounded caches. Large documents and code/test output use artifact references; they are not copied through every parent snapshot. Inspection is paginated, and recurring status work does not scan all runs or external repositories.
 
-Enforce separate limits for event ingress, queued root runs, runnable transitions, outstanding commands, child creation, payload bytes, and retained history. Per-scope fairness prevents one project or event storm from monopolizing the runner. A durable refusal or queued disposition is preferable to unbounded task spawning.
+Enforce separate limits for event ingress, queued root runs, runnable transitions, outstanding commands, child creation, and payload bytes. Kept history and remembered keys are bounded by deletion, not by a limit. Per-scope fairness prevents one project or event storm from monopolizing the runner. A durable refusal or queued disposition is preferable to unbounded task spawning.
 
 Initial performance budgets are provisional: pure transition evaluation p95 below 1 ms, local durable event admission p95 below 25 ms excluding overload/network, and ready-work dispatch p95 below 100 ms under declared normal load. Measure on named hardware and representative payloads before adopting release thresholds. External command time is reported separately.
 
@@ -514,7 +515,7 @@ Core tests require Rust, fake adapters, and temporary fixtures. They run without
 | T14 | A decision or check for one revision cannot satisfy an operation requiring another revision. |
 | T15 | Competing holds and current-state preconditions prevent one workflow from bypassing another obligation. |
 | T16 | Simulation invokes no real adapter and reports missing results/incomplete exploration honestly. |
-| T17 | Retention preserves dependency artifacts, unresolved effects, waits, and supported replay identities under quota pressure. |
+| T17 | Deleting finished records preserves dependency artifacts, unresolved effects, waits, and replay identities still in the rolling set; no run is refused because finished records are many. |
 | T18 | Public logs/receipts omit protected values; unavailable protection refuses unsafe persistence. |
 | T19 | Persistence tests prove atomic snapshot/receipt/wait/child/intent boundaries and exclusive runtime ownership. |
 | T20 | A fake-host coding workflow covers implementation, review, validation, publication conflict, repair, and independent follow-up. |
@@ -548,7 +549,7 @@ Deferral does not permit silent omission. A policy requiring a missing feature m
 | Source syntax | Markdown plus a small structured header and separate semantic proposal; exact schema still to be designed. |
 | JSON Schema and expression subset | Select a bounded, portable subset and numeric semantics before publishing the artifact format. |
 | Protected-value storage | Choose the key/encryption binding and backup/restore behavior before live confidential inputs are supported. |
-| Default limits | Set child depth, total admissions, payload/retention budgets, timeout defaults, and concurrency using pilot workloads. No unbounded defaults. |
+| Default limits | Set child depth, total admissions, payload budgets, rolling sizes (`replay_keep`, `history_keep`, windows), timeout defaults, and concurrency using pilot workloads. No unbounded defaults. |
 | Callable catalog policy | Resolve statically named dependencies from explicit authorized bindings at root admission; define exact version-selection syntax and administrative controls. |
 | Context and work schemas | Specify the finite schemas for the five context view categories, supported work templates/change variants, and operation lifetime contracts; count additions as API growth. |
 | Cross-run state | Host-owned task/attempt identities and the findings service cover initial needs. Generic engine-owned state requires a separate demonstrated use case. |
