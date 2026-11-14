@@ -402,21 +402,20 @@ hosts compile:
   same either way (tested: `deprecated_limit_fields_decode_and_change_nothing`).
 
 `set_retention_policy` refuses only a zero window (`event_replay_ms`,
-`admission_replay_ms` or `audit_ms`): "retention windows must be positive".
-GC no longer refuses for the event tombstone or correlation fence count,
-and the age of a finished root it may collect is `audit_ms` alone.
-PostgreSQL does not count `disposal_tombstones` rows on a full commit; its
-cutoff deletes over those rows (`collect`) run only in a commit that moves
-the GC clock. Rows written before this change are deleted by the drain, a
-bounded number per commit, and never refuse a commit.
+`admission_replay_ms` or `audit_ms`): "retention windows must be positive",
+and a zero per-commit bound (see "Per-commit bounds are policy fields").
+PostgreSQL does not count `disposal_tombstones` rows on a full commit; the
+GC clock's cutoff delete (`collect`) takes artifact rows only. Rows of
+runs, operations and events written before this change are deleted by the
+drain, a bounded number per commit, and never refuse a commit.
 
 **What stays, because it is not a namespace limit:** the limits a playbook
 declares for itself in its artifact (step visits, children, depth,
 iterations, duration, concurrent effects and children, payload and history
 bytes), which bound one run and are part of the playbook's meaning; input
 validation bounds (payload sizes, key and text lengths); the bounded amount
-of deletion work per commit (64 window drops, 64 evictions, 50 cohorts, the
-history trim batch); and the removal fences, which are about the
+of deletion work per commit (window drops, evictions, drained cohorts and
+entries, the history trim batch, all policy fields); and the removal fences, which are about the
 correctness of deletion, not capacity.
 
 **A namespace written before this change** still holds the runs that
@@ -508,8 +507,9 @@ bounds the record (about 120 entries; 132.7 KB at run 200).
   index existed fills it through the drain.
 - `retention::evict`, in every commit that changes the State except a
   licensed admin commit, after the window drop: while the order holds more
-  than `replay_keep`, take its head, at most `REPLAY_EVICTIONS_PER_COMMIT`
-  (64) per commit (counted apart from the window drop's own 64). A held head
+  than `replay_keep`, take its head, at most
+  `policy.replay_evictions_per_commit` (default 64) per commit (counted
+  apart from the window drop's own bound). A held head
   leaves the order; otherwise the entry is forgotten exactly as when its
   window passes (item, expiry record, expiry-order key; for an event its
   epoch, indexes and `event:<key>` receipts, which go to history). It never
@@ -589,7 +589,7 @@ allow), `history_keep` event receipts and `history_keep` admin receipts.
 
 Each commit that writes history deletes the oldest of each set beyond
 `history_keep`: at most what it writes of that set plus
-`HISTORY_TRIM_RUNS_PER_COMMIT` (64), so it keeps up with any commit and a
+`policy.history_trim_per_commit` (default 64), so it keeps up with any commit and a
 lowered `history_keep` is reached within a bounded number of commits. A run
 is deleted with all its items first and its `runs` row last, in the same
 transaction. The bound counts units, not rows: 64 runs of 1,500 receipts
@@ -612,8 +612,13 @@ cursor's run is trimmed before the next page neither repeats nor skips a
 remaining item: the next page starts after the cursor (tested:
 `a_page_across_a_trim_neither_repeats_nor_panics`).
 
-`delete_history_before` (host-called, by finish time) keeps working and
-keeps the counts right, so the trim after it is still exact.
+`Engine::delete_history_before(before_ms)` (host-called, by finish time)
+keeps working and keeps the counts right, so the trim after it is still
+exact. It is optional: history is already a rolling log. It is an `Engine`
+method, so any host holding the engine reaches it (on PostgreSQL it needs
+the engine's lease); it commits no State and moves no clock. aq-server's
+owner thread (`aq-playbook-host`) has no request for it yet: a server
+follow-on, if the server wants to delete history by time.
 
 ### PostgreSQL (migration 7)
 
@@ -717,8 +722,8 @@ dirty sets, so cohorts settled before it are seen by no settlement.
   admitted runs) are untouched by the drain and settle normally.
 - Inspection lists each legacy run exactly once at every commit: in the
   live State until its cohort is drained, in history from that commit.
-- `collect_garbage` (kept for Task 10) removes finished runs without
-  history. While a drain is in progress it leaves them to the drain.
+- `collect_garbage` is an ordinary commit: it takes the drain's next
+  step like any other (see "`collect_garbage` (Task 10)").
 - **Operations dispatched by the old engine.** They carry no dispatch
   sequence, so without help an operation whose handle is lost would hold
   every event of its contract and, when its membership changed, judge all
@@ -737,12 +742,11 @@ dirty sets, so cohorts settled before it are seen by no settlement.
 format 2, and both format 3 paths) deletes up to
 `drain_entries_per_commit` rows of kinds `event`, `run` and `intent`
 (`DELETE … WHERE ctid IN (SELECT ctid … LIMIT n)`, through the primary key),
-after the identity-reuse check and before the legacy rows the commit itself
-writes. Artifact rows stay (they guard artifact bytes). The rows are their
-own progress record. When a commit deletes fewer than its bound, the
-storage handle stops issuing the delete for that namespace; a new handle
-(a restart) issues it once more, and a commit that writes legacy rows
-(legacy GC) arms it again.
+after the identity-reuse check. Artifact rows stay (they guard artifact
+bytes). The rows are their own progress record. When a commit deletes
+fewer than its bound, the storage handle stops issuing the delete for that
+namespace; a new handle (a restart) issues it once more. No engine writes
+such rows any more.
 
 **What an operator sees.** The drain starts by itself at the first open
 after the upgrade. Each commit moves up to 50 finished runs to history and
@@ -828,3 +832,141 @@ left to the operator.
 The structural remedy on record is to compress the snapshot before
 encrypting it on protected format 2. That shrinks the record bytes, the
 write volume per transition and this plateau together.
+
+## `collect_garbage` (Task 10)
+
+`collect_garbage` is not needed, by anything: every commit already deletes
+finished work and old entries, a bounded amount each. It stays callable so
+existing callers compile, and the CLI `gc` command keeps working (its help
+says it is not needed).
+
+`Engine::collect_garbage(now_ms, limit)` is one ordinary commit at host time
+`now_ms`: the same bounded settle, drain of a namespace an older engine
+wrote, window drop and eviction every commit does (`finish_commit`), plus
+its own small part (`retention::gc`): a page of at most `limit` artifacts
+examined for disposal (`1..=policy.gc_page_limit`), catalog history no live
+run, event or audit window needs, artifact disposals past `audit_ms`, and
+the GC clock (`last_gc_at_ms`; a call before the previous one is refused).
+
+It removes no run, operation, receipt or event itself, and writes no event
+tombstone, correlation fence, disposal record or (PostgreSQL)
+`disposal_tombstones` row of a run, operation or event. A finished run
+leaves only with its history: on an older engine's namespace the call
+advances the same drain, so its runs go to history.
+
+`GcReport` (fields kept, two added with serde defaults):
+
+| Field | Now |
+| --- | --- |
+| `runs` | finished runs this commit moved to history (settled, or drained) |
+| `events` | events forgotten by the window drop |
+| `admissions` (new) | keyed receipts forgotten by the window drop |
+| `evicted` (new) | window entries evicted past `replay_keep` |
+| `receipts` | receipts moved to history |
+| `artifacts` | artifacts disposed of |
+| `preserved` | artifacts kept because something references them (it no longer counts runs or events: those are not examined) |
+| `more` | more bounded work is due: settled cohorts past the settle bound, an unfinished drain, expired entries past the drop bound, entries past `replay_keep` past the eviction bound, or the artifact phase |
+
+Removed with it: GC's run removal without history and its event removal
+(with tombstone, fence and disposal record); the disposal-record licence of
+the removal fences (`retention::Removals`; `verify_removals` and
+`check_removals` return `()`), on every backend and path; the PostgreSQL
+tombstone writes for runs, operations and events and the per-handle re-arm
+only they needed; the GC cutoff delete of run and operation rows; GC's
+whole-record receipt reindex; and the writes of `indexes.root_last_activity`,
+which only GC's age test read (the field still decodes; an entry an older
+engine wrote leaves with its cohort). `RetentionState::{event_tombstones,
+expired_correlations, disposals}` and an older engine's GC cursor still
+decode, are never written, and are drained; while one is still in the
+record it behaves as before (a tombstoned redelivery is refused, a fenced
+wait is refused).
+
+## Per-commit bounds are policy fields (Task 10)
+
+The owner's rule: no hard-coded limits. Every bound of the deletion work a
+commit does is a `RetentionPolicy` field with a serde default (the old
+constant), so a stored policy decodes with or without it and may set it;
+`set_retention_policy` refuses 0.
+
+| Field | Default | Bounds, per commit |
+| --- | ---: | --- |
+| `window_drops_per_commit` | 64 | expired window entries examined (dropped or deferred) |
+| `replay_evictions_per_commit` | 64 | entries evicted past `replay_keep`; the eviction licence reads the same field (of the State the commit writes) |
+| `history_trim_per_commit` | 64 | history units a commit trims beyond what it writes, per rolling set, on every backend |
+| `gc_page_limit` | 1,000 | the largest `collect_garbage` page, and the PostgreSQL artifact catalog delete of a GC commit |
+| `drain_cohorts_per_commit` | 50 | (Task 9) |
+| `drain_entries_per_commit` | 500 | (Task 9) |
+
+Constants that remain: `retention::COHORTS_PER_COMMIT` (50, the settle
+bound; not part of this task), `REBASE_ADJUSTMENTS_LISTED` (1,000, how many
+capped timers a clock-rebase receipt lists; an audit list size, not a
+deletion bound), the index query page cap (1,000 items, a read bound), and
+the per-row profile bounds of the catalog projection. The old constants
+(`WINDOW_DROPS_PER_COMMIT`, `REPLAY_EVICTIONS_PER_COMMIT`,
+`HISTORY_TRIM_RUNS_PER_COMMIT`, `GC_PAGE_LIMIT`) remain as the defaults.
+
+## A lost handle's hold lapses (Task 10, ruling C)
+
+An asynchronous operation whose dispatch lost its handle holds the later
+events of its completion contract and scope (they may be its completion),
+uncounted and never evicted. That hold now lapses once the retention clock
+is past the operation's command deadline (`Intent::deadline_at_ms`) plus
+the completion event's window (`max(event_replay_ms,
+contract.retention_ms)`). After it, those events are ordinary unheld
+entries: they rejoin the eviction order at their acceptance positions (so
+as the oldest) and leave by `replay_keep` or by their own window.
+
+- Each commit takes the lapsed operations out of the uncertain index
+  (`retention::lapse_holds`; O(uncertain operations), nothing when no
+  handle is lost), so `rejoin` judges the events they held again.
+  `event_hold` applies the same rule, so the removal fences agree on every
+  path.
+- **The handle found before the lapse:** the held completion matches and
+  the operation completes, as before.
+- **The handle found after the lapse:** the completion may be gone. The
+  operation is then past its command deadline, so the next drive marks it
+  `Unknown` again ("operation deadline elapsed with unresolved external
+  outcome") and it is in the recovery queue: a `Reconcilable` command is
+  reconciled with the host, whose answer completes it; other recovery
+  kinds need an operator's authorized recovery or a cancel, as for any
+  operation whose outcome is unknown. (Tested both ways.)
+
+## PostgreSQL: receipt index rows by sequence (Task 10)
+
+On protected and plain format 2 the runtime-index rows of receipts
+(`receipt`, `all_receipt`) are keyed by the receipt's sequence (20
+zero-padded digits), not by its position in the record. A commit that
+compacts the receipts (a cohort leaving, the drain) therefore writes the
+rows of the receipts it adds or removes only; before, it rewrote the rows
+of every later receipt (1.1 s of a 1.8 s drain commit on the 10 MB legacy
+namespace, Task 9 review I1).
+
+- **Rows an older engine wrote** (keyed by position, unpadded, so never
+  equal to a new key) are not converted and need no migration: each is
+  deleted by its sequence when its receipt leaves, and a commit that
+  writes a receipt's row afresh deletes any other row of that receipt. The
+  delete names the rows and finds each through
+  `runtime_correlated_sequence` (one lookup per row; with table statistics,
+  as a long-lived table has them). After a restore without `ANALYZE` the
+  planner may use the primary key prefix instead, which reads all of a
+  namespace's receipt rows per lookup (measured below); run `ANALYZE
+  aq_playbooks.runtime_index` after a restore (autovacuum does it within a
+  naptime).
+- `IndexQuery::Receipts` answers each item's `key` with the receipt's
+  sequence (20 digits) on every backend (it was the receipt's position).
+
+**Measured** on the 1,000-run legacy dump (`legacy-a-1000.dump`, protected
+format 2, 10.7 MB record, 24,000 receipt rows keyed by position), the
+Task 9 procedure under aq-server's session settings (`statement_timeout`
+2 s, `lock_timeout` 500 ms), after `ANALYZE`:
+
+| Commit | Task 9 | Now |
+| ---: | ---: | ---: |
+| 1 (open) | 2,815 ms | 802 ms |
+| 10 | 1,410 ms | 452 ms |
+| drain, commits 1–21 | 25.8 s | 9.3 s |
+
+The drain completed at commit 21 as before; afterwards a step took about
+27 ms. Without statistics (restored, `ANALYZE` not run, autovacuum off for
+the table): commit 1 took 1,720 ms, commit 10 856 ms.
+

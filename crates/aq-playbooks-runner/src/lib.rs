@@ -796,7 +796,10 @@ impl<S: Storage> Engine<S> {
         Ok(self.store.inspect(&self.namespace, query)?)
     }
     /// Delete the history of runs finished before `before_ms`; returns the
-    /// number of history items deleted.
+    /// number of history items deleted. Host-callable and optional: history
+    /// is already a rolling log of `policy.history_keep` per set. Commits
+    /// no State and moves no clock; on PostgreSQL it needs this engine's
+    /// lease, which the engine holds.
     pub fn delete_history_before(&self, before_ms: i64) -> Result<u64> {
         Ok(self
             .store
