@@ -407,8 +407,8 @@ GC no longer refuses for the event tombstone or correlation fence count,
 and the age of a finished root it may collect is `audit_ms` alone.
 PostgreSQL does not count `disposal_tombstones` rows on a full commit; its
 cutoff deletes over those rows (`collect`) run only in a commit that moves
-the GC clock. Rows written before this change are drained by Task 9 and
-never refuse a commit.
+the GC clock. Rows written before this change are deleted by the drain, a
+bounded number per commit, and never refuse a commit.
 
 **What stays, because it is not a namespace limit:** the limits a playbook
 declares for itself in its artifact (step visits, children, depth,
@@ -420,8 +420,9 @@ history trim batch); and the removal fences, which are about the
 correctness of deletion, not capacity.
 
 **A namespace written before this change** still holds the runs that
-finished before the upgrade until the drain moves them out (Task 9). They
-never make new work wait (tested:
+finished before the upgrade until the drain moves them out (Task 9, see
+"Draining a namespace an older engine wrote"). They never make new work
+wait (tested:
 `a_legacy_namespace_holding_finished_runs_admits_new_work_and_drains`).
 
 ## Repeat protection is a rolling set (`replay_keep`)
@@ -486,21 +487,25 @@ bounds the record (about 120 entries; 132.7 KB at run 200).
   never stored, filled by the index sync and by cohort removal). Held, it is
   out of the order; unheld, in it.
 - A hold through an uncertain completion: an asynchronous operation
-  without a handle (dispatched, or with its admission handle lost) may be
-  completed by an event of its contract and scope, but only one accepted
-  after its dispatch. The engine records the dispatch's sequence on the
-  operation (`Intent::dispatch_sequence`), and such an operation holds
-  only events accepted after it. When a contract's uncertain operations
+  without a handle (dispatched, or with its admission handle lost, or
+  prepared again by recovery after such a dispatch) may be completed by an
+  event of its contract and scope, but only one accepted after its first
+  dispatch. The engine records the first dispatch's sequence on the
+  operation (`Intent::dispatch_sequence`; a re-dispatch keeps it, since an
+  idempotent re-delivery's completion may answer the first), and such an
+  operation holds only events accepted after it. An operation never
+  dispatched (stopped by revoked authority before dispatch) is not
+  uncertain and holds nothing. When a contract's uncertain operations
   change, the commit judges again only the events of that contract
   accepted after the earliest dispatch concerned
   (`indexes.contract_events`, ordered by sequence). So a dispatch judges
   no event at all, the binding of its handle judges the events that
   arrived during the host call, and while a handle is lost its later
   events are held (never evicted, not counted) and rejoin at their
-  acceptance positions when it is found. Operations dispatched before this
-  change carry no dispatch sequence and hold every event of their
-  contract, as before. A State written before the index existed fills it
-  once on open.
+  acceptance positions when it is found. Operations an older engine dispatched
+  get their dispatch sequence once on open, from their own first
+  `dispatch` receipt (see the drain, below). A State written before the
+  index existed fills it through the drain.
 - `retention::evict`, in every commit that changes the State except a
   licensed admin commit, after the window drop: while the order holds more
   than `replay_keep`, take its head, at most `REPLAY_EVICTIONS_PER_COMMIT`
@@ -562,12 +567,9 @@ evicted: the policy serializes its two new fields, the two maps their
 entries (about 90 bytes per remembered entry in `replay_order`, plus the
 `replay_held` entry of each live keyed run).
 
-**Entries written before this change are not in the order.** They never
-count and are never evicted; they still leave by their window. The index
-rebuild on open judges every event (so a namespace opened with
-uninitialized indexes puts its unheld events in the order), but keyed
-receipts written before stay out. Task 9's drain should add them, as it
-adds their expiry-order keys.
+**Entries written before this change** join the order through the drain
+(Task 9, below): each keyed receipt and event gets its expiry record,
+window key and place in the order, a bounded number per commit.
 
 ## History is a rolling log (`history_keep`)
 
@@ -644,6 +646,119 @@ keeps the counts right, so the trim after it is still exact.
   schema but not owning `run_history` is refused ("must be owner of table
   run_history"). Migrations 6 and 7 are both new on this branch, so a
   deployment applies them together, as one role, in one transaction.
+
+## Draining a namespace an older engine wrote (Task 9)
+
+A namespace written before this change (aq-server's live namespace among
+them) still holds runs that finished before the upgrade, with their
+operations and receipts, `admin` receipts, events and keyed receipts with
+no window or eviction-order entry, event tombstones, correlation fences,
+disposal records, and on PostgreSQL legacy `disposal_tombstones` rows. The
+drain moves all of it out as part of ordinary commits, a bounded amount per
+commit, while new work is served. There is no offline step and no storage
+format change. It needs no host call: the open commit of `Engine::new` and
+every later commit that changes the State take one step
+(`retention::drain_step`), timed or not; a licensed admin commit drains
+nothing.
+
+**Bounds** (policy fields, so a stored policy may set them; both must be
+positive, `set_retention_policy` refuses 0 with "drain bounds must be
+positive"):
+
+| Field | Default | Bounds, per commit |
+| --- | ---: | --- |
+| `drain_cohorts_per_commit` | 50 | roots examined by the cohort scan, and settled cohorts moved to history (those the commit's own settlement moved count against it) |
+| `drain_entries_per_commit` | 500 | legacy entries handled (tombstones, fences, disposal records, admin receipts, keyed receipts and events examined); also PostgreSQL legacy tombstone rows deleted |
+
+**What it does, in order.** Progress is stored in `retention.drain`
+(`DrainState`: `done`, `root_cursor`, `roots_done`, `phase`, `cursor`,
+`legacy_sequence`), absent in an older State and then defaulted, so the
+drain runs; a restart continues where it stopped.
+
+1. *Cohorts.* The roots after `root_cursor` are examined; each settled one
+   (members, none active, no unsettled operation) leaves as history, exactly
+   as a cohort that settles now: one history row per run, effect and
+   receipt, the run row's sequence its legacy terminal receipt's, so drained
+   runs sort as the oldest in the rolling history and pass through its trim
+   (with more than `history_keep` legacy runs the excess is trimmed as it is
+   written: inspection keeps the newest `history_keep`). A live legacy
+   cohort is skipped and leaves in the commit that settles it, like any
+   other. All cohorts a commit removes share one compaction of the live
+   receipts and one pass over the live waits.
+2. *Entries,* one phase after the other: event tombstones and correlation
+   fences are dropped; disposal records are cleared; `admin` receipts the
+   older engine wrote go to history, each dated by its own time (receipts
+   an admin action writes during the drain still leave with their own
+   commit); each keyed receipt gets its expiry record (acceptance plus
+   `admission_replay_ms`) and window key, and joins the eviction order, or
+   `replay_held` while its run is live; each event gets its expiry record
+   and window key, its `indexes.contract_events` entry, and joins the
+   eviction order unless live work holds it. Each addition is skipped when
+   already present, and each is the item's own key, as the eviction
+   licence requires.
+3. When both parts are complete, `drain.done` is set. From then on a commit
+   pays one check.
+
+**Re-arming.** A commit whose settlement finds more than 50 settled
+cohorts sets `report.more` and re-arms the cohort scan, which picks up the
+rest in later commits (none is stranded). An index rebuild (a State with
+uninitialized indexes) re-arms the whole drain: the rebuild drops the
+dirty sets, so cohorts settled before it are seen by no settlement.
+
+**Correct while draining.**
+- A duplicate of a legacy event or keyed admission is recognised as before
+  until its entry leaves by the normal rules (window, then the rolling
+  bound once it is in the eviction order). A redelivery of an event the old
+  GC disposed of is refused while its tombstone is in the record, and
+  accepted as new after the tombstone has left (as for any forgotten key).
+  A wait registered while a correlation fence is still there is refused as
+  before; after, it times out (ruling NR-1).
+- Legacy live runs (a parent waiting on a child, joins, waiting runs,
+  admitted runs) are untouched by the drain and settle normally.
+- Inspection lists each legacy run exactly once at every commit: in the
+  live State until its cohort is drained, in history from that commit.
+- `collect_garbage` (kept for Task 10) removes finished runs without
+  history. While a drain is in progress it leaves them to the drain.
+- **Operations dispatched by the old engine.** They carry no dispatch
+  sequence, so without help an operation whose handle is lost would hold
+  every event of its contract and, when its membership changed, judge all
+  of them again in one commit (a day of events on aq-server). `Engine::new`
+  fills the sequence once from the operation's own first `dispatch`
+  receipt (an operation without one was never dispatched and holds
+  nothing). And the events the older engine accepted are judged only by the
+  drain, a bounded number per commit: until the drain has reached an event,
+  a change of its contract's uncertain operations skips it. So no commit
+  judges more than the bound of them (tested on bound record containers:
+  the most any commit reads does not depend on how many such events there
+  are). The fill of `contract_events` that `Engine::new` used to do in one
+  pass over the events is part of the same bounded phase.
+
+**PostgreSQL legacy tombstone rows.** Each commit (protected and plain
+format 2, and both format 3 paths) deletes up to
+`drain_entries_per_commit` rows of kinds `event`, `run` and `intent`
+(`DELETE … WHERE ctid IN (SELECT ctid … LIMIT n)`, through the primary key),
+after the identity-reuse check and before the legacy rows the commit itself
+writes. Artifact rows stay (they guard artifact bytes). The rows are their
+own progress record. When a commit deletes fewer than its bound, the
+storage handle stops issuing the delete for that namespace; a new handle
+(a restart) issues it once more, and a commit that writes legacy rows
+(legacy GC) arms it again.
+
+**What an operator sees.** The drain starts by itself at the first open
+after the upgrade. Each commit moves up to 50 finished runs to history and
+handles up to 500 legacy entries; at aq-server's commit rate a namespace of
+a few thousand finished runs drains within its first hundred or so
+commits. Meanwhile the record shrinks with every commit, step time falls
+with it, the run list keeps showing every run, and `run_history` rows grow
+by the drained runs. It has finished when the State's
+`retention.drain.done` is `true` (and `retention.drain` has no cursors),
+the record holds no finished run, and no `disposal_tombstones` row of kind
+`event`, `run` or `intent` is left for the namespace:
+
+```sql
+SELECT count(*) FROM aq_playbooks.disposal_tombstones
+ WHERE namespace = $1 AND kind IN ('event','run','intent');
+```
 
 ## With no limits
 

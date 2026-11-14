@@ -87,6 +87,12 @@ pub struct PostgresStorage {
     /// New unprotected namespaces use writer format 3 (records).
     records: bool,
     stats: Mutex<TransitionStats>,
+    /// Namespaces whose legacy tombstone rows this handle has seen drained
+    /// (a commit deleted fewer than its bound): their commits skip the
+    /// delete. The rows themselves are the progress, so a new handle
+    /// probes once again. A commit that writes legacy rows (legacy GC)
+    /// takes its namespace out.
+    tombstones_drained: Mutex<std::collections::BTreeSet<String>>,
     #[cfg(test)]
     lose_catalog_commit_reply: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -195,6 +201,7 @@ impl PostgresStorage {
             profiling: Default::default(),
             records: false,
             stats: Mutex::new(TransitionStats::default()),
+            tombstones_drained: Mutex::new(Default::default()),
             #[cfg(test)]
             lose_catalog_commit_reply: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -727,7 +734,15 @@ impl PostgresStorage {
             }
         }
         tx.phase("retention");
-        retention::verify_and_record(&mut tx, namespace, &previous, state, &removals)?;
+        let drain_limit = self.tombstone_drain_limit(namespace, state);
+        let rows = retention::verify_and_record(
+            &mut tx,
+            namespace,
+            &previous,
+            state,
+            &removals,
+            drain_limit,
+        )?;
         let items = aq_playbooks_runner::history_items(&state.settled);
         aq_playbooks_runner::history::check_not_live(state, &items)?;
         history::check_unrecorded(
@@ -857,6 +872,38 @@ impl PostgresStorage {
         if let Some(lease) = conn.leases.get_mut(namespace) {
             lease.catalog_uncertain = false;
         }
+        self.tombstones_committed(namespace, drain_limit, rows);
         Ok(next as u64)
+    }
+    /// The bound of this commit's delete of legacy tombstone rows
+    /// (`policy.drain_entries_per_commit`), or `None` when this handle has
+    /// seen them drained.
+    pub(crate) fn tombstone_drain_limit(&self, namespace: &str, state: &State) -> Option<usize> {
+        let drained = self
+            .tombstones_drained
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(namespace);
+        (!drained).then_some(state.retention.policy.drain_entries_per_commit)
+    }
+    /// After a commit: remember that the rows are drained when its delete
+    /// found fewer than its bound, forget it when it wrote new ones.
+    pub(crate) fn tombstones_committed(
+        &self,
+        namespace: &str,
+        limit: Option<usize>,
+        rows: retention::TombstoneRows,
+    ) {
+        let mut drained = self
+            .tombstones_drained
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if rows.wrote {
+            drained.remove(namespace);
+        } else if let (Some(limit), Some(deleted)) = (limit, rows.deleted)
+            && deleted < limit as u64
+        {
+            drained.insert(namespace.to_string());
+        }
     }
 }

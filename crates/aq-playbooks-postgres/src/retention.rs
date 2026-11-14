@@ -33,17 +33,41 @@ pub(crate) fn collect(
     }
     Ok(())
 }
+/// Delete up to `limit` of the namespace's legacy tombstone rows of runs,
+/// operations and events (written by engines before spec 0003, and by
+/// legacy GC); artifact rows stay, they guard artifact bytes. Returns how
+/// many it deleted: fewer than `limit` means none is left. One index-backed
+/// statement (the rows' primary key leads with the namespace and kind).
+pub(crate) fn drain_tombstones(
+    tx: &mut ObservedTransaction<'_>,
+    namespace: &str,
+    limit: usize,
+) -> Result<u64, StorageError> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    tx.execute("DELETE FROM aq_playbooks.disposal_tombstones WHERE ctid IN (SELECT ctid FROM aq_playbooks.disposal_tombstones WHERE namespace=$1 AND kind IN ('event','run','intent') LIMIT $2)",&[&namespace,&limit]).map_err(backend)
+}
+/// What a commit did to the legacy tombstone rows: `deleted` by the drain
+/// (when it ran), and whether it `wrote` new legacy ones (legacy GC).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TombstoneRows {
+    pub deleted: Option<u64>,
+    pub wrote: bool,
+}
 /// Durable side of the shared removal check. `removals` is what
 /// `retention::verify_removals` allowed for this commit: only its legacy
 /// removals (and artifact disposals) write tombstone rows. A removal allowed
-/// by its history or by an expired window entry writes none.
+/// by its history or by an expired window entry writes none. With
+/// `drain_limit`, up to that many legacy rows are deleted first
+/// ([`drain_tombstones`]), after the identity check and before this
+/// commit's own legacy rows are written.
 pub(crate) fn verify_and_record(
     tx: &mut ObservedTransaction<'_>,
     namespace: &str,
     previous: &State,
     next: &State,
     removals: &Removals,
-) -> Result<(), StorageError> {
+    drain_limit: Option<usize>,
+) -> Result<TombstoneRows, StorageError> {
     if next.sequence < previous.sequence {
         return Err(backend("namespace invocation sequence cannot decrease"));
     }
@@ -137,6 +161,15 @@ pub(crate) fn verify_and_record(
             }
         }
     }
+    let rows = TombstoneRows {
+        deleted: match drain_limit {
+            Some(limit) => Some(drain_tombstones(tx, namespace, limit)?),
+            None => None,
+        },
+        wrote: !(removals.legacy_events.is_empty()
+            && removals.legacy_runs.is_empty()
+            && removals.legacy_intents.is_empty()),
+    };
     for id in &removals.legacy_events {
         let tombstone = &next.retention.event_tombstones[id];
         record(
@@ -183,7 +216,7 @@ pub(crate) fn verify_and_record(
     }
     // No tombstone count: `max_tombstones` is accepted and ignored, and
     // legacy rows beyond it (drained later) never refuse a commit.
-    Ok(())
+    Ok(rows)
 }
 /// Delete the tombstone rows of event tombstones the State no longer holds.
 pub(crate) fn forget_event_tombstones(

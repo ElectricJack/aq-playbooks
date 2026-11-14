@@ -722,7 +722,9 @@ impl<S: Storage> Engine<S> {
         Self::open(store, namespace, owner, EngineConfig::default())
     }
     /// Acquire the namespace and run the upgrade's bookkeeping commit (index
-    /// rebuild, `root_intents` fill).
+    /// rebuild, `root_intents` and dispatch sequence fills). Like every
+    /// commit, it also takes the drain's first step on a namespace an older
+    /// engine wrote (`retention::drain_step`).
     fn open(
         store: S,
         namespace: impl Into<String>,
@@ -750,8 +752,8 @@ impl<S: Storage> Engine<S> {
             // A State from before `root_intents` (pre-D10): cohort removal
             // needs every operation there, so fill it once.
             indexes::backfill_root_intents(s);
-            // Before `contract_events` (Task 8b): fill it once.
-            indexes::backfill_contract_events(s)?;
+            // `contract_events` of a State written before it (Task 8b) is
+            // filled by the drain, a bounded number of events per commit.
             // Before `Intent::dispatch_sequence` (Task 8b): fill it once.
             indexes::backfill_dispatch_sequences(s);
             Ok(())
@@ -837,16 +839,21 @@ impl<S: Storage> Engine<S> {
         now_ms: Finish,
         f: impl FnOnce(&mut State) -> Result<(T, bool)>,
     ) -> Result<(T, retention::CommitReport)> {
-        fn finish(state: &mut State, mode: Finish) -> Result<retention::CommitReport> {
+        // `started`: the namespace sequence the commit began at.
+        fn finish(
+            state: &mut State,
+            mode: Finish,
+            started: u64,
+        ) -> Result<retention::CommitReport> {
             let Finish::Host(now_ms) = mode else {
                 indexes::sync(state)?;
-                let report = retention::finish_licensed_commit(state)?;
+                let report = retention::finish_licensed_commit(state, started)?;
                 indexes::sync(state)?;
                 return Ok(report);
             };
             let candidates = retention::candidate_roots(state);
             indexes::sync(state)?;
-            let report = retention::finish_commit(state, now_ms, candidates)?;
+            let report = retention::finish_commit(state, now_ms, candidates, started)?;
             indexes::sync(state)?;
             Ok(report)
         }
@@ -860,13 +867,14 @@ impl<S: Storage> Engine<S> {
                 .take()
                 .ok_or_else(|| Error::Conflict("transition plan ran twice".into()))?;
             state.protection_available = protection;
+            let sequence = state.sequence;
             let started = std::time::Instant::now();
             let evaluated = f(state);
             metrics.record_time(metrics::Timing::Transition, started.elapsed());
             let (value, changed) = evaluated?;
             result = Some(value);
             if changed {
-                report = finish(state, now_ms)?;
+                report = finish(state, now_ms, sequence)?;
             }
             Ok(changed)
         };
@@ -897,6 +905,7 @@ impl<S: Storage> Engine<S> {
             indexes::rebuild(&mut v.state)?;
         }
         v.state.protection_available = protection;
+        let sequence = v.state.sequence;
         let started = std::time::Instant::now();
         let evaluated = f(&mut v.state);
         self.metrics
@@ -905,7 +914,7 @@ impl<S: Storage> Engine<S> {
         if !changed {
             return Ok((result, retention::CommitReport::default()));
         }
-        let report = finish(&mut v.state, now_ms)?;
+        let report = finish(&mut v.state, now_ms, sequence)?;
         let started = std::time::Instant::now();
         let committed =
             self.store
@@ -3752,6 +3761,9 @@ impl<S: Storage> Engine<S> {
         }
         if policy.replay_keep == 0 {
             return Err(Error::Refused("replay_keep must be positive".into()));
+        }
+        if policy.drain_cohorts_per_commit == 0 || policy.drain_entries_per_commit == 0 {
+            return Err(Error::Refused("drain bounds must be positive".into()));
         }
         self.transaction_at(None, |s| {
             s.retention.policy = policy;

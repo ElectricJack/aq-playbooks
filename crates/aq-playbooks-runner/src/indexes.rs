@@ -129,7 +129,8 @@ pub struct RuntimeIndexes {
     #[serde(default)]
     pub root_intents_complete: bool,
     /// `contract_events` holds every event. False in a State written before
-    /// the index existed; `Engine::new` then fills it once.
+    /// the index existed; the drain then fills it, a bounded number of
+    /// events per commit (`retention::drain_step`).
     #[serde(default)]
     pub contract_events_complete: bool,
     /// Every dispatched live operation carries its dispatch sequence. False
@@ -508,33 +509,6 @@ pub(crate) fn unindex_contract_event(s: &mut State, e: &crate::AcceptedEvent) ->
             s.indexes.contract_events.remove(&contract);
         }
     }
-    Ok(())
-}
-/// A State written before `contract_events` existed: fill it once from the
-/// events (one pass over them).
-pub(crate) fn backfill_contract_events(s: &mut State) -> Result<()> {
-    if !s.indexes.initialized || s.indexes.contract_events_complete {
-        return Ok(());
-    }
-    let events: Vec<(String, u64, String)> = s
-        .events
-        .iter()
-        .map(|(id, e)| {
-            Ok((
-                trigger_key(&e.envelope.contract, &e.envelope.scope)?,
-                e.sequence,
-                id.clone(),
-            ))
-        })
-        .collect::<Result<_>>()?;
-    for (contract, sequence, id) in events {
-        s.indexes
-            .contract_events
-            .entry(contract)
-            .or_default()
-            .insert(sequence, id);
-    }
-    s.indexes.contract_events_complete = true;
     Ok(())
 }
 pub(crate) fn index_activation(s: &mut State, binding: &str) -> Result<()> {
@@ -1010,6 +984,9 @@ pub(crate) fn rebuild(s: &mut State) -> Result<()> {
     s.indexes.initialized = true;
     s.indexes.root_intents_complete = true;
     s.indexes.contract_events_complete = true;
+    // A rebuild drops the dirty sets, so cohorts settled before it are
+    // seen by no settle: the drain scans for them again.
+    s.retention.drain = crate::retention::DrainState::default();
     Ok(())
 }
 /// Once per namespace written before `root_intents` existed (pre-D10, whose

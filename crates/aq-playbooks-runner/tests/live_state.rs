@@ -4818,11 +4818,12 @@ fn legacy_tombstones_beyond_max_tombstones_stop_neither_gc_nor_policy_changes() 
     assert_eq!(e.snapshot().unwrap().retention.event_tombstones.len(), 3);
     e.set_retention_policy(policy).unwrap();
 }
-/// A namespace written before this change holds finished runs (until the
-/// drain of Task 9; here, GC by `audit_ms`, with `terminal_run_ms`
-/// ignored). They never make new work wait, whatever a host's deprecated
+/// A namespace written before this change holds finished runs until the
+/// drain moves them to history (Task 9; before it, GC moved them out by
+/// `audit_ms`). They never make new work wait, whatever a host's deprecated
 /// `max_runs` says (Task 8b, no limits): new work is admitted, a live run
-/// finishes and leaves, and GC moves the finished runs out.
+/// finishes and leaves, and the drain moves the finished runs out (GC,
+/// which would remove them without history, leaves them to it).
 #[test]
 fn a_legacy_namespace_holding_finished_runs_admits_new_work_and_drains() {
     let legacy = 51;
@@ -4853,13 +4854,22 @@ fn a_legacy_namespace_holding_finished_runs_admits_new_work_and_drains() {
     }
     s.indexes.initialized = false;
     overwrite(&e.store, "i-1", &s);
+    // The commit that rebuilds the indexes re-arms the drain and takes its
+    // first step: 50 of the 51 legacy runs leave.
     let admitted = e.admit("a", "main", Value::Null, authority(), 2).unwrap();
+    assert_eq!(e.collect_garbage(1_000, 1_000).unwrap().runs, 0);
     assert!(e.advance(&live, 3).unwrap());
     assert!(e.advance(&admitted, 3).unwrap());
-    assert_eq!(e.snapshot().unwrap().runs.len(), legacy);
     e.admit("a", "main", Value::Null, authority(), 4).unwrap();
-    assert_eq!(e.collect_garbage(1_000, 1_000).unwrap().runs, legacy);
     assert_eq!(e.snapshot().unwrap().runs.len(), 1);
+    let history = inspect_all(&e, InspectionKind::Runs, None);
+    assert_eq!(
+        history
+            .iter()
+            .filter(|r| r["id"].as_str().unwrap().starts_with("old-"))
+            .count(),
+        legacy
+    );
 }
 fn ok_host(n: usize) -> FakeHost {
     FakeHost {
@@ -5980,8 +5990,17 @@ fn eviction_work_on_record_storage_depends_on_entries_evicted_not_on_entries_kep
 /// unheld one; the stored commit passes the licence.
 #[test]
 fn the_engine_takes_held_entries_at_the_head_out_of_the_order() {
+    // States this engine wrote (drained): the drain would otherwise judge
+    // the entries first (Task 9).
+    let drained = retention::DrainState {
+        done: true,
+        roots_done: true,
+        phase: retention::DRAIN_DONE,
+        ..retention::DrainState::default()
+    };
     let mut keyed_head = eviction_state();
     keyed_head.indexes.initialized = true;
+    keyed_head.retention.drain = drained.clone();
     let mut event_head = State::default();
     event_head.retention.clock_ms = Some(500);
     event_head.retention.policy.admission_replay_ms = EVICTION_WINDOW as u64;
@@ -5994,6 +6013,7 @@ fn the_engine_takes_held_entries_at_the_head_out_of_the_order() {
     }
     event_head.sequence = 20;
     event_head.indexes.initialized = true;
+    event_head.retention.drain = drained;
     for (label, state, kept) in [
         (
             "a keyed receipt whose run is live",
@@ -6685,4 +6705,804 @@ fn a_legacy_dispatched_operation_gets_its_dispatch_sequence_on_open() {
         work
     };
     assert_eq!(measure(10), measure(60));
+}
+
+// --- Task 9: the drain of namespaces written by an older engine -------------
+
+/// Inject into `s` `cohorts` settled one-run cohorts as an older engine left
+/// them in the record (`run-0-legacy-NNNN`, which sort before the engine's
+/// `run-<16 hex>` ids), each with an admitted and a terminal receipt and a
+/// budget, and `tombstones` event tombstones.
+fn inject_legacy(s: &mut State, cohorts: usize, tombstones: usize) {
+    for i in 0..cohorts {
+        let id = format!("run-0-legacy-{i:04}");
+        let mut run = completed_run(&id);
+        for kind in ["admitted", "terminal"] {
+            s.sequence += 1;
+            s.receipts.push(Receipt {
+                sequence: s.sequence,
+                run: id.clone(),
+                step: "main".into(),
+                at_ms: 1,
+                kind: kind.into(),
+                detail: json!({}),
+            });
+        }
+        run.terminal_sequence = Some(s.sequence);
+        s.runs.insert(id.clone(), run);
+        s.budgets.insert(id, Budget::default());
+    }
+    for i in 0..tombstones {
+        s.retention
+            .event_tombstones
+            .insert(format!("tomb-{i:04}"), tombstone(&format!("d-{i}")));
+    }
+}
+/// Store `s` over the namespace as an older engine stored it: indexes not
+/// initialized, and no drain state.
+fn store_legacy<S: Storage>(store: &S, mut s: State) {
+    s.indexes.initialized = false;
+    let mut value = serde_json::to_value(&s).unwrap();
+    value["retention"].as_object_mut().unwrap().remove("drain");
+    let s: State = serde_json::from_value(value).unwrap();
+    store.acquire("test", "writer").unwrap();
+    let revision = store.load("test").unwrap().revision;
+    store
+        .compare_and_swap("test", "writer", revision, &s)
+        .unwrap();
+    store.release("test", "writer").unwrap();
+}
+/// A legacy namespace (the brief's helper): `"a"` installed and activated
+/// through a throwaway engine, then `cohorts` settled legacy cohorts and
+/// `tombstones` event tombstones; `edit` may change the State first.
+fn legacy_with(cohorts: usize, tombstones: usize, edit: impl FnOnce(&mut State)) -> MemoryStorage {
+    let store = MemoryStorage::retaining_settled();
+    let e = Engine::new(store.clone(), "test", "setup").unwrap();
+    install(&e, done_artifact(), "a");
+    e.release().unwrap();
+    let mut s = store.load("test").unwrap().state;
+    inject_legacy(&mut s, cohorts, tombstones);
+    edit(&mut s);
+    store_legacy(&store, s);
+    store
+}
+fn legacy(cohorts: usize, tombstones: usize) -> MemoryStorage {
+    legacy_with(cohorts, tombstones, |_| {})
+}
+/// A new namespace `"test"` in `store` holding `state` (an older engine's
+/// State, which has no retention clock), written by direct CAS.
+fn fresh_legacy<S: Storage>(store: S, state: &State) -> S {
+    store.acquire("test", "writer").unwrap();
+    store.compare_and_swap("test", "writer", 0, state).unwrap();
+    store.release("test", "writer").unwrap();
+    store
+}
+fn legacy_ids(e: &Engine<impl Storage>) -> Vec<String> {
+    inspect_all(e, InspectionKind::Runs, None)
+        .iter()
+        .map(|r| r["id"].as_str().unwrap().to_string())
+        .filter(|id| id.starts_with("run-0-legacy-"))
+        .collect()
+}
+/// `state` as the engine aq-server vendors (0173673) stores it: none of the
+/// fields this branch added (window, eviction order, clock, drain, new
+/// policy fields, new indexes, dispatch sequences).
+fn old_engine_shape(state: &State) -> State {
+    let mut value = serde_json::to_value(vendored_shape(state)).unwrap();
+    let retention = value["retention"].as_object_mut().unwrap();
+    for f in [
+        "clock_ms",
+        "expiry",
+        "admission_expires_at_ms",
+        "stale_floor_ms",
+        "replay_order",
+        "replay_held",
+        "drain",
+    ] {
+        retention.remove(f);
+    }
+    let policy = retention["policy"].as_object_mut().unwrap();
+    for f in [
+        "admission_replay_ms",
+        "replay_keep",
+        "history_keep",
+        "drain_cohorts_per_commit",
+        "drain_entries_per_commit",
+    ] {
+        policy.remove(f);
+    }
+    for intent in value["intents"].as_object_mut().unwrap().values_mut() {
+        intent.as_object_mut().unwrap().remove("dispatch_sequence");
+    }
+    serde_json::from_value(value).unwrap()
+}
+
+/// The brief's test: the open commit and each later commit move at most 50
+/// settled legacy cohorts to history and drop at most 500 tombstones; the
+/// drain then records that it is done; every legacy run is in history.
+#[test]
+fn legacy_namespace_drains_50_cohorts_and_500_entries_per_commit() {
+    let e = Engine::new(legacy(120, 1_200), "test", "i-1").unwrap(); // commit 1
+    let count = |e: &Engine<MemoryStorage>| {
+        let s = e.snapshot().unwrap();
+        (s.runs.len(), s.retention.event_tombstones.len())
+    };
+    assert_eq!(count(&e), (70, 700));
+    assert!(!e.snapshot().unwrap().retention.drain.done);
+    e.admit("a", "main", Value::Null, authority(), 1).unwrap();
+    assert_eq!(count(&e), (21, 200)); // 20 legacy cohorts left plus the new, still live run
+    e.admit("a", "main", Value::Null, authority(), 2).unwrap();
+    assert_eq!(count(&e), (2, 0));
+    assert!(e.snapshot().unwrap().retention.drain.done);
+    assert_eq!(legacy_ids(&e).len(), 120);
+}
+/// The brief's test, with live legacy runs of three shapes: five admitted
+/// runs, and a parent waiting on its child, which waits for an event. The
+/// drain moves the settled cohorts and leaves the live ones; each live one
+/// settles normally and leaves in the commit that settles it.
+#[test]
+fn legacy_live_cohorts_survive_the_drain_and_leave_when_they_finish() {
+    let store = MemoryStorage::retaining_settled();
+    let e = Engine::new(store.clone(), "test", "setup").unwrap();
+    install(&e, done_artifact(), "a");
+    let child = wait_artifact();
+    install(&e, child.clone(), "waiter");
+    install(&e, parent_artifact(&child, CallMode::Wait), "parent");
+    let parent = e
+        .admit("parent", "main", Value::Null, authority(), 0)
+        .unwrap();
+    e.drive(&mut FakeHost::default(), 0, 20).unwrap();
+    let live: Vec<String> = (0..5)
+        .map(|_| e.admit("a", "main", Value::Null, authority(), 0).unwrap())
+        .collect();
+    e.release().unwrap();
+    let mut s = store.load("test").unwrap().state;
+    let kid = s.runs[&parent].children[0].clone();
+    assert_eq!(s.runs[&parent].status, RunStatus::Waiting);
+    assert_eq!(s.runs[&kid].status, RunStatus::Waiting);
+    inject_legacy(&mut s, 60, 0);
+    store_legacy(&store, s);
+    let e = Engine::new(store, "test", "i-1").unwrap();
+    e.install(done_artifact()).unwrap(); // one more commit (a no-op install)
+    let s = e.snapshot().unwrap();
+    assert_eq!(legacy_ids(&e).len(), 60);
+    assert!(s.runs.keys().all(|id| !id.starts_with("run-0-legacy-")));
+    assert_eq!(s.runs.len(), 7);
+    for id in &live {
+        assert!(e.advance(id, 1).unwrap());
+        assert!(!e.snapshot().unwrap().runs.contains_key(id), "{id} left");
+    }
+    e.admit_event("host", event("for-the-child", 2), 1).unwrap();
+    for _ in 0..4 {
+        e.drive(&mut FakeHost::default(), 2, 10).unwrap();
+    }
+    assert!(e.snapshot().unwrap().runs.is_empty());
+    let runs = inspect_all(&e, InspectionKind::Runs, None);
+    assert_eq!(runs.len(), 67);
+    let outcome = |id: &str| {
+        runs.iter()
+            .find(|r| r["id"] == id)
+            .map(|r| r["outcome"].clone())
+    };
+    assert_eq!(outcome(&parent), Some(json!("ok")));
+    assert_eq!(outcome(&kid), Some(json!("ok")));
+}
+/// Mid-drain, inspection shows every legacy run exactly once, whether it is
+/// still in the record or already in history.
+#[test]
+fn inspection_lists_each_legacy_run_once_at_every_commit_of_the_drain() {
+    let e = Engine::new(
+        legacy_with(120, 0, |s| s.retention.policy.drain_cohorts_per_commit = 7),
+        "test",
+        "i-1",
+    )
+    .unwrap();
+    let left = |e: &Engine<MemoryStorage>| {
+        e.snapshot()
+            .unwrap()
+            .runs
+            .keys()
+            .filter(|id| id.starts_with("run-0-legacy-"))
+            .count()
+    };
+    let listed_once = |e: &Engine<MemoryStorage>, step: usize| {
+        let mut ids = legacy_ids(e);
+        assert_eq!(ids.len(), 120, "step {step}");
+        ids.dedup();
+        assert_eq!(ids.len(), 120, "step {step}: listed twice");
+    };
+    assert_eq!(left(&e), 113);
+    let mut step = 0;
+    while !e.snapshot().unwrap().retention.drain.done {
+        listed_once(&e, step);
+        let before = left(&e);
+        // Two commits: each moves at most 7 cohorts, its own included.
+        let id = e.admit("a", "main", Value::Null, authority(), 1).unwrap();
+        listed_once(&e, step);
+        assert!(e.advance(&id, 1).unwrap());
+        assert!(before - left(&e) <= 7 + 6, "step {step}");
+        step += 1;
+        assert!(step < 30);
+    }
+    listed_once(&e, step);
+    assert_eq!(left(&e), 0);
+}
+/// Drained cohorts go through the rolling history trim and sort as the
+/// oldest: with `history_keep` 30, history keeps the new runs finished
+/// during the drain and the 25 newest legacy runs.
+#[test]
+fn drained_legacy_runs_are_the_oldest_in_the_rolling_history() {
+    let e = Engine::new(
+        legacy_with(120, 0, |s| s.retention.policy.history_keep = 30),
+        "test",
+        "i-1",
+    )
+    .unwrap();
+    let new: Vec<String> = (0..5)
+        .map(|t| {
+            let id = e.admit("a", "main", Value::Null, authority(), t).unwrap();
+            assert!(e.advance(&id, t).unwrap());
+            id
+        })
+        .collect();
+    assert!(e.snapshot().unwrap().retention.drain.done);
+    let listed: BTreeSet<String> = inspect_all(&e, InspectionKind::Runs, None)
+        .iter()
+        .map(|r| r["id"].as_str().unwrap().to_string())
+        .collect();
+    let expected: BTreeSet<String> = (95..120)
+        .map(|i| format!("run-0-legacy-{i:04}"))
+        .chain(new)
+        .collect();
+    assert_eq!(listed, expected);
+}
+/// Receipts owned by no run that an older engine left (`admin`) leave in
+/// bounded steps, counted against the entries bound, each dated by its own
+/// time; an admin receipt written during the drain still leaves with its
+/// own commit.
+#[test]
+fn legacy_admin_receipts_leave_in_bounded_steps_dated_by_their_own_time() {
+    let store = legacy_with(0, 0, |s| {
+        for i in 0..1_200 {
+            s.sequence += 1;
+            s.receipts.push(Receipt {
+                sequence: s.sequence,
+                run: "admin".into(),
+                step: "controls".into(),
+                at_ms: i,
+                kind: "activation_controls".into(),
+                detail: json!({}),
+            });
+        }
+    });
+    let e = Engine::new(store, "test", "i-1").unwrap();
+    assert_eq!(e.snapshot().unwrap().receipts.len(), 700);
+    e.set_activation_controls("a", ActivationControls::default(), 5_000)
+        .unwrap();
+    assert_eq!(
+        e.snapshot().unwrap().receipts.len(),
+        200,
+        "its own left too"
+    );
+    e.install(done_artifact()).unwrap();
+    let s = e.snapshot().unwrap();
+    assert!(s.receipts.is_empty() && s.retention.drain.done);
+    let admin = inspect_all(&e, InspectionKind::Receipts, Some("admin"));
+    assert_eq!(admin.len(), 1_201);
+    // Each row carries its own time: deleting history before 600 removes
+    // exactly the 600 receipts written before it.
+    assert_eq!(e.delete_history_before(600).unwrap(), 600);
+}
+/// Legacy keyed receipts and events (no expiry record, no window or
+/// eviction-order key) are indexed one entry at a time here (entries bound
+/// 1): each gets its expiry record and window key, and joins the eviction
+/// order unless live work holds it (a live run's receipt goes to
+/// `replay_held`; an event a live wait needs stays out). Throughout, a
+/// duplicate of each is still recognised. Afterwards the rolling bound
+/// applies to them like to any entry.
+#[test]
+fn legacy_keyed_receipts_and_events_join_the_window_and_the_eviction_order() {
+    let e = Engine::new(MemoryStorage::retaining_settled(), "test", "setup").unwrap();
+    install(&e, done_artifact(), "a");
+    install(&e, wait_artifact(), "waiter");
+    let request = |key: &str| KeyedAdmissionRequest {
+        key: key.into(),
+        binding: "a".into(),
+        expected_activation_revision: e.snapshot().unwrap().bindings["a"].revision,
+        entry: "main".into(),
+        input: Value::Null,
+        authority: authority(),
+    };
+    let done = e.admit_once(request("k-done"), 10).unwrap();
+    assert!(e.advance(&done.receipt.run_id, 10).unwrap());
+    let live = e.admit_once(request("k-live"), 11).unwrap();
+    let waiter = e
+        .admit("waiter", "main", Value::Null, authority(), 12)
+        .unwrap();
+    e.advance(&waiter, 12).unwrap();
+    let free = e
+        .admit_event("host", correlated_event("free", "nobody"), 13)
+        .unwrap()
+        .key;
+    let mut legacy = old_engine_shape(&e.snapshot().unwrap());
+    legacy.retention.policy.drain_entries_per_commit = 1;
+    e.release().unwrap();
+    let store = fresh_legacy(MemoryStorage::retaining_settled(), &legacy);
+    let e = Engine::new(store, "test", "i-1").unwrap();
+    let mut commits = 0;
+    while !e.snapshot().unwrap().retention.drain.done {
+        assert!(e.admit_once(request("k-done"), 20).unwrap().duplicate);
+        assert!(e.admit_once(request("k-live"), 20).unwrap().duplicate);
+        assert!(
+            e.admit_event("host", correlated_event("free", "nobody"), 20)
+                .unwrap()
+                .duplicate
+        );
+        commits += 1;
+        assert!(commits < 20);
+    }
+    let s = e.snapshot().unwrap();
+    for (key, receipt) in [("k-done", &done.receipt), ("k-live", &live.receipt)] {
+        let at = s.retention.admission_expires_at_ms.get(key).copied();
+        assert_eq!(at, Some(receipt.accepted_at_ms + 604_800_000), "{key}");
+        assert!(window_entries(&s).contains(&(at.unwrap(), format!("k:{key}"))));
+    }
+    assert!(
+        s.retention
+            .replay_order
+            .contains_key(&retention::admission_order_key(&done.receipt))
+    );
+    assert_eq!(
+        s.retention.replay_held.get(&live.receipt.run_id),
+        Some(&"k-live".to_string())
+    );
+    assert!(
+        s.retention
+            .replay_order
+            .contains_key(&retention::event_order_key(&s.events[&free]))
+    );
+    let at = retention::event_expiry(&s, &free).unwrap();
+    assert!(window_entries(&s).contains(&(at, format!("e:{free}"))));
+    assert_eq!(order_members(&s).len(), 2, "{:?}", order_members(&s));
+    // The live run finishes: its receipt joins the order. With
+    // `replay_keep` 1 the oldest legacy entries are then evicted.
+    assert!(e.advance(&live.receipt.run_id, 30).unwrap());
+    assert_eq!(order_members(&e.snapshot().unwrap()).len(), 3);
+    e.set_retention_policy(RetentionPolicy {
+        replay_keep: 1,
+        ..e.snapshot().unwrap().retention.policy
+    })
+    .unwrap();
+    // The newest by acceptance is the event; both keyed receipts go.
+    let s = e.snapshot().unwrap();
+    assert_eq!(order_members(&s), vec![format!("e:{free}")]);
+    assert!(s.keyed_admissions.is_empty());
+    assert!(!e.admit_once(request("k-done"), 31).unwrap().duplicate);
+}
+/// The drain's bounds are policy fields (defaults 50 and 500), read from
+/// the stored policy, and must be positive.
+#[test]
+fn drain_bounds_come_from_the_stored_policy_and_must_be_positive() {
+    let policy = RetentionPolicy::default();
+    assert_eq!(
+        (
+            policy.drain_cohorts_per_commit,
+            policy.drain_entries_per_commit
+        ),
+        (50, 500)
+    );
+    let decoded: RetentionPolicy = serde_json::from_value(
+        json!({"event_replay_ms":1,"terminal_run_ms":1,"audit_ms":1,"max_tombstones":1}),
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            decoded.drain_cohorts_per_commit,
+            decoded.drain_entries_per_commit
+        ),
+        (50, 500)
+    );
+    let e = Engine::new(
+        legacy_with(120, 30, |s| {
+            s.retention.policy.drain_cohorts_per_commit = 10;
+            s.retention.policy.drain_entries_per_commit = 3;
+        }),
+        "test",
+        "i-1",
+    )
+    .unwrap();
+    let s = e.snapshot().unwrap();
+    assert_eq!(
+        (s.runs.len(), s.retention.event_tombstones.len()),
+        (110, 27)
+    );
+    for bad in [
+        RetentionPolicy {
+            drain_cohorts_per_commit: 0,
+            ..RetentionPolicy::default()
+        },
+        RetentionPolicy {
+            drain_entries_per_commit: 0,
+            ..RetentionPolicy::default()
+        },
+    ] {
+        assert!(matches!(
+            e.set_retention_policy(bad),
+            Err(Error::Refused(m)) if m == "drain bounds must be positive"
+        ));
+    }
+}
+/// Progress is stored: a restart continues where the drain stopped, and no
+/// legacy run is written to history twice.
+#[test]
+fn a_drain_continues_after_a_restart() {
+    let store = legacy(120, 0);
+    let e = Engine::new(store.clone(), "test", "i-1").unwrap();
+    assert_eq!(e.snapshot().unwrap().runs.len(), 70);
+    e.release().unwrap();
+    let e = Engine::new(store.clone(), "test", "i-2").unwrap();
+    assert_eq!(e.snapshot().unwrap().runs.len(), 20);
+    e.release().unwrap();
+    let e = Engine::new(store, "test", "i-3").unwrap();
+    let s = e.snapshot().unwrap();
+    assert!(s.runs.is_empty() && s.retention.drain.done);
+    assert_eq!(legacy_ids(&e).len(), 120);
+}
+/// `collect_garbage` (kept for Task 10) removes finished runs without
+/// writing history. While a drain is in progress it leaves them to the
+/// drain, so every legacy run still reaches history.
+#[test]
+fn gc_leaves_legacy_runs_to_the_drain() {
+    let e = Engine::new(
+        legacy_with(120, 0, |s| s.retention.policy.audit_ms = 1),
+        "test",
+        "i-1",
+    )
+    .unwrap();
+    assert_eq!(e.collect_garbage(1_000_000, 1_000).unwrap().runs, 0);
+    for _ in 0..5 {
+        if e.snapshot().unwrap().retention.drain.done {
+            break;
+        }
+        e.install(done_artifact()).unwrap();
+    }
+    assert!(e.snapshot().unwrap().retention.drain.done);
+    assert_eq!(legacy_ids(&e).len(), 120);
+}
+/// A namespace this engine created has nothing to drain: its first commit
+/// (the open commit) records the drain as done.
+#[test]
+fn a_new_namespace_is_drained_by_its_first_commit() {
+    let e = engine();
+    assert!(e.snapshot().unwrap().retention.drain.done);
+}
+/// The carried hazard, bounded: an older engine's namespace with many
+/// events of one completion contract, before and after the dispatch of an
+/// asynchronous operation of that contract whose handle is lost (no
+/// dispatch sequence, the old engine's shape). The drain judges the legacy
+/// events a bounded number per commit (entries bound 8 here); a change of
+/// the contract's uncertain operations before the drain has reached an
+/// event leaves it to the drain. So when the host finds the handle in the
+/// first commits after the upgrade (`recover`, mid-drain), no commit — the
+/// open commit, the binding one, nor a drain commit — judges all of them:
+/// on bound record containers the most any one commit reads does not
+/// depend on how many there are. With the handle found after the drain,
+/// the events it held rejoin through `contract_events`, which the drain
+/// filled. Either way every event ends unheld in the eviction order and the
+/// run finishes `ok`.
+fn legacy_hazard(before: usize, after: usize, bind_mid_drain: bool) -> usize {
+    use std::sync::atomic::Ordering;
+    let e = Engine::new(RecordStorage::new(), "test", "i-1").unwrap();
+    let (a, completion) = async_artifact();
+    install_on(&e, a, "async");
+    install_on(&e, done_artifact(), "a");
+    let accept = |label: &str, i: usize, t: i64| {
+        let envelope = EventEnvelope {
+            correlation: BTreeMap::from([("operation".into(), format!("{label}-{i}"))]),
+            ..async_event(&completion, &format!("{label}{i}"))
+        };
+        e.admit_event("host", envelope, t).unwrap();
+    };
+    for i in 0..before {
+        accept("b", i, i as i64);
+    }
+    let run = e
+        .admit("async", "main", Value::Null, authority(), 1_000)
+        .unwrap();
+    let mut host = FakeHost::default();
+    e.drive(&mut host, 1_000, 10).unwrap();
+    for i in 0..after {
+        accept("a", i, 1_001);
+    }
+    let done = e
+        .admit_event("host", async_event(&completion, "done"), 1_001)
+        .unwrap()
+        .key;
+    let mut legacy = old_engine_shape(&e.snapshot().unwrap());
+    legacy.retention.policy.drain_entries_per_commit = 8;
+    legacy.retention.policy.replay_keep = 100_000;
+    e.release().unwrap();
+    let store = fresh_legacy(RecordStorage::new(), &legacy);
+    let stats = store.stats.clone();
+    let reads = || stats.record_reads.load(Ordering::Relaxed);
+    let mut work = vec![];
+    let measured = |work: &mut Vec<usize>, f: &mut dyn FnMut()| {
+        let before = reads();
+        f();
+        work.push(reads() - before);
+    };
+    let mut e = None;
+    measured(&mut work, &mut || {
+        e = Some(Engine::new(store.clone(), "test", "i-2").unwrap())
+    });
+    let e = e.unwrap();
+    host.responses.insert(
+        "reconcile:test.command".into(),
+        vec![DispatchResult::Accepted {
+            handle: "server-operation".into(),
+        }],
+    );
+    if bind_mid_drain {
+        measured(&mut work, &mut || {
+            e.recover(&mut host, 1_002).unwrap();
+        });
+    }
+    let mut t = 1_003;
+    while !e.snapshot().unwrap().retention.drain.done {
+        measured(&mut work, &mut || e.install(done_artifact()).unwrap());
+        t += 1;
+        assert!(t < 2_000);
+    }
+    if !bind_mid_drain {
+        e.recover(&mut host, t).unwrap();
+    }
+    for t in t..t + 5 {
+        e.drive(&mut host, t, 20).unwrap();
+    }
+    let s = e.snapshot().unwrap();
+    let runs = inspect_all(&e, InspectionKind::Runs, Some(&run));
+    assert_eq!(runs[0]["outcome"], "ok", "{runs:?}");
+    // Every event (the delivered completion too) is unheld and in the
+    // eviction order.
+    assert!(s.events.contains_key(&done));
+    assert_eq!(
+        s.retention.replay_order.len(),
+        before + after + 1,
+        "{work:?}"
+    );
+    assert!(s.indexes.contract_events_complete);
+    work.into_iter().max().unwrap()
+}
+#[test]
+fn legacy_events_are_ordered_in_bounded_steps_and_never_all_rejudged_at_once() {
+    // A drain commit reads the same for any number of events (8 judged).
+    // The binding commits re-judge only held events the drain has already
+    // reached (at most a few commits' bound), so their cost varies with
+    // which events those are, not with how many there are: three times the
+    // events cost no more (10 % allowed for which ones were reached).
+    let small = legacy_hazard(40, 40, true);
+    let large = legacy_hazard(120, 120, true);
+    assert!(large <= small + small / 10, "{large} vs {small}");
+    legacy_hazard(20, 20, false);
+}
+/// The same when the open commit rebuilds the indexes (a State whose
+/// indexes were never initialized): the rebuild puts every event into
+/// `contract_events` at once, and the drain still judges the older
+/// engine's events itself. When the handle of the operation that held 40
+/// of them is found mid-drain, they do not all join the eviction order in
+/// that commit: only those the drain has reached; the drain then judges the
+/// rest, 4 per commit here.
+#[test]
+fn a_rebuilt_legacy_namespace_leaves_its_events_to_the_drain() {
+    let e = engine();
+    let (a, completion) = async_artifact();
+    install(&e, a, "async");
+    e.admit("async", "main", Value::Null, authority(), 0)
+        .unwrap();
+    let mut host = FakeHost::default();
+    e.drive(&mut host, 0, 10).unwrap();
+    for i in 0..40 {
+        let envelope = EventEnvelope {
+            correlation: BTreeMap::from([("operation".into(), format!("after-{i}"))]),
+            ..async_event(&completion, &format!("after-{i}"))
+        };
+        e.admit_event("host", envelope, 1).unwrap();
+    }
+    let mut legacy = old_engine_shape(&e.snapshot().unwrap());
+    legacy.retention.policy.drain_entries_per_commit = 4;
+    legacy.indexes.initialized = false;
+    e.release().unwrap();
+    let e = Engine::new(
+        fresh_legacy(MemoryStorage::retaining_settled(), &legacy),
+        "test",
+        "i-1",
+    )
+    .unwrap();
+    let held = e.snapshot().unwrap();
+    assert!(
+        held.indexes.contract_events_complete,
+        "the rebuild filled it"
+    );
+    assert!(held.retention.replay_order.len() <= 4);
+    host.responses.insert(
+        "reconcile:test.command".into(),
+        vec![DispatchResult::Accepted {
+            handle: "server-operation".into(),
+        }],
+    );
+    e.recover(&mut host, 2).unwrap();
+    // `recover` is two commits: the drain reached at most 3 × 4 events.
+    let s = e.snapshot().unwrap();
+    assert!(s.intents.values().all(|i| i.handle.is_some()));
+    assert!(
+        s.retention.replay_order.len() <= 12,
+        "{} joined at once",
+        s.retention.replay_order.len()
+    );
+    while !e.snapshot().unwrap().retention.drain.done {
+        e.install(done_artifact()).unwrap();
+    }
+    assert_eq!(e.snapshot().unwrap().retention.replay_order.len(), 40);
+}
+/// `tests/fixtures/legacy_state_0173673.json` is a namespace written by the
+/// engine aq-server vendors (0173673) on its in-memory store, by the
+/// generator kept in `.local/task9/generator/` (see the Task 9 report): a
+/// GC (short windows) that removed 5 finished runs and 3 expired events
+/// (tombstones, correlation fences, disposals); 33 finished cohorts still
+/// in the record (two with operations, one keyed); live runs: 3 admitted,
+/// one waiting for a 24 h event, a terminal parent with a waiting
+/// independent child, a parent waiting on its waiting child, a live keyed
+/// admission, and an asynchronous operation dispatched without a handle;
+/// an admin receipt; events of the completion contract before and after
+/// that dispatch; ten events inside their 24 h window.
+fn vendored_fixture() -> State {
+    serde_json::from_str(include_str!("fixtures/legacy_state_0173673.json")).unwrap()
+}
+/// The vendored engine's namespace opens and drains to the end while new
+/// runs are admitted and served at every commit (bounds 4 cohorts and 3
+/// entries per commit, from its stored policy, so the drain spans many
+/// commits); no commit fails. Legacy duplicates are recognised until their
+/// entries leave by the normal rules, every legacy live run settles
+/// normally, and inspection lists every legacy run exactly once at every
+/// step.
+fn vendored_namespace_drains_while_new_runs_are_served<S: Storage + Clone>(store: S) {
+    let legacy = vendored_fixture();
+    let finished: BTreeSet<String> = legacy
+        .runs
+        .values()
+        .filter(|r| r.status.terminal())
+        .map(|r| r.id.clone())
+        .collect();
+    let all_legacy: BTreeSet<String> = legacy.runs.keys().cloned().collect();
+    let day = legacy.waits.values().find_map(|w| w.event.clone()).unwrap();
+    let completion = legacy
+        .events
+        .values()
+        .find(|e| e.envelope.event_id.starts_with("async-before"))
+        .unwrap()
+        .envelope
+        .contract
+        .clone();
+    let day_event = |id: &str, invocation: &str| EventEnvelope {
+        contract: day.clone(),
+        correlation: BTreeMap::from([("invocation".into(), invocation.into())]),
+        subject: None,
+        revision: None,
+        ..event(id, 1)
+    };
+    let mut stored = legacy.clone();
+    stored.retention.policy.drain_cohorts_per_commit = 4;
+    stored.retention.policy.drain_entries_per_commit = 3;
+    let mut value = serde_json::to_value(&stored).unwrap();
+    value["retention"].as_object_mut().unwrap().remove("drain");
+    let stored: State = serde_json::from_value(value).unwrap();
+    store.acquire("test", "vendored").unwrap();
+    store
+        .compare_and_swap("test", "vendored", 0, &stored)
+        .unwrap();
+    store.release("test", "vendored").unwrap();
+    let e = Engine::new(store, "test", "upgraded").unwrap();
+    assert!(
+        !e.snapshot().unwrap().retention.drain.done,
+        "the drain spans more than the open commit"
+    );
+    let keyed = |key: &str| KeyedAdmissionRequest {
+        key: key.into(),
+        binding: "done".into(),
+        expected_activation_revision: legacy.bindings["done"].revision,
+        entry: "main".into(),
+        input: Value::Null,
+        authority: authority(),
+    };
+    let listed_once = |e: &Engine<S>, step: &str| {
+        let ids: Vec<String> = inspect_all(e, InspectionKind::Runs, None)
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .filter(|id| all_legacy.contains(id))
+            .collect();
+        let unique: BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "{step}: listed twice");
+        assert_eq!(unique.len(), all_legacy.len(), "{step}: missing");
+    };
+    listed_once(&e, "open");
+    let mut host = FakeHost {
+        responses: BTreeMap::from([(
+            "reconcile:test.command".into(),
+            vec![DispatchResult::Accepted {
+                handle: "server-operation".into(),
+            }],
+        )]),
+        ..Default::default()
+    };
+    let mut t = 30_000;
+    let mut new_runs = vec![];
+    let mut commits = 0;
+    while !e.snapshot().unwrap().retention.drain.done {
+        t += 1;
+        // New work at every step, while the drain goes on.
+        let id = e
+            .admit("done", "main", Value::Null, authority(), t)
+            .unwrap();
+        e.drive(&mut host, t, 20).unwrap();
+        new_runs.push(id);
+        // Legacy duplicates are still recognised.
+        assert!(e.admit_once(keyed("k-done"), t).unwrap().duplicate);
+        assert!(e.admit_once(keyed("k-live"), t).unwrap().duplicate);
+        assert!(
+            e.admit_event("host", day_event("day-3", "other-3"), t)
+                .unwrap()
+                .duplicate
+        );
+        listed_once(&e, &format!("commit {commits}"));
+        commits += 1;
+        assert!(commits < 200);
+    }
+    // The live legacy runs settle normally: the waiting run and both
+    // children receive their event, the operation's handle is found and its
+    // completion arrives, the keyed and admitted runs advance.
+    e.admit_event("host", day_event("wake", "exact-invocation"), t + 1)
+        .unwrap();
+    e.recover(&mut host, t + 1).unwrap();
+    e.admit_event(
+        "host",
+        EventEnvelope {
+            contract: completion.clone(),
+            correlation: BTreeMap::from([("operation".into(), "server-operation".into())]),
+            ..async_event(&async_artifact().1, "completion")
+        },
+        t + 2,
+    )
+    .unwrap();
+    for t in t + 2..t + 10 {
+        e.drive(&mut host, t, 50).unwrap();
+    }
+    let s = e.snapshot().unwrap();
+    assert!(s.runs.is_empty(), "{:?}", s.runs.keys().collect::<Vec<_>>());
+    let r = &s.retention;
+    assert!(r.event_tombstones.is_empty() && r.expired_correlations.is_empty());
+    assert!(r.disposals.is_empty());
+    let runs = inspect_all(&e, InspectionKind::Runs, None);
+    for id in all_legacy.iter().chain(&new_runs) {
+        let found: Vec<&Value> = runs.iter().filter(|r| r["id"] == id.as_str()).collect();
+        assert_eq!(found.len(), 1, "{id}");
+        if !finished.contains(id) {
+            assert_eq!(found[0]["outcome"], "ok", "{id}: {:?}", found[0]);
+        }
+    }
+    // After the drain a re-delivery of an event the old GC disposed of is
+    // judged by the rules of this engine: its tombstone has left, so it is
+    // accepted as new.
+    assert!(
+        !e.admit_event("host", event("gc-old-0", 2), t + 20)
+            .unwrap()
+            .duplicate
+    );
+}
+#[test]
+fn memory_storage_vendored_namespace_drains_while_new_runs_are_served() {
+    vendored_namespace_drains_while_new_runs_are_served(MemoryStorage::retaining_settled());
+}
+#[test]
+fn record_storage_vendored_namespace_drains_while_new_runs_are_served() {
+    vendored_namespace_drains_while_new_runs_are_served(RecordStorage::new());
 }

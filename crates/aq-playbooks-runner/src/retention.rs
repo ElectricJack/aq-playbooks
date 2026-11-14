@@ -45,6 +45,24 @@ pub struct RetentionPolicy {
     /// history at all (inspection then finds no finished run).
     #[serde(default = "default_history_keep")]
     pub history_keep: u64,
+    /// The drain of a namespace an older engine wrote ([`drain_step`]):
+    /// at most this many roots examined, and settled cohorts moved to
+    /// history, per commit (together with those [`settle`] moves).
+    /// Positive.
+    #[serde(default = "default_drain_cohorts")]
+    pub drain_cohorts_per_commit: usize,
+    /// The drain's other work per commit: at most this many legacy entries
+    /// (tombstones, correlation fences, disposals, admin receipts, keyed
+    /// receipts and events examined), and at most this many PostgreSQL
+    /// legacy tombstone rows deleted. Positive.
+    #[serde(default = "default_drain_entries")]
+    pub drain_entries_per_commit: usize,
+}
+fn default_drain_cohorts() -> usize {
+    50
+}
+fn default_drain_entries() -> usize {
+    500
 }
 fn default_replay_keep() -> usize {
     256
@@ -71,6 +89,8 @@ impl Default for RetentionPolicy {
             admission_replay_ms: default_admission_replay_ms(),
             replay_keep: default_replay_keep(),
             history_keep: default_history_keep(),
+            drain_cohorts_per_commit: default_drain_cohorts(),
+            drain_entries_per_commit: default_drain_entries(),
         }
     }
 }
@@ -127,6 +147,31 @@ pub struct RetentionState {
     /// `replay_order` when its run leaves the record.
     #[serde(default)]
     pub replay_held: LazyMap<String, String>,
+    /// Progress of the drain of what an older engine left in the record
+    /// ([`drain_step`]). Absent in a State written before it: the drain
+    /// then runs.
+    #[serde(default)]
+    pub drain: DrainState,
+}
+/// Progress of the drain ([`drain_step`]), stored with the State so a
+/// restart continues where it stopped.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrainState {
+    /// Nothing is left to drain: every commit's drain work is one check.
+    pub done: bool,
+    /// The last root the cohort scan examined (`None`: from the first).
+    pub root_cursor: Option<String>,
+    /// The cohort scan has passed the last root since it was (re)armed.
+    #[serde(default)]
+    pub roots_done: bool,
+    /// The entry phase: one of the `DRAIN_*` phases.
+    pub phase: u8,
+    /// The last key the entry phase examined (`None`: from the first).
+    pub cursor: Option<String>,
+    /// The namespace sequence when the drain began: events at or before it
+    /// were accepted by the older engine, and the event phase judges them.
+    #[serde(default)]
+    pub legacy_sequence: Option<u64>,
 }
 /// The [`RetentionState::replay_order`] key of `member` accepted at
 /// `sequence`: the sequence as 16 lowercase hex digits, then the member.
@@ -481,9 +526,12 @@ pub(crate) fn check_licensed_header(
         producer_epochs,
         artifact_disposals,
         gc_cursor,
+        // A licensed commit drains nothing.
+        drain,
     } = retention;
     let (n, r) = (next, &next.retention);
     let unchanged = same(policy, &r.policy)
+        && *drain == r.drain
         && *producer_epochs == r.producer_epochs
         && *last_gc_at_ms == r.last_gc_at_ms
         && *gc_cursor == r.gc_cursor
@@ -924,24 +972,36 @@ fn cohort_settled(s: &State, root: &str) -> bool {
 }
 /// Remove every settled cohort among `candidates` (at most `limit`) from the
 /// State and hand each to storage as history (`State::settled`). A settled
-/// candidate beyond `limit` sets `report.more`.
+/// candidate beyond `limit` sets `report.more` and re-arms the drain's
+/// cohort scan ([`drain_step`]), which finds it in a later commit, so no
+/// settled cohort is stranded.
 pub(crate) fn settle(
     s: &mut State,
     candidates: BTreeSet<String>,
     limit: usize,
     report: &mut CommitReport,
 ) -> Result<()> {
-    let mut removed = 0;
+    let mut roots = vec![];
     for root in candidates {
         if !cohort_settled(s, &root) {
             continue;
         }
-        if removed >= limit {
+        if roots.len() >= limit {
             report.more = true;
+            let drain = &mut s.retention.drain;
+            drain.done = false;
+            drain.roots_done = false;
+            drain.root_cursor = None;
             break;
         }
-        let cohort = remove_cohort(s, &root)?;
-        removed += 1;
+        roots.push(root);
+    }
+    take_cohorts(s, &roots, report)
+}
+/// [`remove_cohorts`] for `roots`, handing each to storage as history and
+/// counting it in `report`.
+fn take_cohorts(s: &mut State, roots: &[String], report: &mut CommitReport) -> Result<()> {
+    for cohort in remove_cohorts(s, roots)? {
         report.cohorts += 1;
         report.runs += cohort.runs.len();
         report.receipts += cohort.receipts.len();
@@ -993,85 +1053,122 @@ fn receipt_offsets(s: &State, run: &str) -> Vec<usize> {
         .filter(|&offset| s.receipts.get(offset).is_some_and(|r| r.run == run))
         .collect()
 }
-/// Remove the cohort of `root` from the State: its runs, operations, their
-/// recovery requests, waits, receipts and budget. Its runs and operations
-/// are marked dirty, so the next `indexes::sync` drops their index entries.
-/// O(cohort) plus O(live receipts) for compaction and O(live waits).
-pub(crate) fn remove_cohort(s: &mut State, root: &str) -> Result<SettledCohort> {
-    let members: Vec<String> = s
-        .indexes
-        .root_members
-        .get(root)
-        .map(|ids| ids.iter().cloned().collect())
-        .unwrap_or_default();
-    let intent_ids: Vec<String> = s
-        .indexes
-        .root_intents
-        .get(root)
-        .map(|ids| ids.iter().cloned().collect())
-        .unwrap_or_default();
+/// Remove the cohorts of `roots` from the State: their runs, operations,
+/// their recovery requests, waits, receipts and budgets. Their runs and
+/// operations are marked dirty, so the next `indexes::sync` drops their
+/// index entries. O(cohorts), plus one compaction of the live receipts and
+/// one pass over the live waits for all of them together.
+pub(crate) fn remove_cohorts(s: &mut State, roots: &[String]) -> Result<Vec<SettledCohort>> {
+    if roots.is_empty() {
+        return Ok(vec![]);
+    }
+    struct Taken {
+        root: String,
+        members: Vec<String>,
+        intents: Vec<String>,
+        finished_at_ms: Option<i64>,
+    }
+    let mut taken = vec![];
     let mut offsets = BTreeSet::new();
-    let mut finished_at_ms = None;
-    for id in &members {
-        offsets.extend(receipt_offsets(s, id));
-        let terminal = s
-            .runs
-            .get(id)
-            .and_then(|r| r.terminal_sequence)
-            .and_then(|sequence| s.indexes.all_receipts.get(&sequence).copied())
-            .and_then(|offset| s.receipts.get(offset));
-        if let Some(receipt) = terminal {
-            finished_at_ms = finished_at_ms.max(Some(receipt.at_ms));
+    let mut owner: BTreeMap<String, usize> = BTreeMap::new();
+    for root in roots {
+        let members: Vec<String> = s
+            .indexes
+            .root_members
+            .get(root)
+            .map(|ids| ids.iter().cloned().collect())
+            .unwrap_or_default();
+        let intents: Vec<String> = s
+            .indexes
+            .root_intents
+            .get(root)
+            .map(|ids| ids.iter().cloned().collect())
+            .unwrap_or_default();
+        let mut finished_at_ms = None;
+        for id in &members {
+            offsets.extend(receipt_offsets(s, id));
+            owner.insert(id.clone(), taken.len());
+            let terminal = s
+                .runs
+                .get(id)
+                .and_then(|r| r.terminal_sequence)
+                .and_then(|sequence| s.indexes.all_receipts.get(&sequence).copied())
+                .and_then(|offset| s.receipts.get(offset));
+            if let Some(receipt) = terminal {
+                finished_at_ms = finished_at_ms.max(Some(receipt.at_ms));
+            }
         }
+        taken.push(Taken {
+            root: root.clone(),
+            members,
+            intents,
+            finished_at_ms,
+        });
     }
     // Their waits end with them: the events those waits held are judged
     // again (`rejoin`) before the next index sync drops the subscriptions.
-    for token in members
+    for t in &taken {
+        for token in t
+            .members
+            .iter()
+            .cloned()
+            .chain(t.intents.iter().map(|id| format!("intent:{id}")))
+        {
+            if let Some(keys) = s.indexes.run_subscriptions.get(&token) {
+                let keys = keys.clone();
+                s.replay_touched.wait_keys.extend(keys);
+            }
+        }
+    }
+    let mut cohorts: Vec<SettledCohort> = taken
         .iter()
-        .cloned()
-        .chain(intent_ids.iter().map(|id| format!("intent:{id}")))
-    {
-        if let Some(keys) = s.indexes.run_subscriptions.get(&token) {
-            let keys = keys.clone();
-            s.replay_touched.wait_keys.extend(keys);
+        .map(|t| SettledCohort {
+            root: t.root.clone(),
+            finished_at_ms: 0,
+            runs: vec![],
+            intents: vec![],
+            receipts: vec![],
+        })
+        .collect();
+    let mut all_intents = BTreeSet::new();
+    let mut all_members = BTreeSet::new();
+    for (cohort, t) in cohorts.iter_mut().zip(&taken) {
+        for id in &t.members {
+            if let Some(run) = s.runs.remove(id) {
+                cohort.runs.push(run);
+            }
+            crate::indexes::mark_run(s, id);
+            all_members.insert(id.clone());
         }
-    }
-    let mut runs = vec![];
-    for id in &members {
-        if let Some(run) = s.runs.remove(id) {
-            runs.push(run);
+        for id in &t.intents {
+            if let Some(intent) = s.intents.remove(id) {
+                cohort.intents.push(intent);
+            }
+            crate::indexes::mark_intent(s, id);
+            all_intents.insert(id.clone());
         }
-        crate::indexes::mark_run(s, id);
+        s.budgets.remove(&t.root);
     }
-    let mut intents = vec![];
-    for id in &intent_ids {
-        if let Some(intent) = s.intents.remove(id) {
-            intents.push(intent);
-        }
-        crate::indexes::mark_intent(s, id);
-    }
-    if !intent_ids.is_empty() && !s.recovery_requests.is_empty() {
-        let ids: BTreeSet<&String> = intent_ids.iter().collect();
+    if !all_intents.is_empty() && !s.recovery_requests.is_empty() {
         s.recovery_requests
-            .retain(|_, request| !ids.contains(&request.intent));
+            .retain(|_, request| !all_intents.contains(&request.intent));
     }
     if !s.waits.is_empty() {
-        let ids: BTreeSet<&String> = members.iter().collect();
-        s.waits.retain(|_, wait| !ids.contains(&wait.run));
+        s.waits.retain(|_, wait| !all_members.contains(&wait.run));
     }
-    let receipts = take_receipts(s, &offsets);
-    s.budgets.remove(root);
-    let finished_at_ms = finished_at_ms
-        .or_else(|| receipts.iter().map(|r| r.at_ms).max())
-        .or(s.retention.clock_ms)
-        .unwrap_or(0);
-    Ok(SettledCohort {
-        root: root.into(),
-        finished_at_ms,
-        runs,
-        intents,
-        receipts,
-    })
+    for receipt in take_receipts(s, &offsets) {
+        if let Some(&i) = owner.get(&receipt.run) {
+            cohorts[i].receipts.push(receipt);
+        }
+    }
+    for (cohort, t) in cohorts.iter_mut().zip(&taken) {
+        cohort.finished_at_ms = t
+            .finished_at_ms
+            .or_else(|| cohort.receipts.iter().map(|r| r.at_ms).max())
+            .or(s.retention.clock_ms)
+            .unwrap_or(0);
+    }
+    Ok(cohorts)
 }
 /// Move the receipts owned by `owner`, which belongs to no cohort (`"admin"`,
 /// `"event:<key>"`), out of the State as a cohort of root `owner` with no
@@ -1095,6 +1192,45 @@ pub(crate) fn move_unowned_receipts(s: &mut State, owner: &str) -> Result<Option
         intents: vec![],
         receipts,
     }))
+}
+/// Move the `"admin"` receipts this commit wrote (sequence after `started`,
+/// the sequence it began at) to history. Older ones were written by an
+/// older engine and leave through the drain, a bounded number per commit.
+fn move_admin_receipts(s: &mut State, started: u64, report: &mut CommitReport) -> Result<()> {
+    let offsets: BTreeSet<usize> = s
+        .indexes
+        .receipts
+        .get("admin")
+        .into_iter()
+        .flat_map(|offsets| {
+            offsets
+                .range((
+                    std::ops::Bound::Excluded(started),
+                    std::ops::Bound::Unbounded,
+                ))
+                .map(|(_, offset)| *offset)
+        })
+        .filter(|&offset| s.receipts.get(offset).is_some_and(|r| r.run == "admin"))
+        .collect();
+    if offsets.is_empty() {
+        return Ok(());
+    }
+    let receipts = take_receipts(s, &offsets);
+    report.receipts += receipts.len();
+    let finished_at_ms = receipts
+        .iter()
+        .map(|r| r.at_ms)
+        .max()
+        .or(s.retention.clock_ms)
+        .unwrap_or(0);
+    s.settled.push(SettledCohort {
+        root: "admin".into(),
+        finished_at_ms,
+        runs: vec![],
+        intents: vec![],
+        receipts,
+    });
+    Ok(())
 }
 /// At most this many window entries are examined (dropped or deferred) by
 /// one commit, oldest expiry first.
@@ -1181,15 +1317,12 @@ pub(crate) fn rebase_clock(s: &mut State, to_ms: i64) -> (usize, usize) {
     (events, admissions)
 }
 /// The end of a licensed admin commit (a clock rebase or a floor
-/// lowering): only its `"admin"` receipt moves to history. The clock is not
-/// advanced, nothing settles and nothing is dropped, so the commit is
-/// exactly its licence.
-pub(crate) fn finish_licensed_commit(s: &mut State) -> Result<CommitReport> {
+/// lowering): only its own `"admin"` receipt (written after `started`)
+/// moves to history. The clock is not advanced, nothing settles, nothing is
+/// dropped or drained, so the commit is exactly its licence.
+pub(crate) fn finish_licensed_commit(s: &mut State, started: u64) -> Result<CommitReport> {
     let mut report = CommitReport::default();
-    if let Some(cohort) = move_unowned_receipts(s, "admin")? {
-        report.receipts += cohort.receipts.len();
-        s.settled.push(cohort);
-    }
+    move_admin_receipts(s, started, &mut report)?;
     Ok(report)
 }
 /// Remove the keyed admission receipt `key` ahead of its drop, with its
@@ -1557,10 +1690,15 @@ pub(crate) fn rejoin(s: &mut State) -> Result<()> {
             events.extend(ids.values().cloned());
         }
     }
+    // Events an older engine accepted that the drain has not judged yet
+    // are left to it: it judges them a bounded number per commit, so no
+    // change of a contract's uncertain operations judges them all at once.
+    let drain = &s.retention.drain;
     for (key, after) in touched.contract_keys {
         if let Some(ids) = s.indexes.contract_events.get(&key) {
             events.extend(
                 ids.range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+                    .filter(|(sequence, id)| !drain.event_pending(id, **sequence))
                     .map(|(_, id)| id.clone()),
             );
         }
@@ -1790,32 +1928,325 @@ pub fn check_evictions(
 }
 /// The retention work of every commit that changes the State, after its
 /// indexes are synchronized: move the clock to the commit's host time, remove
-/// the settled cohorts among `candidates` (see [`candidate_roots`]), put the
+/// the settled cohorts among `candidates` (see [`candidate_roots`]), drain a
+/// bounded amount of what an older engine left ([`drain_step`]), put the
 /// window entries whose hold this commit may have changed in or out of the
 /// eviction order ([`rejoin`]), drop expired window entries
 /// ([`drop_expired`]), evict the oldest entries past `policy.replay_keep`
-/// ([`evict`]) and move `"admin"` receipts to history. The clock step and
-/// the drop need host time; eviction does not.
+/// ([`evict`]) and move the `"admin"` receipts this commit wrote (after
+/// `started`, the sequence it began at) to history. The clock step and the
+/// drop need host time; eviction and the drain do not.
 pub(crate) fn finish_commit(
     s: &mut State,
     now_ms: Option<i64>,
     candidates: BTreeSet<String>,
+    started: u64,
 ) -> Result<CommitReport> {
     let mut report = CommitReport::default();
     if let Some(now_ms) = now_ms {
         advance_clock(s, now_ms);
     }
     settle(s, candidates, COHORTS_PER_COMMIT, &mut report)?;
+    drain_step(s, started, &mut report)?;
     rejoin(s)?;
     if now_ms.is_some() {
         drop_expired(s, WINDOW_DROPS_PER_COMMIT, &mut report)?;
     }
     evict(s, REPLAY_EVICTIONS_PER_COMMIT, &mut report)?;
-    if let Some(cohort) = move_unowned_receipts(s, "admin")? {
-        report.receipts += cohort.receipts.len();
-        s.settled.push(cohort);
-    }
+    move_admin_receipts(s, started, &mut report)?;
     Ok(report)
+}
+/// Drain phase: legacy event tombstones are dropped.
+pub const DRAIN_TOMBSTONES: u8 = 0;
+/// Drain phase: legacy correlation fences are dropped.
+pub const DRAIN_FENCES: u8 = 1;
+/// Drain phase: legacy disposal records are dropped.
+pub const DRAIN_DISPOSALS: u8 = 2;
+/// Drain phase: legacy `"admin"` receipts go to history.
+pub const DRAIN_ADMIN: u8 = 3;
+/// Drain phase: legacy keyed receipts join the window and eviction order.
+pub const DRAIN_KEYED: u8 = 4;
+/// Drain phase: legacy events join the window and eviction order.
+pub const DRAIN_EVENTS: u8 = 5;
+/// Every entry phase is complete.
+pub const DRAIN_DONE: u8 = 6;
+impl DrainState {
+    /// Whether event `key` (accepted at `sequence`) was accepted by an older
+    /// engine and the drain has not judged it yet.
+    pub fn event_pending(&self, key: &str, sequence: u64) -> bool {
+        !self.done
+            && self.phase <= DRAIN_EVENTS
+            && self
+                .legacy_sequence
+                .is_some_and(|legacy| sequence <= legacy)
+            && (self.phase < DRAIN_EVENTS || self.cursor.as_deref().is_none_or(|c| key > c))
+    }
+}
+#[cfg(test)]
+thread_local! {
+    /// Calls of `drain_step` that did any work beyond the `done` check.
+    static DRAIN_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+/// Move what an older engine left in the record out of it, a bounded amount
+/// per commit, in every commit that changes the State (not a licensed
+/// one), timed or not; `started` is the sequence the commit began at. Two
+/// parts, each with its own bound from the policy:
+///
+/// - **Cohorts.** The roots after `drain.root_cursor` are examined, at most
+///   `policy.drain_cohorts_per_commit`; the settled ones leave as history
+///   ([`remove_cohorts`]), so that with those [`settle`] moved the commit
+///   moves at most that many. Live ones stay and leave when they settle.
+/// - **Entries**, at most `policy.drain_entries_per_commit`, in phases:
+///   event tombstones and correlation fences are dropped, disposal records
+///   cleared, `"admin"` receipts written before this commit moved to history
+///   (each dated by its own time); then each keyed receipt and event gets
+///   its expiry record and window key and joins the eviction order unless
+///   live work holds it (a keyed receipt of a live run then waits in
+///   `replay_held`), and each event joins `indexes.contract_events`.
+///
+/// When both parts are complete, `drain.done` is set and every later commit
+/// costs one check. A [`settle`] beyond its bound re-arms the cohort part;
+/// an index rebuild re-arms all of it.
+pub(crate) fn drain_step(s: &mut State, started: u64, report: &mut CommitReport) -> Result<()> {
+    if s.retention.drain.done {
+        return Ok(());
+    }
+    #[cfg(test)]
+    DRAIN_STEPS.with(|steps| steps.set(steps.get() + 1));
+    // The cohorts this commit removed leave the root index first, so the
+    // scan's bound is not spent on them.
+    crate::indexes::sync(s)?;
+    if s.retention.drain.legacy_sequence.is_none() {
+        s.retention.drain.legacy_sequence = Some(started);
+    }
+    let cohorts = s.retention.policy.drain_cohorts_per_commit;
+    let entries = s.retention.policy.drain_entries_per_commit;
+    drain_cohorts(s, cohorts, report)?;
+    drain_entries(s, started, entries, report)?;
+    let drain = &mut s.retention.drain;
+    if drain.roots_done && drain.phase >= DRAIN_DONE {
+        drain.done = true;
+        drain.root_cursor = None;
+        drain.cursor = None;
+    }
+    Ok(())
+}
+fn drain_cohorts(s: &mut State, limit: usize, report: &mut CommitReport) -> Result<()> {
+    if s.retention.drain.roots_done {
+        return Ok(());
+    }
+    let mut removable = limit.saturating_sub(report.cohorts);
+    let mut cursor = s.retention.drain.root_cursor.clone();
+    let mut roots = vec![];
+    let mut end = false;
+    for _ in 0..limit {
+        let Some(root) = s.indexes.root_members.next_key(cursor.as_ref()) else {
+            end = true;
+            break;
+        };
+        if cohort_settled(s, &root) {
+            if removable == 0 {
+                break;
+            }
+            removable -= 1;
+            roots.push(root.clone());
+        }
+        cursor = Some(root);
+    }
+    take_cohorts(s, &roots, report)?;
+    let drain = &mut s.retention.drain;
+    drain.root_cursor = cursor;
+    drain.roots_done = end;
+    Ok(())
+}
+fn drain_entries(
+    s: &mut State,
+    started: u64,
+    limit: usize,
+    report: &mut CommitReport,
+) -> Result<()> {
+    let mut budget = limit;
+    while budget > 0 && s.retention.drain.phase < DRAIN_DONE {
+        let used = match s.retention.drain.phase {
+            DRAIN_TOMBSTONES => {
+                let keys = s
+                    .retention
+                    .event_tombstones
+                    .keys_after::<String>(None, budget);
+                for key in &keys {
+                    s.retention.event_tombstones.remove(key);
+                }
+                keys.len()
+            }
+            DRAIN_FENCES => {
+                let keys = s
+                    .retention
+                    .expired_correlations
+                    .keys_after::<String>(None, budget);
+                for key in &keys {
+                    s.retention.expired_correlations.remove(key);
+                }
+                keys.len()
+            }
+            DRAIN_DISPOSALS => {
+                let len = s.retention.disposals.len();
+                let n = len.min(budget);
+                if n > 0 {
+                    s.retention.disposals.truncate(len - n);
+                }
+                n
+            }
+            DRAIN_ADMIN => drain_admin_receipts(s, started, budget, report),
+            DRAIN_KEYED => {
+                let cursor = s.retention.drain.cursor.clone();
+                let keys = s.keyed_admissions.keys_after(cursor.as_ref(), budget);
+                for key in &keys {
+                    index_legacy_admission(s, key);
+                }
+                if let Some(last) = keys.last() {
+                    s.retention.drain.cursor = Some(last.clone());
+                }
+                keys.len()
+            }
+            _ => {
+                let cursor = s.retention.drain.cursor.clone();
+                let keys = s.events.keys_after(cursor.as_ref(), budget);
+                for key in &keys {
+                    index_legacy_event(s, key)?;
+                }
+                if let Some(last) = keys.last() {
+                    s.retention.drain.cursor = Some(last.clone());
+                }
+                keys.len()
+            }
+        };
+        report.drained += used;
+        if used < budget {
+            // The phase is exhausted.
+            if s.retention.drain.phase == DRAIN_EVENTS {
+                s.indexes.contract_events_complete = true;
+            }
+            let drain = &mut s.retention.drain;
+            drain.phase += 1;
+            drain.cursor = None;
+        }
+        budget -= used;
+    }
+    Ok(())
+}
+/// Up to `budget` of the `"admin"` receipts written before this commit
+/// (sequence at or before `started`), oldest first, each to history as a
+/// cohort of its own dated by its own time. Returns how many.
+fn drain_admin_receipts(
+    s: &mut State,
+    started: u64,
+    budget: usize,
+    report: &mut CommitReport,
+) -> usize {
+    let offsets: BTreeSet<usize> = s
+        .indexes
+        .receipts
+        .get("admin")
+        .into_iter()
+        .flat_map(|offsets| offsets.range(..=started).map(|(_, offset)| *offset))
+        .filter(|&offset| s.receipts.get(offset).is_some_and(|r| r.run == "admin"))
+        .take(budget)
+        .collect();
+    let receipts = take_receipts(s, &offsets);
+    report.receipts += receipts.len();
+    let n = receipts.len();
+    for receipt in receipts {
+        s.settled.push(SettledCohort {
+            root: "admin".into(),
+            finished_at_ms: receipt.at_ms,
+            runs: vec![],
+            intents: vec![],
+            receipts: vec![receipt],
+        });
+    }
+    n
+}
+/// A keyed admission receipt an older engine wrote: its expiry record
+/// (acceptance plus the admission window) and window key, and its place in
+/// the eviction order, or in `replay_held` while its run is live. Each is
+/// added only if missing.
+fn index_legacy_admission(s: &mut State, key: &str) {
+    let Some(receipt) = s.keyed_admissions.get(key).cloned() else {
+        return;
+    };
+    let at = match s.retention.admission_expires_at_ms.get(key) {
+        Some(at) => *at,
+        None => {
+            let at = receipt
+                .accepted_at_ms
+                .saturating_add(window(s.retention.policy.admission_replay_ms));
+            s.retention
+                .admission_expires_at_ms
+                .insert(key.to_string(), at);
+            at
+        }
+    };
+    let member = window_key(at, &format!("{WINDOW_ADMISSION}{key}"));
+    if !s.retention.expiry.contains_key(&member) {
+        s.retention.expiry.insert(member, ());
+    }
+    if s.runs.contains_key(&receipt.run_id) {
+        if !s.retention.replay_held.contains_key(&receipt.run_id) {
+            s.retention
+                .replay_held
+                .insert(receipt.run_id.clone(), key.to_string());
+        }
+    } else {
+        let order = admission_order_key(&receipt);
+        if !s.retention.replay_order.contains_key(&order) {
+            s.retention.replay_order.insert(order, ());
+        }
+    }
+}
+/// An event an older engine accepted: its expiry record and window key, its
+/// `indexes.contract_events` entry, and its place in or out of the eviction
+/// order as live work holds it. Each is added only if missing.
+fn index_legacy_event(s: &mut State, key: &str) -> Result<()> {
+    let Some((sequence, order, contract)) = s.events.get(key).map(|e| {
+        (
+            e.sequence,
+            event_order_key(e),
+            crate::indexes::trigger_key(&e.envelope.contract, &e.envelope.scope),
+        )
+    }) else {
+        return Ok(());
+    };
+    let contract = contract?;
+    let Some(at) = event_expiry(s, key) else {
+        return Ok(());
+    };
+    if !s.retention.event_expires_at_ms.contains_key(key) {
+        s.retention.event_expires_at_ms.insert(key.to_string(), at);
+    }
+    let member = window_key(at, &format!("{WINDOW_EVENT}{key}"));
+    if !s.retention.expiry.contains_key(&member) {
+        s.retention.expiry.insert(member, ());
+    }
+    if !s
+        .indexes
+        .contract_events
+        .get(&contract)
+        .is_some_and(|ids| ids.contains_key(&sequence))
+    {
+        s.indexes
+            .contract_events
+            .entry(contract)
+            .or_default()
+            .insert(sequence, key.to_string());
+    }
+    let held = event_held(s, key)?;
+    let in_order = s.retention.replay_order.contains_key(&order);
+    if held && in_order {
+        s.retention.replay_order.remove(&order);
+    } else if !held && !in_order {
+        s.retention.replay_order.insert(order, ());
+    }
+    Ok(())
 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GcReport {
@@ -1915,6 +2346,14 @@ pub(crate) fn gc(s: &mut State, now: i64, limit: usize) -> Result<GcReport> {
     let mut examined = 0;
     while examined < limit {
         match phase {
+            // While a drain is in progress the settled cohorts an older
+            // engine left go to history through it, not out without
+            // history here.
+            0 if !s.retention.drain.done => {
+                phase = 1;
+                cursor.clear();
+                inclusive = false;
+            }
             0 => {
                 let key = if inclusive && s.indexes.root_members.contains_key(&cursor) {
                     Some(cursor.clone())
@@ -2325,6 +2764,98 @@ mod window_tests {
         }
         assert_eq!(s.retention.expiry.len(), 100);
         assert!(s.retention.expiry.keys().all(|k| k.len() == 16 + 2 + 5));
+    }
+    /// A plain State with `n` settled one-run cohorts, indexed.
+    fn settled_cohorts(n: usize) -> State {
+        let mut s = State::default();
+        for i in 0..n {
+            let id = format!("run-{i:04}");
+            s.sequence += 1;
+            s.receipts.push(Receipt {
+                sequence: s.sequence,
+                run: id.clone(),
+                step: "ok".into(),
+                at_ms: 1,
+                kind: "terminal".into(),
+                detail: serde_json::Value::Null,
+            });
+            s.runs.insert(
+                id.clone(),
+                Run {
+                    catalog_revision: 0,
+                    id: id.clone(),
+                    root: id.clone(),
+                    parent: None,
+                    origin: None,
+                    artifact: "artifact".into(),
+                    entry: "main".into(),
+                    dependencies: BTreeMap::new(),
+                    authority: crate::Authority {
+                        actor: "a".into(),
+                        scope: "project".into(),
+                        capabilities: BTreeSet::new(),
+                    },
+                    step: "ok".into(),
+                    status: crate::RunStatus::Completed,
+                    input: serde_json::Value::Null,
+                    variables: BTreeMap::new(),
+                    outcome: Some("ok".into()),
+                    output: None,
+                    reason: None,
+                    admitted_at_ms: 1,
+                    visits: 1,
+                    depth: 0,
+                    children: vec![],
+                    pending: None,
+                    loops: vec![],
+                    attempts: BTreeMap::new(),
+                    pending_return: None,
+                    pending_failure: false,
+                    terminal_sequence: Some(s.sequence),
+                },
+            );
+        }
+        crate::indexes::rebuild(&mut s).unwrap();
+        s
+    }
+    /// The brief's unit test (Review Focus 2): a commit with more settled
+    /// candidates than `COHORTS_PER_COMMIT` re-arms the drain's cohort scan,
+    /// which then moves the rest, so none is stranded.
+    #[test]
+    fn settle_cap_rearms_the_drain() {
+        let mut s = settled_cohorts(60);
+        s.retention.drain = DrainState {
+            done: true,
+            roots_done: true,
+            phase: DRAIN_DONE,
+            ..DrainState::default()
+        };
+        let candidates: BTreeSet<String> = s.runs.keys().cloned().collect();
+        let mut report = CommitReport::default();
+        settle(&mut s, candidates, COHORTS_PER_COMMIT, &mut report).unwrap();
+        assert_eq!(s.runs.len(), 10);
+        assert!(report.more);
+        assert!(!s.retention.drain.done && !s.retention.drain.roots_done);
+        assert_eq!(s.retention.drain.root_cursor, None);
+        let started = s.sequence;
+        drain_step(&mut s, started, &mut CommitReport::default()).unwrap();
+        assert_eq!(s.runs.len(), 0);
+        assert!(s.retention.drain.done);
+    }
+    /// A drained namespace pays one check per commit: `drain_step` does no
+    /// work, however large the State.
+    #[test]
+    fn a_drained_namespace_does_no_drain_work() {
+        let mut s = settled_cohorts(200);
+        s.retention.drain.done = true;
+        DRAIN_STEPS.with(|steps| steps.set(0));
+        let mut report = CommitReport::default();
+        drain_step(&mut s, 0, &mut report).unwrap();
+        assert_eq!(DRAIN_STEPS.with(std::cell::Cell::get), 0);
+        assert_eq!((report, s.runs.len()), (CommitReport::default(), 200));
+        s.retention.drain.done = false;
+        drain_step(&mut s, 0, &mut CommitReport::default()).unwrap();
+        assert_eq!(DRAIN_STEPS.with(std::cell::Cell::get), 1);
     }
     /// A State written by Task 6's first commit (`expiry` as expiry → set of
     /// members) is refused when decoded, not silently emptied.
