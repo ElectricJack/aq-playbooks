@@ -894,16 +894,20 @@ constant), so a stored policy decodes with or without it and may set it;
 | `replay_evictions_per_commit` | 64 | entries evicted past `replay_keep`; the eviction licence reads the same field (of the State the commit writes) |
 | `history_trim_per_commit` | 64 | history units a commit trims beyond what it writes, per rolling set, on every backend |
 | `gc_page_limit` | 1,000 | the largest `collect_garbage` page, and the PostgreSQL artifact catalog delete of a GC commit |
+| `settle_cohorts_per_commit` | 50 | settled cohorts that leave the State in the commit that settles them (the rest re-arm the drain) |
 | `drain_cohorts_per_commit` | 50 | (Task 9) |
 | `drain_entries_per_commit` | 500 | (Task 9) |
 
-Constants that remain: `retention::COHORTS_PER_COMMIT` (50, the settle
-bound; not part of this task), `REBASE_ADJUSTMENTS_LISTED` (1,000, how many
+`window_drops_per_commit` also bounds the events a commit judges again
+after a contract's uncertain operations change (see the hold lapse below).
+
+Constants that remain: `REBASE_ADJUSTMENTS_LISTED` (1,000, how many
 capped timers a clock-rebase receipt lists; an audit list size, not a
 deletion bound), the index query page cap (1,000 items, a read bound), and
 the per-row profile bounds of the catalog projection. The old constants
 (`WINDOW_DROPS_PER_COMMIT`, `REPLAY_EVICTIONS_PER_COMMIT`,
-`HISTORY_TRIM_RUNS_PER_COMMIT`, `GC_PAGE_LIMIT`) remain as the defaults.
+`HISTORY_TRIM_RUNS_PER_COMMIT`, `GC_PAGE_LIMIT`, `COHORTS_PER_COMMIT`)
+remain as the defaults.
 
 ## A lost handle's hold lapses (Task 10, ruling C)
 
@@ -918,7 +922,16 @@ as the oldest) and leave by `replay_keep` or by their own window.
 
 - Each commit takes the lapsed operations out of the uncertain index
   (`retention::lapse_holds`; O(uncertain operations), nothing when no
-  handle is lost), so `rejoin` judges the events they held again.
+  handle is lost), so `rejoin` judges the events they held again: in
+  batches of at most `window_drops_per_commit` per commit, from
+  `RetentionState::rejudge` (contract → the sequence to continue after;
+  not written when empty), with `CommitReport::more` set until done. The
+  same bounded queue serves every change of a contract's uncertain
+  operations (a handle lost or found); a later change restarts from the
+  earliest dispatch concerned. Until an event is judged it is never
+  forgotten early: if it has become held, `evict` takes it out of the
+  order instead of evicting it; if unheld, it waits outside the order or
+  leaves by its window.
   `event_hold` applies the same rule, so the removal fences agree on every
   path.
 - **The handle found before the lapse:** the held completion matches and
@@ -946,12 +959,23 @@ namespace, Task 9 review I1).
   deleted by its sequence when its receipt leaves, and a commit that
   writes a receipt's row afresh deletes any other row of that receipt. The
   delete names the rows and finds each through
-  `runtime_correlated_sequence` (one lookup per row; with table statistics,
-  as a long-lived table has them). After a restore without `ANALYZE` the
-  planner may use the primary key prefix instead, which reads all of a
-  namespace's receipt rows per lookup (measured below); run `ANALYZE
-  aq_playbooks.runtime_index` after a restore (autovacuum does it within a
-  naptime).
+  `runtime_correlated_sequence` (one lookup per row) when the table has
+  planner statistics; without them the planner uses the primary-key
+  prefix, which reads all of a namespace's receipt rows per lookup, and no
+  query shape avoids that. So **opening the storage analyzes the engine's
+  tables that have no statistics** (after the migrations, outside and
+  before any commit): each table never analyzed (`reltuples` < 0) or
+  holding rows with no `pg_stats` entry, as a `pg_restore` leaves them
+  (PostgreSQL 17 restores no statistics; its index builds set
+  `reltuples`), gets one `ANALYZE` of its own. It takes SHARE UPDATE
+  EXCLUSIVE (blocks no reader or writer) and reads a bounded sample: about
+  150 ms in all on the restored 1,000-run dump (`runtime_index` 52 ms,
+  `inspection_rows` 59 ms, the rest a few ms each; the listing 9 ms). A
+  table with statistics costs one catalog query. It is best effort: a role
+  that may not analyze a table it does not own gets a server warning, the
+  table is skipped and the skip is reported on stderr; any error is
+  reported and ignored. Such a role should have the owner run `ANALYZE`
+  after a restore (autovacuum also does it within a naptime).
 - `IndexQuery::Receipts` answers each item's `key` with the receipt's
   sequence (20 digits) on every backend (it was the receipt's position).
 
@@ -967,6 +991,8 @@ Task 9 procedure under aq-server's session settings (`statement_timeout`
 | drain, commits 1–21 | 25.8 s | 9.3 s |
 
 The drain completed at commit 21 as before; afterwards a step took about
-27 ms. Without statistics (restored, `ANALYZE` not run, autovacuum off for
-the table): commit 1 took 1,720 ms, commit 10 856 ms.
+27 ms. Without statistics and without the analyze at open (restored,
+autovacuum off): commit 1 took 1,720 ms, commit 10 856 ms. With the
+analyze at open, on a never-analyzed restored copy (autovacuum off for
+every engine table): commit 1 671 ms, commit 10 303 ms, the drain 6.3 s.
 
