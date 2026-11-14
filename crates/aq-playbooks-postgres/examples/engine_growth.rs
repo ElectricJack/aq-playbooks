@@ -16,6 +16,17 @@
 //! (a burst: every commit carries time 0). `window` sets the policy's event
 //! and keyed admission windows (spec 0003), else they keep their defaults.
 //! JSON lines on stdout; progress on stderr.
+//!
+//! Optional environment (defaults keep the behaviour above), used to run
+//! the benchmark on top of a restored legacy namespace (Task 9):
+//! - `ENGINE_GROWTH_KEY_PREFIX`: prefix of admission keys, tickets and event
+//!   ids, so new runs do not repeat keys the namespace remembers;
+//! - `ENGINE_GROWTH_START_MS`: added to every host time;
+//! - `ENGINE_GROWTH_COMMIT_LOG=<n>`: a `commit` JSON line for each of the
+//!   first `n` commits, counted from the open commit (1): its step time,
+//!   the record size, the legacy cohorts and legacy window entries left in
+//!   the State it wrote, history rows, legacy tombstone rows and the drain
+//!   state. Gathered outside the timed window.
 use aq_playbooks_model::*;
 use aq_playbooks_postgres::{PostgresStorage, ProtectionKeyring};
 use aq_playbooks_runner::{
@@ -281,6 +292,85 @@ struct Measured {
     inner: PostgresStorage,
     monitor: Mutex<Client>,
     rec: Mutex<Rec>,
+    /// `ENGINE_GROWTH_COMMIT_LOG`: commits to log, and commits seen.
+    commit_log: (u64, std::sync::atomic::AtomicU64),
+}
+/// Legacy items left in `s` (Task 9): finished runs (the benchmark's new
+/// runs leave the State when they finish, so a terminal run in it was
+/// written by the older engine), and keyed receipts and events without a
+/// key in the expiry order (written before it).
+fn legacy_left(s: &State) -> Value {
+    use aq_playbooks_runner::retention::{
+        WINDOW_ADMISSION, WINDOW_EVENT, admission_expiry, event_expiry, window_key,
+    };
+    let cohorts = s
+        .runs
+        .values()
+        .filter(|r| r.status.terminal() && r.root == r.id)
+        .count();
+    let keyed = s
+        .keyed_admissions
+        .keys()
+        .filter(|k| {
+            admission_expiry(s, k).is_none_or(|at| {
+                !s.retention
+                    .expiry
+                    .contains_key(&window_key(at, &format!("{WINDOW_ADMISSION}{k}")))
+            })
+        })
+        .count();
+    let events = s
+        .events
+        .keys()
+        .filter(|k| {
+            event_expiry(s, k).is_none_or(|at| {
+                !s.retention
+                    .expiry
+                    .contains_key(&window_key(at, &format!("{WINDOW_EVENT}{k}")))
+            })
+        })
+        .count();
+    json!({"cohorts": cohorts, "window_entries": keyed + events, "keyed": keyed, "events": events,
+           "runs": s.runs.len(), "receipts": s.receipts.len(),
+           "tombstones": s.retention.event_tombstones.len(),
+           "drain": s.retention.drain})
+}
+impl Measured {
+    /// One `commit` line (see the module docs) after a commit of `s`.
+    fn log_commit(&self, s: &State, us: u64, path: &str) {
+        let n = self
+            .commit_log
+            .1
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if n > self.commit_log.0 {
+            return;
+        }
+        let mut m = self.monitor.lock().unwrap();
+        let one = |m: &mut Client, sql: &str| -> i64 { m.query_one(sql, &[&NS]).unwrap().get(0) };
+        let record = one(
+            &mut m,
+            "SELECT coalesce(max(pg_column_size(x.*)),0)::bigint FROM aq_playbooks.namespaces x WHERE namespace=$1",
+        );
+        let history = one(
+            &mut m,
+            "SELECT count(*) FROM aq_playbooks.run_history WHERE namespace=$1",
+        );
+        let history_runs = one(
+            &mut m,
+            "SELECT count(*) FROM aq_playbooks.run_history WHERE namespace=$1 AND kind='runs'",
+        );
+        let rows = one(
+            &mut m,
+            "SELECT count(*) FROM aq_playbooks.disposal_tombstones WHERE namespace=$1 AND kind IN ('event','run','intent')",
+        );
+        println!(
+            "{}",
+            json!({"kind":"commit","commit":n,"us":us,"path":path,"record_bytes":record,
+                   "history_rows":history,"history_runs":history_runs,"tombstone_rows":rows,
+                   "legacy":legacy_left(s)})
+        );
+    }
 }
 impl Measured {
     fn lsn(&self) -> i64 {
@@ -354,6 +444,10 @@ impl Storage for Measured {
                 path: "full",
                 gc,
             });
+            drop(rec);
+            if out.is_ok() {
+                self.log_commit(s, us, "full");
+            }
         }
         out
     }
@@ -571,10 +665,17 @@ fn main() {
     } else {
         PostgresStorage::connect(url).unwrap()
     };
+    let env = |name: &str| std::env::var(name).ok();
+    let prefix = env("ENGINE_GROWTH_KEY_PREFIX").unwrap_or_default();
+    let start_ms: i64 = env("ENGINE_GROWTH_START_MS").map_or(0, |v| v.parse().unwrap());
     let store = Measured {
         inner,
         monitor: Mutex::new(Client::connect(url, NoTls).unwrap()),
         rec: Mutex::default(),
+        commit_log: (
+            env("ENGINE_GROWTH_COMMIT_LOG").map_or(0, |v| v.parse().unwrap()),
+            Default::default(),
+        ),
     };
     let e = Engine::new(store, NS, "bench-owner").unwrap();
     let a = playbook();
@@ -624,15 +725,15 @@ fn main() {
     let mut stopped = None;
     let started = Instant::now();
     for k in 1..=runs {
-        let mut now = k as i64 * spacing;
+        let mut now = start_ms + k as i64 * spacing;
         let run_started = Instant::now();
         let wal0 = e.store.lsn();
-        let ticket = format!("ticket-{k:06}");
+        let ticket = format!("{prefix}ticket-{k:06}");
         // Keyed admission, as aq-server's host uses (`admit_once`).
         let id = e
             .admit_once(
                 KeyedAdmissionRequest {
-                    key: format!("admission-{k:06}"),
+                    key: format!("{prefix}admission-{k:06}"),
                     binding: "growth".into(),
                     expected_activation_revision: activation_revision,
                     entry: "main".into(),
@@ -659,7 +760,7 @@ fn main() {
                 "host",
                 EventEnvelope {
                     producer: "host".into(),
-                    event_id: format!("signal-{k:06}"),
+                    event_id: format!("{prefix}signal-{k:06}"),
                     contract: ContractRef {
                         name: c.name.clone(),
                         fingerprint: c.fingerprint().unwrap(),

@@ -87,6 +87,12 @@ pub struct PostgresStorage {
     /// New unprotected namespaces use writer format 3 (records).
     records: bool,
     stats: Mutex<TransitionStats>,
+    /// Namespaces whose legacy tombstone rows this handle has seen drained
+    /// (a commit deleted fewer than its bound): their commits skip the
+    /// delete. The rows themselves are the progress, so a new handle
+    /// probes once again. A commit that writes legacy rows (legacy GC)
+    /// takes its namespace out.
+    tombstones_drained: Mutex<std::collections::BTreeSet<String>>,
     #[cfg(test)]
     lose_catalog_commit_reply: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -115,8 +121,56 @@ fn check_name(name: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// The engine's tables without planner statistics: never analyzed
+/// (`reltuples` negative), or holding rows but no column statistics, as a
+/// fresh `pg_restore` leaves them (PostgreSQL 17 restores no statistics;
+/// its index builds set `reltuples`). An analyzed empty table (`reltuples`
+/// 0, no statistics to keep) is not one of them.
+const UNANALYZED_TABLES_SQL: &str = "SELECT c.relname FROM pg_class c WHERE c.relnamespace='aq_playbooks'::regnamespace AND c.relkind IN ('r','p') AND (c.reltuples<0 OR (c.reltuples>0 AND NOT EXISTS(SELECT 1 FROM pg_stats s WHERE s.schemaname='aq_playbooks' AND s.tablename=c.relname))) ORDER BY c.relname";
+/// Analyze the engine's tables that have no planner statistics
+/// ([`UNANALYZED_TABLES_SQL`]). Without them the planner may answer an
+/// indexed lookup by a prefix scan (the drain's receipt-row delete then
+/// reads every receipt row of the namespace per named row). Each gets one
+/// `ANALYZE` of its own, outside any commit, before the first commit. A
+/// table that has statistics is not touched, so this costs one catalog
+/// query after the first connection. `ANALYZE` takes SHARE UPDATE EXCLUSIVE, which blocks no
+/// reader or writer, and reads a bounded sample. It is best effort: a role
+/// that may not analyze a table it does not own gets a server warning and
+/// the table is skipped; any error (a statement or lock timeout, say) is
+/// reported on stderr, value-free, and ignored. Autovacuum analyzes such a
+/// table later anyway.
+fn analyze_unanalyzed(client: &mut Client) {
+    let tables: Vec<String> = match client.query(UNANALYZED_TABLES_SQL, &[]) {
+        Ok(rows) => rows.iter().map(|row| row.get(0)).collect(),
+        Err(error) => {
+            eprintln!("aq-playbooks: could not list tables without statistics: {error}");
+            return;
+        }
+    };
+    for table in tables {
+        // `relname` comes from the catalog of our own schema; quoted anyway.
+        let statement = format!("ANALYZE aq_playbooks.\"{}\"", table.replace('"', "\"\""));
+        if let Err(error) = client.batch_execute(&statement) {
+            eprintln!("aq-playbooks: ANALYZE aq_playbooks.{table} skipped: {error}");
+            continue;
+        }
+        // A role without the right gets only a server warning: say so.
+        let skipped = client
+            .query(UNANALYZED_TABLES_SQL, &[])
+            .map(|rows| rows.iter().any(|row| row.get::<_, String>(0) == table))
+            .unwrap_or(false);
+        if skipped {
+            eprintln!(
+                "aq-playbooks: ANALYZE aq_playbooks.{table} skipped (this role may not analyze it); run ANALYZE as its owner"
+            );
+        }
+    }
+}
+
 impl PostgresStorage {
-    /// Connects and transactionally applies the crate-owned schema migrations.
+    /// Connects and transactionally applies the crate-owned schema migrations,
+    /// then analyzes the engine's tables that have no planner statistics yet
+    /// (see [`analyze_unanalyzed`]).
     /// Credentials are never included in adapter error messages. This convenience
     /// constructor uses NoTls; use `from_client` with a host-configured TLS client
     /// for remote production databases requiring transport encryption.
@@ -185,6 +239,7 @@ impl PostgresStorage {
             .map_err(backend)?;
         }
         tx.commit().map_err(backend)?;
+        analyze_unanalyzed(&mut client);
         Ok(Self {
             connection: Mutex::new(Connection {
                 client,
@@ -195,6 +250,7 @@ impl PostgresStorage {
             profiling: Default::default(),
             records: false,
             stats: Mutex::new(TransitionStats::default()),
+            tombstones_drained: Mutex::new(Default::default()),
             #[cfg(test)]
             lose_catalog_commit_reply: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -701,7 +757,7 @@ impl PostgresStorage {
             previous
         };
         tx.phase("artifact_locks");
-        let removals = aq_playbooks_runner::retention::verify_removals(&previous, state)?;
+        aq_playbooks_runner::retention::verify_removals(&previous, state)?;
         let addresses: std::collections::BTreeSet<_> = previous
             .artifacts
             .keys()
@@ -727,7 +783,8 @@ impl PostgresStorage {
             }
         }
         tx.phase("retention");
-        retention::verify_and_record(&mut tx, namespace, &previous, state, &removals)?;
+        let drain_limit = self.tombstone_drain_limit(namespace, state);
+        let rows = retention::verify_and_record(&mut tx, namespace, &previous, state, drain_limit)?;
         let items = aq_playbooks_runner::history_items(&state.settled);
         aq_playbooks_runner::history::check_not_live(state, &items)?;
         history::check_unrecorded(
@@ -735,12 +792,7 @@ impl PostgresStorage {
             namespace,
             &aq_playbooks_runner::history::new_live_keys(&previous, state),
         )?;
-        history::insert(
-            &mut tx,
-            namespace,
-            &items,
-            state.retention.policy.history_keep,
-        )?;
+        history::insert(&mut tx, namespace, &items, &state.retention.policy)?;
         for (digest, artifact) in &state.artifacts {
             tx.phase("artifact_compare");
             // Previous bytes were freshly read, authenticated and fully verified
@@ -857,6 +909,37 @@ impl PostgresStorage {
         if let Some(lease) = conn.leases.get_mut(namespace) {
             lease.catalog_uncertain = false;
         }
+        self.tombstones_committed(namespace, drain_limit, rows);
         Ok(next as u64)
+    }
+    /// The bound of this commit's delete of legacy tombstone rows
+    /// (`policy.drain_entries_per_commit`), or `None` when this handle has
+    /// seen them drained.
+    pub(crate) fn tombstone_drain_limit(&self, namespace: &str, state: &State) -> Option<usize> {
+        let drained = self
+            .tombstones_drained
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(namespace);
+        (!drained).then_some(state.retention.policy.drain_entries_per_commit)
+    }
+    /// After a commit: remember that the rows are drained when its delete
+    /// found fewer than its bound (no engine writes such rows any more; a
+    /// new handle looks once more).
+    pub(crate) fn tombstones_committed(
+        &self,
+        namespace: &str,
+        limit: Option<usize>,
+        rows: retention::TombstoneRows,
+    ) {
+        let mut drained = self
+            .tombstones_drained
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let (Some(limit), Some(deleted)) = (limit, rows.deleted)
+            && deleted < limit as u64
+        {
+            drained.insert(namespace.to_string());
+        }
     }
 }

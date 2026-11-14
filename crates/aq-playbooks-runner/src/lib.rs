@@ -722,7 +722,9 @@ impl<S: Storage> Engine<S> {
         Self::open(store, namespace, owner, EngineConfig::default())
     }
     /// Acquire the namespace and run the upgrade's bookkeeping commit (index
-    /// rebuild, `root_intents` fill).
+    /// rebuild, `root_intents` and dispatch sequence fills). Like every
+    /// commit, it also takes the drain's first step on a namespace an older
+    /// engine wrote (`retention::drain_step`).
     fn open(
         store: S,
         namespace: impl Into<String>,
@@ -750,8 +752,8 @@ impl<S: Storage> Engine<S> {
             // A State from before `root_intents` (pre-D10): cohort removal
             // needs every operation there, so fill it once.
             indexes::backfill_root_intents(s);
-            // Before `contract_events` (Task 8b): fill it once.
-            indexes::backfill_contract_events(s)?;
+            // `contract_events` of a State written before it (Task 8b) is
+            // filled by the drain, a bounded number of events per commit.
             // Before `Intent::dispatch_sequence` (Task 8b): fill it once.
             indexes::backfill_dispatch_sequences(s);
             Ok(())
@@ -794,7 +796,10 @@ impl<S: Storage> Engine<S> {
         Ok(self.store.inspect(&self.namespace, query)?)
     }
     /// Delete the history of runs finished before `before_ms`; returns the
-    /// number of history items deleted.
+    /// number of history items deleted. Host-callable and optional: history
+    /// is already a rolling log of `policy.history_keep` per set. Commits
+    /// no State and moves no clock; on PostgreSQL it needs this engine's
+    /// lease, which the engine holds.
     pub fn delete_history_before(&self, before_ms: i64) -> Result<u64> {
         Ok(self
             .store
@@ -837,16 +842,21 @@ impl<S: Storage> Engine<S> {
         now_ms: Finish,
         f: impl FnOnce(&mut State) -> Result<(T, bool)>,
     ) -> Result<(T, retention::CommitReport)> {
-        fn finish(state: &mut State, mode: Finish) -> Result<retention::CommitReport> {
+        // `started`: the namespace sequence the commit began at.
+        fn finish(
+            state: &mut State,
+            mode: Finish,
+            started: u64,
+        ) -> Result<retention::CommitReport> {
             let Finish::Host(now_ms) = mode else {
                 indexes::sync(state)?;
-                let report = retention::finish_licensed_commit(state)?;
+                let report = retention::finish_licensed_commit(state, started)?;
                 indexes::sync(state)?;
                 return Ok(report);
             };
             let candidates = retention::candidate_roots(state);
             indexes::sync(state)?;
-            let report = retention::finish_commit(state, now_ms, candidates)?;
+            let report = retention::finish_commit(state, now_ms, candidates, started)?;
             indexes::sync(state)?;
             Ok(report)
         }
@@ -860,13 +870,14 @@ impl<S: Storage> Engine<S> {
                 .take()
                 .ok_or_else(|| Error::Conflict("transition plan ran twice".into()))?;
             state.protection_available = protection;
+            let sequence = state.sequence;
             let started = std::time::Instant::now();
             let evaluated = f(state);
             metrics.record_time(metrics::Timing::Transition, started.elapsed());
             let (value, changed) = evaluated?;
             result = Some(value);
             if changed {
-                report = finish(state, now_ms)?;
+                report = finish(state, now_ms, sequence)?;
             }
             Ok(changed)
         };
@@ -897,6 +908,7 @@ impl<S: Storage> Engine<S> {
             indexes::rebuild(&mut v.state)?;
         }
         v.state.protection_available = protection;
+        let sequence = v.state.sequence;
         let started = std::time::Instant::now();
         let evaluated = f(&mut v.state);
         self.metrics
@@ -905,7 +917,7 @@ impl<S: Storage> Engine<S> {
         if !changed {
             return Ok((result, retention::CommitReport::default()));
         }
-        let report = finish(&mut v.state, now_ms)?;
+        let report = finish(&mut v.state, now_ms, sequence)?;
         let started = std::time::Instant::now();
         let committed =
             self.store
@@ -1848,13 +1860,6 @@ fn next_id(s: &mut State, prefix: &str) -> String {
 }
 fn receipt(s: &mut State, run: &str, step: &str, now: i64, kind: &str, detail: Value) {
     s.sequence += 1;
-    if let Some(r) = s.runs.get(run) {
-        s.indexes
-            .root_last_activity
-            .entry(r.root.clone())
-            .and_modify(|at| *at = (*at).max(now))
-            .or_insert(now);
-    }
     let offset = s.receipts.len();
     s.indexes
         .receipts
@@ -3753,6 +3758,19 @@ impl<S: Storage> Engine<S> {
         if policy.replay_keep == 0 {
             return Err(Error::Refused("replay_keep must be positive".into()));
         }
+        if policy.drain_cohorts_per_commit == 0 || policy.drain_entries_per_commit == 0 {
+            return Err(Error::Refused("drain bounds must be positive".into()));
+        }
+        if policy.window_drops_per_commit == 0
+            || policy.replay_evictions_per_commit == 0
+            || policy.history_trim_per_commit == 0
+            || policy.gc_page_limit == 0
+            || policy.settle_cohorts_per_commit == 0
+        {
+            return Err(Error::Refused(
+                "per-commit retention bounds must be positive".into(),
+            ));
+        }
         self.transaction_at(None, |s| {
             s.retention.policy = policy;
             Ok(())
@@ -3849,8 +3867,26 @@ impl<S: Storage> Engine<S> {
             Ok((from_ms, to_ms))
         })
     }
+    /// Not needed: every commit already does this work, a bounded amount
+    /// each (see `docs/implementation/0003-live-state-only.md`). Kept so
+    /// existing callers compile. One ordinary commit at host time `now_ms`
+    /// (the bounded settle, drain of an older engine's namespace, window
+    /// drop and eviction of every commit), plus a page of at most `limit`
+    /// artifacts examined for disposal (`1..=policy.gc_page_limit`); refused
+    /// if `now_ms` is before the previous call's. It removes no run without
+    /// its history and writes no tombstone, correlation fence or disposal
+    /// record. `more` says more bounded work is due.
     pub fn collect_garbage(&self, now_ms: i64, limit: usize) -> Result<GcReport> {
-        self.transaction_at(Some(now_ms), |s| retention::gc(s, now_ms, limit))
+        let (mut gc, commit) = self.transaction_report_at(Finish::Host(Some(now_ms)), |s| {
+            retention::gc(s, now_ms, limit).map(|gc| (gc, true))
+        })?;
+        gc.runs = commit.runs;
+        gc.events = commit.events;
+        gc.admissions = commit.admissions;
+        gc.receipts = commit.receipts;
+        gc.evicted = commit.evicted;
+        gc.more = gc.more || commit.more;
+        Ok(gc)
     }
     pub fn advance_producer_epoch(
         &self,

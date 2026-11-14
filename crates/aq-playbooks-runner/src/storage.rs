@@ -348,11 +348,7 @@ impl Storage for MemoryStorage {
         }
         entry.catalog = catalog;
         entry.catalog_projected_revision = revision;
-        history::insert(
-            &mut entry.history,
-            items,
-            state.retention.policy.history_keep,
-        );
+        history::insert(&mut entry.history, items, &state.retention.policy);
         let mut stored = state.clone();
         let settled = std::mem::take(&mut stored.settled);
         if self.retain_settled {

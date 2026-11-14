@@ -264,8 +264,13 @@ fn protected_admin_lifecycle_control_recovery_rotation_and_paged_inspection() {
         json!({"event_replay_ms":100,"terminal_run_ms":100,"audit_ms":100,"max_tombstones":1000}),
     );
     f.ok(&["retention", policy.to_str().unwrap()], Some(&keys_b));
+    // `gc` keeps working and says plainly that it is not needed: it is one
+    // more ordinary commit of the bounded work every commit does.
+    let help = f.call(&["gc", "--help"], None);
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Not needed"));
     let report = f.ok(&["gc", "--limit", "10"], Some(&keys_b));
     assert_eq!(report["runs"], 0); // unresolved effects survive aggressive retention
+    assert_eq!(report["admissions"], 0);
     f.ok(
         &[
             "retire-producer",

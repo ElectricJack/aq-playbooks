@@ -76,18 +76,19 @@ backups, exported files, and previously exposed plaintext are not retroactively
 encrypted; the operator must retire them under its migration and backup policy.
 Use protection from namespace creation when source constants are confidential.
 
-Garbage collection requires explicit runner disposal records. It preserves active
-and unresolved runs, children/effects, event destinations, callable dependency
-closures, and retained audit references. Replay tombstones survive event payload
-expiry. Only a recorded increase in the producer's replay epoch permits removal of
-that epoch's native event tombstones; stale delivery epochs remain refused. The
-injected monotonic GC clock and audit horizon permit compaction of settled
-run/operation disposal metadata and unreferenced artifact payload/catalog metadata.
+No host needs to call garbage collection: finished runs leave in the commit
+that finishes them (as history), and every commit deletes a bounded number of
+expired or evicted window entries. `collect_garbage` is one more such commit
+plus a page of unreferenced artifact disposal. No commit writes a
+`disposal_tombstones` row for a run, operation or event; rows an older engine
+wrote are deleted by the drain, a bounded number per commit, and refuse the
+reuse of their identity until then. A retired producer epoch still refuses
+stale delivery epochs. The GC clock and audit horizon permit compaction of
+unreferenced artifact payload/catalog metadata (artifact disposal rows only).
 Shared artifact installation and disposal serialize on digest locks. The
-disposal tombstone rows are not counted (`max_tombstones` is ignored), and their
-cutoff deletes run only in a commit that moves the GC clock. Artifact addresses
-remain content verified, including a byte digest while their disposal tombstone is
-retained.
+disposal tombstone rows are not counted (`max_tombstones` is ignored).
+Artifact addresses remain content verified, including a byte digest while
+their disposal tombstone is retained.
 
 Run the required storage and protected CLI suites with an isolated Docker database:
 

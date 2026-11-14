@@ -1,7 +1,6 @@
 use crate::backend;
 use crate::profiling::ObservedTransaction;
 use aq_playbooks_model::{canonical_bytes, hash_bytes};
-use aq_playbooks_runner::retention::Removals;
 use aq_playbooks_runner::{State, StorageError};
 
 fn record(
@@ -28,22 +27,46 @@ pub(crate) fn collect(
     if let Some(now) = next.retention.last_gc_at_ms {
         let cutoff =
             now.saturating_sub(i64::try_from(next.retention.policy.audit_ms).unwrap_or(i64::MAX));
-        tx.execute("WITH candidates AS MATERIALIZED(SELECT c.digest FROM aq_playbooks.artifact_catalog c JOIN aq_playbooks.disposal_tombstones t ON t.identity=c.digest AND t.kind='artifact' WHERE t.namespace=$1 AND t.disposed_at_ms<$2 AND NOT EXISTS(SELECT 1 FROM aq_playbooks.namespace_artifacts n WHERE n.digest=c.digest) AND NOT EXISTS(SELECT 1 FROM aq_playbooks.artifacts a WHERE a.digest=c.digest) AND NOT EXISTS(SELECT 1 FROM aq_playbooks.encrypted_artifacts e WHERE e.digest=c.digest) ORDER BY c.digest LIMIT 1000 FOR UPDATE OF c SKIP LOCKED) DELETE FROM aq_playbooks.artifact_catalog c USING candidates x WHERE c.digest=x.digest",&[&namespace,&cutoff]).map_err(backend)?;
-        tx.execute("DELETE FROM aq_playbooks.disposal_tombstones t WHERE namespace=$1 AND disposed_at_ms<$2 AND ((kind='run' AND NOT EXISTS(SELECT 1 FROM aq_playbooks.inspection_rows r WHERE r.namespace=t.namespace AND r.kind='runs' AND r.item_key=t.identity)) OR (kind='intent' AND NOT EXISTS(SELECT 1 FROM aq_playbooks.inspection_rows r WHERE r.namespace=t.namespace AND r.kind='effects' AND r.item_key=t.identity)) OR (kind='artifact' AND NOT EXISTS(SELECT 1 FROM aq_playbooks.artifact_catalog c WHERE c.digest=t.identity)))",&[&namespace,&cutoff]).map_err(backend)?;
+        // At most a GC page of shared catalog rows per GC commit.
+        let page = i64::try_from(next.retention.policy.gc_page_limit).unwrap_or(i64::MAX);
+        tx.execute("WITH candidates AS MATERIALIZED(SELECT c.digest FROM aq_playbooks.artifact_catalog c JOIN aq_playbooks.disposal_tombstones t ON t.identity=c.digest AND t.kind='artifact' WHERE t.namespace=$1 AND t.disposed_at_ms<$2 AND NOT EXISTS(SELECT 1 FROM aq_playbooks.namespace_artifacts n WHERE n.digest=c.digest) AND NOT EXISTS(SELECT 1 FROM aq_playbooks.artifacts a WHERE a.digest=c.digest) AND NOT EXISTS(SELECT 1 FROM aq_playbooks.encrypted_artifacts e WHERE e.digest=c.digest) ORDER BY c.digest LIMIT $3 FOR UPDATE OF c SKIP LOCKED) DELETE FROM aq_playbooks.artifact_catalog c USING candidates x WHERE c.digest=x.digest",&[&namespace,&cutoff,&page]).map_err(backend)?;
+        // Artifact rows only: legacy rows of runs, operations and events
+        // leave through the drain ([`drain_tombstones`]).
+        tx.execute("DELETE FROM aq_playbooks.disposal_tombstones t WHERE namespace=$1 AND disposed_at_ms<$2 AND kind='artifact' AND NOT EXISTS(SELECT 1 FROM aq_playbooks.artifact_catalog c WHERE c.digest=t.identity)",&[&namespace,&cutoff]).map_err(backend)?;
     }
     Ok(())
 }
-/// Durable side of the shared removal check. `removals` is what
-/// `retention::verify_removals` allowed for this commit: only its legacy
-/// removals (and artifact disposals) write tombstone rows. A removal allowed
-/// by its history or by an expired window entry writes none.
+/// Delete up to `limit` of the namespace's legacy tombstone rows of runs,
+/// operations and events (written by engines before spec 0003; no engine
+/// writes them any more); artifact rows stay, they guard artifact bytes. Returns how
+/// many it deleted: fewer than `limit` means none is left. One index-backed
+/// statement (the rows' primary key leads with the namespace and kind).
+pub(crate) fn drain_tombstones(
+    tx: &mut ObservedTransaction<'_>,
+    namespace: &str,
+    limit: usize,
+) -> Result<u64, StorageError> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    tx.execute("DELETE FROM aq_playbooks.disposal_tombstones WHERE ctid IN (SELECT ctid FROM aq_playbooks.disposal_tombstones WHERE namespace=$1 AND kind IN ('event','run','intent') LIMIT $2)",&[&namespace,&limit]).map_err(backend)
+}
+/// What a commit did to the legacy tombstone rows: how many the drain
+/// `deleted` (when it ran).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TombstoneRows {
+    pub deleted: Option<u64>,
+}
+/// Durable side of the shared removal check (`retention::verify_removals`
+/// judged the commit before). Only artifact disposals write tombstone rows:
+/// a removal allowed by its history or by its window writes none. With
+/// `drain_limit`, up to that many legacy rows of runs, operations and
+/// events are deleted ([`drain_tombstones`]), after the identity check.
 pub(crate) fn verify_and_record(
     tx: &mut ObservedTransaction<'_>,
     namespace: &str,
     previous: &State,
     next: &State,
-    removals: &Removals,
-) -> Result<(), StorageError> {
+    drain_limit: Option<usize>,
+) -> Result<TombstoneRows, StorageError> {
     if next.sequence < previous.sequence {
         return Err(backend("namespace invocation sequence cannot decrease"));
     }
@@ -137,39 +160,12 @@ pub(crate) fn verify_and_record(
             }
         }
     }
-    for id in &removals.legacy_events {
-        let tombstone = &next.retention.event_tombstones[id];
-        record(
-            tx,
-            namespace,
-            "event",
-            id,
-            Some(&previous.events[id].digest),
-            tombstone.disposed_at_ms,
-        )?;
-    }
-    let disposed_at = |run: &str| {
-        next.retention
-            .disposals
-            .iter()
-            .find(|d| d.kind == "run" && d.key == run)
-            .map(|d| d.at_ms)
-            .ok_or_else(|| backend("run removal requires explicit disposal"))
+    let rows = TombstoneRows {
+        deleted: match drain_limit {
+            Some(limit) => Some(drain_tombstones(tx, namespace, limit)?),
+            None => None,
+        },
     };
-    for id in &removals.legacy_runs {
-        record(tx, namespace, "run", id, None, disposed_at(id)?)?;
-    }
-    for id in &removals.legacy_intents {
-        let intent = &previous.intents[id];
-        record(
-            tx,
-            namespace,
-            "intent",
-            id,
-            Some(&intent.input_digest),
-            disposed_at(&intent.run)?,
-        )?;
-    }
     for (id, artifact) in &previous.artifacts {
         if !next.artifacts.contains_key(id) {
             let at = *next
@@ -183,7 +179,7 @@ pub(crate) fn verify_and_record(
     }
     // No tombstone count: `max_tombstones` is accepted and ignored, and
     // legacy rows beyond it (drained later) never refuse a commit.
-    Ok(())
+    Ok(rows)
 }
 /// Delete the tombstone rows of event tombstones the State no longer holds.
 pub(crate) fn forget_event_tombstones(

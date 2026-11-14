@@ -1331,9 +1331,10 @@ fn gc_preserves_bound_transitive_closure_then_collects_terminal_cohorts_in_pages
 }
 
 #[test]
-fn gc_tombstones_expired_event_identity_and_epoch_fence_compacts_safely() {
+fn an_expired_event_identity_is_judged_by_time_and_the_epoch_fence_refuses_old_epochs() {
     let e = engine();
-    e.install(wait_artifact()).unwrap();
+    // Activated, so GC's artifact phase keeps the event contract.
+    install(&e, wait_artifact(), "waiter");
     e.set_retention_policy(RetentionPolicy {
         event_replay_ms: 1,
         terminal_run_ms: 1,
@@ -1344,15 +1345,15 @@ fn gc_tombstones_expired_event_identity_and_epoch_fence_compacts_safely() {
     .unwrap();
     let envelope = event("expired", 2);
     let disposition = e.admit_event("host", envelope.clone(), 0).unwrap();
+    // The commit's window drop forgets it; spec 0003 writes no tombstone.
     assert_eq!(e.collect_garbage(2000, 10).unwrap().events, 1);
-    assert!(
-        e.snapshot()
-            .unwrap()
-            .retention
-            .event_tombstones
-            .contains_key(&disposition.key)
-    );
-    assert!(e.admit_event("host", envelope.clone(), 2001).is_err());
+    let s = e.snapshot().unwrap();
+    assert!(!s.events.contains_key(&disposition.key));
+    assert!(s.retention.event_tombstones.is_empty());
+    // A repeat with its producer time is stale and writes nothing.
+    let stale = e.admit_event_at("host", envelope.clone(), 0, Some(0), 2001);
+    assert!(matches!(stale, Err(Error::Stale { .. })), "{stale:?}");
+    assert!(!e.snapshot().unwrap().events.contains_key(&disposition.key));
     e.advance_producer_epoch(
         "host",
         1,
@@ -1580,8 +1581,12 @@ fn gc_preserves_possible_async_completion_while_lost_admission_handle_is_unknown
             1,
         )
         .unwrap();
+    // Past the event's own window (1,001) but inside the hold: the
+    // operation's command deadline (100) plus that window (1,000). After
+    // the hold lapses (1,100) the event is an ordinary entry (Task 10,
+    // ruling C).
     for _ in 0..10 {
-        if !e.collect_garbage(4000, 1).unwrap().more {
+        if !e.collect_garbage(1050, 1).unwrap().more {
             break;
         }
     }
@@ -1592,8 +1597,8 @@ fn gc_preserves_possible_async_completion_while_lost_admission_handle_is_unknown
             handle: "server-operation".into(),
         }],
     );
-    e.recover(&mut host, 4001).unwrap();
-    e.drive(&mut host, 4001, 20).unwrap();
+    e.recover(&mut host, 1051).unwrap();
+    e.drive(&mut host, 1051, 20).unwrap();
     assert_eq!(settled(&e, &id).outcome.as_deref(), Some("ok"));
 }
 

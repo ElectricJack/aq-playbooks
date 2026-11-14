@@ -1261,7 +1261,7 @@ fn retired_producer_epochs_need_no_new_tombstones_for_late_gc() {
 }
 
 #[test]
-fn expired_replay_tombstones_and_retired_epochs_refuse_old_identities() {
+fn expired_replay_identities_are_judged_by_time_and_retired_epochs_refuse_old_ones() {
     let e = engine();
     let mut a = artifact(
         "replay-catalog",
@@ -1282,8 +1282,18 @@ fn expired_replay_tombstones_and_retired_epochs_refuse_old_identities() {
     .unwrap();
     e.admit_event("host", envelope("original"), 0).unwrap();
     e.collect_garbage(20_000, 10).unwrap();
-    assert_eq!(e.snapshot().unwrap().retention.event_tombstones.len(), 1);
-    assert!(e.admit_event("host", envelope("original"), 20_001).is_err());
+    // Spec 0003: the expired identity leaves with no tombstone. A repeat
+    // with its producer time is stale; without one it is new.
+    assert!(e.snapshot().unwrap().retention.event_tombstones.is_empty());
+    assert!(matches!(
+        e.admit_event_at("host", envelope("original"), 0, Some(0), 20_001),
+        Err(Error::Stale { .. })
+    ));
+    assert!(
+        !e.admit_event("host", envelope("original"), 20_001)
+            .unwrap()
+            .duplicate
+    );
     e.advance_producer_epoch("host", 1, "operator", "new explicit replay epoch", 20_002)
         .unwrap();
     assert!(e.admit_event("host", envelope("original"), 20_003).is_err());

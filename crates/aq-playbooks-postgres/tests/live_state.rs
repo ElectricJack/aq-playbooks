@@ -2278,9 +2278,11 @@ fn a_pinned_clock_is_rebased_on_postgres() {
 // --- Task 8: max_tombstones is ignored ------------------------------------
 
 /// Legacy disposal tombstone rows beyond `max_tombstones` refuse no full
-/// commit, and a full commit that does not move the GC clock leaves them in
-/// place (no tombstone count, no cutoff deletes). The commit that moves the
-/// GC clock still runs the cutoff deletes. On f2 protected, f2 plain and f3.
+/// commit and are not counted. Rows of runs are left to the drain, never to
+/// the GC clock's cutoff deletes: a handle that has seen the namespace
+/// drained does not look again (here they were inserted behind its back),
+/// and a new handle deletes them `drain_entries_per_commit` per commit. On
+/// f2 protected, f2 plain and f3.
 #[test]
 fn legacy_tombstone_rows_beyond_max_tombstones_refuse_no_commit_and_are_not_scanned() {
     for (label, store) in [
@@ -2316,7 +2318,20 @@ fn legacy_tombstone_rows_beyond_max_tombstones_refuse_no_commit_and_are_not_scan
         let revision = store.compare_and_swap(&ns, "w", base, &next).unwrap();
         assert_eq!(tombstone_rows(&ns), 1_000, "{label}");
         next.retention.last_gc_at_ms = Some(20);
-        store.compare_and_swap(&ns, "w", revision, &next).unwrap();
+        let revision = store.compare_and_swap(&ns, "w", revision, &next).unwrap();
+        assert_eq!(tombstone_rows(&ns), 1_000, "{label}");
+        store.release(&ns, "w").unwrap();
+        let store = match label {
+            "f2" => support::protected(),
+            "f2_plain" => support::store(),
+            _ => support::records(),
+        };
+        store.acquire(&ns, "w2").unwrap();
+        next.sequence += 1;
+        let revision = store.compare_and_swap(&ns, "w2", revision, &next).unwrap();
+        assert_eq!(tombstone_rows(&ns), 500, "{label}");
+        next.sequence += 1;
+        store.compare_and_swap(&ns, "w2", revision, &next).unwrap();
         assert_eq!(tombstone_rows(&ns), 0, "{label}");
     }
 }
@@ -3065,4 +3080,980 @@ fn history_run_ids_by_sequence(ns: &str) -> Vec<String> {
         .into_iter()
         .map(|row| row.get(0))
         .collect()
+}
+
+// --- Task 9: the drain of namespaces written by an older engine -------------
+
+/// Write `rows` legacy tombstone rows of `kind` as the namespace writer.
+fn legacy_rows(ns: &str, format: &str, kind: &str, rows: i64) {
+    let mut c = support::client();
+    let mut tx = c.transaction().unwrap();
+    tx.query_one(
+        "SELECT set_config('aq_playbooks.writer_namespace',$1,true),set_config('aq_playbooks.writer_format',$2,true)",
+        &[&ns, &format],
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO aq_playbooks.disposal_tombstones(namespace,kind,identity,content_digest,disposed_at_ms) SELECT $1,$2,'legacy-'||$2||'-'||i,NULL,1 FROM generate_series(1,$3::bigint) i",
+        &[&ns, &kind, &rows],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+}
+fn format_of(label: &str) -> &'static str {
+    if label == "f3" { "3" } else { "2" }
+}
+/// A new storage handle of the kind `label` names (as a restarted process
+/// opens the namespace).
+fn handle(label: &str) -> PostgresStorage {
+    if label == "f3" {
+        support::records()
+    } else {
+        support::protected()
+    }
+}
+/// `state` without its drain record, as an older engine stored it.
+fn without_drain(state: &State) -> State {
+    let mut value = serde_json::to_value(state).unwrap();
+    value["retention"].as_object_mut().unwrap().remove("drain");
+    serde_json::from_value(value).unwrap()
+}
+fn legacy_runs_left(store: &PostgresStorage, ns: &str) -> usize {
+    store
+        .load(ns)
+        .unwrap()
+        .state
+        .runs
+        .keys()
+        .filter(|id| id.starts_with("run-0-legacy-"))
+        .count()
+}
+fn history_runs(ns: &str) -> i64 {
+    support::client()
+        .query_one(
+            "SELECT count(*) FROM aq_playbooks.run_history WHERE namespace=$1 AND kind='runs'",
+            &[&ns],
+        )
+        .unwrap()
+        .get(0)
+}
+/// The brief's test, on protected format 2 and format 3: a legacy State of
+/// 120 settled cohorts (indexes not initialized) and 1,200 legacy event
+/// tombstone rows. The open commit moves 50 cohorts and deletes 500 rows;
+/// two more commits finish both; history holds the 120 runs.
+#[test]
+fn legacy_protected_namespace_drains_records_and_sql_tombstones() {
+    for (label, store) in both() {
+        let ns = support::namespace("drain");
+        let mut state = State::default();
+        for i in 0..120 {
+            let id = format!("run-0-legacy-{i:04}");
+            let mut run = completed_run(&id);
+            for kind in ["admitted", "terminal"] {
+                state.sequence += 1;
+                state.receipts.push(Receipt {
+                    kind: kind.into(),
+                    ..audit(state.sequence, &id)
+                });
+            }
+            run.terminal_sequence = Some(state.sequence);
+            state.runs.insert(id.clone(), run);
+            state.budgets.insert(id, Budget::default());
+        }
+        state.indexes.initialized = false;
+        store.acquire(&ns, "writer").unwrap();
+        store
+            .compare_and_swap(&ns, "writer", 0, &without_drain(&state))
+            .unwrap();
+        store.release(&ns, "writer").unwrap();
+        legacy_rows(&ns, format_of(label), "event", 1_200);
+        // Artifact rows guard artifact bytes: the drain leaves them.
+        legacy_rows(&ns, format_of(label), "artifact", 1);
+        let e = Engine::new(handle(label), &ns, "w").unwrap();
+        assert_eq!(
+            (legacy_runs_left(&e.store, &ns), tombstone_rows(&ns)),
+            (70, 701),
+            "{label}"
+        );
+        e.install(support::artifact("a")).unwrap();
+        e.install(support::artifact("a")).unwrap();
+        assert_eq!(
+            (legacy_runs_left(&e.store, &ns), tombstone_rows(&ns)),
+            (0, 1),
+            "{label}: the artifact row stays"
+        );
+        assert!(e.snapshot().unwrap().retention.drain.done, "{label}");
+        assert_eq!(history_runs(&ns), 120, "{label}");
+    }
+}
+/// Once a commit finds fewer rows than its bound, the handle issues no
+/// delete for that namespace again: rows that appear behind its back stay
+/// (a drained namespace pays nothing per commit); a new handle probes once.
+#[test]
+fn drained_tombstone_rows_cost_no_statement_per_commit() {
+    for (label, store) in both() {
+        let ns = support::namespace("drained-rows");
+        store.acquire(&ns, "setup").unwrap();
+        store
+            .compare_and_swap(&ns, "setup", 0, &State::default())
+            .unwrap();
+        store.release(&ns, "setup").unwrap();
+        legacy_rows(&ns, format_of(label), "run", 3);
+        let e = Engine::new(handle(label), &ns, "w").unwrap();
+        assert_eq!(tombstone_rows(&ns), 0, "{label}");
+        // Drained: rows written behind the handle's back are not looked for.
+        legacy_rows(&ns, format_of(label), "run", 2);
+        e.install(support::artifact("a")).unwrap();
+        assert_eq!(tombstone_rows(&ns), 2, "{label}: no delete once drained");
+        // A new handle probes once and finds them.
+        e.release().unwrap();
+        let e = Engine::new(handle(label), &ns, "w2").unwrap();
+        assert_eq!(tombstone_rows(&ns), 0, "{label}");
+        e.release().unwrap();
+    }
+}
+/// The fixture of the runner's tests: a namespace the engine aq-server
+/// vendors (0173673) wrote on its in-memory store (see that test).
+fn vendored_fixture() -> State {
+    serde_json::from_str(include_str!(
+        "../../aq-playbooks-runner/tests/fixtures/legacy_state_0173673.json"
+    ))
+    .unwrap()
+}
+fn vendored_authority() -> Authority {
+    Authority {
+        actor: "alice".into(),
+        scope: "project".into(),
+        capabilities: ["execute".to_string()].into(),
+    }
+}
+/// Drive a namespace an older engine wrote (`ns` on `store`, already
+/// holding it) to fully drained while new runs are admitted and served at
+/// every step: no commit fails, every legacy run is listed exactly once at
+/// every step, legacy duplicates are recognised, and in the end the record
+/// and the legacy tombstone rows are drained and every legacy run is in
+/// history. Returns the number of steps.
+fn drain_while_serving(e: &Engine<PostgresStorage>, ns: &str, legacy: &State) -> usize {
+    let all: std::collections::BTreeSet<String> = legacy.runs.keys().cloned().collect();
+    let listed_once = |step: usize| {
+        let mut ids = vec![];
+        let mut after = None;
+        loop {
+            let page = e
+                .inspect(&InspectionQuery {
+                    after,
+                    limit: 7,
+                    ..runs_query()
+                })
+                .unwrap();
+            ids.extend(
+                page.items
+                    .iter()
+                    .map(|r| r["id"].as_str().unwrap().to_string())
+                    .filter(|id| all.contains(id)),
+            );
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        let unique: std::collections::BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "step {step}: listed twice");
+        assert_eq!(unique.len(), all.len(), "step {step}: missing");
+    };
+    let keyed = |key: &str| KeyedAdmissionRequest {
+        key: key.into(),
+        binding: "done".into(),
+        expected_activation_revision: legacy.bindings["done"].revision,
+        entry: "main".into(),
+        input: Value::Null,
+        authority: vendored_authority(),
+    };
+    let mut host = FakeHost::default();
+    let mut step = 0;
+    loop {
+        listed_once(step);
+        if e.snapshot().unwrap().retention.drain.done && tombstone_rows(ns) == 0 {
+            break;
+        }
+        let t = 30_000 + step as i64;
+        let id = e
+            .admit("done", "main", Value::Null, vendored_authority(), t)
+            .unwrap();
+        e.drive(&mut host, t, 20).unwrap();
+        assert!(!e.snapshot().unwrap().runs.contains_key(&id), "served");
+        if legacy.keyed_admissions.contains_key("k-done") {
+            assert!(e.admit_once(keyed("k-done"), t).unwrap().duplicate);
+            assert!(e.admit_once(keyed("k-live"), t).unwrap().duplicate);
+        }
+        step += 1;
+        assert!(step < 400, "the drain did not finish");
+    }
+    let s = e.snapshot().unwrap();
+    let r = &s.retention;
+    assert!(r.event_tombstones.is_empty() && r.expired_correlations.is_empty());
+    assert!(r.disposals.is_empty());
+    // Runs of cohorts that were settled when the older engine left them.
+    let finished = legacy
+        .runs
+        .values()
+        .filter(|run| {
+            legacy
+                .runs
+                .values()
+                .all(|other| other.root != run.root || other.status.terminal())
+        })
+        .count();
+    assert!(
+        s.runs.values().all(|run| s
+            .runs
+            .values()
+            .any(|other| other.root == run.root && !other.status.terminal())),
+        "only live cohorts remain"
+    );
+    assert!(history_runs(ns) >= finished as i64);
+    step
+}
+/// Settle every live run the older engine left (the fixture's shapes): the
+/// waiting run and both children receive their event, the asynchronous
+/// operation's handle is found by recovery and its completion arrives, the
+/// admitted and keyed runs advance. Every one finishes `ok` and leaves.
+fn finish_live_legacy(e: &Engine<PostgresStorage>, legacy: &State, t: i64) {
+    use aq_playbooks_model::EventEnvelope;
+    let day = legacy.waits.values().find_map(|w| w.event.clone()).unwrap();
+    let completion = legacy
+        .events
+        .values()
+        .find(|e| e.envelope.event_id.starts_with("async-before"))
+        .unwrap()
+        .envelope
+        .clone();
+    let wake = EventEnvelope {
+        event_id: "wake".into(),
+        contract: day,
+        correlation: BTreeMap::from([("invocation".into(), "exact-invocation".into())]),
+        subject: None,
+        revision: None,
+        ..completion.clone()
+    };
+    let wake = EventEnvelope {
+        payload: Value::Null,
+        ..wake
+    };
+    e.admit_event("host", wake, t).unwrap();
+    let mut host = FakeHost {
+        responses: BTreeMap::from([(
+            "reconcile:test.command".into(),
+            vec![DispatchResult::Accepted {
+                handle: "server-operation".into(),
+            }],
+        )]),
+        ..Default::default()
+    };
+    e.recover(&mut host, t + 1).unwrap();
+    e.admit_event(
+        "host",
+        EventEnvelope {
+            event_id: "completion".into(),
+            correlation: BTreeMap::from([("operation".into(), "server-operation".into())]),
+            ..completion
+        },
+        t + 2,
+    )
+    .unwrap();
+    for t in t + 2..t + 10 {
+        e.drive(&mut host, t, 50).unwrap();
+    }
+    let s = e.snapshot().unwrap();
+    assert!(s.runs.is_empty(), "{:?}", s.runs.keys().collect::<Vec<_>>());
+    let runs = run_ids(&e.store, &e.namespace);
+    for (id, run) in &legacy.runs {
+        assert!(runs.contains(&Value::from(id.as_str())), "{id}");
+        if !run.status.terminal() {
+            let page = e
+                .inspect(&InspectionQuery {
+                    run: Some(id.clone()),
+                    ..runs_query()
+                })
+                .unwrap();
+            assert_eq!(page.items[0]["outcome"], "ok", "{id}: {:?}", page.items[0]);
+        }
+    }
+}
+/// The vendored engine's namespace (fixture) on protected format 2 and on
+/// format 3, with the legacy tombstone rows its GC wrote (5 runs, 3 events)
+/// plus 200 more, and bounds of 4 cohorts and 3 entries per commit: it
+/// drains over many commits while new runs are served.
+#[test]
+fn vendored_namespace_drains_on_postgres_while_new_runs_are_served() {
+    for (label, store) in both() {
+        let ns = support::namespace("vendored");
+        let legacy = vendored_fixture();
+        let mut stored = legacy.clone();
+        stored.retention.policy.drain_cohorts_per_commit = 4;
+        stored.retention.policy.drain_entries_per_commit = 3;
+        store.acquire(&ns, "vendored").unwrap();
+        store
+            .compare_and_swap(&ns, "vendored", 0, &without_drain(&stored))
+            .unwrap();
+        store.release(&ns, "vendored").unwrap();
+        legacy_rows(&ns, format_of(label), "run", 5);
+        legacy_rows(&ns, format_of(label), "event", 203);
+        let e = Engine::new(handle(label), &ns, "upgraded").unwrap();
+        let steps = drain_while_serving(&e, &ns, &legacy);
+        assert!(steps > 5, "{label}: {steps} steps");
+        finish_live_legacy(&e, &legacy, 40_000);
+    }
+}
+/// A namespace the vendored engine's own PostgreSQL crate wrote on protected
+/// format 2 (key `k`, `[7; 32]`), named by `AQ_PLAYBOOKS_VENDORED_NAMESPACE`
+/// in the test database: produced by the generator in
+/// `.local/task9/generator/` (see the Task 9 report). Run with `--ignored`.
+/// Its stored drain bounds are first lowered to 4 cohorts and 3 entries per
+/// commit (one direct CAS, which drains nothing of the record), so the
+/// drain spans many commits while new runs are served; then every live run
+/// the vendored engine left is driven to completion.
+#[test]
+#[ignore = "needs a namespace written by the vendored engine"]
+fn a_namespace_the_vendored_engine_wrote_on_postgres_drains() {
+    let ns = std::env::var("AQ_PLAYBOOKS_VENDORED_NAMESPACE").unwrap();
+    let keys = || {
+        aq_playbooks_postgres::ProtectionKeyring::new(
+            "k",
+            BTreeMap::from([("k".into(), [7u8; 32])]),
+        )
+        .unwrap()
+    };
+    let store = PostgresStorage::connect_protected(&support::database(), keys()).unwrap();
+    let legacy = store.load(&ns).unwrap().state;
+    let before = tombstone_rows(&ns);
+    assert!(before > 0, "the vendored GC wrote tombstone rows");
+    let mut bounded = legacy.clone();
+    bounded.retention.policy.drain_cohorts_per_commit = 4;
+    bounded.retention.policy.drain_entries_per_commit = 3;
+    store.acquire(&ns, "setup").unwrap();
+    let revision = store.load(&ns).unwrap().revision;
+    store
+        .compare_and_swap(&ns, "setup", revision, &without_drain(&bounded))
+        .unwrap();
+    store.release(&ns, "setup").unwrap();
+    let e = Engine::new(
+        PostgresStorage::connect_protected(&support::database(), keys()).unwrap(),
+        &ns,
+        "upgraded",
+    )
+    .unwrap();
+    assert!(!e.snapshot().unwrap().retention.drain.done);
+    let steps = drain_while_serving(&e, &ns, &legacy);
+    eprintln!(
+        "VENDORED-PG legacy runs {} (live {}), rows {before}, steps {steps}, history runs {}",
+        legacy.runs.len(),
+        legacy
+            .runs
+            .values()
+            .filter(|r| !r.status.terminal())
+            .count(),
+        history_runs(&ns)
+    );
+    assert!(steps > 1, "{steps} steps");
+    finish_live_legacy(&e, &legacy, 40_000);
+}
+
+// --- Task 10, item A: receipt index rows keyed by sequence ------------------
+
+/// The runtime-index rows of receipts (`receipt` and `all_receipt`) the
+/// namespace holds: (kind, run, sequence) each.
+fn receipt_index_rows(ns: &str) -> Vec<(String, String, i64)> {
+    support::client()
+        .query(
+            "SELECT kind,lookup_key,sequence FROM aq_playbooks.runtime_index WHERE namespace=$1 AND kind IN ('receipt','all_receipt') ORDER BY kind,lookup_key,sequence",
+            &[&ns],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect()
+}
+/// The same rows as the State's receipt indexes say they must be.
+fn expected_receipt_index_rows(s: &State) -> Vec<(String, String, i64)> {
+    let mut rows: Vec<(String, String, i64)> = s
+        .indexes
+        .receipts
+        .iter()
+        .flat_map(|(run, receipts)| {
+            receipts
+                .keys()
+                .map(|sequence| ("receipt".to_string(), run.clone(), *sequence as i64))
+        })
+        .chain(
+            s.indexes
+                .all_receipts
+                .keys()
+                .map(|sequence| ("all_receipt".to_string(), String::new(), *sequence as i64)),
+        )
+        .collect();
+    rows.sort();
+    rows
+}
+/// The newest transaction id so far; rows a later commit inserts or updates
+/// carry a larger `xmin` (a disposable test database never wraps).
+fn current_xid() -> i64 {
+    support::client()
+        .query_one("SELECT pg_current_xact_id()::text::bigint", &[])
+        .unwrap()
+        .get(0)
+}
+/// Receipt index rows inserted or updated after `xid`.
+fn receipt_rows_written_since(ns: &str, xid: i64) -> i64 {
+    support::client()
+        .query_one(
+            "SELECT count(*) FROM aq_playbooks.runtime_index WHERE namespace=$1 AND kind IN ('receipt','all_receipt') AND xmin::text::bigint > $2",
+            &[&ns, &(xid % 4_294_967_296)],
+        )
+        .unwrap()
+        .get(0)
+}
+/// Rewrite the namespace's receipt index rows as an engine before this
+/// change wrote them: `item_key` is the receipt's position in the State's
+/// receipts (they are in sequence order).
+fn rewrite_receipt_rows_by_position(ns: &str) {
+    let mut c = support::client();
+    let mut tx = support::marked(&mut c, ns);
+    tx.execute(
+        "UPDATE aq_playbooks.runtime_index r SET item_key=(o.position-1)::text FROM (SELECT sequence,row_number() OVER (ORDER BY sequence) AS position FROM aq_playbooks.runtime_index WHERE namespace=$1 AND kind='all_receipt') o WHERE r.namespace=$1 AND r.kind IN ('receipt','all_receipt') AND r.sequence=o.sequence",
+        &[&ns],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+}
+/// Every receipt index query answers as the State's own indexes do.
+fn receipt_queries_match(e: &Engine<PostgresStorage>, ns: &str) {
+    let s = e.snapshot().unwrap();
+    let runs: Vec<Option<String>> = std::iter::once(None)
+        .chain(s.indexes.receipts.keys().cloned().map(Some))
+        .collect();
+    for run in runs {
+        let query = IndexQuery::Receipts {
+            run,
+            after_sequence: 0,
+            limit: 1000,
+        };
+        assert_eq!(
+            serde_json::to_value(e.store.query(ns, &query).unwrap()).unwrap(),
+            serde_json::to_value(s.indexes.query(&s, &query)).unwrap(),
+            "{query:?}"
+        );
+    }
+}
+/// `waiters` live runs waiting (each with its receipts in the record), the
+/// first admitted earliest; then the commit that times it out removes its
+/// cohort, whose receipts are the oldest in the record. Returns the receipt
+/// index rows that commit inserted or updated.
+fn rows_written_when_the_oldest_cohort_leaves(waiters: usize, legacy_rows: bool) -> i64 {
+    let ns = support::namespace("receipt_rows");
+    let e = Engine::new(support::protected(), &ns, "w").unwrap();
+    let w = pg_waiter_artifact();
+    let digest = w.digest.clone();
+    e.install(w).unwrap();
+    e.activate_at("waiter", &digest, pg_authority(), 0).unwrap();
+    let first = e
+        .admit("waiter", "main", Value::Null, pg_authority(), 0)
+        .unwrap();
+    e.advance(&first, 0).unwrap();
+    for _ in 1..waiters {
+        let id = e
+            .admit("waiter", "main", Value::Null, pg_authority(), 1_000)
+            .unwrap();
+        e.advance(&id, 1_000).unwrap();
+    }
+    assert_eq!(e.snapshot().unwrap().runs.len(), waiters);
+    if legacy_rows {
+        rewrite_receipt_rows_by_position(&ns);
+        assert!(
+            support::client()
+                .query_one(
+                    "SELECT bool_and(item_key !~ '^[0-9]{20}$') FROM aq_playbooks.runtime_index WHERE namespace=$1 AND kind IN ('receipt','all_receipt')",
+                    &[&ns],
+                )
+                .unwrap()
+                .get::<_, bool>(0)
+        );
+    }
+    receipt_queries_match(&e, &ns);
+    let xid = current_xid();
+    e.drive(&mut FakeHost::default(), 150, 20).unwrap();
+    let s = e.snapshot().unwrap();
+    assert!(
+        !s.runs.contains_key(&first),
+        "the first waiter timed out and left"
+    );
+    assert_eq!(s.runs.len(), waiters - 1);
+    let written = receipt_rows_written_since(&ns, xid);
+    assert_eq!(receipt_index_rows(&ns), expected_receipt_index_rows(&s));
+    receipt_queries_match(&e, &ns);
+    // The others time out and leave too; no receipt row is left behind
+    // (rows of either keying are deleted with their receipts).
+    e.drive(&mut FakeHost::default(), 1_200, 10 * waiters)
+        .unwrap();
+    let s = e.snapshot().unwrap();
+    assert!(s.runs.is_empty());
+    assert_eq!(receipt_index_rows(&ns), expected_receipt_index_rows(&s));
+    receipt_queries_match(&e, &ns);
+    written
+}
+/// Task 9 review I1: on protected format 2 the runtime-index rows of
+/// receipts are keyed by the receipt's sequence, not by its position in
+/// the record. A commit that removes the oldest cohort (which moves every
+/// later receipt) writes the rows of the receipts it adds, never those of
+/// the receipts that moved: the same for 10 and for 40 live runs.
+#[test]
+fn a_commit_that_removes_a_cohort_writes_receipt_index_rows_for_that_cohort_only() {
+    let few = rows_written_when_the_oldest_cohort_leaves(10, false);
+    let many = rows_written_when_the_oldest_cohort_leaves(40, false);
+    assert_eq!(few, many, "rows written do not depend on the record");
+    assert!(few <= 10, "{few} rows");
+}
+/// Rows an engine before this change wrote (keyed by position) are left as
+/// they are: no commit rewrites them. A receipt's row, of either keying,
+/// is deleted when the receipt leaves; the queries answer the same from
+/// both.
+#[test]
+fn receipt_index_rows_keyed_by_position_are_replaced_as_their_receipts_leave() {
+    let few = rows_written_when_the_oldest_cohort_leaves(10, true);
+    let many = rows_written_when_the_oldest_cohort_leaves(40, true);
+    assert_eq!(few, many, "rows written do not depend on the record");
+    assert!(few <= 10, "{few} rows");
+}
+/// A commit that writes every receipt row afresh (its namespace's indexes
+/// are not marked materialized) over rows keyed by position leaves one row
+/// per receipt, not two.
+#[test]
+fn rewriting_receipt_rows_over_rows_keyed_by_position_leaves_one_row_each() {
+    let ns = support::namespace("receipt_rewrite");
+    let e = Engine::new(support::protected(), &ns, "w").unwrap();
+    let w = pg_waiter_artifact();
+    let digest = w.digest.clone();
+    e.install(w).unwrap();
+    e.activate_at("waiter", &digest, pg_authority(), 0).unwrap();
+    for _ in 0..5 {
+        let id = e
+            .admit("waiter", "main", Value::Null, pg_authority(), 0)
+            .unwrap();
+        e.advance(&id, 0).unwrap();
+    }
+    rewrite_receipt_rows_by_position(&ns);
+    let mut c = support::client();
+    let mut tx = support::marked(&mut c, &ns);
+    tx.execute(
+        "UPDATE aq_playbooks.namespaces SET indexes_materialized=false WHERE namespace=$1",
+        &[&ns],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    e.admit("waiter", "main", Value::Null, pg_authority(), 1)
+        .unwrap();
+    let s = e.snapshot().unwrap();
+    assert_eq!(receipt_index_rows(&ns), expected_receipt_index_rows(&s));
+    receipt_queries_match(&e, &ns);
+}
+
+// --- Task 10, item B: collect_garbage writes no legacy record -----------------
+
+/// On protected format 2 and format 3, `collect_garbage` over an expired
+/// event writes no `disposal_tombstones` row and no tombstone, fence or
+/// disposal record: the event leaves by the commit's window drop, and a
+/// redelivery is new.
+#[test]
+fn collect_garbage_writes_no_disposal_tombstone_row_on_postgres() {
+    for (format, store) in both() {
+        let ns = support::namespace("gc_rows");
+        let e = Engine::new(store, &ns, "w").unwrap();
+        let mut content = support::artifact("a").content;
+        content
+            .registry
+            .events
+            .insert("test.signal".into(), pg_event_contract());
+        let a = aq_playbooks_model::Artifact::seal(content).unwrap();
+        let digest = a.digest.clone();
+        e.install(a).unwrap();
+        e.activate_at("a", &digest, pg_authority(), 0).unwrap();
+        e.set_retention_policy(RetentionPolicy {
+            event_replay_ms: 1,
+            audit_ms: 1,
+            ..RetentionPolicy::default()
+        })
+        .unwrap();
+        let first = e.admit_event("host", pg_event("gone"), 0).unwrap();
+        let report = e.collect_garbage(10_000, 100).unwrap();
+        assert_eq!(report.events, 1, "{format}");
+        let s = e.snapshot().unwrap();
+        assert!(!s.events.contains_key(&first.key), "{format}");
+        assert!(s.retention.event_tombstones.is_empty(), "{format}");
+        assert!(s.retention.expired_correlations.is_empty(), "{format}");
+        assert!(s.retention.disposals.is_empty(), "{format}");
+        assert_eq!(tombstone_rows(&ns), 0, "{format}");
+        assert!(
+            !e.admit_event("host", pg_event("gone"), 10_001)
+                .unwrap()
+                .duplicate,
+            "{format}"
+        );
+    }
+}
+
+// --- Task 10 fix round 1, I1: tables with no statistics are analyzed at open --
+
+/// A database of its own (`CREATE DATABASE`), so the tests below can reset
+/// planner statistics without touching other tests' tables. Returns its
+/// name and its connection string.
+fn own_database(label: &str) -> (String, String) {
+    let name = format!("t10_{}_{}", label, std::process::id());
+    let mut c = support::client();
+    c.batch_execute(&format!("DROP DATABASE IF EXISTS {name}"))
+        .unwrap();
+    c.batch_execute(&format!("CREATE DATABASE {name}")).unwrap();
+    (
+        name.clone(),
+        format!("{} dbname={name}", support::database()),
+    )
+}
+/// As a fresh `pg_restore` leaves it: PostgreSQL 17 restores no column
+/// statistics, while its index builds set `reltuples`. Needs a superuser,
+/// as the disposable test server's `postgres` is.
+fn forget_statistics(url: &str) {
+    let mut c = postgres::Client::connect(url, postgres::NoTls).unwrap();
+    // `reltuples` as the restore's index builds set it, then no statistics.
+    c.batch_execute("ANALYZE aq_playbooks.runtime_index")
+        .unwrap();
+    c.batch_execute(
+        "DELETE FROM pg_statistic WHERE starelid IN (SELECT oid FROM pg_class WHERE relnamespace='aq_playbooks'::regnamespace)",
+    )
+    .unwrap();
+}
+/// Whether `table` has column statistics.
+fn has_statistics(url: &str, table: &str) -> bool {
+    postgres::Client::connect(url, postgres::NoTls)
+        .unwrap()
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_stats WHERE schemaname='aq_playbooks' AND tablename=$1)",
+            &[&table],
+        )
+        .unwrap()
+        .get(0)
+}
+fn reltuples(url: &str, table: &str) -> f32 {
+    postgres::Client::connect(url, postgres::NoTls)
+        .unwrap()
+        .query_one(
+            "SELECT reltuples FROM pg_class WHERE oid=('aq_playbooks.'||$1)::regclass",
+            &[&table],
+        )
+        .unwrap()
+        .get(0)
+}
+/// The plan of the drain's receipt-row delete for one named `all_receipt`
+/// row of namespace `ns`.
+fn receipt_delete_plan(url: &str, ns: &str) -> String {
+    let rows = json!([{"kind":"all_receipt","lookup_key":"","item_key":"00000000000000000005","keep":false}]);
+    postgres::Client::connect(url, postgres::NoTls)
+        .unwrap()
+        .query(
+            "EXPLAIN DELETE FROM aq_playbooks.runtime_index WHERE ctid=ANY(ARRAY(SELECT r.ctid FROM jsonb_to_recordset($2) AS d(kind text,lookup_key text,item_key text,keep boolean) CROSS JOIN LATERAL (SELECT old.ctid FROM aq_playbooks.runtime_index old WHERE old.namespace=$1 AND old.kind=d.kind AND old.lookup_key=d.lookup_key AND old.sequence=d.item_key::bigint AND (NOT d.keep OR old.item_key<>d.item_key) OFFSET 0) r))",
+            &[&ns, &rows],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+/// Review I1: the receipt-row delete stays an index lookup per named row
+/// only when `runtime_index` has statistics. A database restored without
+/// them (and not yet reached by autovacuum) is analyzed when the storage
+/// connects, before any commit: every engine table never analyzed, or
+/// holding rows but no column statistics, gets its own `ANALYZE`.
+#[test]
+fn opening_the_storage_analyzes_engine_tables_that_have_no_statistics() {
+    let (name, url) = own_database("analyze");
+    let ns = support::namespace("analyze");
+    let store = PostgresStorage::connect(&url).unwrap();
+    store.acquire(&ns, "w").unwrap();
+    let mut state = State::default();
+    for sequence in 1..=4_000u64 {
+        let run = format!("run-{}", sequence % 4);
+        state.receipts.push(live_receipt(sequence));
+        let offset = state.receipts.len() - 1;
+        state.receipts[offset].run = run.clone();
+        state
+            .indexes
+            .receipts
+            .entry(run)
+            .or_default()
+            .insert(sequence, offset);
+        state.indexes.all_receipts.insert(sequence, offset);
+    }
+    store.compare_and_swap(&ns, "w", 0, &state).unwrap();
+    store.release(&ns, "w").unwrap();
+    drop(store);
+    forget_statistics(&url);
+    assert!(
+        reltuples(&url, "runtime_index") >= 4_000.0,
+        "as a restore leaves it"
+    );
+    assert!(!has_statistics(&url, "runtime_index"));
+    // Without statistics the planner reads every receipt row per lookup.
+    assert!(!receipt_delete_plan(&url, &ns).contains("runtime_correlated_sequence"));
+    let store = PostgresStorage::connect(&url).unwrap();
+    assert!(has_statistics(&url, "runtime_index"));
+    assert!(reltuples(&url, "run_history") >= 0.0, "empty tables too");
+    let plan = receipt_delete_plan(&url, &ns);
+    assert!(plan.contains("runtime_correlated_sequence"), "{plan}");
+    // Tables that have statistics are not analyzed again.
+    let analyzed = |c: &mut postgres::Client| -> i64 {
+        c.query_one(
+            "SELECT coalesce(sum(analyze_count),0)::bigint FROM pg_stat_user_tables WHERE schemaname='aq_playbooks'",
+            &[],
+        )
+        .unwrap()
+        .get(0)
+    };
+    let mut c = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let before = analyzed(&mut c);
+    drop(PostgresStorage::connect(&url).unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    let mut c = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    assert_eq!(analyzed(&mut c), before);
+    drop(store);
+    drop(c);
+    support::client()
+        .batch_execute(&format!("DROP DATABASE {name} WITH (FORCE)"))
+        .unwrap();
+}
+/// A role that may write the engine's tables but not analyze them (it does
+/// not own them) still opens: the `ANALYZE` is skipped with a warning and
+/// never fails the connection.
+#[test]
+fn a_role_that_cannot_analyze_still_opens() {
+    let (name, url) = own_database("noanalyze");
+    drop(PostgresStorage::connect(&url).unwrap());
+    let role = format!("t10_writer_{}", std::process::id());
+    let mut c = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    c.batch_execute(&format!(
+        "DROP ROLE IF EXISTS {role};
+         CREATE ROLE {role} LOGIN PASSWORD 'synthetic-writer';
+         GRANT CONNECT, CREATE ON DATABASE {name} TO {role};
+         GRANT USAGE, CREATE ON SCHEMA aq_playbooks TO {role};
+         GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA aq_playbooks TO {role};"
+    ))
+    .unwrap();
+    // Never analyzed, as a database the owner has not opened yet.
+    postgres::Client::connect(&url, postgres::NoTls)
+        .unwrap()
+        .batch_execute(
+            "UPDATE pg_class SET reltuples=-1 WHERE relnamespace='aq_playbooks'::regnamespace AND relkind='r'",
+        )
+        .unwrap();
+    let writer = format!("{url} user={role} password=synthetic-writer");
+    let store = PostgresStorage::connect(&writer).unwrap();
+    assert!(reltuples(&url, "namespaces") < 0.0, "skipped, not analyzed");
+    drop(store);
+    drop(c);
+    let mut admin = support::client();
+    admin
+        .batch_execute(&format!("DROP DATABASE {name} WITH (FORCE)"))
+        .unwrap();
+    admin.batch_execute(&format!("DROP ROLE {role}")).unwrap();
+}
+
+// --- Task 11: format 3 parity with the in-memory reference ----------------
+
+fn parity_keyed<S: Storage>(e: &Engine<S>, key: &str) -> KeyedAdmissionRequest {
+    KeyedAdmissionRequest {
+        key: key.into(),
+        binding: "a".into(),
+        expected_activation_revision: e.snapshot().unwrap().bindings["a"].revision,
+        entry: "main".into(),
+        input: Value::Null,
+        authority: pg_authority(),
+    }
+}
+/// The serialized snapshot and the Runs, Effects and Receipts pages (items
+/// and cursor; the page revision is the backend's own) of an engine.
+type ParityView = (Value, Vec<(Vec<Value>, Option<String>)>);
+fn parity_view<S: Storage>(e: &Engine<S>) -> ParityView {
+    let pages = [
+        InspectionKind::Runs,
+        InspectionKind::Effects,
+        InspectionKind::Receipts,
+    ]
+    .into_iter()
+    .map(|kind| {
+        let page = e
+            .inspect(&InspectionQuery {
+                kind,
+                ..runs_query()
+            })
+            .unwrap();
+        (page.items, page.next)
+    })
+    .collect();
+    (serde_json::to_value(e.snapshot().unwrap()).unwrap(), pages)
+}
+/// Run `$call` with `$e` bound to the reference engine, then to the format 3
+/// engine; its results (`Debug`) and both engines' views must be equal.
+/// Returns the format 3 result and the format 3 store's work counters for
+/// the call alone.
+macro_rules! on_both {
+    ($reference:expr, $records:expr, $label:expr, |$e:ident| $call:expr) => {{
+        $records.store.reset_transition_stats();
+        let expected = {
+            let $e = &$reference;
+            $call
+        };
+        let actual = {
+            let $e = &$records;
+            $call
+        };
+        let stats = $records.store.transition_stats();
+        assert_eq!(
+            format!("{actual:?}"),
+            format!("{expected:?}"),
+            "{}: result",
+            $label
+        );
+        let (reference, records) = (parity_view(&$reference), parity_view(&$records));
+        assert_eq!(records.0, reference.0, "{}: snapshot", $label);
+        assert_eq!(records.1, reference.1, "{}: inspection pages", $label);
+        (actual, stats)
+    }};
+}
+/// `state` with `count` settled legacy cohorts, as an older engine left
+/// them: a completed root with its admitted and terminal receipts and its
+/// budget, runtime indexes not initialized, no drain record.
+fn with_legacy_cohorts(state: &State, count: usize) -> State {
+    let mut state = state.clone();
+    for i in 0..count {
+        let id = format!("run-0-legacy-{i:04}");
+        let mut run = completed_run(&id);
+        for kind in ["admitted", "terminal"] {
+            state.sequence += 1;
+            state.receipts.push(Receipt {
+                kind: kind.into(),
+                ..audit(state.sequence, &id)
+            });
+        }
+        run.terminal_sequence = Some(state.sequence);
+        state.runs.insert(id.clone(), run);
+        state.budgets.insert(id, Budget::default());
+    }
+    state.indexes.initialized = false;
+    without_drain(&state)
+}
+/// The same script on `Engine<MemoryStorage>` (the reference) and on
+/// `Engine<PostgresStorage>` writing format 3: after every call the two
+/// agree (snapshot, Runs/Effects/Receipts pages, call results), and format 3
+/// takes the commit path SC-13 names: a commit that settles a cohort is
+/// heavy; an admission and the commit that drops expired window entries are
+/// bounded; no commit that settles nothing takes a full-container fallback.
+#[test]
+fn format_3_matches_the_reference_for_settle_drop_stale_and_drain() {
+    let ns = support::namespace("parity");
+    let reference = Engine::new(MemoryStorage::default(), &ns, "w").unwrap();
+    let records = Engine::new(support::records(), &ns, "w").unwrap();
+    let a = support::artifact("a");
+    let digest = a.digest.clone();
+    let setup = [
+        on_both!(reference, records, "install", |e| e.install(a.clone())),
+        on_both!(reference, records, "activate", |e| e.activate_at(
+            "a",
+            &digest,
+            pg_authority(),
+            0
+        )),
+        on_both!(reference, records, "policy", |e| e.set_retention_policy(
+            RetentionPolicy {
+                admission_replay_ms: 1_000,
+                ..RetentionPolicy::default()
+            }
+        )),
+    ];
+    for (result, stats) in setup {
+        result.unwrap();
+        assert!(stats.fallbacks.is_empty(), "setup: {:?}", stats.fallbacks);
+    }
+    for i in 0..3_i64 {
+        let label = format!("admit k-{i}");
+        let (_, stats) = on_both!(reference, records, label, |e| e
+            .admit_once(parity_keyed(e, &format!("k-{i}")), i));
+        assert_eq!((stats.incremental, stats.heavy), (1, 0), "{label}");
+        assert!(stats.fallbacks.is_empty(), "{label}: {:?}", stats.fallbacks);
+        let label = format!("settle k-{i}");
+        let (_, stats) = on_both!(reference, records, label, |e| e.drive(
+            &mut FakeHost::default(),
+            i,
+            20
+        ));
+        assert_eq!(stats.heavy, 1, "{label}: {stats:?}");
+        assert!(records.snapshot().unwrap().runs.is_empty(), "{label}");
+    }
+    // k-0..k-2 expire at 1_000..1_002: the admission at 2_000 drops all three.
+    let (_, stats) = on_both!(reference, records, "drop", |e| e
+        .admit_once(parity_keyed(e, "k-3"), 2_000));
+    assert_eq!((stats.incremental, stats.heavy), (1, 0), "drop: {stats:?}");
+    assert!(stats.fallbacks.is_empty(), "drop: {:?}", stats.fallbacks);
+    let s = records.snapshot().unwrap();
+    assert_eq!(
+        s.keyed_admissions.keys().cloned().collect::<Vec<_>>(),
+        vec!["k-3".to_string()]
+    );
+    // A forgotten key whose request time is older than the window.
+    let (stale, stats) = on_both!(reference, records, "stale", |e| e.admit_once_at(
+        parity_keyed(e, "k-0"),
+        Some(500),
+        2_001
+    ));
+    assert!(
+        matches!(stale, Err(Error::Stale { .. })),
+        "stale: {stale:?}"
+    );
+    assert_eq!((stats.incremental, stats.heavy), (0, 0), "stale: {stats:?}");
+    // 60 legacy cohorts seeded by a direct CAS on each backend, then opened
+    // again: the drain takes 50 at open and the rest in the next commit.
+    let reference_store = reference.store.clone();
+    let revision = reference_store.load(&ns).unwrap().revision;
+    let legacy = with_legacy_cohorts(&reference.snapshot().unwrap(), 60);
+    reference_store
+        .compare_and_swap(&ns, "w", revision, &legacy)
+        .unwrap();
+    let revision = records.store.load(&ns).unwrap().revision;
+    records
+        .store
+        .compare_and_swap(&ns, "w", revision, &legacy)
+        .unwrap();
+    reference.release().unwrap();
+    records.release().unwrap();
+    let reference = Engine::new(reference_store, &ns, "w2").unwrap();
+    let records = Engine::new(support::records(), &ns, "w2").unwrap();
+    let (r, p) = (parity_view(&reference), parity_view(&records));
+    assert_eq!(p.0, r.0, "open: snapshot");
+    assert_eq!(p.1, r.1, "open: inspection pages");
+    let left = |e: &Engine<PostgresStorage>| {
+        e.snapshot()
+            .unwrap()
+            .runs
+            .keys()
+            .filter(|id| id.starts_with("run-0-legacy-"))
+            .count()
+    };
+    assert_eq!(left(&records), 10, "open drains 50");
+    let (_, stats) = on_both!(reference, records, "drain", |e| e.drive(
+        &mut FakeHost::default(),
+        2_002,
+        20
+    ));
+    assert_eq!(stats.heavy, 1, "drain: {stats:?}");
+    assert_eq!(left(&records), 0, "drain: {stats:?}");
+    let s = records.snapshot().unwrap();
+    assert!(s.retention.drain.done && s.runs.is_empty(), "drained");
+    assert_eq!(history_runs(&ns), 64, "60 legacy runs and k-0..k-3");
 }

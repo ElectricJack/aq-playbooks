@@ -53,6 +53,8 @@ pub enum IndexQuery {
         after: Option<String>,
         limit: usize,
     },
+    /// Receipts after `after_sequence`, of one run or of all. Each item's
+    /// `key` is the receipt's sequence as 20 zero-padded digits.
     Receipts {
         run: Option<String>,
         after_sequence: u64,
@@ -92,6 +94,9 @@ pub struct RuntimeIndexes {
     /// Every intent (terminal included) per root, for bounded history checks.
     #[serde(default)]
     pub root_intents: LazyMap<String, BTreeSet<String>>,
+    /// Deprecated: the latest receipt time of each root, read only by the
+    /// collector spec 0003 retired (its age test). No longer written; an
+    /// entry an older engine wrote leaves with its cohort.
     pub root_last_activity: LazyMap<String, i64>,
     pub run_roots: LazyMap<String, String>,
     pub intent_roots: LazyMap<String, String>,
@@ -129,7 +134,8 @@ pub struct RuntimeIndexes {
     #[serde(default)]
     pub root_intents_complete: bool,
     /// `contract_events` holds every event. False in a State written before
-    /// the index existed; `Engine::new` then fills it once.
+    /// the index existed; the drain then fills it, a bounded number of
+    /// events per commit (`retention::drain_step`).
     #[serde(default)]
     pub contract_events_complete: bool,
     /// Every dispatched live operation carries its dispatch sequence. False
@@ -352,7 +358,9 @@ impl RuntimeIndexes {
                         .take(limit)
                     {
                         items.push(IndexItem {
-                            key: offset.to_string(),
+                            // The receipt's sequence (its stable identity),
+                            // never its position in the record.
+                            key: format!("{seq:020}"),
                             scope: String::new(),
                             sequence: *seq,
                             at_ms: state.receipts.get(*offset).map(|r| r.at_ms),
@@ -508,33 +516,6 @@ pub(crate) fn unindex_contract_event(s: &mut State, e: &crate::AcceptedEvent) ->
             s.indexes.contract_events.remove(&contract);
         }
     }
-    Ok(())
-}
-/// A State written before `contract_events` existed: fill it once from the
-/// events (one pass over them).
-pub(crate) fn backfill_contract_events(s: &mut State) -> Result<()> {
-    if !s.indexes.initialized || s.indexes.contract_events_complete {
-        return Ok(());
-    }
-    let events: Vec<(String, u64, String)> = s
-        .events
-        .iter()
-        .map(|(id, e)| {
-            Ok((
-                trigger_key(&e.envelope.contract, &e.envelope.scope)?,
-                e.sequence,
-                id.clone(),
-            ))
-        })
-        .collect::<Result<_>>()?;
-    for (contract, sequence, id) in events {
-        s.indexes
-            .contract_events
-            .entry(contract)
-            .or_default()
-            .insert(sequence, id);
-    }
-    s.indexes.contract_events_complete = true;
     Ok(())
 }
 pub(crate) fn index_activation(s: &mut State, binding: &str) -> Result<()> {
@@ -893,6 +874,7 @@ fn refresh_intent_indexes(s: &mut State, id: &str) -> Result<()> {
     }
     if let Some(asynchronous) = &i.command.asynchronous
         && uncertain(&i)
+        && !hold_lapsed(s, &i)
     {
         let event = &s.artifacts[&s.runs[&i.run].artifact]
             .content
@@ -962,6 +944,33 @@ pub(crate) fn uncertain(i: &crate::Intent) -> bool {
             IntentStatus::Prepared | IntentStatus::Dispatched | IntentStatus::Unknown
         )
 }
+/// The window of the completion event of asynchronous operation `i`:
+/// `max(policy.event_replay_ms, contract.retention_ms)` (the policy's alone
+/// if its artifact or contract is not found).
+pub(crate) fn completion_window(s: &State, i: &crate::Intent) -> u64 {
+    let contract_ms = i
+        .command
+        .asynchronous
+        .as_ref()
+        .and_then(|a| {
+            let run = s.runs.get(&i.run)?;
+            let artifact = s.artifacts.get(&run.artifact)?;
+            artifact.content.registry.events.get(&a.completion_event)
+        })
+        .map_or(0, |event| event.retention_ms);
+    s.retention.policy.event_replay_ms.max(contract_ms)
+}
+/// Ruling C (Task 10): an uncertain operation holds the events of its
+/// completion contract only until the retention clock is past its command
+/// deadline plus the completion event's window. From then on those events
+/// are ordinary unheld entries (evicted by `replay_keep`, dropped by time),
+/// so a lost handle no operator recovers does not hold them for ever.
+pub(crate) fn hold_lapsed(s: &State, i: &crate::Intent) -> bool {
+    let window = i64::try_from(completion_window(s, i)).unwrap_or(i64::MAX);
+    s.retention
+        .clock_ms
+        .is_some_and(|clock| clock >= i.deadline_at_ms.saturating_add(window))
+}
 pub(crate) fn sync(s: &mut State) -> Result<()> {
     let intents = std::mem::take(&mut s.indexes.dirty_intents);
     for id in intents {
@@ -995,14 +1004,6 @@ pub(crate) fn rebuild(s: &mut State) -> Result<()> {
         .map(|(i, r)| (i, r.run.clone(), r.sequence))
         .collect::<Vec<_>>();
     for (i, run, seq) in receipts {
-        if let Some(r) = s.runs.get(&run) {
-            let at = s.receipts[i].at_ms;
-            s.indexes
-                .root_last_activity
-                .entry(r.root.clone())
-                .and_modify(|old| *old = (*old).max(at))
-                .or_insert(at);
-        }
         s.indexes.receipts.entry(run).or_default().insert(seq, i);
         s.indexes.all_receipts.insert(seq, i);
     }
@@ -1010,6 +1011,9 @@ pub(crate) fn rebuild(s: &mut State) -> Result<()> {
     s.indexes.initialized = true;
     s.indexes.root_intents_complete = true;
     s.indexes.contract_events_complete = true;
+    // A rebuild drops the dirty sets, so cohorts settled before it are
+    // seen by no settle: the drain scans for them again.
+    s.retention.drain = crate::retention::DrainState::default();
     Ok(())
 }
 /// Once per namespace written before `root_intents` existed (pre-D10, whose

@@ -559,6 +559,17 @@ impl PostgresStorage {
         if state.retention.last_gc_at_ms != previous.retention.last_gc_at_ms {
             crate::retention::collect(&mut tx, namespace, &state)?;
         }
+        // The drain of legacy tombstone rows, after the identity check
+        // above; a bounded commit writes no legacy row.
+        let drain_limit = self.tombstone_drain_limit(namespace, &state);
+        let rows = crate::retention::TombstoneRows {
+            deleted: match drain_limit {
+                Some(limit) => Some(crate::retention::drain_tombstones(
+                    &mut tx, namespace, limit,
+                )?),
+                None => None,
+            },
+        };
         let retired: Vec<&String> = staged.retired_event_tombstones.iter().collect();
         crate::retention::forget_event_tombstones(&mut tx, namespace, &retired)?;
         if !staged.deleted_fields.is_empty() {
@@ -576,7 +587,7 @@ impl PostgresStorage {
             &mut tx,
             namespace,
             &aq_playbooks_runner::history_items(&state.settled),
-            state.retention.policy.history_keep,
+            &state.retention.policy,
         )?;
         let published = tx.execute("UPDATE aq_playbooks.namespaces SET state_header=$2,state_accounting=$3,revision=$4,catalog_projected_revision=$4,updated_at=clock_timestamp() WHERE namespace=$1 AND revision=$5",&[&namespace,&stripped,&accounting_json(&staged.accounting),&next,&expected]).map_err(backend)?;
         if published != 1 {
@@ -589,6 +600,7 @@ impl PostgresStorage {
             }
             return Err(backend(error).into());
         }
+        self.tombstones_committed(namespace, drain_limit, rows);
         self.count(|s| {
             s.incremental += 1;
             s.records_written += written;

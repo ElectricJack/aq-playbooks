@@ -135,7 +135,10 @@ enum Command {
         #[command(flatten)]
         store: StoreArgs,
     },
-    /// Collect one bounded page of safely expired state using the installed retention policy.
+    /// Not needed: every commit already deletes finished work and old
+    /// entries, a bounded amount each. Kept for existing scripts: runs one
+    /// more such commit (plus a page of unreferenced artifact disposal) and
+    /// prints what it did.
     Gc {
         #[arg(long, default_value_t = 100)]
         limit: usize,
