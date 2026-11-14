@@ -1581,8 +1581,12 @@ fn gc_preserves_possible_async_completion_while_lost_admission_handle_is_unknown
             1,
         )
         .unwrap();
+    // Past the event's own window (1,001) but inside the hold: the
+    // operation's command deadline (100) plus that window (1,000). After
+    // the hold lapses (1,100) the event is an ordinary entry (Task 10,
+    // ruling C).
     for _ in 0..10 {
-        if !e.collect_garbage(4000, 1).unwrap().more {
+        if !e.collect_garbage(1050, 1).unwrap().more {
             break;
         }
     }
@@ -1593,8 +1597,8 @@ fn gc_preserves_possible_async_completion_while_lost_admission_handle_is_unknown
             handle: "server-operation".into(),
         }],
     );
-    e.recover(&mut host, 4001).unwrap();
-    e.drive(&mut host, 4001, 20).unwrap();
+    e.recover(&mut host, 1051).unwrap();
+    e.drive(&mut host, 1051, 20).unwrap();
     assert_eq!(settled(&e, &id).outcome.as_deref(), Some("ok"));
 }
 

@@ -1451,6 +1451,8 @@ fn event_hold(
                 && crate::indexes::uncertain(i)
                 // Its completion is accepted after its (first) dispatch.
                 && i.dispatch_sequence.is_some_and(|d| d < event.sequence)
+                // Until its command deadline plus the window (ruling C).
+                && !crate::indexes::hold_lapsed(s, i)
         })
     }))
 }
@@ -1636,6 +1638,35 @@ fn drop_event(s: &mut State, key: &str, clock: i64, report: &mut CommitReport) -
         return Ok(());
     }
     remove_event(s, key, report)
+}
+/// Ruling C (Task 10): the uncertain operations whose hold has lapsed (the
+/// clock is past their command deadline plus their completion event's
+/// window, [`crate::indexes::hold_lapsed`]) leave the uncertain index, so
+/// [`rejoin`] judges the events they held again: unheld now, those join
+/// the eviction order at their acceptance positions. O(uncertain
+/// operations): nothing when no handle is lost.
+fn lapse_holds(s: &mut State) -> Result<()> {
+    if s.indexes.uncertain_contract_membership.is_empty() {
+        return Ok(());
+    }
+    let lapsed: Vec<String> = s
+        .indexes
+        .uncertain_contract_membership
+        .keys()
+        .filter(|id| {
+            s.intents
+                .get(*id)
+                .is_some_and(|i| crate::indexes::hold_lapsed(s, i))
+        })
+        .cloned()
+        .collect();
+    if lapsed.is_empty() {
+        return Ok(());
+    }
+    for id in &lapsed {
+        crate::indexes::mark_intent(s, id);
+    }
+    crate::indexes::sync(s)
 }
 /// The window entries a commit may have changed the hold of, for
 /// [`rejoin`]: events it accepted or fanned out, and the correlation keys
@@ -1951,6 +1982,7 @@ pub(crate) fn finish_commit(
     if !s.retention.drain.done {
         report.more = true;
     }
+    lapse_holds(s)?;
     rejoin(s)?;
     if now_ms.is_some() {
         let drops = s.retention.policy.window_drops_per_commit;

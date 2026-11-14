@@ -874,6 +874,7 @@ fn refresh_intent_indexes(s: &mut State, id: &str) -> Result<()> {
     }
     if let Some(asynchronous) = &i.command.asynchronous
         && uncertain(&i)
+        && !hold_lapsed(s, &i)
     {
         let event = &s.artifacts[&s.runs[&i.run].artifact]
             .content
@@ -942,6 +943,33 @@ pub(crate) fn uncertain(i: &crate::Intent) -> bool {
             i.status,
             IntentStatus::Prepared | IntentStatus::Dispatched | IntentStatus::Unknown
         )
+}
+/// The window of the completion event of asynchronous operation `i`:
+/// `max(policy.event_replay_ms, contract.retention_ms)` (the policy's alone
+/// if its artifact or contract is not found).
+pub(crate) fn completion_window(s: &State, i: &crate::Intent) -> u64 {
+    let contract_ms = i
+        .command
+        .asynchronous
+        .as_ref()
+        .and_then(|a| {
+            let run = s.runs.get(&i.run)?;
+            let artifact = s.artifacts.get(&run.artifact)?;
+            artifact.content.registry.events.get(&a.completion_event)
+        })
+        .map_or(0, |event| event.retention_ms);
+    s.retention.policy.event_replay_ms.max(contract_ms)
+}
+/// Ruling C (Task 10): an uncertain operation holds the events of its
+/// completion contract only until the retention clock is past its command
+/// deadline plus the completion event's window. From then on those events
+/// are ordinary unheld entries (evicted by `replay_keep`, dropped by time),
+/// so a lost handle no operator recovers does not hold them for ever.
+pub(crate) fn hold_lapsed(s: &State, i: &crate::Intent) -> bool {
+    let window = i64::try_from(completion_window(s, i)).unwrap_or(i64::MAX);
+    s.retention
+        .clock_ms
+        .is_some_and(|clock| clock >= i.deadline_at_ms.saturating_add(window))
 }
 pub(crate) fn sync(s: &mut State) -> Result<()> {
     let intents = std::mem::take(&mut s.indexes.dirty_intents);
