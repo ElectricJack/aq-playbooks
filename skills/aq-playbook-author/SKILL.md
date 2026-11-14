@@ -90,12 +90,15 @@ command before it prints, with `…` for text left out.
    it, the data it tests, the command that does it. Decide now whether the
    document can be followed at all; see "When not to write a playbook". Ask
    or give up before you write anything.
-   A document that says a task is filed, made or added starts on
+   A document that says a playbook files, makes or adds a task starts on
    `aq.work.changed` with outcome `ensured`, which means the task exists
    now and is sent whether the task was new or already there; it never says
    which. Go on when what the sentence asks for also holds for a task that
    already existed (as in notify-when-ready); ask when it depends on the
-   task being new.
+   task being new. The event is sent only for a playbook's own call in this
+   namespace, never when a person creates a task: when the document does
+   not say who files the task, or means a person, ask, and do not start on
+   this event.
 4. Read the worked example closest to the document (`examples/`). Then write
    `draft.json`. `LANGUAGE.md` lists every operation and expression. Write
    commands and events by their names; the tool fills in their identities.

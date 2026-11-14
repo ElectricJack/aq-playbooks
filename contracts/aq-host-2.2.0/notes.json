@@ -104,13 +104,13 @@
         "fields": "Today the host has no adapter for this command, and what it does with no fields is not decided: include at least one field. One entry per labelled question: `{id, description, choices}`, at most 16, with up to 64 choices of at most 128 bytes. Include a choice such as `unknown` when the document says what to do if it cannot be told.",
         "flags": "Yes/no questions: `{id, description}`, at most 32. The model says which hold.",
         "rationale_max_bytes": "How long the model's explanation may be, 0 to 4096.",
-        "budget": "`deadline_ms` (1000 to 600000), how long the host may take; `max_output_tokens`. 120000 ms and 2048 tokens are plenty for a classification. Today the host refuses a budget above its caps with `budget_exceeded`."
+        "budget": "`deadline_ms` (1000 to 600000), how long the host may take; `max_output_tokens`. 120000 ms and 2048 tokens are plenty for a classification. The host must refuse a budget above its caps with `budget_exceeded`."
       },
       "outcomes": {
         "accepted": "The question is queued; the edge binds `{handle}`. Join the handle under a key, accepting only `assessed`.",
         "assessed": "`labels` has exactly one label per field, in field order (`labels.0` answers `fields[0]`), each one of that field's choices; `flags` lists the flags that hold, each once; `rationale`; `reference` identifies the judgment. Read these only on the join's `completed` edge.",
         "failed": "No usable answer: `indeterminate`, `provider_error`, `provider_unavailable` or `deadline_exceeded`. Take the fallback the document gives.",
-        "refused": "The request was not run. Today the host refuses it with `invalid_request` (over 65536 bytes, duplicate field ids, a field without choices) or `budget_exceeded`. It can come at once, on the invoke's own `refused` edge, or through the join. Take the fallback the document gives."
+        "refused": "The request was not run. The host must refuse it with `invalid_request` (over 65536 bytes, duplicate field ids, a field without choices) or `budget_exceeded`. It can come at once, on the invoke's own `refused` edge, or through the join. Take the fallback the document gives."
       },
       "notes": [
         "The host must give every accepted judgment exactly one final answer, at the latest `failed` with `deadline_exceeded` when the host's own deadline passes. The join's deadline only decides when the run stops waiting.",
