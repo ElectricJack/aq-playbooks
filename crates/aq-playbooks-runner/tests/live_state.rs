@@ -2970,6 +2970,13 @@ fn correlated_event(id: &str, invocation: &str) -> EventEnvelope {
 fn burst_at_a_frozen_clock_leaves_at_most_2_kb_of_window_entries_per_run() {
     let e = ret_engine();
     e.install(wait_artifact()).unwrap();
+    // Task 8b: above the burst's 400 entries, so nothing is evicted by
+    // count and the bytes of every window entry are measured.
+    e.set_retention_policy(RetentionPolicy {
+        replay_keep: 1_000,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
     let mut after_first = 0;
     for i in 0..200 {
         let d = e
@@ -5094,4 +5101,789 @@ fn deprecated_limit_fields_decode_and_change_nothing() {
     };
     let reference = script(EngineConfig::default(), without);
     assert_eq!(script(tiny_limits(), with), reference);
+}
+
+// --- Task 8b R1: the eviction licence (fence tests, every runner path) ----
+
+/// Window entries of the eviction fence states never expire (window
+/// 100_000, clock 500).
+const EVICTION_WINDOW: i64 = 100_000;
+fn running_run(id: &str) -> Run {
+    let mut run = completed_run(id);
+    run.status = RunStatus::Running;
+    run.outcome = None;
+    run.terminal_sequence = None;
+    run
+}
+/// A keyed admission receipt accepted at `sequence` (its run id carries
+/// it); with a live run when `live`; in the eviction order when `in_order`,
+/// else (live) waiting for its run in `replay_held`.
+fn keyed_entry(s: &mut State, key: &str, sequence: u64, live: bool, in_order: bool) {
+    let mut r = receipt(key, 0);
+    r.run_id = format!("run-{sequence:016x}");
+    s.keyed_admissions.insert(key.into(), r.clone());
+    s.retention
+        .admission_expires_at_ms
+        .insert(key.into(), EVICTION_WINDOW);
+    s.retention.expiry.insert(
+        retention::window_key(EVICTION_WINDOW, &format!("k:{key}")),
+        (),
+    );
+    if live {
+        s.runs.insert(r.run_id.clone(), running_run(&r.run_id));
+    }
+    if in_order {
+        s.retention
+            .replay_order
+            .insert(retention::admission_order_key(&r), ());
+    } else if live {
+        s.retention.replay_held.insert(r.run_id, key.into());
+    }
+}
+fn event_entry(s: &mut State, key: &str, sequence: u64, in_order: bool) {
+    let mut e = accepted_event(key, 0);
+    e.sequence = sequence;
+    if in_order {
+        s.retention
+            .replay_order
+            .insert(retention::event_order_key(&e), ());
+    }
+    s.events.insert(key.into(), e);
+    s.retention
+        .event_expires_at_ms
+        .insert(key.into(), EVICTION_WINDOW);
+    s.retention.expiry.insert(
+        retention::window_key(EVICTION_WINDOW, &format!("e:{key}")),
+        (),
+    );
+}
+/// Event `key` held by the live waiter `run-w` on correlation key `corr`.
+fn hold_by_waiter(s: &mut State, key: &str) {
+    s.runs.insert("run-w".into(), running_run("run-w"));
+    s.indexes
+        .event_memberships
+        .insert(key.into(), vec!["corr".into()]);
+    s.indexes
+        .waiters
+        .insert("corr".into(), BTreeSet::from(["run-w".to_string()]));
+}
+/// Evict keyed receipt `key` as `retention::evict` does: the item, its
+/// expiry record, its window key and its order key.
+fn evict_keyed(n: &mut State, key: &str) {
+    let r = n.keyed_admissions.remove(key).unwrap();
+    n.retention.admission_expires_at_ms.remove(key);
+    n.retention
+        .expiry
+        .remove(&retention::window_key(EVICTION_WINDOW, &format!("k:{key}")));
+    n.retention
+        .replay_order
+        .remove(&retention::admission_order_key(&r));
+}
+fn evict_event(n: &mut State, key: &str) {
+    let e = n.events.remove(key).unwrap();
+    n.retention.event_expires_at_ms.remove(key);
+    n.retention
+        .expiry
+        .remove(&retention::window_key(EVICTION_WINDOW, &format!("e:{key}")));
+    n.retention
+        .replay_order
+        .remove(&retention::event_order_key(&e));
+    n.indexes.event_memberships.remove(key);
+}
+/// Take keyed receipt `key`, whose run is live, out of the order into
+/// `replay_held`, as `retention::evict` does with a held head.
+fn hold_out(n: &mut State, key: &str) {
+    let r = n.keyed_admissions.get(key).unwrap().clone();
+    n.retention
+        .replay_order
+        .remove(&retention::admission_order_key(&r));
+    n.retention.replay_held.insert(r.run_id, key.into());
+}
+/// The eviction fence state: `replay_keep` 5; the order holds, oldest
+/// first, "kh" (sequence 0, its run live: held, as an entry whose hold began
+/// after it joined), "k0".."k3" (1..4), "e4" (5) and "ew" (7, held by a
+/// live waiter): 7 entries. "kh2" (live run) waits in `replay_held`; "ex"
+/// (8, unheld) is outside the order. The correct eviction takes "kh" out
+/// of the order and evicts "k0", leaving 5.
+fn eviction_state() -> State {
+    let mut s = State::default();
+    s.retention.clock_ms = Some(500);
+    s.retention.policy.admission_replay_ms = EVICTION_WINDOW as u64;
+    s.retention.policy.event_replay_ms = EVICTION_WINDOW as u64;
+    s.retention.policy.replay_keep = 5;
+    keyed_entry(&mut s, "kh", 0, true, true);
+    for i in 0..4 {
+        keyed_entry(&mut s, &format!("k{i}"), i + 1, false, true);
+    }
+    event_entry(&mut s, "e4", 5, true);
+    event_entry(&mut s, "ew", 7, true);
+    hold_by_waiter(&mut s, "ew");
+    keyed_entry(&mut s, "kh2", 9, true, false);
+    event_entry(&mut s, "ex", 8, false);
+    s.sequence = 20;
+    s
+}
+/// The correct eviction of `eviction_state()`.
+fn evicted_correctly(n: &mut State) {
+    hold_out(n, "kh");
+    evict_keyed(n, "k0");
+}
+/// Each a (label, refusal, previous State, change): every way an eviction
+/// can break the licence.
+type EvictionCase = (&'static str, &'static str, State, Box<dyn Fn(&mut State)>);
+fn eviction_refusal_cases() -> Vec<EvictionCase> {
+    let licence = retention::REFUSE_EVICTION;
+    let early = retention::REFUSE_EARLY_REMOVAL;
+    let base = eviction_state();
+    // "ew" (held by its waiter) at the head of the order.
+    let mut held_event = State::default();
+    held_event.retention.clock_ms = Some(500);
+    held_event.retention.policy.admission_replay_ms = EVICTION_WINDOW as u64;
+    held_event.retention.policy.event_replay_ms = EVICTION_WINDOW as u64;
+    held_event.retention.policy.replay_keep = 4;
+    event_entry(&mut held_event, "ew", 0, true);
+    hold_by_waiter(&mut held_event, "ew");
+    for i in 0..5 {
+        keyed_entry(&mut held_event, &format!("k{i}"), i + 1, false, true);
+    }
+    held_event.sequence = 20;
+    vec![
+        (
+            "a held keyed receipt",
+            licence,
+            base.clone(),
+            Box::new(|n| evict_keyed(n, "kh")),
+        ),
+        (
+            "an event a live waiter holds",
+            licence,
+            held_event,
+            Box::new(|n| evict_event(n, "ew")),
+        ),
+        (
+            "fewer than replay_keep left",
+            licence,
+            base.clone(),
+            Box::new(|n| {
+                hold_out(n, "kh");
+                evict_keyed(n, "k0");
+                evict_keyed(n, "k1");
+            }),
+        ),
+        (
+            "at replay_keep after a policy change",
+            licence,
+            base.clone(),
+            Box::new(|n| {
+                n.retention.policy.replay_keep = 6;
+                evicted_correctly(n);
+            }),
+        ),
+        (
+            "not the oldest",
+            licence,
+            base.clone(),
+            Box::new(|n| evict_keyed(n, "k1")),
+        ),
+        (
+            "older than a kept entry",
+            licence,
+            base.clone(),
+            Box::new(|n| {
+                hold_out(n, "kh");
+                evict_keyed(n, "k1");
+            }),
+        ),
+        (
+            "an entry outside the order, not the oldest",
+            early,
+            base.clone(),
+            Box::new(|n| evict_event(n, "ex")),
+        ),
+        (
+            "its order key kept",
+            early,
+            base.clone(),
+            Box::new(|n| {
+                hold_out(n, "kh");
+                n.keyed_admissions.remove("k0");
+                n.retention.admission_expires_at_ms.remove("k0");
+            }),
+        ),
+        (
+            "an order entry without its item",
+            licence,
+            base.clone(),
+            Box::new(|n| {
+                n.retention
+                    .replay_order
+                    .insert(retention::replay_key(30, "k:ghost"), ());
+            }),
+        ),
+        (
+            "an order entry for a held item",
+            licence,
+            base.clone(),
+            Box::new(|n| {
+                let r = n.keyed_admissions.get("kh2").unwrap().clone();
+                n.retention
+                    .replay_order
+                    .insert(retention::admission_order_key(&r), ());
+            }),
+        ),
+        (
+            "an order entry at another sequence",
+            licence,
+            base.clone(),
+            Box::new(|n| {
+                n.retention
+                    .replay_order
+                    .insert(retention::replay_key(30, "k:k3"), ());
+            }),
+        ),
+        (
+            "an order entry that inflates the count",
+            licence,
+            base.clone(),
+            Box::new(|n| {
+                n.retention
+                    .replay_order
+                    .insert(retention::replay_key(8, "e:ex"), ());
+                n.retention
+                    .replay_order
+                    .insert(retention::replay_key(31, "k:ghost"), ());
+                hold_out(n, "kh");
+                evict_keyed(n, "k0");
+                evict_keyed(n, "k1");
+            }),
+        ),
+        (
+            "more than 64 in one commit",
+            licence,
+            bulk_eviction_state(),
+            Box::new(|n| {
+                for i in 0..65 {
+                    evict_keyed(n, &format!("b{i:03}"));
+                }
+            }),
+        ),
+    ]
+}
+/// Store `state` as a namespace reaches it: its entries join the order
+/// unheld (the live runs and waiters absent), then the holds begin in a
+/// second commit (a held entry can never be written into the order).
+/// Returns the revision.
+fn seed_eviction_state(store: &dyn Storage, ns: &str, state: &State) -> u64 {
+    store.acquire(ns, "w").unwrap();
+    let mut unheld = state.clone();
+    unheld.runs.clear();
+    unheld.indexes.waiters.clear();
+    let first = store.compare_and_swap(ns, "w", 0, &unheld).unwrap();
+    store.compare_and_swap(ns, "w", first, state).unwrap()
+}
+/// `replay_keep` 1 and 70 unheld keyed receipts in the order.
+fn bulk_eviction_state() -> State {
+    let mut s = State::default();
+    s.retention.clock_ms = Some(500);
+    s.retention.policy.admission_replay_ms = EVICTION_WINDOW as u64;
+    s.retention.policy.event_replay_ms = EVICTION_WINDOW as u64;
+    s.retention.policy.replay_keep = 1;
+    for i in 0..70 {
+        keyed_entry(&mut s, &format!("b{i:03}"), i + 1, false, true);
+    }
+    s.sequence = 100;
+    s
+}
+/// The eviction licence on a store's compare-and-swap: every refusal
+/// case is refused with its text and writes nothing; the correct
+/// eviction, and 64 at once, are accepted.
+fn eviction_fences_hold_on_cas(store: &dyn Storage) {
+    let count = std::cell::Cell::new(0);
+    let fresh = |state: &State| {
+        count.set(count.get() + 1);
+        let ns = format!("evict-{}", count.get());
+        let base = seed_eviction_state(store, &ns, state);
+        (ns, base)
+    };
+    let mut failures = vec![];
+    for (label, text, previous, f) in eviction_refusal_cases() {
+        let (ns, base) = fresh(&previous);
+        let mut next = previous.clone();
+        f(&mut next);
+        let result = store.compare_and_swap(&ns, "w", base, &next);
+        if !refused_with(result.clone(), text) {
+            failures.push(format!("{label}: {result:?}"));
+        } else {
+            assert_eq!(store.load(&ns).unwrap().revision, base, "{label}");
+        }
+    }
+    for (label, previous, f) in [
+        (
+            "the correct eviction",
+            eviction_state(),
+            Box::new(evicted_correctly) as Box<dyn Fn(&mut State)>,
+        ),
+        (
+            "64 at once",
+            bulk_eviction_state(),
+            Box::new(|n: &mut State| {
+                for i in 0..64 {
+                    evict_keyed(n, &format!("b{i:03}"));
+                }
+            }),
+        ),
+    ] {
+        let (ns, base) = fresh(&previous);
+        let mut next = previous.clone();
+        f(&mut next);
+        if let Err(err) = store.compare_and_swap(&ns, "w", base, &next) {
+            failures.push(format!("{label} refused: {err}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+#[test]
+fn memory_storage_holds_the_eviction_licence() {
+    eviction_fences_hold_on_cas(&MemoryStorage::default());
+}
+#[test]
+fn record_storage_holds_the_eviction_licence() {
+    eviction_fences_hold_on_cas(&RecordStorage::new());
+}
+/// The same licence on `RecordStorage`'s bounded transitions (the patch
+/// fence).
+#[test]
+fn record_storage_transitions_hold_the_eviction_licence() {
+    let store = RecordStorage::new();
+    let count = std::cell::Cell::new(0);
+    let fresh = |state: &State| {
+        count.set(count.get() + 1);
+        let ns = format!("t-evict-{}", count.get());
+        let mut state = state.clone();
+        state.indexes.initialized = true;
+        let base = seed_eviction_state(&store, &ns, &state);
+        (ns, base)
+    };
+    let transition_in = |ns: &str, f: &dyn Fn(&mut State)| {
+        let mut plan = |s: &mut State| {
+            f(s);
+            Ok(true)
+        };
+        store
+            .transition_v1(
+                ns,
+                "w",
+                &mut TransitionRequest {
+                    operation: "evict",
+                    plan: &mut plan,
+                },
+            )
+            .map_err(|e| match e {
+                Error::Storage(e) => e,
+                other => StorageError::Backend(other.to_string()),
+            })
+    };
+    let mut failures = vec![];
+    for (label, text, previous, f) in eviction_refusal_cases() {
+        let (ns, base) = fresh(&previous);
+        let result = transition_in(&ns, &*f);
+        if !refused_with(result.clone(), text) {
+            failures.push(format!("{label}: {result:?}"));
+        } else {
+            assert_eq!(store.load(&ns).unwrap().revision, base, "{label}");
+        }
+    }
+    let full = store
+        .stats
+        .full_commits
+        .load(std::sync::atomic::Ordering::Relaxed);
+    for (label, previous, f) in [
+        (
+            "the correct eviction",
+            eviction_state(),
+            Box::new(evicted_correctly) as Box<dyn Fn(&mut State)>,
+        ),
+        (
+            "64 at once",
+            bulk_eviction_state(),
+            Box::new(|n: &mut State| {
+                for i in 0..64 {
+                    evict_keyed(n, &format!("b{i:03}"));
+                }
+            }),
+        ),
+    ] {
+        let (ns, _) = fresh(&previous);
+        if let Err(err) = transition_in(&ns, &*f) {
+            failures.push(format!("{label} refused: {err}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+    // Four seeding full commits; the evictions themselves are bounded.
+    assert_eq!(
+        store
+            .stats
+            .full_commits
+            .load(std::sync::atomic::Ordering::Relaxed),
+        full + 4
+    );
+}
+
+// --- Task 8b R1: repeat protection is a rolling set (engine) -------------
+
+fn keep_engine(keep: usize) -> Engine<MemoryStorage> {
+    let e = ret_engine();
+    install(&e, wait_artifact(), "waiter");
+    e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 600_000,
+        replay_keep: keep,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    e
+}
+/// Admit keyed `key` at `t` and finish its run.
+fn keyed_done(e: &Engine<MemoryStorage>, key: &str, t: i64) -> KeyedAdmissionDisposition {
+    let d = e.admit_once(keyed(e, key), t).unwrap();
+    if !d.duplicate {
+        assert!(e.advance(&d.receipt.run_id, t).unwrap());
+    }
+    d
+}
+fn order_members(s: &State) -> Vec<String> {
+    s.retention
+        .replay_order
+        .keys()
+        .map(|k| retention::replay_entry(k).unwrap().1.to_string())
+        .collect()
+}
+#[test]
+fn replay_keep_must_be_positive() {
+    let e = engine();
+    assert!(matches!(
+        e.set_retention_policy(RetentionPolicy {
+            replay_keep: 0,
+            ..RetentionPolicy::default()
+        }),
+        Err(Error::Refused(m)) if m == "replay_keep must be positive"
+    ));
+    assert_eq!(RetentionPolicy::default().replay_keep, 256);
+    let stored: RetentionPolicy =
+        serde_json::from_value(json!({"event_replay_ms": 1, "audit_ms": 1})).unwrap();
+    assert_eq!(stored.replay_keep, 256);
+}
+/// With `replay_keep` 4: a duplicate inside the rolling set is recognised;
+/// the 5th distinct unheld key evicts the 1st (oldest first, its window not
+/// passed); a re-send of the 1st is then accepted as new, and with a
+/// request time older than its window refused as stale. No floor: a
+/// re-send whose request time is inside its window is new.
+#[test]
+fn the_fifth_unheld_key_evicts_the_first() {
+    let e = keep_engine(4);
+    for (i, key) in ["k0", "k1", "k2", "k3"].iter().enumerate() {
+        keyed_done(&e, key, i as i64);
+    }
+    assert!(keyed_done(&e, "k0", 10).duplicate);
+    assert_eq!(
+        order_members(&e.snapshot().unwrap()),
+        ["k:k0", "k:k1", "k:k2", "k:k3"]
+    );
+    keyed_done(&e, "k4", 11);
+    let s = e.snapshot().unwrap();
+    assert_eq!(order_members(&s), ["k:k1", "k:k2", "k:k3", "k:k4"]);
+    assert!(!s.keyed_admissions.contains_key("k0"));
+    assert!(!s.retention.admission_expires_at_ms.contains_key("k0"));
+    assert!(window_entries(&s).iter().all(|(_, m)| m != "k:k0"));
+    assert!(keyed_done(&e, "k1", 12).duplicate);
+    // The first is forgotten: with a request time older than its window it
+    // is stale, writing nothing ...
+    let before = e.store.load("test").unwrap().revision;
+    assert!(stale(e.admit_once_at(
+        keyed(&e, "k0"),
+        Some(12 - 600_000),
+        12
+    )));
+    assert_eq!(e.store.load("test").unwrap().revision, before);
+    // ... and with one inside its window (or none) it is new.
+    let again = e.admit_once_at(keyed(&e, "k0"), Some(0), 13).unwrap();
+    assert!(!again.duplicate);
+}
+/// Entries live work still needs are neither evicted nor counted: keyed
+/// receipts of live runs, an event a live waiter holds. A keyed receipt
+/// joins the order when its run finishes.
+#[test]
+fn held_entries_are_not_evicted_and_do_not_count() {
+    let e = keep_engine(2);
+    let live: Vec<String> = (0..3)
+        .map(|i| {
+            e.admit_once(keyed(&e, &format!("live-{i}")), i)
+                .unwrap()
+                .receipt
+                .run_id
+        })
+        .collect();
+    let waiter = e
+        .admit("waiter", "main", Value::Null, authority(), 3)
+        .unwrap();
+    e.advance(&waiter, 3).unwrap();
+    // Matches the waiter: held while the waiter is live (it has not
+    // advanced past its wait yet).
+    let held = e.admit_event("host", event("held", 2), 4).unwrap();
+    keyed_done(&e, "done-0", 5);
+    keyed_done(&e, "done-1", 6);
+    let s = e.snapshot().unwrap();
+    assert_eq!(order_members(&s), ["k:done-0", "k:done-1"]);
+    assert_eq!(s.retention.replay_held.len(), 3);
+    assert_eq!(s.keyed_admissions.len(), 5);
+    assert!(s.events.contains_key(&held.key));
+    // A third finished key evicts the oldest unheld one, not a held one.
+    keyed_done(&e, "done-2", 7);
+    let s = e.snapshot().unwrap();
+    assert_eq!(order_members(&s), ["k:done-1", "k:done-2"]);
+    assert!(s.events.contains_key(&held.key));
+    assert!(live.iter().all(|run| s.runs.contains_key(run)));
+    // A live run finishes: its receipt joins the order (by acceptance, so
+    // it is the oldest) and is evicted first.
+    assert!(e.advance(&live[0], 8).unwrap());
+    let s = e.snapshot().unwrap();
+    assert_eq!(order_members(&s), ["k:done-1", "k:done-2"]);
+    assert!(!s.keyed_admissions.contains_key("live-0"));
+    // The waiter consumes the event and finishes: the event joins the
+    // order by its acceptance (older than "done-1") and, its window not
+    // passed, is evicted as the oldest.
+    while e.snapshot().unwrap().runs.contains_key(&waiter) {
+        e.advance(&waiter, 9).unwrap();
+    }
+    let s = e.snapshot().unwrap();
+    assert_eq!(order_members(&s), ["k:done-1", "k:done-2"]);
+    assert!(!s.events.contains_key(&held.key));
+    assert!(s.retention.event_expires_at_ms.get(&held.key).is_none());
+}
+/// A burst of 10,000 keyed admissions with the clock frozen keeps the
+/// unheld set at `replay_keep` (within the per-commit bound) and refuses
+/// none of them for what is remembered.
+#[test]
+fn a_frozen_clock_burst_keeps_the_remembered_set_at_replay_keep() {
+    let e = ret_engine();
+    let keep = RetentionPolicy::default().replay_keep;
+    for i in 0..10_000 {
+        let d = keyed_done(&e, &format!("burst-{i:05}"), 0);
+        assert!(!d.duplicate, "{i}");
+        if i % 500 == 0 || i == 9_999 {
+            let s = e.snapshot().unwrap();
+            let order = s.retention.replay_order.len();
+            assert!(
+                order <= keep + retention::REPLAY_EVICTIONS_PER_COMMIT,
+                "{i}: {order}"
+            );
+            assert_eq!(s.keyed_admissions.len(), order.min(i + 1), "{i}");
+            if i >= keep {
+                assert!(order >= keep, "{i}: {order}");
+            }
+        }
+    }
+    let s = e.snapshot().unwrap();
+    assert_eq!(s.retention.replay_order.len(), keep);
+    assert!(s.runs.is_empty());
+}
+/// An event whose contract declares a 24 h window is evicted by count
+/// long before its window passes; a wait registered after its eviction
+/// times out, as after an expired event.
+#[test]
+fn a_day_long_event_window_is_evicted_by_count() {
+    let e = ret_engine();
+    let mut day = wait_artifact().content;
+    day.registry
+        .events
+        .get_mut("test.completed")
+        .unwrap()
+        .retention_ms = 86_400_000;
+    // The waiter's contract reference must match the event's.
+    let contract = day.registry.events["test.completed"].clone();
+    if let Operation::Wait { event, .. } = &mut day.playbook.steps.get_mut("wait").unwrap().op {
+        *event = Some(ContractRef {
+            name: contract.name.clone(),
+            fingerprint: contract.fingerprint().unwrap(),
+        });
+    }
+    let day = Artifact::seal(day).unwrap();
+    install(&e, day, "waiter");
+    e.set_retention_policy(RetentionPolicy {
+        event_replay_ms: 1,
+        replay_keep: 2,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    let envelope = |id: &str, invocation: &str| EventEnvelope {
+        contract: ContractRef {
+            name: contract.name.clone(),
+            fingerprint: contract.fingerprint().unwrap(),
+        },
+        ..correlated_event(id, invocation)
+    };
+    let first = e
+        .admit_event("host", envelope("day-0", "exact-invocation"), 0)
+        .unwrap();
+    assert_eq!(
+        e.snapshot().unwrap().retention.event_expires_at_ms[&first.key],
+        86_400_000
+    );
+    e.admit_event("host", envelope("day-1", "inv-1"), 1)
+        .unwrap();
+    e.admit_event("host", envelope("day-2", "inv-2"), 2)
+        .unwrap();
+    let s = e.snapshot().unwrap();
+    assert!(!s.events.contains_key(&first.key));
+    assert_eq!(s.events.len(), 2);
+    assert!(s.indexes.event_memberships.get(&first.key).is_none());
+    // A wait for it registered after its eviction does not match; it times
+    // out.
+    let waiter = e
+        .admit("waiter", "main", Value::Null, authority(), 3)
+        .unwrap();
+    e.advance(&waiter, 3).unwrap();
+    assert_eq!(
+        e.snapshot().unwrap().runs[&waiter].status,
+        RunStatus::Waiting
+    );
+    e.drive(&mut FakeHost::default(), 200, 20).unwrap();
+    assert_eq!(runs_page(&e, Some(&waiter))[0]["outcome"], "error");
+    // A re-send of the evicted event is new.
+    assert!(
+        !e.admit_event("host", envelope("day-0", "exact-invocation"), 201)
+            .unwrap()
+            .duplicate
+    );
+}
+/// Format 3 (bound record containers): the work of a commit that evicts k
+/// entries depends on k, not on the entries kept, and reads no container
+/// whole. The measured commit lowers `replay_keep` by k.
+#[test]
+fn eviction_work_on_record_storage_depends_on_entries_evicted_not_on_entries_kept() {
+    use std::sync::atomic::Ordering;
+    let measure = |kept: usize, k: usize| {
+        let e = Engine::new(RecordStorage::new(), "test", "incarnation-1").unwrap();
+        install_on(&e, done_artifact(), "a");
+        let policy = |keep: usize| RetentionPolicy {
+            replay_keep: keep,
+            ..RetentionPolicy::default()
+        };
+        e.set_retention_policy(policy(kept + k)).unwrap();
+        for i in 0..kept + k {
+            let d = e
+                .admit_once(keyed_on(&e, &format!("k-{i:03}")), i as i64)
+                .unwrap();
+            e.advance(&d.receipt.run_id, i as i64).unwrap();
+        }
+        let reads = e.store.stats.record_reads.load(Ordering::Relaxed);
+        let fallbacks = e.store.stats.fallbacks().len();
+        e.set_retention_policy(policy(kept)).unwrap();
+        let s = e.snapshot().unwrap();
+        assert_eq!(s.retention.replay_order.len(), kept);
+        assert_eq!(s.keyed_admissions.len(), kept);
+        let scanned: BTreeSet<String> = e.store.stats.fallbacks()[fallbacks..]
+            .iter()
+            .map(|f| f.split(' ').next().unwrap().to_string())
+            .collect();
+        (
+            e.store.stats.record_reads.load(Ordering::Relaxed) - reads,
+            scanned,
+        )
+    };
+    let (none_few, scanned) = measure(20, 0);
+    assert!(scanned.is_empty(), "{scanned:?}");
+    let (none_many, _) = measure(80, 0);
+    assert_eq!(none_few, none_many, "nothing evicted");
+    let (eight, scanned) = measure(20, 8);
+    assert!(scanned.is_empty(), "{scanned:?}");
+    let (eight_many, _) = measure(80, 8);
+    assert_eq!(eight, eight_many, "8 evicted");
+    let (sixteen, _) = measure(20, 16);
+    let (twenty_four, _) = measure(20, 24);
+    // A fixed part (the head lookup) and the same per eviction.
+    let per_eight = sixteen - eight;
+    assert_eq!(
+        twenty_four - sixteen,
+        per_eight,
+        "reads grow linearly with evictions"
+    );
+    assert!(per_eight > 0);
+    let fixed = (eight - none_few) - per_eight;
+    assert!(fixed <= 4, "fixed part {fixed}");
+}
+/// Held entries at the head of the order (their holds began after they
+/// joined, as through an untracked uncertain completion): the engine takes
+/// them out of the order rather than evicting them, then evicts the oldest
+/// unheld one; the stored commit passes the licence.
+#[test]
+fn the_engine_takes_held_entries_at_the_head_out_of_the_order() {
+    let mut keyed_head = eviction_state();
+    keyed_head.indexes.initialized = true;
+    let mut event_head = State::default();
+    event_head.retention.clock_ms = Some(500);
+    event_head.retention.policy.admission_replay_ms = EVICTION_WINDOW as u64;
+    event_head.retention.policy.event_replay_ms = EVICTION_WINDOW as u64;
+    event_head.retention.policy.replay_keep = 4;
+    event_entry(&mut event_head, "ew", 0, true);
+    hold_by_waiter(&mut event_head, "ew");
+    for i in 0..5 {
+        keyed_entry(&mut event_head, &format!("k{i}"), i + 1, false, true);
+    }
+    event_head.sequence = 20;
+    event_head.indexes.initialized = true;
+    for (label, state, kept) in [
+        (
+            "a keyed receipt whose run is live",
+            keyed_head,
+            vec!["k:k1", "k:k2", "k:k3", "e:e4", "e:ew"],
+        ),
+        (
+            "an event a waiter holds",
+            event_head,
+            vec!["k:k1", "k:k2", "k:k3", "k:k4"],
+        ),
+    ] {
+        let store = MemoryStorage::default();
+        seed_eviction_state(&store, "test", &state);
+        store.release("test", "w").unwrap();
+        let e = Engine::new(store, "test", "incarnation-1").unwrap();
+        e.set_retention_policy(state.retention.policy.clone())
+            .unwrap_or_else(|err| panic!("{label}: {err}"));
+        let s = e.snapshot().unwrap();
+        assert_eq!(order_members(&s), kept, "{label}");
+        assert!(!s.keyed_admissions.contains_key("k0"), "{label}");
+        assert!(s.events.contains_key("ew"), "{label}");
+        assert_eq!(
+            s.keyed_admissions.contains_key("kh"),
+            state.keyed_admissions.contains_key("kh"),
+            "{label}"
+        );
+    }
+}
+/// An entry that leaves by its window, or is forgotten to be admitted
+/// again, leaves the eviction order with it.
+#[test]
+fn dropped_and_forgotten_entries_leave_the_order() {
+    let e = keep_engine(10);
+    e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 1_000,
+        event_replay_ms: 1,
+        replay_keep: 10,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    for i in 0..3 {
+        keyed_done(&e, &format!("old-{i}"), i);
+    }
+    e.admit_event("host", correlated_event("old-event", "nobody"), 0)
+        .unwrap();
+    assert_eq!(e.snapshot().unwrap().retention.replay_order.len(), 4);
+    // Past the windows: the drop takes the receipts and the event.
+    keyed_done(&e, "new", 2_000);
+    assert_eq!(order_members(&e.snapshot().unwrap()), ["k:new"]);
+    // An expired key admitted again is forgotten first, then new.
+    keyed_done(&e, "new", 4_000);
+    let s = e.snapshot().unwrap();
+    assert_eq!(order_members(&s), ["k:new"]);
+    assert_eq!(s.retention.replay_order.len(), 1);
 }

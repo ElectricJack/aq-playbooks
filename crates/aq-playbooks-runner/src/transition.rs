@@ -81,6 +81,8 @@ impl State {
                 "retention.admission_expires_at_ms",
                 &mut r.admission_expires_at_ms,
             ),
+            ("retention.replay_order", &mut r.replay_order),
+            ("retention.replay_held", &mut r.replay_held),
         ]
     }
 }
@@ -668,8 +670,58 @@ fn verify_patch_removals(data: &RecordData, patch: &StatePatch, next: &State) ->
             .as_ref()
             .is_ok_and(|runs| runs.contains(id))
     };
+    // Evictions: the order keys the patch adds, and the stored correlation
+    // keys of the events it removes.
+    let stored_order = data.container("retention.replay_order");
+    let mut added = vec![];
+    for (path, change) in &patch.changes {
+        if path.field != "retention.replay_order" {
+            continue;
+        }
+        let written: Vec<&TreeKey> = match change {
+            ContainerChange::Entries(rows) => rows
+                .iter()
+                .filter(|(_, new)| new.is_some())
+                .map(|(key, _)| key)
+                .collect(),
+            ContainerChange::Replace(rows) => rows.iter().map(|(key, _)| key).collect(),
+        };
+        for key in written {
+            if stored_order.is_none_or(|c| !c.contains_key(key))
+                && let TreeKey::Str(key) = key
+            {
+                added.push(key.clone());
+            }
+        }
+    }
+    let memberships = |key: &str| -> std::result::Result<Option<Vec<String>>, StorageError> {
+        data.container("indexes.event_memberships")
+            .and_then(|c| c.get(&TreeKey::Str(key.to_string())))
+            .map(|bytes| {
+                serde_json::from_slice(bytes)
+                    .map_err(|e| StorageError::Backend(format!("event memberships record: {e}")))
+            })
+            .transpose()
+    };
+    let evicted = crate::retention::check_evictions(
+        &previous,
+        next,
+        &mut added.into_iter(),
+        &crate::retention::Stored {
+            ordered: &|key| {
+                Ok(stored_order.is_some_and(|c| c.contains_key(&TreeKey::Str(key.to_string()))))
+            },
+            memberships: &memberships,
+        },
+    )?;
     // `previous` holds only removed receipts.
-    let checked = crate::retention::check_removals(&previous, next, &disposed_run, &|_| false);
+    let checked = crate::retention::check_removals(
+        &previous,
+        next,
+        &disposed_run,
+        &|_| false,
+        &|window, key| evicted.contains(&(window, key.to_string())),
+    );
     if let Some(Err(e)) = disposed.get() {
         return Err(backend(e));
     }

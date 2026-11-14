@@ -615,6 +615,10 @@ pub struct State {
     /// history in the same commit. Never stored with the State.
     #[serde(skip)]
     pub settled: Vec<SettledCohort>,
+    /// What this commit may have changed the hold of, for the eviction
+    /// order (`retention::rejoin`). Never stored.
+    #[serde(skip)]
+    pub replay_touched: retention::ReplayTouched,
     #[serde(default)]
     pub indexes: RuntimeIndexes,
     pub artifacts: BTreeMap<String, Artifact>,
@@ -1275,6 +1279,7 @@ impl<S: Storage> Engine<S> {
             }
             s.sequence += 1;
             let sequence = s.sequence;
+            s.replay_touched.events.insert(key.clone());
             s.events.insert(
                 key.clone(),
                 AcceptedEvent {
@@ -1362,6 +1367,7 @@ impl<S: Storage> Engine<S> {
                 count += 1;
             }
             s.events.insert(event_key.into(), event);
+            s.replay_touched.events.insert(event_key.into());
             Ok(count)
         })
     }
@@ -3721,6 +3727,9 @@ impl<S: Storage> Engine<S> {
     pub fn set_retention_policy(&self, policy: RetentionPolicy) -> Result<()> {
         if policy.event_replay_ms == 0 || policy.admission_replay_ms == 0 || policy.audit_ms == 0 {
             return Err(Error::Refused("retention windows must be positive".into()));
+        }
+        if policy.replay_keep == 0 {
+            return Err(Error::Refused("replay_keep must be positive".into()));
         }
         self.transaction_at(None, |s| {
             s.retention.policy = policy;

@@ -34,6 +34,14 @@ pub struct RetentionPolicy {
     /// Window of a keyed admission receipt, from its acceptance.
     #[serde(default = "default_admission_replay_ms")]
     pub admission_replay_ms: u64,
+    /// How many window entries (events and keyed admission receipts
+    /// together) that no live work holds the engine remembers: past it the
+    /// oldest are evicted, whatever their window ([`evict`]). Positive.
+    #[serde(default = "default_replay_keep")]
+    pub replay_keep: usize,
+}
+fn default_replay_keep() -> usize {
+    256
 }
 fn default_admission_replay_ms() -> u64 {
     604_800_000
@@ -52,6 +60,7 @@ impl Default for RetentionPolicy {
             audit_ms: 604_800_000,
             max_tombstones: default_max_tombstones(),
             admission_replay_ms: default_admission_replay_ms(),
+            replay_keep: default_replay_keep(),
         }
     }
 }
@@ -99,7 +108,56 @@ pub struct RetentionState {
     /// decreases. Absent (and not written) until the first rebase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_floor_ms: Option<i64>,
+    /// The window entries no live work holds, in acceptance order: one
+    /// record each, keyed [`replay_key`]`(acceptance sequence, member)`.
+    /// Past `policy.replay_keep` the oldest are evicted.
+    #[serde(default)]
+    pub replay_order: LazyMap<String, ()>,
+    /// Keyed admission receipts whose run is live, by run id: each joins
+    /// `replay_order` when its run leaves the record.
+    #[serde(default)]
+    pub replay_held: LazyMap<String, String>,
 }
+/// The [`RetentionState::replay_order`] key of `member` accepted at
+/// `sequence`: the sequence as 16 lowercase hex digits, then the member.
+/// Byte order of keys is acceptance order.
+pub fn replay_key(sequence: u64, member: &str) -> String {
+    format!("{sequence:016x}{member}")
+}
+/// The acceptance sequence and member of a [`replay_key`].
+pub fn replay_entry(key: &str) -> Option<(u64, &str)> {
+    Some((
+        u64::from_str_radix(key.get(..16)?, 16).ok()?,
+        key.get(16..)?,
+    ))
+}
+/// The acceptance sequence of a keyed admission receipt: that of its run
+/// id (`run-<16 hex>`, assigned by the admitting commit), else 0.
+pub fn admission_sequence(receipt: &crate::KeyedAdmissionReceipt) -> u64 {
+    receipt
+        .run_id
+        .strip_prefix("run-")
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        .unwrap_or(0)
+}
+/// The [`RetentionState::replay_order`] key of a keyed admission receipt.
+pub fn admission_order_key(receipt: &crate::KeyedAdmissionReceipt) -> String {
+    replay_key(
+        admission_sequence(receipt),
+        &format!("{WINDOW_ADMISSION}{}", receipt.key),
+    )
+}
+/// The [`RetentionState::replay_order`] key of an event.
+pub fn event_order_key(event: &crate::AcceptedEvent) -> String {
+    replay_key(event.sequence, &format!("{WINDOW_EVENT}{}", event.key))
+}
+/// At most this many entries at the head of the eviction order are examined
+/// (evicted, or taken out of the order because live work holds them) by one
+/// commit. Counted apart from the window drop's own bound.
+pub const REPLAY_EVICTIONS_PER_COMMIT: usize = 64;
+/// Refusal of a commit that evicts a window entry other than as
+/// [`evict`] does (see [`verify_removals`]).
+pub const REFUSE_EVICTION: &str = "window entry evicted without its licence";
 /// The `RetentionState::expiry` key of `member` expiring at
 /// `expires_at_ms`: the expiry as 16 lowercase hex digits of its
 /// order-preserving unsigned form, then the member. Byte order of keys is
@@ -182,7 +240,7 @@ fn fallback_expiry(s: &State, window: Window, key: &str) -> Option<i64> {
     }
 }
 /// Which expiry record: `event_expires_at_ms` or `admission_expires_at_ms`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Window {
     Event,
     Admission,
@@ -378,6 +436,7 @@ pub(crate) fn check_licensed_header(
         // Not stored.
         protection_available: _,
         settled: _,
+        replay_touched: _,
         catalog_history,
         catalog_history_at_ms,
         retention,
@@ -398,6 +457,8 @@ pub(crate) fn check_licensed_header(
         disposals: _,
         expiry: _,
         admission_expires_at_ms: _,
+        replay_order: _,
+        replay_held: _,
         // What a licence names: judged by `check_licence`.
         clock_ms: _,
         stale_floor_ms: _,
@@ -542,9 +603,11 @@ fn intent_settled(status: &IntentStatus) -> bool {
 /// - an audit receipt: its history is in `next.settled`; or (legacy) its run
 ///   has a disposal;
 /// - an event: its expiry has been reached (with a legacy tombstone, the
-///   tombstone's digest must match);
-/// - a keyed admission receipt: its expiry has been reached (a changed
-///   receipt is always refused).
+///   tombstone's digest must match), or it is evicted as
+///   [`check_evictions`] licenses;
+/// - a keyed admission receipt: its expiry has been reached, or it is
+///   evicted as [`check_evictions`] licenses (a changed receipt is always
+///   refused).
 ///
 /// The clock never decreases, the stale floor never changes, and expiry
 /// records follow [`check_expiry_change`], except in a commit that carries
@@ -586,9 +649,28 @@ pub fn verify_removals(
         }
     }
     let kept: BTreeSet<u64> = next.receipts.iter().map(|r| r.sequence).collect();
-    let removals = check_removals(previous, next, &disposed_run, &|sequence| {
-        kept.contains(&sequence)
-    })?;
+    let stored = &previous.retention.replay_order;
+    let evicted = check_evictions(
+        previous,
+        next,
+        &mut next
+            .retention
+            .replay_order
+            .keys()
+            .filter(|key| !stored.contains_key(*key))
+            .cloned(),
+        &Stored {
+            ordered: &|key| Ok(stored.contains_key(key)),
+            memberships: &|key| Ok(previous.indexes.event_memberships.get(key).cloned()),
+        },
+    )?;
+    let removals = check_removals(
+        previous,
+        next,
+        &disposed_run,
+        &|sequence| kept.contains(&sequence),
+        &|window, key| evicted.contains(&(window, key.to_string())),
+    )?;
     check_expiry_records(previous, next)?;
     Ok(removals)
 }
@@ -602,6 +684,7 @@ pub(crate) fn check_removals(
     next: &State,
     disposed_run: &dyn Fn(&str) -> bool,
     receipt_kept: &dyn Fn(u64) -> bool,
+    evicted: &dyn Fn(Window, &str) -> bool,
 ) -> std::result::Result<Removals, StorageError> {
     verify_artifact_removals(previous, next)?;
     let clock = next.retention.clock_ms;
@@ -618,7 +701,9 @@ pub(crate) fn check_removals(
         match next.keyed_admissions.get(key) {
             Some(kept) if kept == receipt => {}
             Some(_) => return Err(refuse(REFUSE_RECEIPT_CHANGE)),
-            None if admission_expiry(previous, key).is_some_and(|at| expired(at, clock)) => {
+            None if admission_expiry(previous, key).is_some_and(|at| expired(at, clock))
+                || evicted(Window::Admission, key) =>
+            {
                 removal()?
             }
             None => return Err(refuse(REFUSE_EARLY_REMOVAL)),
@@ -631,7 +716,9 @@ pub(crate) fn check_removals(
         }
         removal()?;
         // A legacy tombstone records the removal; it never licenses one.
-        if !event_expiry(previous, key).is_some_and(|at| expired(at, clock)) {
+        if !event_expiry(previous, key).is_some_and(|at| expired(at, clock))
+            && !evicted(Window::Event, key)
+        {
             return Err(refuse(REFUSE_EARLY_REMOVAL));
         }
         if let Some(tombstone) = next.retention.event_tombstones.get(key) {
@@ -782,6 +869,8 @@ pub struct CommitReport {
     pub events: usize,
     pub admissions: usize,
     pub deferred: usize,
+    /// Window entries evicted by count ([`evict`]).
+    pub evicted: usize,
     pub drained: usize,
     pub more: bool,
 }
@@ -917,6 +1006,18 @@ pub(crate) fn remove_cohort(s: &mut State, root: &str) -> Result<SettledCohort> 
             .and_then(|offset| s.receipts.get(offset));
         if let Some(receipt) = terminal {
             finished_at_ms = finished_at_ms.max(Some(receipt.at_ms));
+        }
+    }
+    // Their waits end with them: the events those waits held are judged
+    // again (`rejoin`) before the next index sync drops the subscriptions.
+    for token in members
+        .iter()
+        .cloned()
+        .chain(intent_ids.iter().map(|id| format!("intent:{id}")))
+    {
+        if let Some(keys) = s.indexes.run_subscriptions.get(&token) {
+            let keys = keys.clone();
+            s.replay_touched.wait_keys.extend(keys);
         }
     }
     let mut runs = vec![];
@@ -1086,7 +1187,14 @@ pub(crate) fn forget_admission(s: &mut State, key: &str) {
     }
 }
 fn remove_admission(s: &mut State, key: &str) {
-    s.keyed_admissions.remove(key);
+    if let Some(receipt) = s.keyed_admissions.remove(key) {
+        s.retention
+            .replay_order
+            .remove(&admission_order_key(&receipt));
+        if s.retention.replay_held.get(&receipt.run_id) == Some(&receipt.key) {
+            s.retention.replay_held.remove(&receipt.run_id);
+        }
+    }
     s.retention.admission_expires_at_ms.remove(key);
 }
 /// Whether an event is still needed past its window (SC-9): a live waiter on
@@ -1096,17 +1204,40 @@ pub(crate) fn event_held(s: &State, key: &str) -> Result<bool> {
     let Some(event) = s.events.get(key) else {
         return Ok(false);
     };
+    let memberships = s.indexes.event_memberships.get(key);
+    event_hold(s, key, event, memberships.map(Vec::as_slice))
+}
+/// [`event_held`] for `event` (key `key`, correlation keys `memberships`),
+/// judged by the live work of `s`, which need not hold the event itself (a
+/// commit that removes it): its `event:<key>` receipts are read from `s` and
+/// from the history `s` writes.
+fn event_hold(
+    s: &State,
+    key: &str,
+    event: &crate::AcceptedEvent,
+    memberships: Option<&[String]>,
+) -> Result<bool> {
     if event.destinations.iter().any(|d| d.run.is_none()) {
         let owner = format!("event:{key}");
         let blocked: BTreeSet<String> = receipt_offsets(s, &owner)
             .into_iter()
-            .filter_map(|offset| s.receipts.get(offset))
+            .filter_map(|offset| s.receipts.get(offset).cloned())
+            .chain(
+                s.settled
+                    .iter()
+                    .filter(|cohort| cohort.root == owner)
+                    .flat_map(|cohort| cohort.receipts.iter().cloned()),
+            )
             .filter(|r| {
                 r.kind == "destination_blocked"
                     && r.detail.get("blocked_kind").and_then(|v| v.as_str()) == Some("input")
             })
-            .filter_map(|r| r.detail.get("destination").and_then(|v| v.as_str()))
-            .map(String::from)
+            .filter_map(|r| {
+                r.detail
+                    .get("destination")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
             .collect();
         if event
             .destinations
@@ -1125,7 +1256,7 @@ pub(crate) fn event_held(s: &State, key: &str) -> Result<bool> {
             s.runs.get(target).is_some_and(|r| !r.status.terminal())
         }
     };
-    let waited = s.indexes.event_memberships.get(key).is_some_and(|keys| {
+    let waited = memberships.is_some_and(|keys| {
         keys.iter().any(|k| {
             s.indexes
                 .waiters
@@ -1163,6 +1294,7 @@ fn remove_event(s: &mut State, key: &str, report: &mut CommitReport) -> Result<(
     let Some(event) = s.events.remove(key) else {
         return Ok(());
     };
+    s.retention.replay_order.remove(&event_order_key(&event));
     s.retention.event_epochs.remove(key);
     s.retention.event_expires_at_ms.remove(key);
     if let Some(keys) = s.indexes.event_memberships.remove(key) {
@@ -1299,11 +1431,270 @@ fn drop_event(s: &mut State, key: &str, clock: i64, report: &mut CommitReport) -
     }
     remove_event(s, key, report)
 }
+/// The window entries a commit may have changed the hold of, for
+/// [`rejoin`]: events it accepted or fanned out, and the correlation keys
+/// whose waiters it changed. Never stored.
+#[derive(Debug, Clone, Default)]
+pub struct ReplayTouched {
+    pub events: BTreeSet<String>,
+    pub wait_keys: BTreeSet<String>,
+}
+/// Put the window entries whose hold this commit may have ended or begun
+/// in or out of the eviction order: a keyed admission receipt joins it when
+/// its run leaves the record (in this commit's history); an event is judged
+/// again ([`event_held`]) when the commit accepted it, fanned it out, or
+/// changed the waiters of one of its correlation keys. O(touched).
+///
+/// Not tracked: a hold that begins or ends through an uncertain completion
+/// (an operation whose admission handle is lost). Such an event is judged
+/// when it reaches the head of the order (never evicted while held), and
+/// otherwise leaves with its window.
+pub(crate) fn rejoin(s: &mut State) -> Result<()> {
+    let runs: Vec<String> = s
+        .settled
+        .iter()
+        .flat_map(|cohort| cohort.runs.iter().map(|run| run.id.clone()))
+        .collect();
+    for run in runs {
+        let Some(key) = s.retention.replay_held.remove(&run) else {
+            continue;
+        };
+        if let Some(receipt) = s.keyed_admissions.get(&key)
+            && receipt.run_id == run
+        {
+            let order = admission_order_key(receipt);
+            s.retention.replay_order.insert(order, ());
+        }
+    }
+    let touched = std::mem::take(&mut s.replay_touched);
+    let mut events = touched.events;
+    for key in touched.wait_keys {
+        if let Some(ids) = s.indexes.events.get(&key) {
+            events.extend(ids.values().cloned());
+        }
+    }
+    for key in events {
+        let Some(order) = s.events.get(&key).map(event_order_key) else {
+            continue;
+        };
+        let held = event_held(s, &key)?;
+        let in_order = s.retention.replay_order.contains_key(&order);
+        if held && in_order {
+            s.retention.replay_order.remove(&order);
+        } else if !held && !in_order {
+            s.retention.replay_order.insert(order, ());
+        }
+    }
+    Ok(())
+}
+/// Evict the oldest window entries past `policy.replay_keep`: while the
+/// eviction order holds more, take its head (at most `limit` examined). An
+/// entry live work holds leaves the order without being evicted (a keyed
+/// receipt waits for its run in `replay_held`; an event rejoins when
+/// [`rejoin`] judges it unheld). Otherwise the entry is forgotten: its item,
+/// expiry record, expiry order key and (for an event) indexes, as when its
+/// window passes. Never refuses, never needs host time. Nothing to evict
+/// costs one count; k examined cost O(k).
+pub(crate) fn evict(s: &mut State, limit: usize, report: &mut CommitReport) -> Result<()> {
+    let keep = s.retention.policy.replay_keep;
+    if s.retention.replay_order.len() <= keep {
+        return Ok(());
+    }
+    window_step();
+    let mut head = s.retention.replay_order.next_key_by_one::<String>(None);
+    for _ in 0..limit {
+        if s.retention.replay_order.len() <= keep {
+            break;
+        }
+        let Some(key) = head else {
+            break;
+        };
+        s.retention.replay_order.remove(&key);
+        window_step();
+        head = s.retention.replay_order.next_key_by_one(Some(&key));
+        window_step();
+        let Some((_, member)) = replay_entry(&key) else {
+            continue;
+        };
+        if let Some(item) = member.strip_prefix(WINDOW_ADMISSION) {
+            let Some(receipt) = s.keyed_admissions.get(item).cloned() else {
+                continue;
+            };
+            if admission_order_key(&receipt) != key {
+                continue;
+            }
+            if s.runs.contains_key(&receipt.run_id) {
+                s.retention.replay_held.insert(receipt.run_id, item.into());
+                continue;
+            }
+            let at = admission_expiry(s, item);
+            remove_admission(s, item);
+            if let Some(at) = at {
+                window_remove(s, at, member);
+            }
+            report.evicted += 1;
+        } else if let Some(item) = member.strip_prefix(WINDOW_EVENT) {
+            let Some(order) = s.events.get(item).map(event_order_key) else {
+                continue;
+            };
+            if order != key || event_held(s, item)? {
+                continue;
+            }
+            let at = event_expiry(s, item);
+            let mut removed = CommitReport::default();
+            remove_event(s, item, &mut removed)?;
+            report.receipts += removed.receipts;
+            if let Some(at) = at {
+                window_remove(s, at, member);
+            }
+            report.evicted += 1;
+        }
+    }
+    Ok(())
+}
+/// The window entries `next` holds in its eviction order that `previous`
+/// did not must each be the order key of an item `next` holds and no live
+/// work in `next` holds ([`REFUSE_EVICTION`] otherwise), so the order's
+/// count, which licenses evictions, counts only real unheld entries.
+fn check_order_entry(next: &State, key: &str) -> std::result::Result<(), StorageError> {
+    let genuine = match replay_entry(key) {
+        Some((_, member)) => {
+            if let Some(item) = member.strip_prefix(WINDOW_ADMISSION) {
+                next.keyed_admissions.get(item).is_some_and(|r| {
+                    admission_order_key(r) == key && !next.runs.contains_key(&r.run_id)
+                })
+            } else if let Some(item) = member.strip_prefix(WINDOW_EVENT) {
+                match next.events.get(item) {
+                    Some(e) if event_order_key(e) == key => {
+                        !event_held(next, item).map_err(|e| refuse(&e.to_string()))?
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            }
+        }
+        None => false,
+    };
+    if genuine {
+        Ok(())
+    } else {
+        Err(refuse(REFUSE_EVICTION))
+    }
+}
+/// What [`check_evictions`] reads of the stored State.
+pub struct Stored<'a> {
+    /// Whether the stored eviction order holds `key` (it decides only the
+    /// refusal's text).
+    pub ordered: &'a dyn Fn(&str) -> std::result::Result<bool, StorageError>,
+    /// The stored correlation keys of event `key`.
+    pub memberships: &'a dyn Fn(&str) -> std::result::Result<Option<Memberships>, StorageError>,
+}
+/// An event's correlation keys (`indexes.event_memberships`).
+pub type Memberships = Vec<String>;
+/// The evictions of a commit from `previous` to `next`, which a removal
+/// check then allows: each keyed admission receipt or event of `previous`
+/// that `next` no longer holds, whose expiry the clock has not reached, and
+/// whose eviction order key `next` does not hold (it was in the order, or
+/// joined and left it in this commit). Such an eviction is licensed only
+/// as [`evict`] makes it, else it is refused ([`REFUSE_EVICTION`] when the
+/// stored order held it, [`REFUSE_EARLY_REMOVAL`] when not):
+///
+/// - no live work in `next` holds the entry (a keyed receipt's run is not in
+///   `next`; for an event, [`event_held`] judged by `next`);
+/// - at most [`REPLAY_EVICTIONS_PER_COMMIT`] in the commit, and `next`'s
+///   order still holds at least `policy.replay_keep` entries (so the order
+///   held more before them);
+/// - oldest first: every evicted key is before every key `next`'s order
+///   holds.
+///
+/// `added` are the order keys `next` holds that `previous` did not: each
+/// must be genuine ([`check_order_entry`]), so the count is real. A
+/// removal before expiry whose order key `next` still holds is no eviction:
+/// the removal check refuses it as early. `previous` need hold only the
+/// removed items, their expiry records and the stored header. Cost
+/// O(evicted + added), plus one ordered lookup.
+pub fn check_evictions(
+    previous: &State,
+    next: &State,
+    added: &mut dyn Iterator<Item = String>,
+    stored: &Stored<'_>,
+) -> std::result::Result<BTreeSet<(Window, String)>, StorageError> {
+    // The refusal of an unlicensed eviction: of an entry the order held,
+    // or (no eviction at all) an early removal.
+    let refusal = |ordered: &str| -> StorageError {
+        match (stored.ordered)(ordered) {
+            Ok(true) => refuse(REFUSE_EVICTION),
+            Ok(false) => refuse(REFUSE_EARLY_REMOVAL),
+            Err(error) => error,
+        }
+    };
+    for key in added {
+        check_order_entry(next, &key)?;
+    }
+    let clock = next.retention.clock_ms;
+    let order = &next.retention.replay_order;
+    let mut evicted = vec![];
+    for (key, receipt) in &previous.keyed_admissions {
+        if next.keyed_admissions.contains_key(key)
+            || admission_expiry(previous, key).is_some_and(|at| expired(at, clock))
+        {
+            continue;
+        }
+        let ordered = admission_order_key(receipt);
+        if order.contains_key(&ordered) {
+            continue;
+        }
+        if next.runs.contains_key(&receipt.run_id) {
+            return Err(refusal(&ordered));
+        }
+        evicted.push((ordered, Window::Admission, key.clone()));
+    }
+    for (key, event) in &previous.events {
+        if next.events.contains_key(key)
+            || event_expiry(previous, key).is_some_and(|at| expired(at, clock))
+        {
+            continue;
+        }
+        let ordered = event_order_key(event);
+        if order.contains_key(&ordered) {
+            continue;
+        }
+        let memberships = (stored.memberships)(key)?;
+        if event_hold(next, key, event, memberships.as_deref())
+            .map_err(|e| refuse(&e.to_string()))?
+        {
+            return Err(refusal(&ordered));
+        }
+        evicted.push((ordered, Window::Event, key.clone()));
+    }
+    if evicted.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let first = |evicted: &[(String, Window, String)]| refusal(&evicted[0].0);
+    if evicted.len() > REPLAY_EVICTIONS_PER_COMMIT
+        || order.len() < next.retention.policy.replay_keep
+    {
+        return Err(first(&evicted));
+    }
+    if let Some(head) = order.next_key_by_one::<String>(None)
+        && let Some(late) = evicted.iter().find(|(ordered, ..)| *ordered >= head)
+    {
+        return Err(refusal(&late.0));
+    }
+    Ok(evicted
+        .into_iter()
+        .map(|(_, window, key)| (window, key))
+        .collect())
+}
 /// The retention work of every commit that changes the State, after its
 /// indexes are synchronized: move the clock to the commit's host time, remove
-/// the settled cohorts among `candidates` (see [`candidate_roots`]), drop
-/// expired window entries ([`drop_expired`]) and move `"admin"` receipts to
-/// history. The clock step and the drop need host time.
+/// the settled cohorts among `candidates` (see [`candidate_roots`]), put the
+/// window entries whose hold this commit may have changed in or out of the
+/// eviction order ([`rejoin`]), drop expired window entries
+/// ([`drop_expired`]), evict the oldest entries past `policy.replay_keep`
+/// ([`evict`]) and move `"admin"` receipts to history. The clock step and
+/// the drop need host time; eviction does not.
 pub(crate) fn finish_commit(
     s: &mut State,
     now_ms: Option<i64>,
@@ -1314,9 +1705,11 @@ pub(crate) fn finish_commit(
         advance_clock(s, now_ms);
     }
     settle(s, candidates, COHORTS_PER_COMMIT, &mut report)?;
+    rejoin(s)?;
     if now_ms.is_some() {
         drop_expired(s, WINDOW_DROPS_PER_COMMIT, &mut report)?;
     }
+    evict(s, REPLAY_EVICTIONS_PER_COMMIT, &mut report)?;
     if let Some(cohort) = move_unowned_receipts(s, "admin")? {
         report.receipts += cohort.receipts.len();
         s.settled.push(cohort);
@@ -1573,6 +1966,7 @@ pub(crate) fn gc(s: &mut State, now: i64, limit: usize) -> Result<GcReport> {
                     .copied()
                     .unwrap_or(0);
                 let e = s.events.remove(&id).unwrap();
+                s.retention.replay_order.remove(&event_order_key(&e));
                 s.retention.event_epochs.remove(&id);
                 s.retention.event_expires_at_ms.remove(&id);
                 if epoch == current {
@@ -1760,6 +2154,64 @@ mod window_tests {
         for at in at {
             assert_eq!(window_entry(&window_key(at, "k:x")), Some((at, "k:x")));
         }
+    }
+    /// A plain (format 2) State with `unheld` finished keyed receipts in the
+    /// eviction order and `replay_keep` `keep`.
+    fn ordered(unheld: usize, keep: usize) -> State {
+        let mut s = State::default();
+        s.retention.clock_ms = Some(1_000);
+        s.retention.policy.replay_keep = keep;
+        for i in 0..unheld {
+            let key = format!("k-{i:05}");
+            let receipt = KeyedAdmissionReceipt {
+                key: key.clone(),
+                request_digest: "digest".into(),
+                run_id: format!("run-{:016x}", i + 1),
+                activation_revision: 1,
+                catalog_revision: 1,
+                accepted_at_ms: 0,
+            };
+            s.retention
+                .replay_order
+                .insert(admission_order_key(&receipt), ());
+            s.keyed_admissions.insert(key.clone(), receipt);
+            s.retention
+                .admission_expires_at_ms
+                .insert(key.clone(), 9_000);
+            window_insert(&mut s, 9_000, format!("{WINDOW_ADMISSION}{key}"));
+        }
+        s
+    }
+    fn eviction_steps(unheld: usize, keep: usize) -> (usize, CommitReport) {
+        let mut s = ordered(unheld, keep);
+        let mut report = CommitReport::default();
+        WINDOW_STEPS.with(|steps| steps.set(0));
+        evict(&mut s, REPLAY_EVICTIONS_PER_COMMIT, &mut report).unwrap();
+        assert_eq!(s.keyed_admissions.len(), unheld - report.evicted);
+        assert_eq!(s.retention.replay_order.len(), unheld - report.evicted);
+        assert_eq!(s.retention.expiry.len(), unheld - report.evicted);
+        (WINDOW_STEPS.with(std::cell::Cell::get), report)
+    }
+    /// Eviction work depends on the entries evicted, not on those kept: at
+    /// or under `replay_keep` a commit only counts (no lookup), and k
+    /// evictions are one lookup plus two steps each, at most 64.
+    #[test]
+    fn eviction_work_on_a_plain_state_depends_on_entries_evicted_not_on_entries_kept() {
+        assert_eq!(eviction_steps(10, 256).0, 0);
+        assert_eq!(eviction_steps(256, 256).0, 0);
+        assert_eq!(eviction_steps(5_000, 5_000).0, 0);
+        for k in [1, 8, 64] {
+            for kept in [10, 5_000] {
+                let (work, report) = eviction_steps(kept + k, kept);
+                assert_eq!(
+                    (work, report.evicted),
+                    (1 + 2 * k, k),
+                    "k = {k}, kept {kept}"
+                );
+            }
+        }
+        let (work, report) = eviction_steps(500, 100);
+        assert_eq!((work, report.evicted), (1 + 2 * 64, 64));
     }
     /// The order is one record per entry: a burst in one millisecond adds
     /// records, it does not grow one.

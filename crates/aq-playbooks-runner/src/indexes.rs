@@ -420,6 +420,7 @@ pub(crate) fn timer(s: &mut State, t: TimerIndex) {
     s.indexes.timers.insert(t.key.clone(), t);
 }
 fn subscribe(s: &mut State, run: &str, key: String) {
+    s.replay_touched.wait_keys.insert(key.clone());
     s.indexes
         .waiters
         .entry(key.clone())
@@ -513,6 +514,7 @@ fn refresh_run(s: &mut State, id: &str) -> Result<()> {
     if let Some(keys) = s.indexes.run_subscriptions.remove(id) {
         for key in keys {
             remove_lazy_member(&mut s.indexes.waiters, &key, id);
+            s.replay_touched.wait_keys.insert(key);
         }
     }
     if let Some(ids) = s.indexes.run_dependencies.remove(id) {
@@ -686,6 +688,7 @@ fn refresh_intent(s: &mut State, id: &str) -> Result<()> {
     if let Some(keys) = s.indexes.run_subscriptions.remove(&token) {
         for key in keys {
             remove_lazy_member(&mut s.indexes.waiters, &key, &token);
+            s.replay_touched.wait_keys.insert(key);
         }
     }
     if let Some(memberships) = s.indexes.effect_memberships.remove(id) {
@@ -845,6 +848,7 @@ fn refresh_intent(s: &mut State, id: &str) -> Result<()> {
             handle,
         )?;
         let token = format!("intent:{id}");
+        s.replay_touched.wait_keys.insert(key.clone());
         s.indexes
             .waiters
             .entry(key.clone())

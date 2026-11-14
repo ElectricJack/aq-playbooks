@@ -14,6 +14,7 @@ use aq_playbooks_model::Artifact;
 use aq_playbooks_runner::lazy::{
     ContainerChange, ContainerPath, KeyKind, RecordSource, Shape, TreeKey, header_bytes,
 };
+use aq_playbooks_runner::retention::{self, Window};
 use aq_playbooks_runner::transition::{
     Accounting, StatePatch, TransitionOutcome, TransitionRequest, assemble_state, bind_state,
     header_state, schema, take_patch,
@@ -466,7 +467,8 @@ impl PostgresStorage {
             return Ok(TransitionOutcome::Unsupported);
         }
         state.artifacts = artifacts.clone();
-        let outcome: Result<Option<(StatePatch, Vec<u8>)>, Error> = (|| {
+        type Planned = (StatePatch, Vec<u8>, BTreeSet<(Window, String)>);
+        let outcome: Result<Option<Planned>, Error> = (|| {
             let changed = (request.plan)(&mut state)?;
             source.check()?;
             if !changed {
@@ -479,9 +481,10 @@ impl PostgresStorage {
             )?;
             source.check()?;
             let patch = take_patch(&mut state)?;
+            let evicted = licensed_evictions(&source, &header, &patch, &state)?;
             let stripped = stripped_header(&mut state)?;
             source.check()?;
-            Ok(Some((patch, stripped)))
+            Ok(Some((patch, stripped, evicted)))
         })();
         let reads = *lock(&source.reads);
         let fallbacks = std::mem::take(&mut *lock(&source.fallbacks));
@@ -490,7 +493,7 @@ impl PostgresStorage {
             s.record_reads += reads;
             s.fallbacks.extend(fallbacks.iter().cloned());
         });
-        let Some((patch, stripped)) = outcome? else {
+        let Some((patch, stripped, evicted)) = outcome? else {
             self.count(|s| s.unchanged += 1);
             return Ok(TransitionOutcome::Unchanged);
         };
@@ -507,6 +510,7 @@ impl PostgresStorage {
             state.retention.clock_ms,
             &state.retention.policy,
             rebase,
+            &evicted,
         )?;
         let live_keys = aq_playbooks_runner::history::patch_live_keys(&patch)?;
         source.check()?;
@@ -681,6 +685,100 @@ struct Staged {
     deleted_fields: Vec<String>,
     deleted_keys: Vec<Vec<u8>>,
 }
+/// The evictions of a bounded commit ([`retention::check_evictions`]),
+/// judged while the transaction is still lent: the window entries the patch
+/// deletes, their stored records and expiries, and the order keys it adds,
+/// read one record each. A violation refuses the commit. A patch that
+/// replaces one of these containers whole licenses nothing here: it takes
+/// the complete path, where `verify_removals` judges it.
+fn licensed_evictions(
+    source: &PgSource,
+    header: &[u8],
+    patch: &StatePatch,
+    next: &State,
+) -> Result<BTreeSet<(Window, String)>, Error> {
+    const ITEMS: [&str; 2] = ["keyed_admissions", "events"];
+    const ORDER: &str = "retention.replay_order";
+    let get = |field: &'static str, key: &str| -> Result<Option<Vec<u8>>, StorageError> {
+        source
+            .get(&ContainerPath::field(field), &TreeKey::Str(key.to_string()))
+            .map_err(backend)
+    };
+    let mut previous = header_state(header)?;
+    let mut added = vec![];
+    let mut removed = false;
+    for (path, change) in &patch.changes {
+        let field = path.field;
+        if !ITEMS.contains(&field) && field != ORDER {
+            continue;
+        }
+        let ContainerChange::Entries(rows) = change else {
+            return Ok(BTreeSet::new());
+        };
+        for (key, new) in rows {
+            let TreeKey::Str(key) = key else {
+                return Err(backend(format!("{field}: unexpected record key")).into());
+            };
+            if field == ORDER {
+                if new.is_some() && get(ORDER, key)?.is_none() {
+                    added.push(key.clone());
+                }
+                continue;
+            }
+            if new.is_some() {
+                continue;
+            }
+            let Some(bytes) = get(field, key)? else {
+                continue;
+            };
+            removed = true;
+            let at = |expiry: &'static str| -> Result<Option<i64>, StorageError> {
+                get(expiry, key)?
+                    .map(|b| serde_json::from_slice(&b).map_err(backend))
+                    .transpose()
+            };
+            if field == "events" {
+                previous.events.insert(
+                    key.clone(),
+                    serde_json::from_slice(&bytes).map_err(backend)?,
+                );
+                if let Some(at) = at("retention.event_expires_at_ms")? {
+                    previous
+                        .retention
+                        .event_expires_at_ms
+                        .insert(key.clone(), at);
+                }
+            } else {
+                previous.keyed_admissions.insert(
+                    key.clone(),
+                    serde_json::from_slice(&bytes).map_err(backend)?,
+                );
+                if let Some(at) = at("retention.admission_expires_at_ms")? {
+                    previous
+                        .retention
+                        .admission_expires_at_ms
+                        .insert(key.clone(), at);
+                }
+            }
+        }
+    }
+    if !removed && added.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    Ok(retention::check_evictions(
+        &previous,
+        next,
+        &mut added.into_iter(),
+        &retention::Stored {
+            ordered: &|key| Ok(get(ORDER, key)?.is_some()),
+            memberships: &|key| {
+                get("indexes.event_memberships", key)?
+                    .map(|b| serde_json::from_slice(&b).map_err(backend))
+                    .transpose()
+            },
+        },
+    )?)
+}
 /// Exact record counts of the patch against the current records (one read of
 /// every touched key), plus the keyed admission immutability check. A
 /// keyed admission or event deletion stays bounded only when the same patch
@@ -689,6 +787,7 @@ struct Staged {
 /// `history_removed`, so the complete path runs `verify_removals`. In a
 /// commit that carries an admin licence (`rebase`), a lowered expiry is left
 /// to that path too (it is refused here otherwise).
+#[allow(clippy::too_many_arguments)]
 fn stage(
     tx: &mut ObservedTransaction<'_>,
     namespace: &str,
@@ -697,6 +796,7 @@ fn stage(
     clock_ms: Option<i64>,
     policy: &aq_playbooks_runner::RetentionPolicy,
     rebase: bool,
+    evicted: &BTreeSet<(Window, String)>,
 ) -> Result<Staged, StorageError> {
     let mut staged = Staged {
         full_header: patch.header.clone(),
@@ -897,7 +997,16 @@ fn stage(
                 .and_then(|bytes| serde_json::from_slice(bytes).ok());
             let expired =
                 at.is_some_and(|at| aq_playbooks_runner::retention::expired(at, clock_ms));
-            if !expired || (*item == "events" && tombstoned.contains(key)) {
+            // An eviction the bounded fence licensed (`licensed_evictions`)
+            // stays bounded too.
+            let window = if *item == "events" {
+                Window::Event
+            } else {
+                Window::Admission
+            };
+            let licensed = std::str::from_utf8(key)
+                .is_ok_and(|key| evicted.contains(&(window, key.to_string())));
+            if !(expired || licensed) || (*item == "events" && tombstoned.contains(key)) {
                 staged.history_removed = true;
             }
         }

@@ -217,6 +217,11 @@ impl<S: Storage> Engine<S> {
             };
             s.keyed_admissions
                 .insert(request.key.clone(), receipt.clone());
+            // Held by its live run: it joins the eviction order when the
+            // run leaves (`retention::rejoin`).
+            s.retention
+                .replay_held
+                .insert(receipt.run_id.clone(), request.key.clone());
             let expires_at_ms = retention::window_start(s, now_ms).saturating_add(
                 i64::try_from(s.retention.policy.admission_replay_ms).unwrap_or(i64::MAX),
             );

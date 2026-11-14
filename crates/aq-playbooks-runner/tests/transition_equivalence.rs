@@ -669,6 +669,35 @@ fn scenario(p: &mut Pair) {
     for config in [&mut p.m.config, &mut p.r.config] {
         *config = EngineConfig::default();
     }
+    // Repeat protection is a rolling set (Task 8b R1): lowering
+    // `replay_keep` evicts the oldest unheld entries (at most 64 a commit);
+    // each finished keyed run and each event then evicts the oldest, on
+    // both paths, compared at every step.
+    let unheld = p.m.snapshot().unwrap().retention.replay_order.len();
+    assert!(unheld > 3, "{unheld}");
+    both!(p, |e| e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 1_000,
+        replay_keep: 3,
+        ..RetentionPolicy::default()
+    }));
+    while p.m.snapshot().unwrap().retention.replay_order.len() > 3 {
+        both!(p, |e| e.drive(&mut host(), 31_900, 1));
+    }
+    for i in 0..5 {
+        let request = keyed("a", &format!("rolling-{i}"), p);
+        let admitted = both!(p, |e| e.admit_once(request.clone(), 31_910 + i));
+        assert!(admitted.starts_with("Ok("), "{admitted}");
+        both!(p, |e| e.drive(&mut host(), 31_910 + i, 8));
+        both!(p, |e| e.admit_event_in_epoch(
+            "d10",
+            event(&format!("rolling-{i}"), "p"),
+            u64::MAX,
+            31_910 + i
+        ));
+    }
+    let s = p.m.snapshot().unwrap();
+    assert_eq!(s.retention.replay_order.len(), 3);
+    assert!(!s.keyed_admissions.contains_key("rolling-0"), "evicted");
 }
 
 #[test]

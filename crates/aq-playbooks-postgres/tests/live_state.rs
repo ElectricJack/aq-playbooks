@@ -2383,3 +2383,396 @@ fn nothing_is_refused_for_namespace_capacity_on_postgres() {
         );
     }
 }
+
+// --- Task 8b R1: the eviction licence on every PostgreSQL commit path -----
+
+const EVICTION_WINDOW: i64 = 100_000;
+fn running_run(id: &str) -> Run {
+    let mut run = completed_run(id);
+    run.status = RunStatus::Running;
+    run.outcome = None;
+    run.terminal_sequence = None;
+    run
+}
+fn keyed_entry(s: &mut State, key: &str, sequence: u64, live: bool, in_order: bool) {
+    let mut r = receipt(key, 0);
+    r.run_id = format!("run-{sequence:016x}");
+    s.keyed_admissions.insert(key.into(), r.clone());
+    s.retention
+        .admission_expires_at_ms
+        .insert(key.into(), EVICTION_WINDOW);
+    s.retention.expiry.insert(
+        retention::window_key(EVICTION_WINDOW, &format!("k:{key}")),
+        (),
+    );
+    if live {
+        s.runs.insert(r.run_id.clone(), running_run(&r.run_id));
+    }
+    if in_order {
+        s.retention
+            .replay_order
+            .insert(retention::admission_order_key(&r), ());
+    } else if live {
+        s.retention.replay_held.insert(r.run_id, key.into());
+    }
+}
+fn event_entry(s: &mut State, key: &str, sequence: u64, in_order: bool) {
+    let mut e = accepted_event(key, 0);
+    e.sequence = sequence;
+    if in_order {
+        s.retention
+            .replay_order
+            .insert(retention::event_order_key(&e), ());
+    }
+    s.events.insert(key.into(), e);
+    s.retention
+        .event_expires_at_ms
+        .insert(key.into(), EVICTION_WINDOW);
+    s.retention.expiry.insert(
+        retention::window_key(EVICTION_WINDOW, &format!("e:{key}")),
+        (),
+    );
+}
+fn hold_by_waiter(s: &mut State, key: &str) {
+    s.runs.insert("run-w".into(), running_run("run-w"));
+    s.indexes
+        .event_memberships
+        .insert(key.into(), vec!["corr".into()]);
+    s.indexes.waiters.insert(
+        "corr".into(),
+        std::collections::BTreeSet::from(["run-w".to_string()]),
+    );
+}
+fn evict_keyed(n: &mut State, key: &str) {
+    let r = n.keyed_admissions.remove(key).unwrap();
+    n.retention.admission_expires_at_ms.remove(key);
+    n.retention
+        .expiry
+        .remove(&retention::window_key(EVICTION_WINDOW, &format!("k:{key}")));
+    n.retention
+        .replay_order
+        .remove(&retention::admission_order_key(&r));
+}
+fn evict_event(n: &mut State, key: &str) {
+    let e = n.events.remove(key).unwrap();
+    n.retention.event_expires_at_ms.remove(key);
+    n.retention
+        .expiry
+        .remove(&retention::window_key(EVICTION_WINDOW, &format!("e:{key}")));
+    n.retention
+        .replay_order
+        .remove(&retention::event_order_key(&e));
+    n.indexes.event_memberships.remove(key);
+}
+fn hold_out(n: &mut State, key: &str) {
+    let r = n.keyed_admissions.get(key).unwrap().clone();
+    n.retention
+        .replay_order
+        .remove(&retention::admission_order_key(&r));
+    n.retention.replay_held.insert(r.run_id, key.into());
+}
+fn eviction_base(keep: usize) -> State {
+    let mut s = State::default();
+    s.retention.clock_ms = Some(500);
+    s.retention.policy.admission_replay_ms = EVICTION_WINDOW as u64;
+    s.retention.policy.event_replay_ms = EVICTION_WINDOW as u64;
+    s.retention.policy.replay_keep = keep;
+    s.indexes.initialized = true;
+    s.sequence = 100;
+    s
+}
+/// As the runner's: `replay_keep` 5, order kh (held), k0..k3, e4, ew (held
+/// by a waiter); kh2 waits in `replay_held`; ex is outside the order.
+fn eviction_state() -> State {
+    let mut s = eviction_base(5);
+    keyed_entry(&mut s, "kh", 0, true, true);
+    for i in 0..4 {
+        keyed_entry(&mut s, &format!("k{i}"), i + 1, false, true);
+    }
+    event_entry(&mut s, "e4", 5, true);
+    event_entry(&mut s, "ew", 7, true);
+    hold_by_waiter(&mut s, "ew");
+    keyed_entry(&mut s, "kh2", 9, true, false);
+    event_entry(&mut s, "ex", 8, false);
+    s
+}
+fn evicted_correctly(n: &mut State) {
+    hold_out(n, "kh");
+    evict_keyed(n, "k0");
+}
+fn bulk_eviction_state() -> State {
+    let mut s = eviction_base(1);
+    for i in 0..70 {
+        keyed_entry(&mut s, &format!("b{i:03}"), i + 1, false, true);
+    }
+    s
+}
+fn evict_bulk(n: &mut State, count: usize) {
+    for i in 0..count {
+        evict_keyed(n, &format!("b{i:03}"));
+    }
+}
+type EvictionCase = (&'static str, &'static str, State, Box<dyn Fn(&mut State)>);
+fn eviction_refusal_cases() -> Vec<EvictionCase> {
+    let licence = retention::REFUSE_EVICTION;
+    let early = retention::REFUSE_EARLY_REMOVAL;
+    let base = eviction_state();
+    let mut held_event = eviction_base(4);
+    event_entry(&mut held_event, "ew", 0, true);
+    hold_by_waiter(&mut held_event, "ew");
+    for i in 0..5 {
+        keyed_entry(&mut held_event, &format!("k{i}"), i + 1, false, true);
+    }
+    vec![
+        (
+            "a held keyed receipt",
+            licence,
+            base.clone(),
+            Box::new(|n| evict_keyed(n, "kh")),
+        ),
+        (
+            "an event a live waiter holds",
+            licence,
+            held_event,
+            Box::new(|n| evict_event(n, "ew")),
+        ),
+        (
+            "fewer than replay_keep left",
+            licence,
+            base.clone(),
+            Box::new(|n| {
+                hold_out(n, "kh");
+                evict_keyed(n, "k0");
+                evict_keyed(n, "k1");
+            }),
+        ),
+        (
+            "not the oldest",
+            licence,
+            base.clone(),
+            Box::new(|n| evict_keyed(n, "k1")),
+        ),
+        (
+            "an entry outside the order, not the oldest",
+            early,
+            base.clone(),
+            Box::new(|n| evict_event(n, "ex")),
+        ),
+        (
+            "an order entry without its item",
+            licence,
+            base.clone(),
+            Box::new(|n| {
+                n.retention
+                    .replay_order
+                    .insert(retention::replay_key(30, "k:ghost"), ());
+            }),
+        ),
+        (
+            "an order entry for a held item",
+            licence,
+            base.clone(),
+            Box::new(|n| {
+                let r = n.keyed_admissions.get("kh2").unwrap().clone();
+                n.retention
+                    .replay_order
+                    .insert(retention::admission_order_key(&r), ());
+            }),
+        ),
+        (
+            "an order entry at another sequence",
+            licence,
+            base.clone(),
+            Box::new(|n| {
+                n.retention
+                    .replay_order
+                    .insert(retention::replay_key(30, "k:k3"), ());
+            }),
+        ),
+        (
+            "an order entry that inflates the count",
+            licence,
+            base.clone(),
+            Box::new(|n| {
+                n.retention
+                    .replay_order
+                    .insert(retention::replay_key(31, "k:ghost"), ());
+                hold_out(n, "kh");
+                evict_keyed(n, "k0");
+                evict_keyed(n, "k1");
+            }),
+        ),
+        (
+            "more than 64 in one commit",
+            licence,
+            bulk_eviction_state(),
+            Box::new(|n| evict_bulk(n, 65)),
+        ),
+    ]
+}
+/// Store `state` as a namespace reaches it: entries join unheld, the holds
+/// begin in a second commit.
+fn seed_eviction_state(store: &PostgresStorage, ns: &str, state: &State) -> u64 {
+    store.acquire(ns, "w").unwrap();
+    let mut unheld = state.clone();
+    unheld.runs.clear();
+    unheld.indexes.waiters.clear();
+    let first = store.compare_and_swap(ns, "w", 0, &unheld).unwrap();
+    store.compare_and_swap(ns, "w", first, state).unwrap()
+}
+type AllowedEviction = (&'static str, State, Box<dyn Fn(&mut State)>);
+fn allowed_evictions() -> Vec<AllowedEviction> {
+    vec![
+        (
+            "the correct eviction",
+            eviction_state(),
+            Box::new(evicted_correctly),
+        ),
+        (
+            "64 at once",
+            bulk_eviction_state(),
+            Box::new(|n| evict_bulk(n, 64)),
+        ),
+    ]
+}
+/// The eviction licence on f2 protected, f2 plain and f3 compare-and-swap.
+#[test]
+fn the_eviction_licence_holds_on_every_full_commit_path() {
+    for (label, store) in [
+        ("f2", support::protected()),
+        ("f2_plain", support::store()),
+        ("f3", support::records()),
+    ] {
+        let mut failures = vec![];
+        for (case, text, previous, f) in eviction_refusal_cases() {
+            let ns = support::namespace(label);
+            let base = seed_eviction_state(&store, &ns, &previous);
+            let mut next = previous.clone();
+            f(&mut next);
+            let result = store.compare_and_swap(&ns, "w", base, &next);
+            if !refused_with(result.clone(), text) {
+                failures.push(format!("{label} {case}: {result:?}"));
+            } else {
+                assert_eq!(store.load(&ns).unwrap().revision, base, "{label} {case}");
+            }
+        }
+        for (case, previous, f) in allowed_evictions() {
+            let ns = support::namespace(label);
+            let base = seed_eviction_state(&store, &ns, &previous);
+            let mut next = previous.clone();
+            f(&mut next);
+            if let Err(err) = store.compare_and_swap(&ns, "w", base, &next) {
+                failures.push(format!("{label} {case} refused: {err}"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+}
+/// On f3 bounded transitions: each refusal is made by the bounded commit
+/// itself (no complete path) and writes nothing; a correct eviction, and 64
+/// at once, commit incrementally.
+#[test]
+fn format_3_evictions_are_incremental_and_fenced() {
+    let store = support::records();
+    let transition = |ns: &str, f: &dyn Fn(&mut State)| {
+        let mut plan = |s: &mut State| {
+            f(s);
+            Ok(true)
+        };
+        storage_error(store.transition_v1(
+            ns,
+            "w",
+            &mut TransitionRequest {
+                operation: "evict",
+                plan: &mut plan,
+            },
+        ))
+    };
+    let mut failures = vec![];
+    for (case, text, previous, f) in eviction_refusal_cases() {
+        let ns = support::namespace("f3_evict");
+        let base = seed_eviction_state(&store, &ns, &previous);
+        store.set_profiling(true);
+        let result = transition(&ns, f.as_ref());
+        let complete_path = store
+            .profiling_snapshot()
+            .unwrap()
+            .operations
+            .contains_key("cas");
+        store.set_profiling(false);
+        if !refused_with(result.clone(), text) {
+            failures.push(format!("{case}: {result:?}"));
+        } else if complete_path {
+            failures.push(format!("{case}: refused only on the complete path"));
+        } else {
+            assert_eq!(store.load(&ns).unwrap().revision, base, "{case}");
+        }
+    }
+    store.reset_transition_stats();
+    for (case, previous, f) in allowed_evictions() {
+        let ns = support::namespace("f3_evict");
+        seed_eviction_state(&store, &ns, &previous);
+        if let Err(err) = transition(&ns, f.as_ref()) {
+            failures.push(format!("{case} refused: {err}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+    let stats = store.transition_stats();
+    assert_eq!((stats.incremental, stats.heavy), (2, 0));
+}
+/// The engine on PostgreSQL with `replay_keep` 3: events past it evict the
+/// oldest, on f3 incrementally (no heavy commit), on f2 protected through
+/// the complete fence; an evicted event delivered again is new, a kept one
+/// a duplicate. Finished keyed runs then evict the oldest too.
+#[test]
+fn evictions_on_postgres_are_incremental_on_f3_and_fenced_on_f2() {
+    for (format, store) in both() {
+        let ns = support::namespace("evict");
+        let e = Engine::new(store, &ns, "w").unwrap();
+        let mut content = support::artifact("a").content;
+        content
+            .registry
+            .events
+            .insert("test.signal".into(), pg_event_contract());
+        let a = aq_playbooks_model::Artifact::seal(content).unwrap();
+        let digest = a.digest.clone();
+        e.install(a).unwrap();
+        e.activate_at("a", &digest, pg_authority(), 0).unwrap();
+        e.set_retention_policy(RetentionPolicy {
+            replay_keep: 3,
+            ..RetentionPolicy::default()
+        })
+        .unwrap();
+        e.store.reset_transition_stats();
+        for i in 0..6 {
+            e.admit_event("host", pg_event(&format!("e{i}")), i)
+                .unwrap();
+        }
+        let s = e.snapshot().unwrap();
+        assert_eq!(s.events.len(), 3, "{format}");
+        assert_eq!(s.retention.replay_order.len(), 3, "{format}");
+        if format == "f3" {
+            let stats = e.store.transition_stats();
+            assert_eq!((stats.incremental, stats.heavy), (6, 0), "{format}");
+        }
+        assert!(
+            e.admit_event("host", pg_event("e5"), 10).unwrap().duplicate,
+            "{format}"
+        );
+        assert!(
+            !e.admit_event("host", pg_event("e0"), 11).unwrap().duplicate,
+            "{format}"
+        );
+        for i in 0..4 {
+            let d = e
+                .admit_once(pg_keyed(&e, &format!("k{i}")), 20 + i)
+                .unwrap();
+            e.advance(&d.receipt.run_id, 20 + i).unwrap();
+        }
+        let s = e.snapshot().unwrap();
+        assert_eq!(s.retention.replay_order.len(), 3, "{format}");
+        assert_eq!(s.keyed_admissions.len() + s.events.len(), 3, "{format}");
+        assert!(s.events.is_empty(), "{format}");
+        assert!(!s.keyed_admissions.contains_key("k0"), "{format}");
+    }
+}

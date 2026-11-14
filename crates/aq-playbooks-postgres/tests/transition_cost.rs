@@ -410,6 +410,13 @@ fn measure<C: Candidate>(
 /// Grown on the reference backend, which keeps the settled cohorts.
 fn histories(sizes: &[usize]) -> Vec<(usize, (State, Vec<SettledCohort>))> {
     let e = base(MemoryStorage::retaining_settled());
+    // Task 8b: above the largest history, so every event stays remembered
+    // (none is evicted by count) and record work is measured against all.
+    e.set_retention_policy(RetentionPolicy {
+        replay_keep: 1_000,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
     let mut previous = 0;
     let mut out = vec![];
     for &h in sizes {
