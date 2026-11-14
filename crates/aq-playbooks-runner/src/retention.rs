@@ -1328,6 +1328,8 @@ fn event_hold(
             i.command.asynchronous.is_some()
                 && i.handle.is_none()
                 && matches!(i.status, IntentStatus::Dispatched | IntentStatus::Unknown)
+                // Its completion is accepted after its dispatch.
+                && i.dispatch_sequence.unwrap_or(0) < event.sequence
         })
     }))
 }
@@ -1513,8 +1515,10 @@ fn drop_event(s: &mut State, key: &str, clock: i64, report: &mut CommitReport) -
 pub struct ReplayTouched {
     pub events: BTreeSet<String>,
     pub wait_keys: BTreeSet<String>,
-    /// Contract and scope keys whose uncertain completions changed.
-    pub contract_keys: BTreeSet<String>,
+    /// Contract and scope keys whose uncertain completions changed, each
+    /// with the earliest dispatch sequence concerned: only events accepted
+    /// after it are judged again.
+    pub contract_keys: BTreeMap<String, u64>,
 }
 /// Put the window entries whose hold this commit may have ended or begun
 /// in or out of the eviction order: a keyed admission receipt joins it when
@@ -1525,8 +1529,10 @@ pub struct ReplayTouched {
 ///
 /// A hold through an uncertain completion (an operation whose admission
 /// handle is lost) begins or ends when the uncertain operations of a
-/// contract and scope change: every event of that contract and scope
-/// (`indexes.contract_events`) is judged again, O(those events).
+/// contract and scope change. Such an operation holds only events accepted
+/// after its dispatch, so only those are judged again (from
+/// `indexes.contract_events` by sequence): a dispatch judges none, the
+/// binding of its handle those that arrived during the host call.
 pub(crate) fn rejoin(s: &mut State) -> Result<()> {
     let runs: Vec<String> = s
         .settled
@@ -1551,9 +1557,12 @@ pub(crate) fn rejoin(s: &mut State) -> Result<()> {
             events.extend(ids.values().cloned());
         }
     }
-    for key in touched.contract_keys {
+    for (key, after) in touched.contract_keys {
         if let Some(ids) = s.indexes.contract_events.get(&key) {
-            events.extend(ids.iter().cloned());
+            events.extend(
+                ids.range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+                    .map(|(_, id)| id.clone()),
+            );
         }
     }
     for key in events {

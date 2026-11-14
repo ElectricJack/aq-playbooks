@@ -1203,6 +1203,7 @@ mod tests {
             cancel_dispatched: false,
             late_results: vec![],
             completion_event: None,
+            dispatch_sequence: None,
             handle: None,
             result: None,
             reason: None,

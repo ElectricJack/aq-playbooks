@@ -485,15 +485,22 @@ bounds the record (about 120 entries; 132.7 KB at run 200).
   changes the waiters of one of its correlation keys (`State::replay_touched`,
   never stored, filled by the index sync and by cohort removal). Held, it is
   out of the order; unheld, in it.
-- A hold through an uncertain completion (an operation whose admission
-  handle is lost: its completion may be any event of its contract and
-  scope) begins or ends when that contract's uncertain operations change.
-  `indexes.contract_events` lists the events of each contract and scope;
-  the commit whose index sync changes the uncertain set judges all of them
-  again (O(events of that contract), rare: a lost handle and its
-  recovery). Held, they leave the order and do not count; released, they
-  rejoin at their acceptance positions. A State written before the index
-  existed fills it once on open.
+- A hold through an uncertain completion: an asynchronous operation
+  without a handle (dispatched, or with its admission handle lost) may be
+  completed by an event of its contract and scope, but only one accepted
+  after its dispatch. The engine records the dispatch's sequence on the
+  operation (`Intent::dispatch_sequence`), and such an operation holds
+  only events accepted after it. When a contract's uncertain operations
+  change, the commit judges again only the events of that contract
+  accepted after the earliest dispatch concerned
+  (`indexes.contract_events`, ordered by sequence). So a dispatch judges
+  no event at all, the binding of its handle judges the events that
+  arrived during the host call, and while a handle is lost its later
+  events are held (never evicted, not counted) and rejoin at their
+  acceptance positions when it is found. Operations dispatched before this
+  change carry no dispatch sequence and hold every event of their
+  contract, as before. A State written before the index existed fills it
+  once on open.
 - `retention::evict`, in every commit that changes the State except a
   licensed admin commit, after the window drop: while the order holds more
   than `replay_keep`, take its head, at most `REPLAY_EVICTIONS_PER_COMMIT`

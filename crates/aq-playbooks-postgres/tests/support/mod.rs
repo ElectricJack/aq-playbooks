@@ -185,6 +185,7 @@ pub fn boundary(label: &str) -> State {
             cancel_dispatched: false,
             late_results: vec![],
             completion_event: None,
+            dispatch_sequence: None,
             handle: Some("host-operation".into()),
             result: None,
             reason: None,

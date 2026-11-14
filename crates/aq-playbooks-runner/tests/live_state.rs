@@ -583,6 +583,7 @@ fn intent(id: &str, run: &str, status: IntentStatus) -> Intent {
         reason: None,
         late_results: vec![],
         completion_event: None,
+        dispatch_sequence: None,
     }
 }
 fn accepted_event(key: &str, accepted_at_ms: i64) -> AcceptedEvent {
@@ -5217,9 +5218,12 @@ fn uncertain_event_state() -> State {
             .replay_order
             .insert(retention::admission_order_key(&r), ());
     }
-    event_entry(&mut s, "eu", 0, true);
+    // Accepted after the operation's dispatch (sequence 0), so it may be
+    // its completion; still the head ("e:eu" sorts before "k:k0").
+    event_entry(&mut s, "eu", 1, true);
     let e = s.events.get("eu").unwrap().clone();
     let mut op = intent("op-u", "run-u", IntentStatus::Unknown);
+    op.dispatch_sequence = Some(0);
     op.command.asynchronous = Some(AsyncContract {
         completion_event: e.envelope.contract.name.clone(),
         completion: Schema::Null,
@@ -6208,62 +6212,63 @@ fn a_page_across_a_trim_neither_repeats_nor_panics() {
 
 // --- Task 8b fix round 1 --------------------------------------------------
 
-/// Review I1: holds that begin and end through an uncertain completion are
-/// tracked. One contract holds most of the set (as on aq-server): while an
-/// operation of its completion contract has a lost admission handle, its
-/// events are out of the order and do not count, so no in-bound key of the
-/// other contract is forgotten; when the handle is known they rejoin at
-/// their acceptance positions (the oldest) and are evicted first.
+/// Review I1 and re-review round 1: an operation whose admission handle is
+/// lost holds only the events accepted after its dispatch (its completion
+/// cannot come earlier). Events accepted before it are never held and stay
+/// in the eviction order; events accepted while the handle is lost are held
+/// (never evicted, not counted) and rejoin at their acceptance positions
+/// once the handle is found.
 #[test]
 fn uncertain_completion_holds_are_tracked_both_ways() {
-    let e = keep_engine(4);
+    let e = keep_engine(3);
     let (a, completion) = async_artifact();
     install(&e, a, "async");
-    let held = |id: &str, op: &str| EventEnvelope {
+    let of_contract = |id: &str, op: &str| EventEnvelope {
         correlation: BTreeMap::from([("operation".into(), op.into())]),
         ..async_event(&completion, id)
     };
-    let c: Vec<String> = (0..3)
-        .map(|i| {
-            e.admit_event("host", held(&format!("c{i}"), &format!("op-{i}")), i)
-                .unwrap()
-                .key
-        })
+    let accept = |envelope: EventEnvelope, t: i64| e.admit_event("host", envelope, t).unwrap().key;
+    let before: Vec<String> = (0..2)
+        .map(|i| accept(of_contract(&format!("before-{i}"), &format!("op-{i}")), i))
         .collect();
-    let first = e
-        .admit_event("host", correlated_event("o0", "inv-0"), 3)
-        .unwrap()
-        .key;
-    assert_eq!(e.snapshot().unwrap().retention.replay_order.len(), 4);
-    // The operation's admission handle is lost: its completion contract is
-    // uncertain, and the three events of that contract are held.
-    let run = e
-        .admit("async", "main", Value::Null, authority(), 4)
+    // The dispatch loses the admission handle.
+    e.admit("async", "main", Value::Null, authority(), 2)
         .unwrap();
     let mut host = FakeHost::default();
-    e.drive(&mut host, 4, 10).unwrap();
-    let s = e.snapshot().unwrap();
-    assert_eq!(order_members(&s), [format!("e:{first}")]);
-    let others: Vec<String> = (1..4)
+    e.drive(&mut host, 2, 10).unwrap();
+    let members =
+        |keys: &[&String]| -> Vec<String> { keys.iter().map(|k| format!("e:{k}")).collect() };
+    assert_eq!(
+        order_members(&e.snapshot().unwrap()),
+        members(&before.iter().collect::<Vec<_>>()),
+        "events accepted before the dispatch are not held"
+    );
+    let during: Vec<String> = (0..2)
         .map(|i| {
-            e.admit_event(
-                "host",
-                correlated_event(&format!("o{i}"), &format!("inv-{i}")),
+            accept(
+                of_contract(&format!("during-{i}"), &format!("op-d{i}")),
+                3 + i,
+            )
+        })
+        .collect();
+    let others: Vec<String> = (0..4)
+        .map(|i| {
+            accept(
+                correlated_event(&format!("other-{i}"), &format!("inv-{i}")),
                 5 + i,
             )
-            .unwrap()
-            .key
         })
         .collect();
     let s = e.snapshot().unwrap();
-    assert!(
-        s.events.contains_key(&first),
-        "an in-bound key was forgotten"
+    // Held: never evicted, not counted. The unheld oldest are evicted.
+    assert!(during.iter().all(|k| s.events.contains_key(k)));
+    assert!(before.iter().all(|k| !s.events.contains_key(k)));
+    assert_eq!(
+        order_members(&s),
+        members(&others[1..].iter().collect::<Vec<_>>())
     );
-    assert!(c.iter().chain(&others).all(|k| s.events.contains_key(k)));
-    assert_eq!(s.retention.replay_order.len(), 4);
-    // The handle is found: the hold ends, the three rejoin as the oldest and
-    // are evicted; the other contract's four stay.
+    // The handle is found: the held events rejoin as older than the others
+    // and are evicted first.
     host.responses.insert(
         "reconcile:test.command".into(),
         vec![DispatchResult::Accepted {
@@ -6273,14 +6278,64 @@ fn uncertain_completion_holds_are_tracked_both_ways() {
     e.recover(&mut host, 20).unwrap();
     let s = e.snapshot().unwrap();
     assert!(
-        c.iter().all(|k| !s.events.contains_key(k)),
+        during.iter().all(|k| !s.events.contains_key(k)),
         "rejoined and evicted"
     );
-    let mut kept = vec![first.clone()];
-    kept.extend(others);
-    let members: Vec<String> = kept.iter().map(|k| format!("e:{k}")).collect();
-    assert_eq!(order_members(&s), members);
-    let _ = run;
+    assert_eq!(
+        order_members(&s),
+        members(&others[1..].iter().collect::<Vec<_>>())
+    );
+}
+/// Re-review round 1: an asynchronous dispatch, and the handle that binds
+/// right after it, re-judge no event accepted before the dispatch. On bound
+/// record containers their work does not depend on how many such events of
+/// the completion contract the record holds.
+#[test]
+fn an_async_dispatch_rejudges_no_earlier_event() {
+    use std::sync::atomic::Ordering;
+    let measure = |earlier: usize| {
+        let e = Engine::new(RecordStorage::new(), "test", "incarnation-1").unwrap();
+        let (a, completion) = async_artifact();
+        install_on(&e, a, "async");
+        e.set_retention_policy(RetentionPolicy {
+            replay_keep: 1_000,
+            ..RetentionPolicy::default()
+        })
+        .unwrap();
+        for i in 0..earlier {
+            let envelope = EventEnvelope {
+                correlation: BTreeMap::from([("operation".into(), format!("op-{i}"))]),
+                ..async_event(&completion, &format!("e{i}"))
+            };
+            e.admit_event("host", envelope, i as i64).unwrap();
+        }
+        let run = e
+            .admit("async", "main", Value::Null, authority(), 100)
+            .unwrap();
+        e.advance(&run, 100).unwrap();
+        let order = e.snapshot().unwrap().retention.replay_order.len();
+        assert_eq!(order, earlier);
+        let reads = e.store.stats.record_reads.load(Ordering::Relaxed);
+        let fallbacks = e.store.stats.fallbacks().len();
+        let mut host = FakeHost {
+            responses: BTreeMap::from([(
+                "test.command".into(),
+                vec![DispatchResult::Accepted {
+                    handle: "server-operation".into(),
+                }],
+            )]),
+            ..Default::default()
+        };
+        // The dispatch commit, the host call, and the commit binding the
+        // handle.
+        assert!(e.dispatch_next(&mut host, 101).unwrap().is_some());
+        let s = e.snapshot().unwrap();
+        assert!(s.intents.values().any(|i| i.handle.is_some()));
+        assert_eq!(s.retention.replay_order.len(), earlier);
+        assert!(e.store.stats.fallbacks()[fallbacks..].is_empty());
+        e.store.stats.record_reads.load(Ordering::Relaxed) - reads
+    };
+    assert_eq!(measure(10), measure(60));
 }
 /// Review I2: the trim keeps the newest runs by the namespace's sequence,
 /// not by host finish time: after a host clock that ran ahead, the newest

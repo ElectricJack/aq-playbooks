@@ -102,10 +102,12 @@ pub struct RuntimeIndexes {
     pub run_timer: LazyMap<String, String>,
     pub events: LazyMap<String, BTreeMap<u64, String>>,
     pub event_memberships: LazyMap<String, Vec<String>>,
-    /// The events of each contract and scope (`trigger_key`), so a change
-    /// of that contract's uncertain completions re-judges their holds.
+    /// The events of each contract and scope (`trigger_key`) by acceptance
+    /// sequence, so a change of that contract's uncertain completions
+    /// re-judges the holds of the events accepted after the operation's
+    /// dispatch, and only those.
     #[serde(default)]
-    pub contract_events: LazyMap<String, BTreeSet<String>>,
+    pub contract_events: LazyMap<String, BTreeMap<u64, String>>,
     pub waiters: LazyMap<String, BTreeSet<String>>,
     pub run_subscriptions: LazyMap<String, Vec<String>>,
     pub dependents: LazyMap<String, BTreeSet<String>>,
@@ -488,13 +490,18 @@ pub(crate) fn index_event(s: &mut State, id: &str) -> Result<()> {
         .contract_events
         .entry(contract)
         .or_default()
-        .insert(id.into());
+        .insert(e.sequence, id.into());
     Ok(())
 }
 /// Take event `e` out of `contract_events`.
 pub(crate) fn unindex_contract_event(s: &mut State, e: &crate::AcceptedEvent) -> Result<()> {
     let contract = trigger_key(&e.envelope.contract, &e.envelope.scope)?;
-    remove_lazy_member(&mut s.indexes.contract_events, &contract, &e.key);
+    if let Some(events) = s.indexes.contract_events.get_mut(&contract) {
+        events.remove(&e.sequence);
+        if events.is_empty() {
+            s.indexes.contract_events.remove(&contract);
+        }
+    }
     Ok(())
 }
 /// A State written before `contract_events` existed: fill it once from the
@@ -503,22 +510,23 @@ pub(crate) fn backfill_contract_events(s: &mut State) -> Result<()> {
     if !s.indexes.initialized || s.indexes.contract_events_complete {
         return Ok(());
     }
-    let events: Vec<(String, String)> = s
+    let events: Vec<(String, u64, String)> = s
         .events
         .iter()
         .map(|(id, e)| {
             Ok((
                 trigger_key(&e.envelope.contract, &e.envelope.scope)?,
+                e.sequence,
                 id.clone(),
             ))
         })
         .collect::<Result<_>>()?;
-    for (contract, id) in events {
+    for (contract, sequence, id) in events {
         s.indexes
             .contract_events
             .entry(contract)
             .or_default()
-            .insert(id);
+            .insert(sequence, id);
     }
     s.indexes.contract_events_complete = true;
     Ok(())
@@ -736,8 +744,17 @@ fn refresh_intent(s: &mut State, id: &str) -> Result<()> {
     // that contract and scope are judged again (`retention::rejoin`).
     let is_uncertain = s.indexes.uncertain_contract_membership.get(id).cloned();
     if was_uncertain != is_uncertain {
-        s.replay_touched.contract_keys.extend(was_uncertain);
-        s.replay_touched.contract_keys.extend(is_uncertain);
+        // Only events accepted after the dispatch can be its completion
+        // (an operation gone from the State: every event, 0).
+        let after = s
+            .intents
+            .get(id)
+            .and_then(|i| i.dispatch_sequence)
+            .unwrap_or(0);
+        for key in was_uncertain.into_iter().chain(is_uncertain) {
+            let entry = s.replay_touched.contract_keys.entry(key).or_insert(after);
+            *entry = (*entry).min(after);
+        }
     }
     result
 }
