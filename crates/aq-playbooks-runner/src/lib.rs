@@ -552,11 +552,13 @@ pub struct Intent {
     pub late_results: Vec<(String, Value)>,
     #[serde(default)]
     pub completion_event: Option<String>,
-    /// The namespace sequence of the commit that dispatched the operation
-    /// (its `dispatch` receipt). Its completion can only be an event accepted
-    /// later, so an operation whose admission handle is lost holds only those
-    /// (`retention::event_held`). Absent before dispatch, and in operations
-    /// dispatched before Task 8b (then treated as 0).
+    /// The namespace sequence of the commit that first dispatched the
+    /// operation (its first `dispatch` receipt; a re-dispatch after recovery
+    /// keeps it). Its completion can only be an event accepted later, so an
+    /// operation whose admission handle is lost holds only those
+    /// (`retention::event_held`). Absent until dispatch: an operation never
+    /// dispatched holds nothing. Operations dispatched before Task 8b get it
+    /// on open from their own first `dispatch` receipt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_sequence: Option<u64>,
 }
@@ -750,6 +752,8 @@ impl<S: Storage> Engine<S> {
             indexes::backfill_root_intents(s);
             // Before `contract_events` (Task 8b): fill it once.
             indexes::backfill_contract_events(s)?;
+            // Before `Intent::dispatch_sequence` (Task 8b): fill it once.
+            indexes::backfill_dispatch_sequences(s);
             Ok(())
         })?;
         Ok(e)
@@ -1523,8 +1527,14 @@ impl<S: Storage> Engine<S> {
                 "dispatch",
                 json!({"operation":id}),
             );
+            // The first dispatch counts: a re-dispatch after recovery is the
+            // same idempotent effect, whose completion may answer the first.
             let sequence = s.sequence;
-            s.intents.get_mut(&id).unwrap().dispatch_sequence = Some(sequence);
+            s.intents
+                .get_mut(&id)
+                .unwrap()
+                .dispatch_sequence
+                .get_or_insert(sequence);
             Ok(Some(s.intents[&id].clone()))
         })?;
         let Some(intent) = selected else {

@@ -4634,6 +4634,10 @@ fn a_join_set_at_the_pinned_time_is_capped_by_its_declared_deadline() {
 }
 /// The owned-operation join fixture of `semantics.rs`.
 fn async_artifact() -> (Artifact, EventContract) {
+    async_artifact_with(Recovery::Reconcilable)
+}
+/// [`async_artifact`] whose command recovers by `recovery`.
+fn async_artifact_with(recovery: Recovery) -> (Artifact, EventContract) {
     let admission = Schema::object(BTreeMap::from([("handle".into(), Schema::string(256))]));
     let completion = Schema::object(BTreeMap::from([
         (
@@ -4651,7 +4655,7 @@ fn async_artifact() -> (Artifact, EventContract) {
     ev.correlation_fields = set(&["operation"]);
     ev.subject_field = None;
     ev.revision_field = None;
-    let mut c = command(Recovery::Reconcilable);
+    let mut c = command(recovery);
     c.cancellation = true;
     c.outcomes.insert("accepted".into(), admission);
     c.asynchronous = Some(AsyncContract {
@@ -6462,4 +6466,223 @@ fn memory_storage_trim_keeps_the_last_finished_run() {
 #[test]
 fn record_storage_trim_keeps_the_last_finished_run() {
     the_trim_keeps_the_last_finished_run(RecordStorage::new());
+}
+
+// --- Task 9, first commit: dispatch sequences --------------------------------
+
+fn only_intent(s: &State) -> Intent {
+    assert_eq!(s.intents.len(), 1);
+    s.intents.values().next().unwrap().clone()
+}
+/// Task 8b re-review round 2 (Important): a recovery re-dispatch keeps the
+/// operation's first dispatch sequence. A completion accepted while the
+/// handle was unknown stays held through the recovery (its operation was
+/// issued once and may still answer), is not evicted by newer events, and
+/// is delivered once the re-dispatch binds the same idempotent handle.
+#[test]
+fn a_recovery_redispatch_keeps_the_hold_on_a_completion_accepted_while_the_handle_was_unknown() {
+    let e = keep_engine(3);
+    let (a, completion) = async_artifact_with(Recovery::KeyedIdempotent);
+    install(&e, a, "async");
+    let run = e
+        .admit("async", "main", Value::Null, authority(), 0)
+        .unwrap();
+    // The dispatch loses the admission handle.
+    let mut host = FakeHost::default();
+    e.drive(&mut host, 0, 10).unwrap();
+    let first = only_intent(&e.snapshot().unwrap());
+    assert_eq!(
+        (first.status.clone(), first.handle.clone()),
+        (IntentStatus::Unknown, None)
+    );
+    let dispatched = first.dispatch_sequence.unwrap();
+    // Its completion arrives while the handle is unknown: held.
+    let done = e
+        .admit_event("host", async_event(&completion, "done"), 1)
+        .unwrap()
+        .key;
+    let held = |s: &State| {
+        s.events.contains_key(&done) && !order_members(s).contains(&format!("e:{done}"))
+    };
+    assert!(held(&e.snapshot().unwrap()));
+    // Recovery prepares the idempotent operation again.
+    e.recover(&mut host, 2).unwrap();
+    assert_eq!(
+        only_intent(&e.snapshot().unwrap()).status,
+        IntentStatus::Prepared
+    );
+    // More than `replay_keep` newer unheld events.
+    for i in 0..5 {
+        e.admit_event(
+            "host",
+            correlated_event(&format!("other-{i}"), &format!("inv-{i}")),
+            3 + i,
+        )
+        .unwrap();
+    }
+    assert!(held(&e.snapshot().unwrap()), "held through the recovery");
+    // The re-dispatch binds the same idempotent handle.
+    host.responses.insert(
+        "test.command".into(),
+        vec![DispatchResult::Accepted {
+            handle: "server-operation".into(),
+        }],
+    );
+    e.dispatch_next(&mut host, 10).unwrap();
+    let again = only_intent(&e.snapshot().unwrap());
+    assert_eq!(again.handle.as_deref(), Some("server-operation"));
+    assert_eq!(
+        again.dispatch_sequence,
+        Some(dispatched),
+        "the first dispatch is kept"
+    );
+    for t in 10..20 {
+        e.drive(&mut host, t, 20).unwrap();
+    }
+    let runs = inspect_all(&e, InspectionKind::Runs, Some(&run));
+    assert_eq!(runs[0]["outcome"], "ok", "{runs:?}");
+}
+/// Task 8b re-review round 2 (Minor): an asynchronous operation stopped
+/// ("authority revoked") before it was dispatched was never issued, so
+/// nothing can complete it: it is not uncertain and holds no event. Events
+/// of its contract stay in the eviction order and are evicted by count.
+#[test]
+fn an_operation_never_dispatched_holds_no_event() {
+    let e = keep_engine(3);
+    let (a, completion) = async_artifact();
+    install(&e, a, "async");
+    let run = e
+        .admit("async", "main", Value::Null, authority(), 0)
+        .unwrap();
+    let mut host = FakeHost {
+        revoked: set(&["execute"]),
+        ..Default::default()
+    };
+    e.drive(&mut host, 0, 10).unwrap();
+    let s = e.snapshot().unwrap();
+    let op = only_intent(&s);
+    assert_eq!(
+        (op.status, op.handle, op.dispatch_sequence),
+        (IntentStatus::Unknown, None, None)
+    );
+    assert_eq!(s.runs[&run].status, RunStatus::Blocked);
+    assert!(host.dispatched.is_empty());
+    assert!(
+        s.indexes
+            .uncertain_completion_contracts
+            .values()
+            .all(BTreeSet::is_empty)
+    );
+    let keys: Vec<String> = (0..5)
+        .map(|i| {
+            let envelope = EventEnvelope {
+                correlation: BTreeMap::from([("operation".into(), format!("op-{i}"))]),
+                ..async_event(&completion, &format!("c{i}"))
+            };
+            e.admit_event("host", envelope, 1 + i).unwrap().key
+        })
+        .collect();
+    let s = e.snapshot().unwrap();
+    assert_eq!(
+        order_members(&s),
+        keys[2..]
+            .iter()
+            .map(|k| format!("e:{k}"))
+            .collect::<Vec<_>>()
+    );
+    assert!(!s.events.contains_key(&keys[0]) && !s.events.contains_key(&keys[1]));
+}
+/// Carried hazard (Task 8b re-review round 2): an asynchronous operation
+/// dispatched by an engine from before Task 8b has no dispatch sequence.
+/// Opening the namespace fills it once from the operation's own first
+/// `dispatch` receipt, so it holds exactly the events accepted after its
+/// dispatch: a completion accepted while its handle is lost stays held,
+/// and the commit that binds the handle judges no earlier event (record
+/// reads on bound containers do not depend on how many there are).
+#[test]
+fn a_legacy_dispatched_operation_gets_its_dispatch_sequence_on_open() {
+    use std::sync::atomic::Ordering;
+    let measure = |earlier: usize| {
+        let store = RecordStorage::new();
+        let e = Engine::new(store.clone(), "test", "incarnation-1").unwrap();
+        let (a, completion) = async_artifact();
+        install_on(&e, a, "async");
+        e.set_retention_policy(RetentionPolicy {
+            replay_keep: 1_000,
+            ..RetentionPolicy::default()
+        })
+        .unwrap();
+        for i in 0..earlier {
+            let envelope = EventEnvelope {
+                correlation: BTreeMap::from([("operation".into(), format!("op-{i}"))]),
+                ..async_event(&completion, &format!("e{i}"))
+            };
+            e.admit_event("host", envelope, i as i64).unwrap();
+        }
+        let run = e
+            .admit("async", "main", Value::Null, authority(), 100)
+            .unwrap();
+        let mut host = FakeHost::default();
+        e.drive(&mut host, 100, 10).unwrap();
+        // As the old engine stored it: no dispatch sequence.
+        let mut legacy = e.snapshot().unwrap();
+        let id = only_intent(&legacy).id;
+        let dispatched = legacy.intents[&id].dispatch_sequence.take().unwrap();
+        legacy.indexes.dispatch_sequences_complete = false;
+        // The old engine wrote a `dispatch` receipt for every dispatch; a
+        // later one (a recovery re-dispatch) does not move the first.
+        legacy.sequence += 1;
+        let again = Receipt {
+            sequence: legacy.sequence,
+            run: run.clone(),
+            step: "invoke".into(),
+            at_ms: 100,
+            kind: "dispatch".into(),
+            detail: json!({"operation": id}),
+        };
+        legacy.receipts.push(again);
+        let offset = legacy.receipts.len() - 1;
+        legacy
+            .indexes
+            .receipts
+            .entry(run.clone())
+            .or_default()
+            .insert(legacy.sequence, offset);
+        legacy.indexes.all_receipts.insert(legacy.sequence, offset);
+        overwrite(&e.store, "incarnation-1", &legacy);
+        e.release().unwrap();
+        let e = Engine::new(store, "test", "incarnation-2").unwrap();
+        let s = e.snapshot().unwrap();
+        assert_eq!(s.intents[&id].dispatch_sequence, Some(dispatched));
+        assert!(s.indexes.dispatch_sequences_complete);
+        assert_eq!(
+            s.retention.replay_order.len(),
+            earlier,
+            "earlier events are not held"
+        );
+        let done = e
+            .admit_event("host", async_event(&completion, "done"), 101)
+            .unwrap()
+            .key;
+        let s = e.snapshot().unwrap();
+        assert!(!order_members(&s).contains(&format!("e:{done}")), "held");
+        host.responses.insert(
+            "reconcile:test.command".into(),
+            vec![DispatchResult::Accepted {
+                handle: "server-operation".into(),
+            }],
+        );
+        let reads = e.store.stats.record_reads.load(Ordering::Relaxed);
+        let fallbacks = e.store.stats.fallbacks().len();
+        e.recover(&mut host, 102).unwrap();
+        assert!(e.store.stats.fallbacks()[fallbacks..].is_empty());
+        let work = e.store.stats.record_reads.load(Ordering::Relaxed) - reads;
+        for t in 102..110 {
+            e.drive(&mut host, t, 20).unwrap();
+        }
+        let runs = inspect_all(&e, InspectionKind::Runs, Some(&run));
+        assert_eq!(runs[0]["outcome"], "ok", "{runs:?}");
+        work
+    };
+    assert_eq!(measure(10), measure(60));
 }

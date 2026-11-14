@@ -132,6 +132,12 @@ pub struct RuntimeIndexes {
     /// the index existed; `Engine::new` then fills it once.
     #[serde(default)]
     pub contract_events_complete: bool,
+    /// Every dispatched live operation carries its dispatch sequence. False
+    /// in a State written before `Intent::dispatch_sequence` existed;
+    /// `Engine::new` then fills it once from each operation's own first
+    /// `dispatch` receipt.
+    #[serde(default)]
+    pub dispatch_sequences_complete: bool,
 }
 pub fn correlation_key(
     contract: &ContractRef,
@@ -743,14 +749,17 @@ fn refresh_intent(s: &mut State, id: &str) -> Result<()> {
     // A hold through an uncertain completion begins or ends: the events of
     // that contract and scope are judged again (`retention::rejoin`).
     let is_uncertain = s.indexes.uncertain_contract_membership.get(id).cloned();
-    if was_uncertain != is_uncertain {
-        // Only events accepted after the dispatch can be its completion
-        // (an operation gone from the State: every event, 0).
-        let after = s
-            .intents
-            .get(id)
-            .and_then(|i| i.dispatch_sequence)
-            .unwrap_or(0);
+    // An operation never dispatched holds nothing either way (a membership
+    // it loses here is one an older engine recorded): nothing to judge.
+    let after = match s.intents.get(id) {
+        Some(i) => i.dispatch_sequence,
+        // Gone from the State: every event (0).
+        None => Some(0),
+    };
+    if was_uncertain != is_uncertain
+        && let Some(after) = after
+    {
+        // Only events accepted after the dispatch can be its completion.
         for key in was_uncertain.into_iter().chain(is_uncertain) {
             let entry = s.replay_touched.contract_keys.entry(key).or_insert(after);
             *entry = (*entry).min(after);
@@ -883,8 +892,7 @@ fn refresh_intent_indexes(s: &mut State, id: &str) -> Result<()> {
         );
     }
     if let Some(asynchronous) = &i.command.asynchronous
-        && i.handle.is_none()
-        && matches!(i.status, IntentStatus::Dispatched | IntentStatus::Unknown)
+        && uncertain(&i)
     {
         let event = &s.artifacts[&s.runs[&i.run].artifact]
             .content
@@ -941,6 +949,18 @@ fn refresh_intent_indexes(s: &mut State, id: &str) -> Result<()> {
     wake_dependents(s, id);
     mark_run(s, &i.run);
     Ok(())
+}
+/// Whether `i` (asynchronous) may still be completed by an event its handle
+/// does not name: it was dispatched, has no handle and is not settled. A
+/// recovery that prepares it again does not end that: the first issue may
+/// still answer. An operation never dispatched cannot be completed.
+pub(crate) fn uncertain(i: &crate::Intent) -> bool {
+    i.dispatch_sequence.is_some()
+        && i.handle.is_none()
+        && matches!(
+            i.status,
+            IntentStatus::Prepared | IntentStatus::Dispatched | IntentStatus::Unknown
+        )
 }
 pub(crate) fn sync(s: &mut State) -> Result<()> {
     let intents = std::mem::take(&mut s.indexes.dirty_intents);
@@ -1024,6 +1044,49 @@ pub(crate) fn backfill_root_intents(s: &mut State) -> bool {
         }
     }
     s.indexes.root_intents_complete = true;
+    true
+}
+/// Once per namespace written before `Intent::dispatch_sequence` existed:
+/// give every live asynchronous operation without a handle that an older
+/// engine dispatched the sequence of its own first `dispatch` receipt (its
+/// run is live, so its receipts are in the record), so it holds only the
+/// events accepted after it. One without such a receipt was never
+/// dispatched and holds nothing. Each is marked, so the next sync records
+/// its uncertain membership by the current rule. One pass over live
+/// operations, plus each candidate's run receipts. Returns whether it ran.
+pub(crate) fn backfill_dispatch_sequences(s: &mut State) -> bool {
+    if !s.indexes.initialized || s.indexes.dispatch_sequences_complete {
+        return false;
+    }
+    let candidates: Vec<(String, String)> = s
+        .intents
+        .values()
+        .filter(|i| {
+            i.command.asynchronous.is_some() && i.handle.is_none() && i.dispatch_sequence.is_none()
+        })
+        .map(|i| (i.id.clone(), i.run.clone()))
+        .collect();
+    for (id, run) in candidates {
+        let first = s
+            .indexes
+            .receipts
+            .get(&run)
+            .into_iter()
+            .flat_map(|offsets| offsets.values().copied())
+            .filter_map(|offset| s.receipts.get(offset))
+            .filter(|r| {
+                r.run == run
+                    && r.kind == "dispatch"
+                    && r.detail.get("operation").and_then(|v| v.as_str()) == Some(id.as_str())
+            })
+            .map(|r| r.sequence)
+            .min();
+        if let Some(intent) = s.intents.get_mut(&id) {
+            intent.dispatch_sequence = first;
+        }
+        mark_intent(s, &id);
+    }
+    s.indexes.dispatch_sequences_complete = true;
     true
 }
 

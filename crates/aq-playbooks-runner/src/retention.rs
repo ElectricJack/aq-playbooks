@@ -1311,8 +1311,9 @@ fn event_hold(
             }
         }
     }
-    // An operation whose admission handle is lost may complete through any
-    // event of its completion contract and scope.
+    // An operation dispatched without a handle (yet) may complete through
+    // any event of its completion contract and scope accepted after its
+    // first dispatch.
     let contract = crate::indexes::trigger_key(&event.envelope.contract, &event.envelope.scope)?;
     let mut uncertain: BTreeSet<String> = s
         .indexes
@@ -1326,10 +1327,9 @@ fn event_hold(
     Ok(uncertain.iter().any(|id| {
         s.intents.get(id).is_some_and(|i| {
             i.command.asynchronous.is_some()
-                && i.handle.is_none()
-                && matches!(i.status, IntentStatus::Dispatched | IntentStatus::Unknown)
-                // Its completion is accepted after its dispatch.
-                && i.dispatch_sequence.unwrap_or(0) < event.sequence
+                && crate::indexes::uncertain(i)
+                // Its completion is accepted after its (first) dispatch.
+                && i.dispatch_sequence.is_some_and(|d| d < event.sequence)
         })
     }))
 }
