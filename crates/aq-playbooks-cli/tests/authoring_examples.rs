@@ -235,7 +235,9 @@ fn example_files_are_the_examples_on_disk() {
     );
     assert_eq!(listed, on_disk);
     for (path, text) in &listed {
-        if path.ends_with(".md") {
+        // The owner's documents (each example's source.md and its stuck
+        // variants), not the host's CATALOG.md.
+        if path.ends_with(".md") && !path.ends_with("/CATALOG.md") {
             for code in ["`", "work.", "judgment.", "message.", "aq.", "_"] {
                 assert!(!text.contains(code), "{path} contains {code:?}");
             }
@@ -423,6 +425,20 @@ fn every_command_and_case_the_documents_show_runs_as_shown() {
                     serde_json::from_str::<BTreeMap<String, Vec<CaseReturn>>>(&block.body)
                         .unwrap_or_else(|e| panic!("{at}: {e}"));
                 }
+                // An output or a report shows what the block before it
+                // printed, so it must follow its command.
+                ("json", "output") => {
+                    let before = i.checked_sub(1).map(|j| role(&found[j]).0);
+                    assert_eq!(before, Some("sh"), "{at}: an output follows its command");
+                }
+                ("json", "report") => {
+                    let before = i.checked_sub(1).map(|j| role(&found[j]));
+                    assert_eq!(
+                        before,
+                        Some(("json", "case")),
+                        "{at}: a report follows its case"
+                    );
+                }
                 ("json", _) | ("", _) => {}
                 (other, _) => panic!("{at}: a {other} block is not run by any test"),
             }
@@ -460,4 +476,133 @@ fn every_command_and_case_the_documents_show_runs_as_shown() {
             }
         }
     }
+}
+
+/// `commands describe` and `events describe` carry the same notes as the
+/// workspace's `CATALOG.md`, and `CATALOG.md` lists exactly the contract's
+/// input fields and outcomes that `describe` shows.
+#[test]
+fn describe_carries_the_notes_catalog_md_renders() {
+    let dir = written("describe");
+    for (name, _, _) in EXAMPLES {
+        let root = dir.0.join(name);
+        let catalog = fs::read_to_string(root.join("CATALOG.md")).unwrap();
+        for (kind, list) in [("commands", "commands"), ("events", "events")] {
+            let names = ok(&root, &[list, "list"]);
+            for contract in names.as_array().unwrap() {
+                let contract = contract.as_str().unwrap();
+                let described = ok(&root, &[list, "describe", contract]);
+                assert_eq!(
+                    described["notes"],
+                    aq_playbooks_compiler::docs::notes(kind, contract).unwrap(),
+                    "{name}: {contract}"
+                );
+                let section = catalog
+                    .split(&format!("\n### `{contract}` "))
+                    .nth(1)
+                    .unwrap_or_else(|| panic!("{name}: CATALOG.md has no {contract}"))
+                    .split("\n### ")
+                    .next()
+                    .unwrap();
+                let rows = |schema: &Value| -> Vec<String> {
+                    schema["properties"]
+                        .as_object()
+                        .map(|m| m.keys().cloned().collect())
+                        .unwrap_or_default()
+                };
+                let fields = if kind == "commands" {
+                    rows(&described["input"])
+                } else {
+                    rows(&described["payload"])
+                };
+                for field in fields {
+                    assert!(
+                        section.contains(&format!("| `{field}` |")),
+                        "{name}: {contract}.{field}"
+                    );
+                }
+                if let Some(outcomes) = described["outcomes"].as_object() {
+                    for outcome in outcomes.keys() {
+                        assert!(
+                            section.contains(&format!("| `{outcome}` |")),
+                            "{name}: {contract} {outcome}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A run that stops on the playbook's own duration limit says so under
+/// `try` (here a wait inside a loop body, which `check` does not add up).
+#[test]
+fn a_run_that_stops_on_its_duration_limit_says_so() {
+    let dir = written("duration");
+    let root = dir.0.join("notify-when-ready");
+    let mut draft = json_file(&root.join("draft.json"));
+    draft["steps"]["wait"]["op"]["deadline_ms"] = serde_json::json!(86_400_000);
+    draft["steps"]["wait"]["edges"]["timeout"] = serde_json::json!("each");
+    draft["steps"]["each"] = serde_json::json!({"op": {"kind": "for_each",
+        "collection": {"op": "literal", "value": [1]}, "item": "n", "body": "wait",
+        "next": "read", "max_items": 1, "concurrency": 1, "on_failure": "stop"},
+        "edges": {}, "on_error": "failed"});
+    draft["steps"]["ready"]["edges"]["true"] = serde_json::json!("each");
+    fs::write(
+        root.join("draft.json"),
+        serde_json::to_vec_pretty(&draft).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ok(&root, &["check"])["ok"], true);
+    let out = run(&root, &["try", "cases/still-no-description.json"]);
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["passed"], false);
+    assert!(
+        report["problems"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("the run stopped at step wait on the playbook's own duration limit: it had run 86400000 ms, and `limits.max_duration_ms` is 86400000."),
+        "{report:#}"
+    );
+}
+
+/// An asynchronous command can answer at once with one of its own outcomes,
+/// and the invoke's own edge is taken; a synchronous command cannot be
+/// given `at_once`.
+#[test]
+fn an_answer_at_once_takes_the_invokes_own_edge() {
+    let dir = written("at-once");
+    let root = dir.0.join("escalate-on-judgment");
+    let report = ok(&root, &["try", "cases/judgment-refused-at-once.json"]);
+    let steps: Vec<(&str, &str)> = report["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["step"].as_str().unwrap(), c["outcome"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            ("read", "observed"),
+            ("ask", "refused"),
+            ("assume", "routed")
+        ]
+    );
+    let notify = dir.0.join("notify-when-ready");
+    let mut case = json_file(&notify.join("cases/task-gone.json"));
+    case["returns"]["work.read"][0]["at_once"] = serde_json::json!(true);
+    fs::write(
+        notify.join("cases/x.json"),
+        serde_json::to_vec(&case).unwrap(),
+    )
+    .unwrap();
+    let out = run(&notify, &["try", "cases/x.json"]);
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        report["problems"][0]
+            .as_str()
+            .unwrap()
+            .contains("work.read always answers at once; leave at_once out."),
+        "{report:#}"
+    );
 }

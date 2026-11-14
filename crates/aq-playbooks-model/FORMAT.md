@@ -1,5 +1,10 @@
 # Portable format 1
 
+This is the format specification of stored artifacts, for engine
+developers. It is not shipped to authoring agents: an agent writes a draft
+(contract names, never `{name, fingerprint}`), described by the compiler's
+`LANGUAGE.md`, which also carries the draft rules below in that form.
+
 Artifacts use UTF-8 JSON, no whitespace or BOM, recursively ordered object keys
 by Rust string ordering (Unicode scalar order), integer JSON numbers in signed
 64-bit or unsigned 64-bit range, and serde_json's string escaping: quotes,

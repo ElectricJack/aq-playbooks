@@ -5,7 +5,7 @@
 //! The commands and cases the documents show are run by the CLI's
 //! `authoring_examples` test, with the real binary.
 use aq_playbooks_compiler::Diagnostic;
-use aq_playbooks_compiler::docs::{FORMAT, GUIDE, LANGUAGE, example_files};
+use aq_playbooks_compiler::docs::{GUIDE, LANGUAGE, catalog, catalog_registry, example_files};
 use aq_playbooks_compiler::draft::{self, MAX_DRAFT_JSON_BYTES, MAX_DRAFT_STEPS, Workspace};
 use aq_playbooks_model::{Expr, MAX_DRAFT_EXPANSION, MAX_DRAFT_EXPANSION_TOTAL, MAX_DRAFT_SCOPE};
 use serde_json::{Value, json};
@@ -260,7 +260,14 @@ fn the_docs_module_returns_the_documents_and_the_examples() {
     assert!(GUIDE.starts_with("---\nname: aq-playbook-author\n"));
     assert!(GUIDE.contains("\n# Authoring guide\n"));
     assert!(LANGUAGE.starts_with("# Language reference\n"));
-    assert!(FORMAT.starts_with("# Portable format 1\n"));
+    // FORMAT.md is the engine's specification and is not shipped: nothing
+    // sends the agent to it.
+    for (name, doc) in DOCUMENTS {
+        assert!(
+            !doc.contains("FORMAT.md"),
+            "{name} sends the agent to FORMAT.md"
+        );
+    }
     let files = example_files();
     for example in EXAMPLES {
         for name in [
@@ -280,6 +287,13 @@ fn the_docs_module_returns_the_documents_and_the_examples() {
             diagnostics(&workspace(example)),
             Vec::<Value>::new(),
             "{example}"
+        );
+        // Its CATALOG.md is the one the host writes for its record.
+        let record = workspace(example).record;
+        assert_eq!(
+            example_file(example, "CATALOG.md"),
+            catalog(&record.commands, &record.events).unwrap(),
+            "{example}/CATALOG.md is not docs::catalog of its record"
         );
     }
 }
@@ -419,6 +433,59 @@ fn every_validation_code_has_an_entry() {
     );
 }
 
+/// The notes cover every contract of the pinned catalog exactly (the
+/// renderer refuses notes that miss or add an input field, an outcome or a
+/// payload field), and every rendered section lists each field and outcome.
+#[test]
+fn the_catalog_notes_cover_every_contract_of_the_pinned_catalog() {
+    let registry = catalog_registry();
+    let commands = registry.commands.keys().cloned().collect();
+    let events = registry.events.keys().cloned().collect();
+    let all = catalog(&commands, &events).unwrap();
+    for (name, contract) in &registry.commands {
+        let section = all
+            .split(&format!("\n### `{name}` "))
+            .nth(1)
+            .unwrap_or_else(|| panic!("no section for {name}"))
+            .split("\n### ")
+            .next()
+            .unwrap();
+        if let aq_playbooks_model::Schema::Object { properties, .. } = &contract.input {
+            for field in properties.keys() {
+                assert!(
+                    section.contains(&format!("| `{field}` |")),
+                    "{name}: input {field}"
+                );
+            }
+        }
+        for outcome in contract.outcomes.keys() {
+            assert!(
+                section.contains(&format!("| `{outcome}` |")),
+                "{name}: outcome {outcome}"
+            );
+        }
+    }
+    for name in registry.events.keys() {
+        assert!(
+            all.contains(&format!("\n### `{name}` ")),
+            "no section for {name}"
+        );
+    }
+    // A name outside the pinned catalog is refused.
+    assert!(catalog(&["work.reed".to_string()].into(), &Default::default()).is_err());
+    for hidden in [
+        "sha256:",
+        "crates/",
+        ".rs",
+        "aq-server",
+        "docs/",
+        "README",
+        "Task ",
+    ] {
+        assert!(!all.contains(hidden), "CATALOG.md contains {hidden:?}");
+    }
+}
+
 #[test]
 fn the_guide_names_every_tool() {
     for tool in [
@@ -549,7 +616,13 @@ fn every_strict_rule_and_bound_is_taught() {
         "may be null at this step",
         "Bind a table, or its result, to a `let` name once",
         "part of what the playbook means",
+        "covers the whole run from its start",
         "ask the owner to split the document",
+        "When both apply, ask first",
+        "Never stand one thing in for another",
+        "something no command returns",
+        "read the event's **Sent** line in `CATALOG.md`",
+        "a message's words come from the document",
     ] {
         assert!(
             words(GUIDE).contains(taught),
@@ -616,17 +689,79 @@ fn the_documents_show_no_identifier_an_agent_cannot_see() {
     }
 }
 
+/// What a catalog says about routing reaches the agent in `CATALOG.md`,
+/// and only when its record allows those commands; the guide and the
+/// language reference say nothing about it.
 #[test]
-fn the_guide_speaks_of_routing_only_in_its_catalog_notes() {
+fn the_guide_speaks_of_routing_nowhere() {
     for (section, line) in prose(GUIDE) {
-        if section != "Notes on the host catalog" {
-            assert!(
-                !line.to_lowercase().contains("rout"),
-                "outside the catalog notes ({section}): {line}"
-            );
-        }
+        assert!(
+            !line.to_lowercase().contains("rout"),
+            "GUIDE.md ({section}): {line}"
+        );
     }
     for (_, line) in prose(LANGUAGE) {
         assert!(!line.to_lowercase().contains("rout"), "LANGUAGE.md: {line}");
     }
+}
+
+/// Rewrites each example's `CATALOG.md` after the notes change:
+/// `cargo test -p aq-playbooks-compiler --test docs -- --ignored write_example_catalogs`.
+#[test]
+#[ignore]
+fn write_example_catalogs() {
+    for example in EXAMPLES {
+        let record = workspace(example).record;
+        let path = format!(
+            "{}/authoring-examples/{example}/CATALOG.md",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::write(path, catalog(&record.commands, &record.events).unwrap()).unwrap();
+    }
+}
+
+/// `check` adds up the waits on each way through the run (I1): one wait as
+/// long as the run's limit, or two that together reach it, are refused,
+/// naming the steps and the limit; a limit above them checks clean.
+#[test]
+fn a_way_whose_waits_reach_the_run_limit_is_refused() {
+    let mut ws = workspace("notify-when-ready");
+    let mut second = ws.draft["steps"]["wait"].clone();
+    ws.draft["steps"]["wait"]["op"]["deadline_ms"] = json!(50_000_000);
+    ws.draft["steps"]["wait"]["edges"]["timeout"] = json!("wait2");
+    second["op"]["deadline_ms"] = json!(50_000_000);
+    second["op"]["bind"] = json!("waited2");
+    ws.draft["steps"]["wait2"] = second;
+    let got = diagnostics(&ws);
+    let want = json!({"code": "deadline", "path": "draft.json:limits",
+        "message": "limits.max_duration_ms: a run from entry `main` may wait 100000000 ms on one way, at `wait` (50000000 ms), `wait2` (50000000 ms), which reaches the playbook's duration limit of 86400000 ms (the default).…"});
+    assert!(got.iter().any(|d| fits(&want, d)), "{got:#?}");
+    let mut limits = serde_json::to_value(aq_playbooks_model::Limits::default()).unwrap();
+    limits["max_duration_ms"] = json!(100_000_001);
+    ws.draft["limits"] = limits;
+    assert_eq!(diagnostics(&ws), Vec::<Value>::new());
+    // A wait inside a for_each body may run any number of times: it is not
+    // added up (try reports a run that stops on the limit there).
+    let mut ws = workspace("notify-when-ready");
+    ws.draft["steps"]["wait"]["op"]["deadline_ms"] = json!(86_400_000);
+    ws.draft["steps"]["wait"]["edges"]["timeout"] = json!("each");
+    ws.draft["steps"]["each"] = json!({"op": {"kind": "for_each",
+        "collection": {"op": "literal", "value": [1]}, "item": "n", "body": "wait",
+        "next": "read", "max_items": 1, "concurrency": 1, "on_failure": "stop"},
+        "edges": {}, "on_error": "failed"});
+    ws.draft["steps"]["ready"]["edges"]["true"] = json!("each");
+    let got = diagnostics(&ws);
+    assert!(got.iter().all(|d| d["code"] != "deadline"), "{got:#?}");
+}
+
+/// A name the record allows that the catalog lacks is the host's fault
+/// (`catalog`), not the draft's.
+#[test]
+fn a_record_name_the_catalog_lacks_is_a_host_fault() {
+    let mut ws = workspace("notify-when-ready");
+    ws.catalog.commands.remove("message.send");
+    let got = diagnostics(&ws);
+    let want = json!({"code": "catalog", "path": "catalog.json",
+        "message": "record.json allows the command message.send, but catalog.json has no contract for it: the host's files disagree, and no draft can fix that.…"});
+    assert!(got.iter().any(|d| fits(&want, d)), "{got:#?}");
 }

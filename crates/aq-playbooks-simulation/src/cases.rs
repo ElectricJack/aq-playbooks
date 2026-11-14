@@ -72,6 +72,9 @@ pub const MAX_REASON_BYTES: usize = 4096;
 /// One question names at most this many sentences.
 pub const MAX_SENTENCES: usize = 16;
 pub const MAX_SENTENCE_BYTES: usize = 8192;
+/// The workspace files the host writes, which an `unable` may name instead
+/// of a sentence when the fault is in one of them.
+pub const HOST_FILES: [&str; 3] = ["record.json", "catalog.json", "facts.json"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -100,17 +103,31 @@ pub enum CaseStart {
     Entry { entry: String, input: Value },
 }
 /// `{"outcome": …, "output": …}`, or `{"pending": true}` for no answer.
+/// For an asynchronous command, `{"outcome": …, "output": …, "at_once":
+/// true}` answers the call itself with one of the command's own outcomes
+/// other than `accepted` (such as `refused` at admission), instead of
+/// accepting it and answering through the completion event.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum CaseReturn {
-    Answer { outcome: String, output: Value },
-    Pending { pending: bool },
+    Answer {
+        outcome: String,
+        output: Value,
+    },
+    AtOnce {
+        outcome: String,
+        output: Value,
+        at_once: bool,
+    },
+    Pending {
+        pending: bool,
+    },
 }
 // Written by hand so a wrong return says which shape is accepted.
 impl<'de> Deserialize<'de> for CaseReturn {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         use serde::de::Error;
-        let shape = "a return is an answer, {\"outcome\": \"<outcome>\", \"output\": {…}}, or no answer, {\"pending\": true}";
+        let shape = "a return is an answer, {\"outcome\": \"<outcome>\", \"output\": {…}}, an answer an asynchronous command gives at once, {\"outcome\": \"<outcome>\", \"output\": {…}, \"at_once\": true}, or no answer, {\"pending\": true}";
         let map = serde_json::Map::<String, Value>::deserialize(d)?;
         let keys: Vec<&str> = map.keys().map(String::as_str).collect();
         match keys.as_slice() {
@@ -121,6 +138,16 @@ impl<'de> Deserialize<'de> for CaseReturn {
                 }),
                 other => Err(D::Error::custom(format!(
                     "outcome must be a string, found {other}; {shape}"
+                ))),
+            },
+            ["at_once", "outcome", "output"] => match (&map["outcome"], &map["at_once"]) {
+                (Value::String(outcome), Value::Bool(at_once)) => Ok(Self::AtOnce {
+                    outcome: outcome.clone(),
+                    output: map["output"].clone(),
+                    at_once: *at_once,
+                }),
+                _ => Err(D::Error::custom(format!(
+                    "outcome must be a string and at_once true; {shape}"
                 ))),
             },
             ["pending"] => match &map["pending"] {
@@ -323,6 +350,47 @@ fn check_case(artifact: &Artifact, case: &Case) -> Vec<String> {
                         ));
                     }
                 }
+                CaseReturn::AtOnce {
+                    outcome,
+                    output,
+                    at_once,
+                } => {
+                    if !at_once {
+                        p.push(format!(
+                            "{at}.at_once: write \"at_once\": true, or leave it out for an answer that arrives later."
+                        ));
+                    }
+                    let direct = || {
+                        names(
+                            contract
+                                .outcomes
+                                .keys()
+                                .map(String::as_str)
+                                .filter(|o| *o != "accepted"),
+                        )
+                    };
+                    match (&contract.asynchronous, contract.outcomes.get(outcome)) {
+                        (None, _) => p.push(format!(
+                            "{at}.at_once: {command} always answers at once; leave at_once out."
+                        )),
+                        (Some(_), None) if outcome != "accepted" => p.push(format!(
+                            "{at}.outcome: {outcome:?} is not an outcome of {command}; it can answer at once with: {}.",
+                            direct()
+                        )),
+                        (Some(_), _) if outcome == "accepted" => p.push(format!(
+                            "{at}.outcome: an answer at once is one of {command}'s own outcomes other than accepted: {}. For an answer that arrives later, leave at_once out.",
+                            direct()
+                        )),
+                        (Some(_), Some(schema)) => {
+                            if let Err(e) = schema.validate(output) {
+                                p.push(format!(
+                                    "{at}.output: does not fit {command}'s {outcome:?} output: {e}. `aq-playbooks commands describe {command}` shows each outcome's output."
+                                ));
+                            }
+                        }
+                        (Some(_), None) => {}
+                    }
+                }
                 CaseReturn::Answer { outcome, output } => match &contract.asynchronous {
                     None => match contract.outcomes.get(outcome) {
                         None => p.push(format!(
@@ -504,6 +572,12 @@ impl Host for CaseHost<'_> {
                     DispatchResult::Accepted { handle }
                 }
             },
+            Some(CaseReturn::AtOnce {
+                outcome, output, ..
+            }) => {
+                call.outcome = Some(outcome.clone());
+                DispatchResult::Completed { outcome, output }
+            }
             Some(CaseReturn::Pending { .. }) => DispatchResult::Accepted {
                 handle: self.handle(),
             },
@@ -537,6 +611,43 @@ fn inspected<S: aq_playbooks_runner::Storage>(
             None => return Ok(items),
         }
     }
+}
+
+/// Why a failed run stopped, when it stopped on one of the playbook's own
+/// limits: the engine records an `engine_failure` for the run, and its time
+/// and the run's visits tell which limit it was.
+fn own_limit<S: aq_playbooks_runner::Storage>(
+    engine: &Engine<S>,
+    artifact: &Artifact,
+    run: &Value,
+) -> anyhow::Result<Option<String>> {
+    let receipts = inspected(engine, InspectionKind::Receipts)?;
+    let Some(failure) = receipts
+        .iter()
+        .find(|r| r["run"] == run["id"] && r["kind"] == "engine_failure")
+    else {
+        return Ok(None);
+    };
+    let limits = &artifact.content.playbook.limits;
+    let step = failure["step"].as_str().unwrap_or_default();
+    let elapsed =
+        failure["at_ms"].as_i64().unwrap_or(0) - run["admitted_at_ms"].as_i64().unwrap_or(0);
+    let visits = run["visits"].as_u64().unwrap_or(0);
+    Ok(Some(if elapsed >= limits.max_duration_ms as i64 {
+        format!(
+            "the run stopped at step {step} on the playbook's own duration limit: it had run {elapsed} ms, and `limits.max_duration_ms` is {}. The limit covers the whole run from its start, so it must be longer than every wait and join deadline on the longest way through the run. Set it from what the document says (a wait of a day needs a limit above a day).",
+            limits.max_duration_ms
+        )
+    } else if visits >= limits.max_step_visits {
+        format!(
+            "the run stopped at step {step} on the playbook's own limit of {} step visits (`limits.max_step_visits`). Look for a loop that runs more often than the document allows, or set the limit from the document.",
+            limits.max_step_visits
+        )
+    } else {
+        format!(
+            "the run stopped at step {step} on one of the playbook's own `limits` (iterations, child runs, history or payload size). Compare the run with the limits set in the draft, and set them from the document."
+        )
+    }))
 }
 
 /// The outcome a live run has returned while it finishes.
@@ -792,10 +903,16 @@ fn run_within(artifact: &Artifact, case: &Case, limit: usize) -> anyhow::Result<
         [] => report.problems.push("start: no run started.".to_string()),
         [run] => match run["status"].as_str() {
             Some("completed") => report.outcome = run["outcome"].as_str().map(String::from),
-            Some("failed") => report.problems.push(format!(
-                "the run failed at step {} without an outcome; give each step's command a return that fits it, and an `on_error` edge where a call may fail.",
-                at(run)
-            )),
+            Some("failed") => {
+                let problem = match own_limit(&engine, artifact, run)? {
+                    Some(problem) => problem,
+                    None => format!(
+                        "the run failed at step {} without an outcome; give each step's command a return that fits it, and an `on_error` edge where a call may fail.",
+                        at(run)
+                    ),
+                };
+                report.problems.push(problem);
+            }
             Some("cancelled") => report
                 .problems
                 .push(format!("the run was cancelled at step {}.", at(run))),
@@ -1014,14 +1131,20 @@ pub enum Outcome {
         question: String,
         sentences: Vec<Sentence>,
     },
-    /// Why the document could not be turned into a playbook, and the
-    /// sentence it is about (its lines as in [`Sentence`]).
+    /// Why the document could not be turned into a playbook: either the
+    /// sentence it is about (`line`, `end_line` as in [`Sentence`], and
+    /// `sentence`), or, for a fault in one of the host's own files, that
+    /// file ([`HOST_FILES`]) and no sentence.
     Unable {
         reason: String,
-        line: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         end_line: Option<u32>,
-        sentence: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sentence: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file: Option<String>,
     },
 }
 impl Outcome {
@@ -1097,10 +1220,28 @@ impl Outcome {
                 line,
                 end_line,
                 sentence,
+                file,
             } => {
                 text("reason", reason, MAX_REASON_BYTES)?;
-                lines_named(*line, *end_line)?;
-                text("sentence", sentence, MAX_SENTENCE_BYTES)
+                match (line, sentence, file) {
+                    (Some(line), Some(sentence), None) => {
+                        lines_named(*line, *end_line)?;
+                        text("sentence", sentence, MAX_SENTENCE_BYTES)
+                    }
+                    (None, None, Some(file)) if end_line.is_none() => {
+                        if HOST_FILES.contains(&file.as_str()) {
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "file {file:?} is not one of the host's files ({})",
+                                HOST_FILES.join(", ")
+                            ))
+                        }
+                    }
+                    _ => Err(
+                        "an unable names either a sentence (line and sentence) or a host file, not both and not neither".into(),
+                    ),
+                }
             }
         }
     }
@@ -1205,7 +1346,7 @@ mod tests {
     }
     fn output(r: &CaseReturn) -> Value {
         match r {
-            CaseReturn::Answer { output, .. } => output.clone(),
+            CaseReturn::Answer { output, .. } | CaseReturn::AtOnce { output, .. } => output.clone(),
             CaseReturn::Pending { .. } => panic!("no output"),
         }
     }

@@ -24,6 +24,13 @@ The layout matches 2.1.0:
   (the rule for a `judgment.assess` answer) and the `compatibility`
   section. That section records the 2.1.0 base, the unchanged and added
   fingerprints, and that no command changed.
+- `notes.json` holds, for every command and event, what an authoring agent
+  needs beyond the schema: its purpose, what each input field means, when
+  each outcome happens and what to do next, and when each event is sent. It
+  is rendered into the agent's `CATALOG.md`
+  (`aq_playbooks_compiler::docs::catalog`) and shown by `commands describe`.
+  It sits beside the registry, so no fingerprint depends on it. Where a
+  meaning is an empty string, the catalog does not state it.
 
 Fingerprint: `sha256:ca3c3d68959d760cc761d0c39b8db8740a27b3e414ae54e76d64df944f9b677a`,
 which is `aq_playbooks_model::digest(&("2.2.0", &registry))`.
@@ -43,7 +50,7 @@ A trigger starts a run only when its event is sent. Today, on aq-server:
 | Event | When it is sent |
 | --- | --- |
 | `aq.work.route_needed` | By the host on its own, for a ready task in a project on the automatic router that has no route (see its section below). |
-| `aq.work.changed` | Only as the effect of a playbook's own `work.ensure` or `work.change`, with outcome `ensured` or `changed`. It is not sent when a person creates, edits, finishes or cancels a task. |
+| `aq.work.changed` | Only as the effect of `work.ensure` or `work.change` called by any playbook in the namespace, with outcome `ensured` or `changed`. It is not sent when a person creates, edits, finishes or cancels a task. |
 | `aq.operation.updated`, `aq.check.receipted`, `aq.decision.completed`, `aq.judgment.completed`, `aq.judgment.assessed` | Only as the completion of an operation a playbook started (`work.ensure`, `check.request`, `decision.request`, `judgment.request`, `judgment.assess`). Join the handle; do not start a playbook on them. |
 | `aq.artifact.recorded`, `aq.check.completed`, `aq.integration.changed`, `aq.signal.reported` | Not stated for this catalog's host profile. Do not author a trigger on them without asking the owner. |
 

@@ -149,7 +149,7 @@ enum Command {
         #[command(flatten)]
         store: StoreArgs,
     },
-    /// Fence a retired authenticated producer epoch before compacting replay tombstones.
+    /// Fence a retired authenticated producer epoch: its events and requests are refused from then on.
     RetireProducer {
         producer: String,
         epoch: u64,
@@ -322,16 +322,35 @@ fn advance_until_settled(e: &Engine<PostgresStorage>, run: &str) -> Result<()> {
     }
     Ok(())
 }
+/// Lists or describes a contract. A contract that is the pinned catalog's
+/// own is described with the host's notes on it (`"notes"`), the same notes
+/// `CATALOG.md` renders.
 fn choose<T: Serialize>(
+    kind: &str,
     map: &std::collections::BTreeMap<String, T>,
     action: CatalogAction,
 ) -> Result<()> {
     match action {
         CatalogAction::List => print(&map.keys().collect::<Vec<_>>()),
-        CatalogAction::Describe { name } => print(
-            map.get(&name)
-                .with_context(|| format!("unknown registration: {name}"))?,
-        ),
+        CatalogAction::Describe { name } => {
+            let contract = map
+                .get(&name)
+                .with_context(|| format!("unknown registration: {name}"))?;
+            let mut described = serde_json::to_value(contract)?;
+            let pinned = aq_playbooks_compiler::docs::catalog_registry();
+            let same = match kind {
+                "commands" => pinned.commands.get(&name).map(serde_json::to_value),
+                _ => pinned.events.get(&name).map(serde_json::to_value),
+            };
+            if let (Some(Ok(pinned)), Some(notes)) =
+                (same, aq_playbooks_compiler::docs::notes(kind, &name))
+                && pinned == described
+                && let Some(object) = described.as_object_mut()
+            {
+                object.insert("notes".into(), notes);
+            }
+            print(&described)
+        }
     }
 }
 fn catalog_file(path: Option<PathBuf>) -> Result<Registry> {
@@ -371,8 +390,12 @@ fn execute(cli: Cli) -> Result<()> {
         Command::Artifact {
             action: ArtifactAction::Inspect { path },
         } => print(&artifact(&path)?),
-        Command::Commands { registry, action } => choose(&catalog_file(registry)?.commands, action),
-        Command::Events { registry, action } => choose(&catalog_file(registry)?.events, action),
+        Command::Commands { registry, action } => {
+            choose("commands", &catalog_file(registry)?.commands, action)
+        }
+        Command::Events { registry, action } => {
+            choose("events", &catalog_file(registry)?.events, action)
+        }
         Command::Examples { output } => {
             let files = aq_playbooks_compiler::docs::example_files();
             for (path, text) in &files {

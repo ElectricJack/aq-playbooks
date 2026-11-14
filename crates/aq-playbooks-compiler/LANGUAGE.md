@@ -1,12 +1,9 @@
 # Language reference
 
 This is what `draft.json` may say, and what each diagnostic code means.
-`GUIDE.md` says how to work; `FORMAT.md` is the stored format and the full
-rules for values that are not there ("What a draft is held to").
-
-`FORMAT.md` writes commands and events as `{"name", "fingerprint"}`
-objects, because that is how a stored artifact holds them. In `draft.json`
-write only the name, as every example here does.
+`GUIDE.md` says how to work, and `CATALOG.md` what each command and event
+of this playbook does. Write a command or an event by its name only, as
+every example here does; the tool fills in its identity.
 
 ## A draft
 
@@ -197,7 +194,7 @@ unknown operand makes the result unknown, even `and(false, unknown)`.
 `contains` tests whether an array holds a value.
 
 ```json expr
-{"op": "eq", "left": {"op": "ref", "root": "task", "path": ["facts", "route"]}, "right": {"op": "literal", "value": "owner"}}
+{"op": "eq", "left": {"op": "ref", "root": "task", "path": ["facts", "origin"]}, "right": {"op": "literal", "value": "owner"}}
 ```
 
 ```json expr
@@ -229,7 +226,7 @@ value the key can take. Only the chosen case is evaluated. A missing key
 takes the default, so a key must be a value that is always there.
 
 ```json expr
-{"op": "lookup", "key": {"op": "ref", "root": "risk"}, "cases": [{"when": "low", "then": {"op": "literal", "value": "simple-high"}}, {"when": "high", "then": {"op": "literal", "value": "complex-high"}}], "default": {"op": "literal", "value": "complex-high"}}
+{"op": "lookup", "key": {"op": "ref", "root": "size"}, "cases": [{"when": "small", "then": {"op": "literal", "value": 600000}}, {"when": "large", "then": {"op": "literal", "value": 3600000}}], "default": {"op": "literal", "value": 1800000}}
 ```
 
 `let` binds up to 16 names in order; each sees the ones before it, and the
@@ -243,6 +240,76 @@ is evaluated once. With `lookup` it gives `max(a, b)` without arithmetic:
 Conditional lists: write each candidate with a `when` and keep the ones that
 hold with `filter`, then `map` them to their final shape, as the `map`
 example above does.
+
+## Values that are not there
+
+A reference to something that is not there evaluates to missing, and
+missing travels (see "Expressions"). Ordinary typing does not see this: it
+merges the outcomes a binding can hold into one object, in which a field
+only one outcome has is merely optional. So `check` holds a draft to these
+rules, keeping each binding's outcomes apart on every way to each step.
+
+1. **Strict reads.** A reference is refused (`expression_type`) when it
+   reads a field that some outcome lacks:
+   - where several outcome edges of an invoke meet at one step;
+   - among a join's accepted outcomes (every outcome, when
+     `accepted_outcomes` is empty);
+   - a join key that can be absent: on `timeout`, a member that has not
+     answered, and in `any_accepted` or `any_completion` with several
+     members, a member that was not the one selected.
+
+   A field that is optional in its one schema stays readable, and so does a
+   position of an array a schema describes (no schema states a length). A
+   literal is read as the value it is: each row of a literal table keeps
+   its own fields and a literal array its own length, so give every row of
+   a table the same fields.
+2. **Bound reads.** A reference to a binding is refused at a step that some
+   way reaches without binding it: through the binding step's `on_error` (it
+   failed, so nothing was bound) or a wait's `timeout`; from a branch that
+   skips it; on the first pass of a loop that binds it later; after a
+   `for_each` whose body binds it (the collection may be empty); and at an
+   entry step reached again by a back edge. A `for_each` item is bound in the
+   body only, not on `next` or `on_error`, nor in the loop's `collection`.
+   Inside a body, a failing step is handled by the loop (`on_failure`
+   `continue` goes on with the next item, `stop` leaves by the loop's
+   `on_error`), and the check follows both.
+3. **Names carry what they hold.** A `let` name, a name for a name, an
+   object or array holding the value, a `lookup` that can return it, a
+   `map`, `filter` or `difference` over it, and a collection item are all
+   held to the same rule as the direct read, with the same reasons. A
+   missing value bound to a `let` name does nothing until the name's value
+   is needed, so a name used only inside `exists` is fine.
+
+The one exemption is the operand of `exists`. A `lookup` key is not exempt,
+even inside `exists`: a missing key takes the default without a trace. The
+`identity` of a `difference` is not exempt either.
+
+The diagnostic names the step and the place in it, the reference as
+written, what a name in it stands for, every way that lacks the value (at
+most twelve), and the remedy. Read a value only where it is always there:
+after the outcome edge that returns it, or on the `completed` edge of a join
+whose `accepted_outcomes` lists only outcomes that have it. A `decide` on an
+outcome, or on `exists`, does not narrow anything: branch on the edge first,
+and read the value in the step that edge leads to.
+
+Asking a question and reading the answer, as `escalate-on-judgment` does:
+`ask` invokes `judgment.assess` and binds the handle as `j` on `accepted`;
+every other way goes to the fallback `assume`, which reads nothing of the
+answer.
+
+```json step
+{"op": {"kind": "invoke", "command": "judgment.assess", "bind": "j", "retry": null,
+        "input": {"op": "literal", "value": {"subject": {"id": "task-1", "revision": 1}, "question": "How risky is this change?", "context": {"items": []},
+                  "fields": [{"id": "risk", "description": "How much damage the change could do.", "choices": ["low", "high", "unknown"]}],
+                  "flags": [], "rationale_max_bytes": 512, "budget": {"deadline_ms": 120000, "max_output_tokens": 1024}}}},
+ "edges": {"accepted": "await", "assessed": "assume", "failed": "assume", "refused": "assume"}, "on_error": "assume"}
+```
+
+`await` joins `j` under the key `c`, accepting only `assessed` (the `join`
+example under "Steps"). On `completed`, `answer.c.output.labels.0` is the
+`risk` label; on `no_match` (the answer was `failed` or `refused`) and
+`timeout` it cannot be read. An answer that arrives before the run reaches
+the join is kept for it, and one accepted at the deadline still counts.
 
 ## Limits
 
@@ -260,9 +327,20 @@ leave it out for these defaults.
 | `max_concurrent_children` | 16 | 1 to 1024 |
 | `max_payload_bytes` | 1,048,576 | 1 to 16,777,216 |
 | `max_history_bytes` | 16,777,216 | `max_payload_bytes` to 1,073,741,824 |
-| `max_duration_ms` | 86,400,000 | 1 to 31,536,000,000; every wait and join deadline fits in it |
+| `max_duration_ms` | 86,400,000 | 1 to 31,536,000,000; the whole run, from its start |
 | `max_iterations` | 1000 | 1 to 1,000,000; every `for_each` `max_items` fits in it |
 | `max_iteration_depth` | 4 | 1 to 16 |
+
+`max_duration_ms` bounds the whole run from its start, not each wait. A run
+that is still going when it passes stops, at whatever step it is waiting
+in. So set it above the longest way through the run: every wait and join
+deadline on that way, added up. A document that waits a day needs more than
+the default. `check` refuses a way whose waits reach the limit, with
+`deadline` (`GUIDE.md` shows it).
+
+`check` cannot see a wait inside a `for_each` body, which may run many
+times. A run that stops on the limit there fails its case under `try` with
+"the run stopped at step … on the playbook's own duration limit".
 
 ### Evaluation
 
@@ -284,8 +362,11 @@ is refused when it is checked.
 
 A reference counts the size of the type it reads: `task.facts.kind` counts
 one node, `task` its whole type. What a `let` name stands for is counted
-once, where it is written. A literal table has one shape for each row, also
-when the rows have the same fields.
+once, where it is written. So bind a table, or its result, to a `let` name
+once and read the name; read the one field you need, not a whole table or
+binding. A value built from the same name twice at every level doubles at
+every level. A literal table has one shape for each row, also when the rows
+have the same fields.
 
 ```json diagnostic limit=bytes
 {"code": "draft_limit", "message": "…a draft may be at most 786432 bytes. Shorten it…"}
@@ -322,10 +403,11 @@ when the rows have the same fields.
 ## Diagnostic codes
 
 Each diagnostic has `code`, `path` (`<file>:<place>`), and `message`. Fix
-the fault where `path` points. Codes marked "host" come from parts the tool
-writes from the host's files, never from a draft: do not edit those files;
-give up with `unable`, naming the document's first sentence and quoting the
-diagnostic as the reason.
+the fault where `path` points. Codes marked "Host" come from the host's
+files (`record.json`, `catalog.json`, `facts.json`), never from a draft. Do
+not edit those files. Give up with
+`aq-playbooks unable --file <file> <reason>`, which names that file and no
+sentence of the document.
 
 ### workspace_file
 A workspace file is missing, too large, not a regular file, a link, or not
@@ -346,7 +428,8 @@ Host: `catalog.json` cannot be read.
 Host: `facts.json` cannot be read.
 
 ### catalog
-Host: the catalog lacks a contract that a command needs.
+Host: `record.json` allows a command or event that `catalog.json` lacks, or
+the catalog lacks a contract that a command needs.
 
 ### unknown_command
 A command name the record does not allow. The message lists the allowed

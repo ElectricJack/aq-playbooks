@@ -10,8 +10,8 @@
 //! refused, and a file is checked again after it is opened.
 //!
 //! Outcome. `save`, `ask` and `unable` each write only `out/outcome.json`
-//! (at most `MAX_OUTCOME_BYTES`, 4 MiB), whole, and nothing else. Running one again with the same
-//! inputs writes the same bytes. The outcome is data the host checks again,
+//! (at most `MAX_OUTCOME_BYTES`, 4 MiB), whole, and nothing else. A run
+//! ends once: each of them refuses when `out/outcome.json` already exists. The outcome is data the host checks again,
 //! never an instruction.
 use anyhow::{Context, Result, anyhow, bail};
 use aq_playbooks_compiler::Diagnostic;
@@ -20,9 +20,9 @@ use aq_playbooks_compiler::draft::{
 };
 use aq_playbooks_model::{Artifact, Registry, canonical_bytes};
 use aq_playbooks_simulation::{
-    CASES_TRANSITION_BUDGET, Case, CaseReport, MAX_CASES, MAX_QUESTION_BYTES, MAX_REASON_BYTES,
-    MAX_SENTENCES, MIN_CASES, OUTCOME_FILE, Outcome, Sentence, facts_digest, quote, run_case,
-    run_cases,
+    CASES_TRANSITION_BUDGET, Case, CaseReport, HOST_FILES, MAX_CASES, MAX_OUTCOME_BYTES,
+    MAX_QUESTION_BYTES, MAX_REASON_BYTES, MAX_SENTENCES, MIN_CASES, OUTCOME_FILE, Outcome,
+    Sentence, facts_digest, quote, run_case, run_cases,
 };
 use clap::Subcommand;
 use serde_json::{Value, json};
@@ -90,12 +90,15 @@ pub enum Authoring {
     },
     /// Give up: the document cannot be turned into a playbook because of the
     /// sentence on this source.md line (`--line N`) or these lines
-    /// (`--lines A-B`), for this reason.
+    /// (`--lines A-B`), for this reason. For a fault in one of the host's
+    /// own files, name that file instead (`--file catalog.json`).
     Unable {
         #[arg(long = "line")]
         line: Option<u32>,
         #[arg(long = "lines")]
         lines: Option<String>,
+        #[arg(long = "file")]
+        file: Option<String>,
         reason: String,
     },
 }
@@ -231,8 +234,13 @@ fn execute(command: Authoring) -> Result<(bool, Value)> {
             let source = read_inside(&root, SOURCE_FILE, MAX_SOURCE_BYTES)?;
             let sentences = ranges
                 .into_iter()
-                .map(|(line, end)| quote(&source, line, end).map_err(anyhow::Error::msg))
+                .map(|(line, end)| {
+                    let sentence = quote(&source, line, end).map_err(anyhow::Error::msg)?;
+                    whole(&source, line, end)?;
+                    Ok(sentence)
+                })
                 .collect::<Result<Vec<_>>>()?;
+            not_ended(&root)?;
             finish(
                 &root,
                 Outcome::Question {
@@ -244,29 +252,55 @@ fn execute(command: Authoring) -> Result<(bool, Value)> {
         Authoring::Unable {
             line,
             lines,
+            file,
             reason,
         } => {
+            bounded("the reason", &reason, MAX_REASON_BYTES)?;
+            if let Some(file) = file {
+                anyhow::ensure!(
+                    line.is_none() && lines.is_none(),
+                    "--file names a fault in one of the host's files; do not name a sentence too."
+                );
+                anyhow::ensure!(
+                    HOST_FILES.contains(&file.as_str()),
+                    "--file {file}: name one of the host's files ({}); a fault in your draft or cases is yours to fix.",
+                    HOST_FILES.join(", ")
+                );
+                not_ended(&root)?;
+                return finish(
+                    &root,
+                    Outcome::Unable {
+                        reason,
+                        line: None,
+                        end_line: None,
+                        sentence: None,
+                        file: Some(file),
+                    },
+                );
+            }
             let (line, end) = match (line, lines) {
                 (Some(line), None) => (line, None),
                 (None, Some(range)) => parse_range(&range)?,
                 _ => bail!(
-                    "name the sentence once: --line N for one line, or --lines A-B for a sentence over lines A to B."
+                    "name the sentence once: --line N for one line, or --lines A-B for a sentence over lines A to B (or --file for a fault in one of the host's files)."
                 ),
             };
-            bounded("the reason", &reason, MAX_REASON_BYTES)?;
             let source = read_inside(&root, SOURCE_FILE, MAX_SOURCE_BYTES)?;
             let Sentence {
                 line,
                 end_line,
                 text,
             } = quote(&source, line, end).map_err(anyhow::Error::msg)?;
+            whole(&source, line, end)?;
+            not_ended(&root)?;
             finish(
                 &root,
                 Outcome::Unable {
                     reason,
-                    line,
+                    line: Some(line),
                     end_line,
-                    sentence: text,
+                    sentence: Some(text),
+                    file: None,
                 },
             )
         }
@@ -274,6 +308,7 @@ fn execute(command: Authoring) -> Result<(bool, Value)> {
 }
 
 fn save(root: &Path) -> Result<(bool, Value)> {
+    not_ended(root)?;
     let refused = |reasons: Vec<String>, extra: Value| {
         let mut value = json!({
             "saved": false,
@@ -355,6 +390,22 @@ fn save(root: &Path) -> Result<(bool, Value)> {
             "next": FINISHED,
         }),
     ))
+}
+
+/// Refuses a second ending: `save`, `ask` and `unable` each end the run, and
+/// only the first one counts.
+fn not_ended(root: &Path) -> Result<()> {
+    if exists(root, OUTCOME_FILE) {
+        let kind = read_inside(root, OUTCOME_FILE, MAX_OUTCOME_BYTES as u64)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|v| v["kind"].as_str().map(String::from))
+            .unwrap_or_else(|| "an outcome".into());
+        bail!(
+            "{OUTCOME_FILE} already holds this run's ending ({kind}); a run ends once. {FINISHED}"
+        );
+    }
+    Ok(())
 }
 
 /// Writes the outcome and says so.
@@ -597,6 +648,61 @@ fn bounded(what: &str, text: &str, max: usize) -> Result<()> {
         "{what} is {} bytes; keep it to {max}.",
         text.len()
     );
+    Ok(())
+}
+/// The lines named hold whole sentences: the line before them is blank, or
+/// ends a sentence, or they start a new block (a list item or heading); and
+/// their last line ends a sentence, or the next line is blank or starts a
+/// new block. So a quote never stops in the middle of a sentence.
+fn whole(source: &str, line: u32, end: Option<u32>) -> Result<()> {
+    fn ends(text: &str) -> bool {
+        let text = text
+            .trim_end()
+            .trim_end_matches(['"', '\'', '\u{201d}', '\u{2019}', ')', ']', '*', '_']);
+        text.ends_with(['.', '!', '?', ':'])
+    }
+    fn starts_block(text: &str) -> bool {
+        let text = text.trim_start();
+        let numbered = text.split_once(['.', ')']).is_some_and(|(n, rest)| {
+            !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) && rest.starts_with(' ')
+        });
+        numbered
+            || ["- ", "* ", "+ ", "#", ">", "|"]
+                .iter()
+                .any(|p| text.starts_with(p))
+    }
+    let lines: Vec<&str> = source.lines().collect();
+    let first = line as usize - 1;
+    let last = end.unwrap_or(line) as usize - 1;
+    let shown = |a: usize, b: usize| {
+        if a == b {
+            format!("--line {}", a + 1)
+        } else {
+            format!("--lines {}-{}", a + 1, b + 1)
+        }
+    };
+    if first > 0 {
+        let before = lines[first - 1];
+        if !before.trim().is_empty() && !ends(before) && !starts_block(lines[first]) {
+            bail!(
+                "line {}: the sentence starts on line {first}, which it goes on from. Name the whole sentence, from its first line, such as {}.",
+                first + 1,
+                shown(first - 1, last)
+            );
+        }
+    }
+    if let Some(after) = lines.get(last + 1)
+        && !after.trim().is_empty()
+        && !starts_block(after)
+        && !ends(lines[last])
+    {
+        bail!(
+            "line {}: the sentence goes on in line {}. Name the whole sentence, to its last line, such as {}.",
+            last + 1,
+            last + 2,
+            shown(first, last + 1)
+        );
+    }
     Ok(())
 }
 /// `A-B`: the first and last line of a sentence (`None` when they are one).

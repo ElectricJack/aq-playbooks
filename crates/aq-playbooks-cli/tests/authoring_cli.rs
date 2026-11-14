@@ -282,7 +282,19 @@ fn check_try_compare_save_on_a_workspace() {
         .collect();
     assert_eq!(names, ["bugfix", "chore", "design", "docs", "feature"]);
     assert!(bytes.len() <= MAX_OUTCOME_BYTES);
-    // Saving again writes the same file.
+    // A run ends once: saving again is refused and leaves the file.
+    let (ok, refused) = json_of(d, &["save"]);
+    assert!(!ok);
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("a run ends once"),
+        "{refused:#}"
+    );
+    assert_eq!(fs::read(d.join("out/outcome.json")).unwrap(), bytes);
+    // From a fresh start, the same inputs write the same file.
+    fs::remove_file(d.join("out/outcome.json")).unwrap();
     let (ok, _) = json_of(d, &["save"]);
     assert!(ok);
     assert_eq!(fs::read(d.join("out/outcome.json")).unwrap(), bytes);
@@ -353,9 +365,21 @@ fn ask_and_unable_write_the_outcome_with_the_sentence() {
         json!({"kind": "question", "question": question,
                "sentences": [{"line": 21, "text": LINE_21}]})
     );
-    let (ok, _) = json_of(d, &["ask", "--line", "21", question]);
-    assert!(ok);
+    // A second ending is refused, whichever it is, and leaves the first.
+    for args in [
+        &["ask", "--line", "21", question][..],
+        &["unable", "--line", "51", "Why not."],
+        &["save"],
+    ] {
+        let (ok, refused) = json_of(d, args);
+        assert!(!ok, "{args:?}");
+        assert!(
+            refused["error"].as_str().unwrap().contains("(question)"),
+            "{refused:#}"
+        );
+    }
     assert_eq!(fs::read(d.join("out/outcome.json")).unwrap(), bytes);
+    fs::remove_file(d.join("out/outcome.json")).unwrap();
 
     let reason = "No command can wait for a person to approve.";
     let (ok, printed) = json_of(d, &["unable", "--line", "51", reason]);
@@ -367,6 +391,7 @@ fn ask_and_unable_write_the_outcome_with_the_sentence() {
         json!({"kind": "unable", "reason": reason, "line": 51, "sentence": LINE_51})
     );
     // A sentence over two lines.
+    fs::remove_file(d.join("out/outcome.json")).unwrap();
     let (ok, printed) = json_of(d, &["unable", "--lines", "21-22", reason]);
     assert!(ok, "{printed:#}");
     let outcome: Value =
@@ -376,6 +401,27 @@ fn ask_and_unable_write_the_outcome_with_the_sentence() {
         json!({"kind": "unable", "reason": reason, "line": 21, "end_line": 22,
                "sentence": format!("{LINE_21}\n{LINE_22}")})
     );
+    // A fault in one of the host's files names the file, not a sentence.
+    fs::remove_file(d.join("out/outcome.json")).unwrap();
+    let fault = "record.json allows a command catalog.json lacks.";
+    let (ok, printed) = json_of(d, &["unable", "--file", "catalog.json", fault]);
+    assert!(ok, "{printed:#}");
+    let outcome: Value =
+        serde_json::from_slice(&fs::read(d.join("out/outcome.json")).unwrap()).unwrap();
+    assert_eq!(
+        outcome,
+        json!({"kind": "unable", "reason": fault, "file": "catalog.json"})
+    );
+    fs::remove_file(d.join("out/outcome.json")).unwrap();
+    for args in [
+        &["unable", "--file", "draft.json", fault][..],
+        &["unable", "--file", "catalog.json", "--line", "51", fault],
+    ] {
+        let (ok, refused) = json_of(d, args);
+        assert!(!ok, "{args:?}");
+        assert!(refused["error"].is_string(), "{refused:#}");
+    }
+    assert!(!d.join("out/outcome.json").exists());
     // A blank line is not a sentence; one sentence is named once.
     for args in [
         &["unable", "--line", "2", reason][..],
@@ -407,12 +453,14 @@ fn one_question_can_name_two_sentences() {
         json!([{"line": 21, "text": LINE_21}, {"line": 51, "text": LINE_51}])
     );
     let before = fs::read(d.join("out/outcome.json")).unwrap();
-    // A line past the end is refused, and the outcome is left as it was.
+    fs::remove_file(d.join("out/outcome.json")).unwrap();
+    // A line past the end is refused, and nothing is written.
     let (ok, refused) = json_of(d, &["ask", "--line", "21", "--line", "61", question]);
     assert!(!ok);
     let error = refused["error"].as_str().unwrap();
     assert!(error.contains("61") && error.contains("60"), "{error}");
-    assert_eq!(fs::read(d.join("out/outcome.json")).unwrap(), before);
+    assert!(!d.join("out/outcome.json").exists());
+    let _ = before;
     // A sentence over lines 21-22, with another; recorded in document order.
     let (ok, printed) = json_of(d, &["ask", "--line", "51", "--lines", "21-22", question]);
     assert!(ok, "{printed:#}");
@@ -423,7 +471,7 @@ fn one_question_can_name_two_sentences() {
         json!([{"line": 21, "end_line": 22, "text": format!("{LINE_21}\n{LINE_22}")},
                {"line": 51, "text": LINE_51}])
     );
-    let before = fs::read(d.join("out/outcome.json")).unwrap();
+    fs::remove_file(d.join("out/outcome.json")).unwrap();
     for (args, says) in [
         (&["ask", "--lines", "41-50", question][..], "8 lines"),
         (&["ask", "--lines", "51-53", question], "blank"),
@@ -440,7 +488,7 @@ fn one_question_can_name_two_sentences() {
         let error = refused["error"].as_str().unwrap();
         assert!(error.contains(says), "{args:?}: {error}");
     }
-    assert_eq!(fs::read(d.join("out/outcome.json")).unwrap(), before);
+    assert!(!d.join("out/outcome.json").exists());
     // At most 16 sentences.
     let mut args = vec!["ask"];
     let lines: Vec<String> = (0..17).map(|i| (1 + 2 * i).to_string()).collect();
@@ -653,4 +701,38 @@ fn a_forty_case_routing_save_fits_the_outcome_bound() {
     let bytes = fs::read(d.join("out/outcome.json")).unwrap().len();
     println!("40 routing cases and the draft: {bytes} bytes");
     assert!(bytes <= MAX_OUTCOME_BYTES, "{bytes}");
+}
+
+/// A quote holds whole sentences: a line whose sentence goes on, or starts
+/// on the line before, is refused with the range to name instead (review
+/// Minor 3).
+#[test]
+fn a_quote_must_hold_whole_sentences() {
+    let ws = workspace("whole");
+    let d = &ws.0;
+    let text = "# Title\n\nWhen a task is made, send its\nowner a note. Then stop.\n\n- A list item.\n- Another.\n";
+    fs::write(d.join("source.md"), text).unwrap();
+    for (args, says) in [
+        (
+            &["ask", "--line", "3", "Who?"][..],
+            "the sentence goes on in line 4. Name the whole sentence, to its last line, such as --lines 3-4.",
+        ),
+        (
+            &["ask", "--line", "4", "Who?"],
+            "the sentence starts on line 3, which it goes on from. Name the whole sentence, from its first line, such as --lines 3-4.",
+        ),
+        (
+            &["unable", "--line", "3", "No."],
+            "the sentence goes on in line 4",
+        ),
+    ] {
+        let (ok, refused) = json_of(d, args);
+        assert!(!ok, "{args:?}");
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains(says), "{args:?}: {error}");
+    }
+    assert!(!d.join("out/outcome.json").exists());
+    // List items are sentences of their own.
+    let (ok, printed) = json_of(d, &["ask", "--lines", "3-4", "--line", "6", "Who?"]);
+    assert!(ok, "{printed:#}");
 }

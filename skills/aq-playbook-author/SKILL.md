@@ -15,7 +15,7 @@ without guessing, you ask the owner and stop. A guess that checks and saves
 is the worst result: it runs, and nobody sees that it was a guess.
 
 End with exactly one of `aq-playbooks save`, `aq-playbooks ask` or
-`aq-playbooks unable`. Then stop.
+`aq-playbooks unable`. Then stop: a second ending is refused.
 
 ## The workspace
 
@@ -23,17 +23,18 @@ End with exactly one of `aq-playbooks save`, `aq-playbooks ask` or
 | --- | --- | --- |
 | `source.md` | the owner | The document. Lines are numbered from 1. |
 | `record.json` | the host | What the playbook is for, and the commands, events and capabilities it may use. |
-| `facts.json` | the host | Fixed facts, such as the choices the installation offers. Read them with `aq-playbooks facts`. |
-| `catalog.json` | the host | The contracts of those commands and events. It is large: read it with `aq-playbooks commands describe` instead. |
+| `CATALOG.md` | the host | What each of those commands and events does: every input field, every outcome and what to do next, and whether the host sends each event on its own. Read it first. |
+| `facts.json` | the host | Fixed facts, such as the people or choices the installation offers. Read them with `aq-playbooks facts`. |
+| `catalog.json` | the host | The contracts as JSON. It is large: use `aq-playbooks commands describe` instead. |
 | `draft.json` | you | The playbook. |
 | `cases/*.json` | you | 5 to 40 cases. |
 | `out/outcome.json` | the tools | Written by `save`, `ask` or `unable`. Never write it yourself. |
-| `previous.artifact.json`, `previous/` | the host | The playbook running now and its document and cases, when there is one. Do not read the artifact; use `aq-playbooks compare`. |
-| `GUIDE.md`, `LANGUAGE.md`, `FORMAT.md` | the host | This guide; every operation, expression and diagnostic code; the stored format. |
+| `previous.artifact.json`, `previous/` | the host | When a playbook runs now: its artifact, and in `previous/` its document (`source.md`), draft and `cases/`. Read the previous document to see what the owner changed; use `aq-playbooks compare`, not the artifact. |
+| `GUIDE.md`, `LANGUAGE.md` | the host | This guide; every operation, expression, rule and diagnostic code. |
 | `examples/` | the host | Two complete worked workspaces. Read them before you write a draft. |
 
-Never edit `source.md`, `record.json`, `facts.json` or `catalog.json`. The
-host checks your outcome again against its own copies.
+Never edit `source.md`, `record.json`, `facts.json`, `catalog.json` or
+`CATALOG.md`. The host checks your outcome again against its own copies.
 
 Run every tool from the workspace root, the directory that holds
 `record.json`. Give only relative paths inside it, such as
@@ -56,13 +57,15 @@ aq-playbooks try ../cases/task-gone.json
 ```
 
 Every tool prints JSON. A refusal exits with status 1 and says what to fix.
-In this guide, the word after a fence's language names the worked example
-a snippet runs in; a `json output` block shows part of what the command
-before it prints, with `…` for text left out.
+How to read this guide's snippets: the word after a fence's language names
+the worked example a snippet runs in (`doc=` names the version of its
+document it runs on, `in=` the directory it is run from, `limit=` the bound
+a diagnostic is about). A `json output` block shows part of what the
+command before it prints, with `…` for text left out.
 
 ## The workflow
 
-1. Read `source.md` and `record.json`. Then read the facts:
+1. Read `source.md`, `record.json` and `CATALOG.md`. Then read the facts:
 
    ```sh notify-when-ready
    aq-playbooks facts
@@ -72,8 +75,7 @@ before it prints, with `…` for text left out.
    {"facts": {"coordinators": "group:coordinators"}, "facts_version": "settings-7", "use": "Read a fact in the draft as {\"op\": \"ref\", \"root\": \"definitions\", \"path\": [\"<name>\", …]}."}
    ```
 
-2. Find out what you may use. Describe each command and event you might
-   need: its input, its outcomes and what each outcome returns.
+2. The contracts, as JSON with the same notes as `CATALOG.md`:
 
    ```sh notify-when-ready
    aq-playbooks commands list
@@ -84,8 +86,10 @@ before it prints, with `…` for text left out.
 
 3. Go through the document sentence by sentence. Every sentence that
    changes what happens becomes a step, or a branch, or at least a case.
-   Decide now whether the document can be followed at all; see "When not to
-   write a playbook". Ask or give up before you write anything.
+   For each one, find what it needs in `CATALOG.md`: the event that starts
+   it, the data it tests, the command that does it. Decide now whether the
+   document can be followed at all; see "When not to write a playbook". Ask
+   or give up before you write anything.
 4. Read the worked example closest to the document (`examples/`). Then write
    `draft.json`. `LANGUAGE.md` lists every operation and expression. Write
    commands and events by their names; the tool fills in their identities.
@@ -100,11 +104,11 @@ before it prints, with `…` for text left out.
    {"ok": true, "stage": "validation", "diagnostics": []}
    ```
 
-   Faults come in two stages. While the tool cannot fill the draft in
-   (unknown names, identities, capabilities, `source_map` lines), it lists
-   only those (`"stage": "filling"`). Once the draft fills, it lists every
-   validation fault at once. Fix what it lists and run it again. Each fault
-   has a `code`; `LANGUAGE.md` has an entry for each code.
+   `stage` says how far the check got: `reading` (a workspace file cannot
+   be read), `filling` (unknown names, identities, capabilities, calls or
+   `source_map` lines; only those are listed while there are any), then
+   `validation` (every other fault, all at once). Fix what it lists and run
+   it again. Each fault has a `code`; `LANGUAGE.md` has an entry for each.
 6. Write the cases (see "The case format") and try each one:
 
    ```sh notify-when-ready
@@ -123,7 +127,7 @@ before it prints, with `…` for text left out.
    ```
 
    ```json output
-   {"change": "executable", "abilities_changed": false, "diff": {"changed_steps": ["remind", "wait"], "source_changed": true}}
+   {"change": "executable", "abilities_changed": false, "diff": {"capabilities_added": [], "changed_commands": [], "changed_events": [], "changed_steps": ["remind", "wait"], "source_changed": true}}
    ```
 
    `change` is `identical`, `presentation` (only the document, `purpose` or
@@ -146,33 +150,75 @@ before it prints, with `…` for text left out.
 
 ## When not to write a playbook
 
-Ask the owner when you cannot follow a sentence without guessing:
-- A time or a quantity is vague: "wait a while", "a few times", "soon".
-  Never pick a number yourself.
-- The document names a choice the facts do not offer, such as a level, an
-  agent or a person that is not in `facts.json`. Never round it to the
-  nearest one, never substitute another, never drop it.
+One rule decides between the two other endings. **Ask** when the owner could
+settle it by answering or by rewording the document. **Give up** (`unable`)
+when the document is clear but what it asks cannot be done with what the
+host offers at all. When both apply, ask first.
+
+Ask when:
+- A time, an amount or a wording is not given, or is vague: "wait a while",
+  "a few times", "send a reminder" with no text. Never pick a number or
+  write the words yourself: a message's words come from the document.
+- The document names something the facts do not offer, such as a level, an
+  agent or a person not in `facts.json`. Never round it to the nearest one,
+  never substitute another, never drop it.
+- The document tests or uses something no command returns, such as who owns
+  a task, how urgent it is, its status, or when it last changed. Check every
+  outcome in `CATALOG.md` (its notes list what is not there).
 - A sentence has two readings that would make the playbook act differently.
 - The document needs more than a draft may hold (see "Limits"). A draft
   cannot call another playbook, so ask the owner to split the document.
-- The document starts the playbook on something the host does not send as
-  an event (see "Notes on the host catalog"). A playbook whose trigger never
-  fires is not a playbook.
 
-Write the question in the owner's words. Never name commands, steps, files
-or fields. Name each sentence it is about by its line, or by its first and
-last line when it spans several (`--lines A-B`, at most 8 lines). One
-question may name 1 to 16 sentences, and may be at most 4096 bytes.
+Give up when:
+- The document starts on something the host never sends as an event. Before
+  you write a trigger, read the event's **Sent** line in `CATALOG.md`. A
+  playbook whose trigger never fires is not a playbook.
+- A sentence asks for something no command in `record.json` can do.
+- One of the host's own files is at fault (a diagnostic says so): name that
+  file, not a sentence.
 
-```sh notify-when-ready doc=stuck/how-long.md
-aq-playbooks ask --line 3 "How long should a new or changed task wait before the coordinators are asked for its description?"
+A sentence that only describes what the host does by itself (`CATALOG.md`
+says which) needs no step, and is no reason to give up.
+
+### Never stand one thing in for another
+
+This is the mistake no tool catches. The document says "If the task is
+marked urgent, give it one minute instead", and nothing in `CATALOG.md`
+says whether a task is urgent. A draft that tests the task's kind instead
+checks clean, its cases pass because you wrote them, and it saves:
+
+```json draft notify-when-ready
+{"steps": {"check": {"op": {"kind": "decide", "predicate": {"op": "eq", "left": {"op": "ref", "root": "task", "path": ["facts", "kind"]}, "right": {"op": "literal", "value": "urgent"}}}, "edges": {"true": "remind", "false": "described", "unknown": "failed"}, "on_error": null}}}
+```
+
+The task's kind is what whoever filed it typed, not whether it is urgent.
+Ask instead:
+
+```sh notify-when-ready doc=stuck/urgent.md
+aq-playbooks ask --line 6 "The document gives an urgent task one minute, but nothing this playbook can read says whether a task is urgent: it sees only a task's kind, title and description and who filed it. How should an urgent task be recognised, or should this sentence go?"
 ```
 
 ```json output
-{"outcome": {"kind": "question", "question": "How long should a new or changed task wait before the coordinators are asked for its description?", "sentences": [{"line": 3, "text": "When a playbook creates or changes a task, wait a while first."}]}, "next": "The run is finished: end your work now. The host checks the outcome again."}
+{"outcome": {"kind": "question", "sentences": [{"line": 6, "text": "If the task is marked urgent, give it one minute instead."}]}}
 ```
 
-A sentence over two lines:
+### How to ask
+
+Write the question in the owner's words. Never name commands, steps, files
+or fields. Name each sentence it is about by its line, or by its first and
+last line when it spans several (`--lines A-B`, at most 8 lines). Put every
+sentence that needs asking into one question, repeating `--line` and
+`--lines`: 1 to 16 sentences, and a question of at most 4096 bytes.
+
+```sh notify-when-ready doc=stuck/urgent.md
+aq-playbooks ask --line 3 --line 6 "Should an urgent task also be asked about when a playbook only changes it? And how should an urgent task be recognised?"
+```
+
+```json output
+{"outcome": {"kind": "question", "sentences": [{"line": 3}, {"line": 6}]}}
+```
+
+A sentence over two lines, named whole:
 
 ```sh escalate-on-judgment doc=stuck/deep-level.md
 aq-playbooks ask --lines 17-18 "The document gives high risk work Deep, high effort, but Settings offers no Deep level: it offers Simple, Standard and Complex, all at high effort. Which level should high risk work get?"
@@ -182,9 +228,19 @@ aq-playbooks ask --lines 17-18 "The document gives high risk work Deep, high eff
 {"outcome": {"kind": "question", "sentences": [{"line": 17, "end_line": 18, "text": "- High risk work is Deep, high effort, because mistakes there are costly,\n  and only Claude or Codex may take it."}]}}
 ```
 
-Give up with `unable` when a sentence asks for something no command in
-`record.json` can do. Do not leave the sentence out, and do not do something
-else instead. Name the one sentence and say why, plainly:
+A line that does not hold its whole sentence is refused:
+
+```sh notify-when-ready
+aq-playbooks ask --line 10 "Which coordinators?"
+```
+
+```json output
+{"error": "line 10: the sentence goes on in line 11. Name the whole sentence, to its last line, such as --lines 10-11."}
+```
+
+### How to give up
+
+Name the one sentence and say why, plainly, in at most 4096 bytes:
 
 ```sh notify-when-ready doc=stuck/phone-call.md
 aq-playbooks unable --line 14 "No command this playbook may use can make a phone call: it can read a task and send a message, and nothing else."
@@ -194,9 +250,39 @@ aq-playbooks unable --line 14 "No command this playbook may use can make a phone
 {"outcome": {"kind": "unable", "line": 14, "sentence": "If it still has no description after a day, phone the person on duty."}}
 ```
 
-A sentence that only describes what the host does by itself needs no step,
-and is no reason to give up. "Notes on the host catalog" lists the ones it
-knows.
+For a fault in one of the host's files, name the file instead:
+
+```sh notify-when-ready
+aq-playbooks unable --file catalog.json "record.json allows the command message.send, but catalog.json has no contract for it."
+```
+
+```json output
+{"outcome": {"kind": "unable", "file": "catalog.json"}}
+```
+
+The run then ends; a second ending is refused:
+
+```sh notify-when-ready doc=stuck/how-long.md
+aq-playbooks ask --line 3 "How long should a new or changed task wait before the coordinators are asked for its description?"
+aq-playbooks unable --line 3 "The document gives no time."
+```
+
+```json output
+{"error": "out/outcome.json already holds this run's ending (question); a run ends once. The run is finished: end your work now. The host checks the outcome again."}
+```
+
+## Sentences about many runs
+
+A run starts from one event and knows nothing of other runs. So a sentence
+such as "never send more than one reminder for the same version of a task"
+cannot be kept by any step's logic, and no case can show it, since a case is
+one run. It can be kept only by a command that the host itself makes do a
+thing once: `CATALOG.md` says which do, and by what. For example, the host
+sends one `message.send` per `identity`, so an identity that names the task
+version (`task.reference` from `work.read`) keeps that sentence. A step
+maps to one line in `source_map`: map that step to this sentence when it
+has no sentence of its own. If no command the record allows promises it,
+the document's promise cannot be kept: ask the owner.
 
 ## Rules for the draft
 
@@ -329,29 +415,37 @@ refused on `completed` too. A member with a path inside the handle, such as
 
 Every way the answer can fail needs a step that reads nothing of it: the
 join's `no_match`, `timeout` and `on_error`, and the invoke's own outcome
-edges besides `accepted`.
-
-### Build a value once, with `let`
-
-Bind a table, or its result, to a `let` name once and read the name. Read
-the one field you need, not a whole table or binding. Each reference counts
-the size of the type it reads, and a value built from the same name twice
-at every level doubles at every level. See "Limits".
+edges besides `accepted` (a command can refuse at once, without a handle).
+Give each of them a case (see "The case format").
 
 ### Set the playbook's own limits from the document
 
 `limits` (all ten fields, see `LANGUAGE.md`) is part of what the playbook
-means. Leave it out to take the defaults, or set it from what the document
-says, for example how long a run may take. Never raise a limit only to make
-a fault go away. Wrong: a run limited to five minutes that waits ten.
+means. `max_duration_ms` covers the whole run from its start, not each
+wait: a run still going when it passes stops where it is. Leave `limits` out
+for the defaults (a day), or set each limit from what the document says:
+a wait of a day needs a duration limit above a day. Never set a limit at
+its maximum for no reason. Wrong: a wait of a day under the default limit.
 
 ```json draft notify-when-ready
-{"limits": {"max_step_visits": 100, "max_children": 0, "max_depth": 1, "max_concurrent_effects": 1, "max_concurrent_children": 1, "max_payload_bytes": 65536, "max_history_bytes": 1048576, "max_duration_ms": 300000, "max_iterations": 1, "max_iteration_depth": 1}}
+{"steps": {"wait": {"op": {"kind": "wait", "event": null, "correlation": {}, "minimum_revision": null, "deadline_ms": 86400000, "bind": "waited"}, "edges": {"timeout": "read"}, "on_error": "failed"}}}
 ```
 
 ```json diagnostic
-{"code": "deadline", "path": "draft.json:steps.wait", "message": "wait deadline must be bounded by root duration…"}
+{"code": "deadline", "path": "draft.json:limits", "message": "limits.max_duration_ms: a run from entry `main` may wait 86400000 ms on one way, at `wait` (86400000 ms), which reaches the playbook's duration limit of 86400000 ms (the default). The limit covers the whole run from its start…"}
 ```
+
+Right: the same wait, with the duration limit set above it and the other
+limits at their defaults.
+
+```json draft notify-when-ready
+{"steps": {"wait": {"op": {"kind": "wait", "event": null, "correlation": {}, "minimum_revision": null, "deadline_ms": 86400000, "bind": "waited"}, "edges": {"timeout": "read"}, "on_error": "failed"}}, "limits": {"max_step_visits": 10000, "max_children": 100, "max_depth": 8, "max_concurrent_effects": 16, "max_concurrent_children": 16, "max_payload_bytes": 1048576, "max_history_bytes": 16777216, "max_duration_ms": 90000000, "max_iterations": 1000, "max_iteration_depth": 4}}
+```
+
+`check` adds up the waits on every way through the run, but not inside a
+`for_each` body, which may run many times. A run that stops on the limit
+there fails its case under `try` with "the run stopped at step … on the
+playbook's own duration limit".
 
 ### Map steps to sentences
 
@@ -413,14 +507,29 @@ The fields:
   the trigger builds the input.
 - `returns`: for each command, one return per call, in call order. A return
   is `{"outcome", "output"}`, where `output` fits that outcome (see
-  `commands describe`). For an asynchronous command give the answer itself;
-  the tool returns `accepted` with a handle first, by itself. `{"pending":
-  true}` is an asynchronous call that never answers: the clock moves on to
-  each deadline, so the playbook's timeout way runs.
+  `commands describe`). For an asynchronous command there are three forms:
+  - its answer, which the tool delivers later through the completion event,
+    after answering `accepted` with a handle by itself, so the run goes
+    through the join:
 
-  ```json returns
-  {"judgment.assess": [{"pending": true}], "work.route": [{"outcome": "stale", "output": {"reference": "route-1", "subject": {"id": "task-1", "revision": 4}}}]}
-  ```
+    ```json returns
+    {"judgment.assess": [{"outcome": "assessed", "output": {"reference": "judgment:op-1", "subject": {"id": "task-12", "revision": 4}, "labels": ["low"], "flags": [], "rationale": "Only documentation changes.", "provenance": {"context_digest": "context-1", "credential_profile": "profile/judge", "model": "model-a", "output_digest": null, "prompt_digest": "prompt-1", "provider": "provider-a", "usage": {"cost_microunits": 900, "input_tokens": 400, "output_tokens": 60}}}}]}
+    ```
+
+  - an answer at once, `"at_once": true`, with one of its own outcomes
+    other than `accepted`: the invoke's own edge for that outcome is taken,
+    as when the host refuses a request at admission:
+
+    ```json returns
+    {"judgment.assess": [{"outcome": "refused", "output": {"reference": "judgment:op-1", "subject": {"id": "task-12", "revision": 4}, "reason": "budget_exceeded"}, "at_once": true}]}
+    ```
+
+  - no answer, `{"pending": true}`: the clock moves on to each deadline, so
+    the playbook's timeout way runs.
+
+    ```json returns
+    {"judgment.assess": [{"pending": true}]}
+    ```
 
   At most 64 returns per command. A return the run never uses fails the
   case.
@@ -458,9 +567,7 @@ How many cases, and which:
 - Cases that only differ in data the playbook does not look at add nothing.
 
 What a case cannot show:
-- An asynchronous command always answers `accepted` first in a case. The
-  invoke's own other outcome edges are never taken; a case shows the
-  answer arriving through the join.
+- What happens over many runs (see "Sentences about many runs").
 - A completion event is delivered only to the operation that waits for it.
   It does not start a run through a trigger that names it, so a playbook
   that starts on its own completion event shows one run in a case.
@@ -491,95 +598,29 @@ owner to split the document: a draft cannot call another playbook.
 {"code": "draft_limit", "path": "draft.json:steps", "message": "steps: the draft has 257 steps; a draft may have at most 256. Shorten it: one step per decision, with `lookup` and `let` for tables instead of chains of steps. A draft cannot call other playbooks, so if the document needs more than that, ask the owner to split the document."}
 ```
 
+Build a value once. Bind a table, or its result, to a `let` name once and
+read the name. Read the one field you need, not a whole table or binding.
+A value built from the same name twice at every level doubles at every
+level, and is refused:
+
 ```json diagnostic limit=expression
 {"code": "expression_limit", "message": "…an expression may expand to at most 200000. Most of it is `b15` (counted at the size of the type it reads)…Build each value from a name once, not twice at every level, and read the one field you need rather than a whole binding or table."}
 ```
 
 `LANGUAGE.md` gives the message for each of the others.
 
-## Notes on the host catalog
-
-`record.json` names the commands and events this playbook may use. These
-notes cover the commands of host catalog 2.2.0 that need more than their
-contract says.
-
-### Which events start a run
-
-Before you write a trigger, make sure the host sends that event on its own.
-Today the host sends:
-
-| Event | Sent |
-| --- | --- |
-| `aq.work.route_needed` | By the host, for a ready task in a project on the automatic router that has no route. |
-| `aq.work.changed` | Only as the effect of a playbook's own `work.ensure` or `work.change`, with outcome `ensured` or `changed`. Not when a person creates, edits, finishes or cancels a task. |
-| completion events (`aq.operation.updated`, `aq.check.receipted`, `aq.decision.completed`, `aq.judgment.completed`, `aq.judgment.assessed`) | Only as the answer to an operation a playbook started. Join the handle; never trigger on them. |
-| `aq.artifact.recorded`, `aq.check.completed`, `aq.integration.changed`, `aq.signal.reported` | Not stated. Do not trigger on them without asking. |
-
-If the document needs an event the host does not send, ask the owner, or
-give up with `unable`.
-
-### `work.read`
-
-It answers only for a task in a project on the automatic router; for any
-other task it answers `refused` with `not_on_router`. `observed` returns the
-task's current `subject` (pass it on, not the trigger's), its `facts`, and a
-`reference` of the form `<id>@<revision>`, one value per task version. The
-facts hold no status: a playbook cannot tell whether a task was finished.
-
-### `judgment.assess`
-
-Asks a model several labelled questions at once. Put the document's own
-words and definitions in `question`, one entry in `fields` per question with
-its `choices` (include a choice such as `unknown` when the document says
-what to do if it cannot be told), and yes/no `flags`. Join the handle
-accepting only `assessed`. On `completed`, `answer.c.output.labels.0`
-answers `fields[0]`, `labels.1` answers `fields[1]`, and so on: the host
-guarantees exactly one label per field there, each one of its choices.
-Never read labels on a way where the judgment failed, was refused or timed
-out; the check refuses those reads. Test a flag with `contains` on
-`answer.c.output.flags`. When a "yes" to a flag would make the work cost
-more, anchor it in the flag's description and the question, for example:
-"Most tasks do not need this. Answer yes only if you can name what is
-unusually hard."
-
-### `work.route` and `work.unroutable`
-
-These write who may take a task. `escalate-on-judgment` is a complete
-routing-style example: read, judge, look the route up, write it, and a
-fallback route on every way the judgment fails.
-- `work.route` takes `subject` from `work.read`. Write the harness and
-  provider lists the document implies; the host intersects them with what
-  the level offers and drops the rest, so do not filter them yourself.
-  Route only to a level in `definitions.levels`.
-- `routed`: end. `stale`: end; the host sends the event again for the new
-  version. `refused`, for any reason: end. On `not_offered` the host
-  raises the task itself; never try a route the document does not give.
-- `hold: true` only for a sentence that tells work to wait for a particular
-  agent. Otherwise `false`.
-- `work.unroutable` only where the document itself allows nobody to take a
-  task. Never decide from `definitions.offers` that nothing can take it:
-  write the route and let the host refuse it.
-- Give `reasons` for every choice, with the document's sentence as
-  `detail`. A playbook cannot build text, so select fixed reasons with
-  `lookup` or `filter`.
-- If the owner chose the route (`facts.route` is `owner`), end without
-  writing one.
-
-These sentences need no step; the host does them: holding a task until
-something can take it, raising a task nothing could ever take, when a
-route is needed, never choosing by priority or load, which model a harness
-runs, which failures count (`charged_failures`), and recording the decision
-on the task.
-
 ## The worked examples
 
-`examples/` holds two complete workspaces. Read their `source.md`,
-`draft.json` and `cases/` before you write yours, and imitate them.
+`examples/` holds two complete workspaces, each with its `CATALOG.md`. Read
+their `source.md`, `draft.json` and `cases/` before you write yours, and
+imitate them.
 - `notify-when-ready`: a timer, a read, a branch and a message, with no
-  judgment. Its `stuck/` documents show a vague time (`ask`) and a request no
-  command can serve (`unable`).
+  judgment. Its `stuck/` documents show a vague time (`ask`), a test of
+  something no command returns (`ask`), and a request no command can serve
+  (`unable`).
 - `escalate-on-judgment`: a judgment, a join, a `lookup` table bound once
-  with `let`, a fallback on every failure, and 17 cases. Its `stuck/`
-  document shows a choice the facts do not offer (`ask --lines`).
+  with `let`, a fallback on every way the judgment fails (an answer at
+  once included), and 18 cases. Its `stuck/` document shows a choice the
+  facts do not offer (`ask --lines`).
 
 Each `stuck/*.json` holds `why`, the command to `run`, and what it `writes`.

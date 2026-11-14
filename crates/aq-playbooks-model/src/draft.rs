@@ -1955,10 +1955,11 @@ impl<'a> Check<'a> {
                 "playbook",
                 format!(
                     "the draft reads values that can have many different shapes too often to \
-                     check: more than {MAX_SHAPE_WORK} shapes to follow in all. This comes from \
-                     literal rows with differing fields, or a lookup with many differently \
-                     shaped results, read many times through a name or an item. Give the rows \
-                     the same fields, or read the value in fewer places."
+                     check: more than {MAX_SHAPE_WORK} shapes to follow in all. A literal \
+                     table counts one shape for each row, whatever its fields, and a lookup one \
+                     for each result; each read through a name or an item follows all of them. \
+                     Read the table in fewer places (bind what you need from it once with \
+                     `let`), or use a smaller table."
                 ),
             );
         }

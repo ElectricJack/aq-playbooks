@@ -672,7 +672,10 @@ fn allowed_name(
     faults.push(Diagnostic::error(
         &format!("unknown_{kind}"),
         &at(DRAFT_FILE, path),
-        format!("{path}: {name:?} is not a {kind} this source may use. {choice}"),
+        format!(
+            "{path}: {name:?} is not {} {kind} this source may use. {choice}",
+            if kind.starts_with('e') { "an" } else { "a" }
+        ),
     ));
 }
 
@@ -741,6 +744,36 @@ pub fn fill(ws: &Workspace) -> Result<CompileInput, Vec<Diagnostic>> {
         .iter()
         .filter(|n| ws.catalog.events.contains_key(*n))
         .collect();
+    // A name the record allows that the catalog lacks: the host's own files
+    // disagree, which no draft can fix.
+    for (kind, missing) in [
+        (
+            "command",
+            record
+                .commands
+                .iter()
+                .filter(|n| !ws.catalog.commands.contains_key(*n))
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "event",
+            record
+                .events
+                .iter()
+                .filter(|n| !ws.catalog.events.contains_key(*n))
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        for name in missing {
+            faults.push(Diagnostic::error(
+                "catalog",
+                CATALOG_FILE,
+                format!(
+                    "{RECORD_FILE} allows the {kind} {name}, but {CATALOG_FILE} has no contract for it: the host's files disagree, and no draft can fix that. Give up with `aq-playbooks unable --file {CATALOG_FILE} \"<this fault>\"`."
+                ),
+            ));
+        }
+    }
     let mut commands = BTreeSet::new();
     let mut events = BTreeSet::new();
     for (name, step) in &draft.steps {
@@ -1088,7 +1121,7 @@ fn placed(ws: &Workspace, diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
 /// once it fills.
 pub fn check(ws: &Workspace) -> Vec<Diagnostic> {
     match fill(ws) {
-        Ok(input) => placed(ws, validate(&input)),
+        Ok(input) => placed(ws, validated(&input)),
         Err(faults) => faults,
     }
 }
@@ -1096,7 +1129,108 @@ pub fn check(ws: &Workspace) -> Vec<Diagnostic> {
 /// The sealed artifact, or every diagnostic that prevents it.
 pub fn seal(ws: &Workspace) -> Result<Artifact, Vec<Diagnostic>> {
     let input = fill(ws)?;
+    let faults = validated(&input);
+    if !faults.is_empty() {
+        return Err(placed(ws, faults));
+    }
     compile(&input).map_err(|d| placed(ws, d))
+}
+
+/// Validation, plus what only a new draft is held to here: no way through
+/// the run may wait as long as the run itself may last.
+fn validated(input: &CompileInput) -> Vec<Diagnostic> {
+    let mut faults = validate(input);
+    if !faults.iter().any(|d| d.code == "deadline") {
+        faults.extend(duration_faults(&input.proposal.playbook));
+    }
+    faults
+}
+
+/// The longest wait on one way from each entry, adding the `deadline_ms` of
+/// every wait and join on it (a `for_each` body is left out: it may run any
+/// number of times). The run's own `limits.max_duration_ms` bounds the whole
+/// run from its start, so a way whose waits reach it stops the run there.
+fn duration_faults(playbook: &Playbook) -> Vec<Diagnostic> {
+    fn longest(
+        playbook: &Playbook,
+        name: &str,
+        memo: &mut BTreeMap<String, (u64, Vec<String>)>,
+        stack: &mut BTreeSet<String>,
+    ) -> (u64, Vec<String>) {
+        if let Some(found) = memo.get(name) {
+            return found.clone();
+        }
+        let Some(step) = playbook.steps.get(name) else {
+            return (0, vec![]);
+        };
+        if !stack.insert(name.to_string()) {
+            return (0, vec![]);
+        }
+        let own = match &step.op {
+            Operation::Wait { deadline_ms, .. } | Operation::Join { deadline_ms, .. } => {
+                *deadline_ms
+            }
+            _ => 0,
+        };
+        let mut next: Vec<&String> = step.edges.values().chain(step.on_error.iter()).collect();
+        if let Operation::ForEach { next: after, .. } = &step.op {
+            next.push(after);
+        }
+        let mut best = (0, vec![]);
+        for target in next {
+            let found = longest(playbook, target, memo, stack);
+            if found.0 > best.0 {
+                best = found;
+            }
+        }
+        stack.remove(name);
+        let mut way = if own > 0 {
+            vec![name.to_string()]
+        } else {
+            vec![]
+        };
+        way.extend(best.1);
+        let found = (own.saturating_add(best.0), way);
+        memo.insert(name.to_string(), found.clone());
+        found
+    }
+    let limit = playbook.limits.max_duration_ms;
+    let mut faults = vec![];
+    for (entry, point) in &playbook.entries {
+        let (total, way) = longest(
+            playbook,
+            &point.start,
+            &mut BTreeMap::new(),
+            &mut BTreeSet::new(),
+        );
+        if total >= limit && !way.is_empty() {
+            let steps: Vec<String> = way
+                .iter()
+                .map(|s| {
+                    let ms = match &playbook.steps[s].op {
+                        Operation::Wait { deadline_ms, .. }
+                        | Operation::Join { deadline_ms, .. } => *deadline_ms,
+                        _ => 0,
+                    };
+                    format!("`{s}` ({ms} ms)")
+                })
+                .collect();
+            let default = if playbook.limits == Limits::default() {
+                " (the default)"
+            } else {
+                ""
+            };
+            faults.push(Diagnostic::error(
+                "deadline",
+                "playbook.limits",
+                format!(
+                    "limits.max_duration_ms: a run from entry `{entry}` may wait {total} ms on one way, at {}, which reaches the playbook's duration limit of {limit} ms{default}. The limit covers the whole run from its start, so a run that takes that way stops there. Set `max_duration_ms` from the document, above {total} ms, or shorten the waits if the document asks for less.",
+                    steps.join(", ")
+                ),
+            ));
+        }
+    }
+    faults
 }
 
 /// The draft an artifact was filled from: names in place of identities, no
