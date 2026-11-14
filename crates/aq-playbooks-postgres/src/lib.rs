@@ -53,6 +53,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (4, include_str!("../migrations/0004_catalog_inspection.sql")),
     (5, include_str!("../migrations/0005_transition_records.sql")),
     (6, include_str!("../migrations/0006_run_history.sql")),
+    (7, include_str!("../migrations/0007_run_history_trim.sql")),
 ];
 #[cfg(all(test, feature = "postgres-tests"))]
 const WRITE_MARKER_SQL: &str = "SELECT set_config('aq_playbooks.writer_namespace',$1,true),set_config('aq_playbooks.writer_format','2',true)";
@@ -734,7 +735,12 @@ impl PostgresStorage {
             namespace,
             &aq_playbooks_runner::history::new_live_keys(&previous, state),
         )?;
-        history::insert(&mut tx, namespace, &items)?;
+        history::insert(
+            &mut tx,
+            namespace,
+            &items,
+            state.retention.policy.history_keep,
+        )?;
         for (digest, artifact) in &state.artifacts {
             tx.phase("artifact_compare");
             // Previous bytes were freshly read, authenticated and fully verified

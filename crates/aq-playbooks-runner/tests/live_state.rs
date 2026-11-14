@@ -5887,3 +5887,166 @@ fn dropped_and_forgotten_entries_leave_the_order() {
     assert_eq!(order_members(&s), ["k:new"]);
     assert_eq!(s.retention.replay_order.len(), 1);
 }
+
+// --- Task 8b R2: history is a rolling log of history_keep runs -----------
+
+fn history_keep_engine<S: Storage>(store: S, keep: u64) -> Engine<S> {
+    let e = Engine::new(store, "test", "incarnation-1").unwrap();
+    install_on(&e, done_artifact(), "a");
+    e.set_retention_policy(RetentionPolicy {
+        history_keep: keep,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    e
+}
+fn history_items<S: Storage>(e: &Engine<S>, kind: InspectionKind) -> Vec<Value> {
+    e.inspect(&InspectionQuery {
+        kind,
+        run: None,
+        after: None,
+        limit: 1000,
+    })
+    .unwrap()
+    .items
+}
+/// With `history_keep` 5, after 20 finished runs inspection lists the
+/// newest 5, and history holds exactly those runs' items (and the receipts
+/// of no run: admin).
+fn history_keeps_the_newest_runs<S: Storage>(store: S) {
+    let e = history_keep_engine(store, 5);
+    let runs: Vec<String> = (0..20)
+        .map(|t| {
+            let id = e.admit("a", "main", Value::Null, authority(), t).unwrap();
+            assert!(e.advance(&id, t).unwrap());
+            id
+        })
+        .collect();
+    assert!(e.snapshot().unwrap().runs.is_empty());
+    let listed: Vec<String> = history_items(&e, InspectionKind::Runs)
+        .iter()
+        .map(|r| r["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(listed, runs[15..]);
+    for item in history_items(&e, InspectionKind::Receipts) {
+        let run = item["run"].as_str().unwrap();
+        assert!(
+            run == "admin" || runs[15..].iter().any(|r| r == run),
+            "{item}"
+        );
+    }
+    assert!(history_items(&e, InspectionKind::Receipts).len() >= 10);
+}
+#[test]
+fn memory_storage_history_keeps_the_newest_runs() {
+    history_keeps_the_newest_runs(MemoryStorage::default());
+}
+#[test]
+fn record_storage_history_keeps_the_newest_runs() {
+    history_keeps_the_newest_runs(RecordStorage::new());
+}
+/// One commit settling 100 cohorts (more than the trim's spare 64): the
+/// trim keeps up, and history holds the newest `history_keep`.
+fn trim_keeps_up_with_one_commit(store: &impl Storage) {
+    store.acquire("ns", "w").unwrap();
+    let mut state = State::default();
+    state.retention.policy.history_keep = 5;
+    state.settled = (0..100)
+        .map(|i| synthetic_cohort(&format!("c{i:03}"), i, &[i as u64 + 1]))
+        .collect();
+    store.compare_and_swap("ns", "w", 0, &state).unwrap();
+    let ids: Vec<Value> = page(store, InspectionKind::Runs, None, 1000)
+        .items
+        .iter()
+        .map(|v| v["id"].clone())
+        .collect();
+    assert_eq!(ids, ["c095", "c096", "c097", "c098", "c099"]);
+    assert_eq!(
+        page(store, InspectionKind::Receipts, None, 1000)
+            .items
+            .len(),
+        5
+    );
+}
+#[test]
+fn memory_storage_trim_keeps_up_with_one_commit() {
+    trim_keeps_up_with_one_commit(&MemoryStorage::default());
+}
+#[test]
+fn record_storage_trim_keeps_up_with_one_commit() {
+    trim_keeps_up_with_one_commit(&RecordStorage::new());
+}
+/// `history_keep` 0: no history is written; finished runs are not found.
+#[test]
+fn history_keep_zero_writes_no_history() {
+    let e = history_keep_engine(MemoryStorage::default(), 0);
+    let id = e.admit("a", "main", Value::Null, authority(), 0).unwrap();
+    assert!(e.advance(&id, 0).unwrap());
+    assert!(e.snapshot().unwrap().runs.is_empty());
+    assert!(history_items(&e, InspectionKind::Runs).is_empty());
+    assert!(history_items(&e, InspectionKind::Receipts).is_empty());
+    assert_eq!(RetentionPolicy::default().history_keep, 10_000);
+}
+/// `delete_history` (by time) still works beside the trim, and the trim
+/// counts what it leaves: 10 runs keep the newest 5; deleting those
+/// finished before 7 leaves 3; 4 more keep the newest 5 again.
+fn delete_history_and_the_trim<S: Storage>(store: S) {
+    let e = history_keep_engine(store, 5);
+    let admit = |t: i64| {
+        let id = e.admit("a", "main", Value::Null, authority(), t).unwrap();
+        assert!(e.advance(&id, t).unwrap());
+        id
+    };
+    let runs: Vec<String> = (0..10).map(admit).collect();
+    let listed = |e: &Engine<S>| -> Vec<String> {
+        history_items(e, InspectionKind::Runs)
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(listed(&e), runs[5..]);
+    assert!(e.delete_history_before(7).unwrap() > 0);
+    assert_eq!(listed(&e), runs[7..]);
+    let more: Vec<String> = (10..14).map(admit).collect();
+    let mut expected = runs[9..].to_vec();
+    expected.extend(more);
+    assert_eq!(listed(&e), expected);
+}
+#[test]
+fn memory_storage_delete_history_and_the_trim() {
+    delete_history_and_the_trim(MemoryStorage::default());
+}
+#[test]
+fn record_storage_delete_history_and_the_trim() {
+    delete_history_and_the_trim(RecordStorage::new());
+}
+/// A page that straddles a trim neither repeats nor panics: its cursor's
+/// run is trimmed between pages; the next page starts after the cursor.
+#[test]
+fn a_page_across_a_trim_neither_repeats_nor_panics() {
+    let e = history_keep_engine(MemoryStorage::default(), 3);
+    let admit = |t: i64| {
+        let id = e.admit("a", "main", Value::Null, authority(), t).unwrap();
+        assert!(e.advance(&id, t).unwrap());
+        id
+    };
+    let first: Vec<String> = (0..3).map(admit).collect();
+    let query = |after: Option<String>| InspectionQuery {
+        kind: InspectionKind::Runs,
+        run: None,
+        after,
+        limit: 2,
+    };
+    let page_one = e.inspect(&query(None)).unwrap();
+    assert_eq!(page_one.items.len(), 2);
+    let cursor = page_one.next.clone().unwrap();
+    let later: Vec<String> = (3..5).map(admit).collect();
+    let page_two = e.inspect(&query(Some(cursor.clone()))).unwrap();
+    let ids: Vec<String> = page_two
+        .items
+        .iter()
+        .map(|r| r["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, [first[2].clone(), later[0].clone()]);
+    assert!(ids.iter().all(|id| *id > cursor));
+}

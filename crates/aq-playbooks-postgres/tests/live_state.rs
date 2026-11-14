@@ -2776,3 +2776,115 @@ fn evictions_on_postgres_are_incremental_on_f3_and_fenced_on_f2() {
         assert!(!s.keyed_admissions.contains_key("k0"), "{format}");
     }
 }
+
+// --- Task 8b R2: history is a rolling log on PostgreSQL --------------------
+
+fn history_count(ns: &str) -> Option<i64> {
+    support::client()
+        .query_opt(
+            "SELECT runs FROM aq_playbooks.run_history_counts WHERE namespace=$1",
+            &[&ns],
+        )
+        .unwrap()
+        .map(|row| row.get(0))
+}
+fn history_run_ids(ns: &str) -> Vec<String> {
+    support::client()
+        .query(
+            "SELECT item_key FROM aq_playbooks.run_history WHERE namespace=$1 AND kind='runs' ORDER BY finished_at_ms,item_key",
+            &[&ns],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+/// On f2 protected and f3: `history_keep` 5 keeps the newest 5 of 20
+/// finished runs, holds only those runs' items (and admin receipts), and
+/// counts them; deleting history by time keeps the count, so the trim after
+/// it keeps the newest 5 again; `history_keep` 0 writes no row.
+#[test]
+fn history_is_a_rolling_log_on_postgres() {
+    for (format, store) in both() {
+        let ns = support::namespace("rolling");
+        let e = Engine::new(store, &ns, "w").unwrap();
+        let a = support::artifact("a");
+        e.install(a.clone()).unwrap();
+        e.activate_at("a", &a.digest, pg_authority(), 0).unwrap();
+        e.set_retention_policy(RetentionPolicy {
+            history_keep: 5,
+            ..RetentionPolicy::default()
+        })
+        .unwrap();
+        let admit = |t: i64| {
+            let id = e
+                .admit("a", "main", Value::Null, pg_authority(), t)
+                .unwrap();
+            assert!(e.advance(&id, t).unwrap(), "{format}");
+            id
+        };
+        let runs: Vec<String> = (0..20).map(admit).collect();
+        assert_eq!(history_run_ids(&ns), runs[15..], "{format}");
+        assert_eq!(history_count(&ns), Some(5), "{format}");
+        let foreign: i64 = support::client()
+            .query_one(
+                "SELECT count(*) FROM aq_playbooks.run_history WHERE namespace=$1 AND run_id<>ALL($2) AND run_id<>'admin'",
+                &[&ns, &runs[15..].to_vec()],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(foreign, 0, "{format}");
+        let listed: Vec<Value> = e
+            .inspect(&runs_query())
+            .unwrap()
+            .items
+            .iter()
+            .map(|r| r["id"].clone())
+            .collect();
+        assert_eq!(listed.len(), 5, "{format}");
+        // Delete by time, then the trim counts what is left.
+        assert!(e.delete_history_before(17).unwrap() > 0, "{format}");
+        assert_eq!(history_run_ids(&ns), runs[17..], "{format}");
+        assert_eq!(history_count(&ns), Some(3), "{format}");
+        let more: Vec<String> = (20..24).map(admit).collect();
+        let mut expected = runs[19..].to_vec();
+        expected.extend(more);
+        assert_eq!(history_run_ids(&ns), expected, "{format}");
+        assert_eq!(history_count(&ns), Some(5), "{format}");
+        // `history_keep` 0: nothing is written; what is there is trimmed.
+        e.set_retention_policy(RetentionPolicy {
+            history_keep: 0,
+            ..RetentionPolicy::default()
+        })
+        .unwrap();
+        admit(30);
+        assert!(history_run_ids(&ns).is_empty(), "{format}");
+        assert_eq!(history_count(&ns), Some(0), "{format}");
+    }
+}
+/// One commit settling 100 cohorts, on f2 protected, f2 plain and f3: the
+/// trim keeps up, history holds the newest 5.
+#[test]
+fn the_trim_keeps_up_with_one_commit_on_postgres() {
+    for (label, store) in [
+        ("f2", support::protected()),
+        ("f2_plain", support::store()),
+        ("f3", support::records()),
+    ] {
+        let ns = support::namespace(label);
+        store.acquire(&ns, "w").unwrap();
+        let mut state = State::default();
+        state.retention.policy.history_keep = 5;
+        state.settled = (0..100)
+            .map(|i| synthetic_cohort(&format!("c{i:03}"), i, &[i as u64 + 1]))
+            .collect();
+        store.compare_and_swap(&ns, "w", 0, &state).unwrap();
+        assert_eq!(
+            history_run_ids(&ns),
+            ["c095", "c096", "c097", "c098", "c099"],
+            "{label}"
+        );
+        assert_eq!(history_rows(&ns), 10, "{label}");
+        assert_eq!(history_count(&ns), Some(5), "{label}");
+    }
+}

@@ -39,9 +39,18 @@ pub struct RetentionPolicy {
     /// oldest are evicted, whatever their window ([`evict`]). Positive.
     #[serde(default = "default_replay_keep")]
     pub replay_keep: usize,
+    /// How many finished runs history keeps: each commit that writes
+    /// history deletes the oldest beyond it (a bounded number per commit,
+    /// see [`crate::history::HISTORY_TRIM_RUNS_PER_COMMIT`]). `0` writes no
+    /// history at all (inspection then finds no finished run).
+    #[serde(default = "default_history_keep")]
+    pub history_keep: u64,
 }
 fn default_replay_keep() -> usize {
     256
+}
+fn default_history_keep() -> u64 {
+    10_000
 }
 fn default_admission_replay_ms() -> u64 {
     604_800_000
@@ -61,6 +70,7 @@ impl Default for RetentionPolicy {
             max_tombstones: default_max_tombstones(),
             admission_replay_ms: default_admission_replay_ms(),
             replay_keep: default_replay_keep(),
+            history_keep: default_history_keep(),
         }
     }
 }

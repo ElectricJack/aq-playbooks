@@ -181,3 +181,64 @@ fn a_commit_failing_after_the_history_insert_leaves_no_rows() {
         assert_eq!(history_rows(&ns), 2, "records={records}");
     }
 }
+
+/// The trim (Task 8b R2) is index-backed: the oldest runs come from
+/// `run_history_runs_by_finish` in order (no sort, no other scan), their
+/// items are deleted through `run_history_by_run`, their run rows through
+/// the primary key. Over 90,000 history rows.
+#[test]
+fn history_trim_reads_and_deletes_through_indexes() {
+    let (ns, store) = (
+        namespace("trim_plans"),
+        PostgresStorage::connect(&database()).unwrap(),
+    );
+    store.acquire(&ns, "w").unwrap();
+    store
+        .compare_and_swap(&ns, "w", 0, &State::default())
+        .unwrap();
+    let mut c = client();
+    let mut tx = c.transaction().unwrap();
+    tx.query_one(WRITE_MARKER_SQL, &[&ns]).unwrap();
+    tx.execute("INSERT INTO aq_playbooks.run_history(namespace,kind,item_key,run_id,root_id,sequence,finished_at_ms,public_value) SELECT $1,k,CASE k WHEN 'runs' THEN 'r'||lpad(i::text,6,'0') ELSE lpad(i::text,20,'0') END,'r'||lpad(i::text,6,'0'),'r'||lpad(i::text,6,'0'),i,i,jsonb_build_object('sequence',i) FROM generate_series(1,30000) i, unnest(ARRAY['runs','effects','receipts']) k",&[&ns]).unwrap();
+    tx.commit().unwrap();
+    c.batch_execute("ANALYZE aq_playbooks.run_history").unwrap();
+    let mut plan = |sql: &str, params: &[&(dyn postgres::types::ToSql + Sync)]| -> Value {
+        let explain = format!("EXPLAIN (FORMAT JSON) {sql}");
+        let plan: Value = c.query_one(explain.as_str(), params).unwrap().get(0);
+        plan[0]["Plan"].clone()
+    };
+    let mut problems = vec![];
+    for limit in [1_i64, 64, 1_000] {
+        let oldest = plan(history::OLDEST_RUNS_SQL, &[&ns, &limit]);
+        if !uses_index(&oldest, "run_history_runs_by_finish") {
+            problems.push(format!(
+                "oldest runs, limit {limit}: index not used: {oldest}"
+            ));
+        }
+        check_plan(&oldest, false, &mut problems);
+    }
+    let victims: Vec<String> = (1..=64).map(|i| format!("r{i:06}")).collect();
+    let items = plan(history::TRIM_ITEMS_SQL, &[&ns, &victims]);
+    if !uses_index(&items, "run_history_by_run") {
+        problems.push(format!("trim items: run index not used: {items}"));
+    }
+    let runs = plan(history::TRIM_RUNS_SQL, &[&ns, &victims]);
+    if !uses_index(&runs, "run_history_pkey") {
+        problems.push(format!("trim runs: primary key not used: {runs}"));
+    }
+    for (name, p) in [("items", &items), ("runs", &runs)] {
+        let mut found = vec![];
+        no_sequential_scan(p, &mut found);
+        problems.extend(found.into_iter().map(|f| format!("trim {name}: {f}")));
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+/// No node of `plan` is a sequential scan of `run_history`.
+fn no_sequential_scan(plan: &Value, problems: &mut Vec<String>) {
+    if plan["Relation Name"] == "run_history" && plan["Node Type"] == "Seq Scan" {
+        problems.push("Seq Scan on run_history".into());
+    }
+    for child in plan["Plans"].as_array().into_iter().flatten() {
+        no_sequential_scan(child, problems);
+    }
+}

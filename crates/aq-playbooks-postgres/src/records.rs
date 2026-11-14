@@ -576,6 +576,7 @@ impl PostgresStorage {
             &mut tx,
             namespace,
             &aq_playbooks_runner::history_items(&state.settled),
+            state.retention.policy.history_keep,
         )?;
         let published = tx.execute("UPDATE aq_playbooks.namespaces SET state_header=$2,state_accounting=$3,revision=$4,catalog_projected_revision=$4,updated_at=clock_timestamp() WHERE namespace=$1 AND revision=$5",&[&namespace,&stripped,&accounting_json(&staged.accounting),&next,&expected]).map_err(backend)?;
         if published != 1 {

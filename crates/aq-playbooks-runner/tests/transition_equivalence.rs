@@ -675,9 +675,12 @@ fn scenario(p: &mut Pair) {
     // both paths, compared at every step.
     let unheld = p.m.snapshot().unwrap().retention.replay_order.len();
     assert!(unheld > 3, "{unheld}");
+    // History is a rolling log too (R2): the history both paths keep
+    // (compared at every step) is trimmed to 6 finished runs.
     both!(p, |e| e.set_retention_policy(RetentionPolicy {
         admission_replay_ms: 1_000,
         replay_keep: 3,
+        history_keep: 6,
         ..RetentionPolicy::default()
     }));
     while p.m.snapshot().unwrap().retention.replay_order.len() > 3 {
@@ -698,6 +701,16 @@ fn scenario(p: &mut Pair) {
     let s = p.m.snapshot().unwrap();
     assert_eq!(s.retention.replay_order.len(), 3);
     assert!(!s.keyed_admissions.contains_key("rolling-0"), "evicted");
+    let runs =
+        p.m.inspect(&InspectionQuery {
+            kind: InspectionKind::Runs,
+            run: None,
+            after: None,
+            limit: 1000,
+        })
+        .unwrap()
+        .items;
+    assert!(runs.len() <= 6 + s.runs.len(), "{}", runs.len());
 }
 
 #[test]

@@ -1,14 +1,16 @@
 //! Run history (spec 0003 §2). A settled cohort leaves the State in the commit
 //! that settles it and is handed to storage in that same commit, which writes
 //! its public inspection items once as history. History holds public
-//! projections only; it is inserted once, never updated, and deleted by the
-//! host by finish time.
+//! projections only; it is inserted once and never updated. It is a rolling
+//! log: each commit that writes history deletes the oldest finished runs
+//! beyond `policy.history_keep` ([`HISTORY_TRIM_RUNS_PER_COMMIT`] more than
+//! it writes, at most), and the host may delete history by finish time.
 use crate::inspection::{self, InspectionKind, InspectionQuery, InspectionRow};
 use crate::lazy::{ContainerChange, TreeKey};
 use crate::transition::StatePatch;
 use crate::{Intent, Receipt, Run, State, StorageError};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One public inspection item of a finished run. `key` and `sequence` are
 /// exactly those of [`inspection::rows`].
@@ -158,9 +160,87 @@ pub(crate) fn check_unrecorded(rows: &HistoryRows, keys: &[ItemKey]) -> Result<(
     Ok(())
 }
 
+/// A commit that writes history trims at most this many finished runs more
+/// than it writes (so the trim keeps up with any commit, and a lowered
+/// `history_keep` is reached within a bounded number of commits).
+pub const HISTORY_TRIM_RUNS_PER_COMMIT: usize = 64;
+/// The number of finished runs the trim of a commit that writes `written`
+/// runs to a history of `runs` may remove under `keep`.
+pub fn trim_budget(runs: u64, written: usize, keep: u64) -> usize {
+    let excess = usize::try_from(runs.saturating_sub(keep)).unwrap_or(usize::MAX);
+    excess.min(written.saturating_add(HISTORY_TRIM_RUNS_PER_COMMIT))
+}
+/// The runs among `items`.
+pub fn runs_written(items: &[HistoryItem]) -> usize {
+    items
+        .iter()
+        .filter(|item| item.kind == InspectionKind::Runs)
+        .count()
+}
+
 /// History rows of one namespace in the in-memory backends, by
-/// `(kind.key(), key)`.
-pub(crate) type HistoryRows = BTreeMap<(String, String), HistoryItem>;
+/// `(kind.key(), key)`, with the finished runs in finish order and each
+/// run's rows (what the PostgreSQL indexes give).
+#[derive(Debug, Default)]
+pub(crate) struct HistoryRows {
+    pub(crate) rows: BTreeMap<(String, String), HistoryItem>,
+    /// Each run's `runs` row, oldest first: `(finished_at_ms, run)`.
+    runs: BTreeSet<(i64, String)>,
+    /// The rows of each run (`HistoryItem::run`).
+    by_run: BTreeMap<String, BTreeSet<(String, String)>>,
+}
+impl HistoryRows {
+    fn contains_key(&self, key: &(String, String)) -> bool {
+        self.rows.contains_key(key)
+    }
+    fn add(&mut self, item: HistoryItem) {
+        let key = row_key(&item);
+        if item.kind == InspectionKind::Runs {
+            self.runs.insert((item.finished_at_ms, item.key.clone()));
+        }
+        self.by_run
+            .entry(item.run.clone())
+            .or_default()
+            .insert(key.clone());
+        self.rows.insert(key, item);
+    }
+    fn remove(&mut self, key: &(String, String)) -> Option<HistoryItem> {
+        let item = self.rows.remove(key)?;
+        if item.kind == InspectionKind::Runs {
+            self.runs.remove(&(item.finished_at_ms, item.key.clone()));
+        }
+        if let Some(keys) = self.by_run.get_mut(&item.run) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.by_run.remove(&item.run);
+            }
+        }
+        Some(item)
+    }
+    /// Delete the oldest finished runs beyond `keep`, at most
+    /// [`trim_budget`] for a commit that wrote `written` runs: each run's
+    /// other rows, then its `runs` row. O(rows deleted).
+    fn trim(&mut self, keep: u64, written: usize) {
+        for _ in 0..trim_budget(self.runs.len() as u64, written, keep) {
+            let Some((_, run)) = self.runs.first().cloned() else {
+                break;
+            };
+            let run_row = (InspectionKind::Runs.key().to_string(), run.clone());
+            let keys: Vec<(String, String)> = self
+                .by_run
+                .get(&run)
+                .into_iter()
+                .flatten()
+                .filter(|key| **key != run_row)
+                .cloned()
+                .collect();
+            for key in keys {
+                self.remove(&key);
+            }
+            self.remove(&run_row);
+        }
+    }
+}
 fn row_key(item: &HistoryItem) -> (String, String) {
     (item.kind.key().to_string(), item.key.clone())
 }
@@ -176,10 +256,20 @@ pub(crate) fn check_new(rows: &HistoryRows, items: &[HistoryItem]) -> Result<(),
     }
     Ok(())
 }
-pub(crate) fn insert(rows: &mut HistoryRows, items: Vec<HistoryItem>) {
-    for item in items {
-        rows.insert(row_key(&item), item);
+/// Write the history of a commit under `keep` (`policy.history_keep`): its
+/// items (none when `keep` is 0), then the trim of the oldest runs beyond
+/// `keep`, when the commit has history to write.
+pub(crate) fn insert(rows: &mut HistoryRows, items: Vec<HistoryItem>, keep: u64) {
+    if items.is_empty() {
+        return;
     }
+    let written = runs_written(&items);
+    if keep > 0 {
+        for item in items {
+            rows.add(item);
+        }
+    }
+    rows.trim(keep, written);
 }
 /// At most `limit + 1` items matching `query`, in key order.
 pub(crate) fn page(
@@ -194,6 +284,7 @@ pub(crate) fn page(
         None => Included((kind.clone(), String::new())),
     };
     Ok(rows
+        .rows
         .range((start, Unbounded))
         .take_while(|((k, _), _)| *k == kind)
         .map(|(_, item)| item)
@@ -204,7 +295,14 @@ pub(crate) fn page(
 }
 /// Delete the items of runs finished before `before_ms`; returns how many.
 pub(crate) fn delete_before(rows: &mut HistoryRows, before_ms: i64) -> u64 {
-    let before = rows.len();
-    rows.retain(|_, item| item.finished_at_ms >= before_ms);
-    (before - rows.len()) as u64
+    let old: Vec<(String, String)> = rows
+        .rows
+        .iter()
+        .filter(|(_, item)| item.finished_at_ms < before_ms)
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in &old {
+        rows.remove(key);
+    }
+    old.len() as u64
 }
