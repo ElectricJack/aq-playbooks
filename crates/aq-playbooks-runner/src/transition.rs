@@ -664,44 +664,6 @@ fn verify_patch_removals(data: &RecordData, patch: &StatePatch, next: &State) ->
         previous =
             serde_json::from_value(value).map_err(|e| backend(format!("removed records: {e}")))?;
     }
-    // Legacy run disposals: the stored records plus those this patch writes.
-    let disposed: std::cell::OnceCell<Result<BTreeSet<String>>> = std::cell::OnceCell::new();
-    let disposals = || -> Result<BTreeSet<String>> {
-        let mut records: Vec<&[u8]> = data
-            .container("retention.disposals")
-            .into_iter()
-            .flatten()
-            .map(|(_, v)| v.as_slice())
-            .collect();
-        for (path, change) in &patch.changes {
-            if path.field != "retention.disposals" {
-                continue;
-            }
-            match change {
-                ContainerChange::Entries(rows) => {
-                    records.extend(rows.iter().filter_map(|(_, v)| v.as_deref()));
-                }
-                ContainerChange::Replace(rows) => {
-                    records = rows.iter().map(|(_, v)| v.as_slice()).collect();
-                }
-            }
-        }
-        let mut runs = BTreeSet::new();
-        for bytes in records {
-            let disposal: crate::retention::Disposal =
-                serde_json::from_slice(bytes).map_err(backend)?;
-            if disposal.kind == "run" {
-                runs.insert(disposal.key);
-            }
-        }
-        Ok(runs)
-    };
-    let disposed_run = |id: &str| {
-        disposed
-            .get_or_init(disposals)
-            .as_ref()
-            .is_ok_and(|runs| runs.contains(id))
-    };
     // Evictions: the order keys the patch adds, and the stored correlation
     // keys of the events it removes.
     let stored_order = data.container("retention.replay_order");
@@ -756,17 +718,9 @@ fn verify_patch_removals(data: &RecordData, patch: &StatePatch, next: &State) ->
         },
     )?;
     // `previous` holds only removed receipts.
-    let checked = crate::retention::check_removals(
-        &previous,
-        next,
-        &disposed_run,
-        &|_| false,
-        &|window, key| evicted.contains(&(window, key.to_string())),
-    );
-    if let Some(Err(e)) = disposed.get() {
-        return Err(backend(e));
-    }
-    checked?;
+    crate::retention::check_removals(&previous, next, &|_| false, &|window, key| {
+        evicted.contains(&(window, key.to_string()))
+    })?;
     Ok(())
 }
 fn assemble(data: &RecordData) -> Result<State> {

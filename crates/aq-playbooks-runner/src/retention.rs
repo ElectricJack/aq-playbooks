@@ -1,11 +1,12 @@
-//! Explicit replay horizons, disposal records and epoch fences. No unresolved
+//! Replay windows, rolling bounds, history and epoch fences. No unresolved
 //! obligation is ever evicted.
 //!
 //! The retention clock (`RetentionState::clock_ms`) is the latest host time a
 //! commit carried. A removal from the State is allowed only when the commit
-//! writes its history (a settled cohort), when it is a window entry whose
-//! expiry the clock has reached, or (until the legacy drain) when it carries
-//! a legacy disposal record. [`verify_removals`] is that one check, shared by
+//! writes its history (a settled cohort), or when it is a window entry whose
+//! expiry the clock has reached or that the rolling bound evicts. Nothing
+//! writes event tombstones, correlation fences or disposal records any more;
+//! those an older engine left are drained ([`drain_step`]). [`verify_removals`] is that one check, shared by
 //! every storage backend. It covers runs, operations, audit receipts, events
 //! and keyed admission receipts, and the expiry records the window rule
 //! reads (which may only move later). Waits, budgets and recovery requests
@@ -674,14 +675,6 @@ pub(crate) fn advance_clock(s: &mut State, now_ms: i64) {
         .map_or(now_ms, |clock| clock.max(now_ms));
     s.retention.clock_ms = Some(clock);
 }
-/// Removals that carry a legacy disposal record (written by `gc` before the
-/// retention clock). Backends record their durable tombstones as before.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Removals {
-    pub legacy_runs: Vec<String>,
-    pub legacy_intents: Vec<String>,
-    pub legacy_events: Vec<String>,
-}
 fn refuse(text: &str) -> StorageError {
     StorageError::Backend(text.into())
 }
@@ -696,13 +689,11 @@ fn intent_settled(status: &IntentStatus) -> bool {
 /// `next` must be allowed:
 ///
 /// - a run: its history is in `next.settled`, it is terminal, its children
-///   are terminal and its operations settled; or (legacy) a run disposal;
+///   are terminal and its operations settled;
 /// - an operation: its own history and its run's are in `next.settled` and it
-///   is settled; or (legacy) its run has a disposal;
-/// - an audit receipt: its history is in `next.settled`; or (legacy) its run
-///   has a disposal;
-/// - an event: its expiry has been reached (with a legacy tombstone, the
-///   tombstone's digest must match), or it is evicted as
+///   is settled;
+/// - an audit receipt: its history is in `next.settled`;
+/// - an event: its expiry has been reached, or it is evicted as
 ///   [`check_evictions`] licenses;
 /// - a keyed admission receipt: its expiry has been reached, or it is
 ///   evicted as [`check_evictions`] licenses (a changed receipt is always
@@ -712,26 +703,12 @@ fn intent_settled(status: &IntentStatus) -> bool {
 /// records follow [`check_expiry_change`], except in a commit that carries
 /// an admin licence ([`licence`]), which must be exactly that licence and do
 /// nothing else (see [`check_licence`]): a clock rebase lowers the clock and
-/// caps expiries to [`rebase_cap`]; a floor lowering lowers the floor. Event tombstones and correlation fences may
-/// always be removed. Artifact removals are checked by
+/// caps expiries to [`rebase_cap`]; a floor lowering lowers the floor.
+/// Legacy event tombstones, correlation fences and disposal records (which
+/// no engine writes any more; the drain removes them) may always be removed
+/// and license nothing. Artifact removals are checked by
 /// [`verify_artifact_removals`].
-pub fn verify_removals(
-    previous: &State,
-    next: &State,
-) -> std::result::Result<Removals, StorageError> {
-    let disposed: std::cell::OnceCell<BTreeSet<String>> = std::cell::OnceCell::new();
-    let disposed_run = |id: &str| {
-        disposed
-            .get_or_init(|| {
-                next.retention
-                    .disposals
-                    .iter()
-                    .filter(|d| d.kind == "run")
-                    .map(|d| d.key.clone())
-                    .collect()
-            })
-            .contains(id)
-    };
+pub fn verify_removals(previous: &State, next: &State) -> std::result::Result<(), StorageError> {
     if licence(next)?.is_some() {
         let added = next.runs.keys().any(|k| !previous.runs.contains_key(k))
             || next
@@ -764,28 +741,24 @@ pub fn verify_removals(
             waiters: &|key| Ok(previous.indexes.waiters.get(key).cloned()),
         },
     )?;
-    let removals = check_removals(
+    check_removals(
         previous,
         next,
-        &disposed_run,
         &|sequence| kept.contains(&sequence),
         &|window, key| evicted.contains(&(window, key.to_string())),
     )?;
-    check_expiry_records(previous, next)?;
-    Ok(removals)
+    check_expiry_records(previous, next)
 }
-/// [`verify_removals`] without the expiry records, with the legacy run
-/// disposals of `next` given by `disposed_run` and the receipts `next` keeps
-/// by `receipt_kept`. `previous` need only hold the removed records, the
+/// [`verify_removals`] without the expiry records, with the receipts `next`
+/// keeps given by `receipt_kept`. `previous` need only hold the removed records, the
 /// operations of removed runs and the children of removed runs (and its
 /// header fields), so a record backend can check a patch.
 pub(crate) fn check_removals(
     previous: &State,
     next: &State,
-    disposed_run: &dyn Fn(&str) -> bool,
     receipt_kept: &dyn Fn(u64) -> bool,
     evicted: &dyn Fn(Window, &str) -> bool,
-) -> std::result::Result<Removals, StorageError> {
+) -> std::result::Result<(), StorageError> {
     verify_artifact_removals(previous, next)?;
     let clock = next.retention.clock_ms;
     let licensed = licence(next)?;
@@ -809,24 +782,16 @@ pub(crate) fn check_removals(
             None => return Err(refuse(REFUSE_EARLY_REMOVAL)),
         }
     }
-    let mut removals = Removals::default();
     for (key, event) in &previous.events {
         if let Some(kept) = next.events.get(key) {
             check_event_change(event, kept)?;
             continue;
         }
         removal()?;
-        // A legacy tombstone records the removal; it never licenses one.
         if !event_expiry(previous, key).is_some_and(|at| expired(at, clock))
             && !evicted(Window::Event, key)
         {
             return Err(refuse(REFUSE_EARLY_REMOVAL));
-        }
-        if let Some(tombstone) = next.retention.event_tombstones.get(key) {
-            if tombstone.digest != event.digest {
-                return Err(refuse("event disposal digest conflict"));
-            }
-            removals.legacy_events.push(key.clone());
         }
     }
     let removed_receipts: Vec<&crate::Receipt> = previous
@@ -843,7 +808,7 @@ pub(crate) fn check_removals(
             .map(|r| r.sequence)
             .collect();
         for receipt in removed_receipts {
-            if !settled.contains(&receipt.sequence) && !disposed_run(&receipt.run) {
+            if !settled.contains(&receipt.sequence) {
                 return Err(refuse(REFUSE_RUN_REMOVAL));
             }
         }
@@ -859,7 +824,7 @@ pub(crate) fn check_removals(
         .filter(|(id, _)| !next.intents.contains_key(*id))
         .collect();
     if removed_runs.is_empty() && removed_intents.is_empty() {
-        return Ok(removals);
+        return Ok(());
     }
     removal()?;
     // A cohort's runs belong to its root.
@@ -891,8 +856,11 @@ pub(crate) fn check_removals(
                 .push(intent);
         }
     }
-    for (id, run) in removed_runs {
-        let unresolved = if let Some(settled) = settled_runs.get(id.as_str()) {
+    for (id, _) in removed_runs {
+        let Some(settled) = settled_runs.get(id.as_str()) else {
+            return Err(refuse(REFUSE_RUN_REMOVAL));
+        };
+        let unresolved = {
             // Each run and operation as this commit leaves it.
             let terminal = |child: &String| {
                 settled_runs
@@ -920,44 +888,23 @@ pub(crate) fn check_removals(
                     .into_iter()
                     .flatten()
                     .all(settled_intent)
-        } else if disposed_run(id) {
-            removals.legacy_runs.push(id.clone());
-            !run.status.terminal()
-                || run.children.iter().any(|child| {
-                    previous
-                        .runs
-                        .get(child)
-                        .is_some_and(|r| !r.status.terminal())
-                })
-                || intents_of
-                    .get(id.as_str())
-                    .into_iter()
-                    .flatten()
-                    .any(|i| !intent_settled(&i.status))
-        } else {
-            return Err(refuse(REFUSE_RUN_REMOVAL));
         };
         if unresolved {
             return Err(refuse(REFUSE_RUN_OBLIGATIONS));
         }
     }
     for (id, intent) in removed_intents {
-        let status = if let Some(settled) = settled_intents
+        let Some(settled) = settled_intents
             .get(id.as_str())
             .filter(|_| settled_runs.contains_key(intent.run.as_str()))
-        {
-            &settled.status
-        } else if disposed_run(&intent.run) {
-            removals.legacy_intents.push(id.clone());
-            &intent.status
-        } else {
+        else {
             return Err(refuse(REFUSE_RUN_REMOVAL));
         };
-        if !intent_settled(status) {
+        if !intent_settled(&settled.status) {
             return Err(refuse(REFUSE_EFFECT));
         }
     }
-    Ok(removals)
+    Ok(())
 }
 /// At most this many settled cohorts leave the State in one commit.
 pub const COHORTS_PER_COMMIT: usize = 50;
@@ -973,6 +920,10 @@ pub struct CommitReport {
     /// Window entries evicted by count ([`evict`]).
     pub evicted: usize,
     pub drained: usize,
+    /// More bounded work is due than this commit's bounds allowed: settled
+    /// cohorts past the settle bound, the drain of an older engine's
+    /// namespace not done, expired window entries past the drop bound, or
+    /// entries past `replay_keep` past the eviction bound.
     pub more: bool,
 }
 /// The roots this commit touched: the roots of its dirty runs and operations.
@@ -1580,7 +1531,7 @@ pub(crate) fn drop_expired(s: &mut State, limit: usize, report: &mut CommitRepor
     window_step();
     let mut head = s.retention.expiry.next_key_by_one::<String>(None);
     for _ in 0..limit {
-        let Some(key) = head else {
+        let Some(key) = head.clone() else {
             break;
         };
         let Some((at, member)) = window_entry(&key) else {
@@ -1605,6 +1556,14 @@ pub(crate) fn drop_expired(s: &mut State, limit: usize, report: &mut CommitRepor
         } else if let Some(key) = member.strip_prefix(WINDOW_EVENT) {
             drop_event(s, key, clock, report)?;
         }
+    }
+    // Stopped at the bound with an expired entry still at the head.
+    if head
+        .as_deref()
+        .and_then(window_entry)
+        .is_some_and(|(at, _)| at <= clock)
+    {
+        report.more = true;
     }
     Ok(())
 }
@@ -1817,6 +1776,9 @@ pub(crate) fn evict(s: &mut State, limit: usize, report: &mut CommitReport) -> R
             report.evicted += 1;
         }
     }
+    if s.retention.replay_order.len() > keep {
+        report.more = true;
+    }
     Ok(())
 }
 /// The window entries `next` holds in its eviction order that `previous`
@@ -1986,6 +1948,9 @@ pub(crate) fn finish_commit(
     }
     settle(s, candidates, COHORTS_PER_COMMIT, &mut report)?;
     drain_step(s, started, &mut report)?;
+    if !s.retention.drain.done {
+        report.more = true;
+    }
     rejoin(s)?;
     if now_ms.is_some() {
         let drops = s.retention.policy.window_drops_per_commit;
@@ -2288,14 +2253,37 @@ fn index_legacy_event(s: &mut State, key: &str) -> Result<()> {
     }
     Ok(())
 }
+/// What one `collect_garbage` call did. The call is one ordinary commit
+/// (the same bounded settle, drain, window drop and eviction every commit
+/// does), plus a bounded page of the artifact phase; nothing requires
+/// calling it.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GcReport {
+    /// Finished runs this commit moved to history (cohorts that settled,
+    /// or that the drain of an older engine's namespace moved). A run never
+    /// leaves without its history.
     pub runs: usize,
+    /// Events forgotten by the window drop (their window passed).
     pub events: usize,
+    /// Artifacts disposed of by the artifact phase.
     pub artifacts: usize,
+    /// Receipts moved to history.
     pub receipts: usize,
+    /// Artifacts the artifact phase kept because something still references
+    /// them. (It counted kept runs and events too before spec 0003; those
+    /// are no longer examined, so only artifacts count.)
     pub preserved: usize,
+    /// More bounded work is due than this call's bounds allowed: settled
+    /// cohorts, expired window entries, entries past `replay_keep`, the
+    /// drain of an older engine's namespace, or the artifact phase. Call
+    /// again (or let later commits do it).
     pub more: bool,
+    /// Keyed admission receipts forgotten by the window drop.
+    #[serde(default)]
+    pub admissions: usize,
+    /// Window entries evicted past `policy.replay_keep`.
+    #[serde(default)]
+    pub evicted: usize,
 }
 pub fn artifact_referenced(s: &State, id: &str) -> bool {
     let mut pending = s
@@ -2363,6 +2351,13 @@ pub fn verify_artifact_removals(
     }
     Ok(())
 }
+/// The artifact phase of `collect_garbage`, run in its commit before the
+/// commit's ordinary bounded work ([`finish_commit`]): dispose of up to
+/// `limit` unreferenced artifacts (from the stored cursor on), drop catalog
+/// history no live run, event or audit window needs, prune artifact
+/// disposals past `audit_ms`, and move the GC clock to `now` (never back).
+/// It removes no run, operation, receipt or event, and writes no tombstone,
+/// correlation fence or disposal record.
 pub(crate) fn gc(s: &mut State, now: i64, limit: usize) -> Result<GcReport> {
     let most = s.retention.policy.gc_page_limit;
     if limit == 0 || limit > most {
@@ -2375,250 +2370,48 @@ pub(crate) fn gc(s: &mut State, now: i64, limit: usize) -> Result<GcReport> {
         return Err(Error::Refused("GC clock cannot move backwards".into()));
     }
     s.retention.last_gc_at_ms = Some(now);
-    let p = s.retention.policy.clone();
-    let cutoff = |duration: u64| now.saturating_sub(i64::try_from(duration).unwrap_or(i64::MAX));
+    let audit_ms = s.retention.policy.audit_ms;
+    let cutoff = now.saturating_sub(i64::try_from(audit_ms).unwrap_or(i64::MAX));
     let mut report = GcReport::default();
-    let (mut phase, mut cursor, mut inclusive): (u8, String, bool) = s
+    // The cursor of an older engine's GC (its run and event phases come
+    // before the artifact phase, 2) starts the artifact phase afresh.
+    let mut cursor = s
         .retention
         .gc_cursor
         .as_deref()
-        .and_then(|v| serde_json::from_str(v).ok())
-        .unwrap_or((0, String::new(), false));
+        .and_then(|v| serde_json::from_str::<(u8, String, bool)>(v).ok())
+        .filter(|(phase, ..)| *phase == GC_ARTIFACTS)
+        .map(|(_, cursor, _)| cursor)
+        .unwrap_or_default();
     let mut examined = 0;
+    let mut finished = false;
     while examined < limit {
-        match phase {
-            // While a drain is in progress the settled cohorts an older
-            // engine left go to history through it, not out without
-            // history here.
-            0 if !s.retention.drain.done => {
-                phase = 1;
-                cursor.clear();
-                inclusive = false;
-            }
-            0 => {
-                let key = if inclusive && s.indexes.root_members.contains_key(&cursor) {
-                    Some(cursor.clone())
-                } else if inclusive && cursor.is_empty() {
-                    s.indexes.root_members.next_key::<String>(None)
-                } else {
-                    s.indexes.root_members.next_key(Some(&cursor))
-                };
-                let Some(root) = key else {
-                    phase = 1;
-                    cursor.clear();
-                    inclusive = false;
-                    continue;
-                };
-                examined += 1;
-                cursor = root.clone();
-                inclusive = false;
-                let active = s
-                    .indexes
-                    .root_active
-                    .get(&root)
-                    .is_some_and(|ids| !ids.is_empty());
-                let unsettled = s
-                    .indexes
-                    .root_effects
-                    .get(&root)
-                    .is_some_and(|ids| !ids.is_empty());
-                let recent = s
-                    .indexes
-                    .root_last_activity
-                    .get(&root)
-                    .copied()
-                    .unwrap_or(i64::MAX)
-                    > cutoff(p.audit_ms);
-                if active || unsettled || recent {
-                    report.preserved += 1;
-                    continue;
-                }
-                let Some(id) = s.indexes.root_members[&root]
-                    .iter()
-                    .find(|id| *id != &root)
-                    .cloned()
-                    .or_else(|| s.indexes.root_members[&root].first().cloned())
-                else {
-                    continue;
-                };
-                let intents = s
-                    .intents
-                    .values()
-                    .filter(|i| i.run == id)
-                    .map(|i| i.id.clone())
-                    .collect::<Vec<_>>();
-                for intent in intents {
-                    s.intents.remove(&intent);
-                    s.recovery_requests
-                        .retain(|_, request| request.intent != intent);
-                    crate::indexes::mark_intent(s, &intent);
-                }
-                s.runs.remove(&id);
-                s.waits.retain(|_, w| w.run != id);
-                crate::indexes::mark_run(s, &id);
-                let before = s.receipts.len();
-                s.receipts.retain(|receipt| receipt.run != id);
-                report.receipts += before - s.receipts.len();
-                report.runs += 1;
-                s.retention.disposals.push(Disposal {
-                    kind: "run".into(),
-                    key: id.clone(),
-                    at_ms: now,
-                });
-                s.indexes.root_members.get_mut(&root).unwrap().remove(&id);
-                if s.indexes.root_members[&root].is_empty() {
-                    s.indexes.root_members.remove(&root);
-                    s.indexes.root_active.remove(&root);
-                    s.indexes.root_effects.remove(&root);
-                    s.indexes.root_last_activity.remove(&root);
-                    s.budgets.remove(&root);
-                } else {
-                    inclusive = true;
-                }
-            }
-            1 => {
-                let key = s
-                    .events
-                    .range((
-                        std::ops::Bound::Excluded(cursor.clone()),
-                        std::ops::Bound::Unbounded,
-                    ))
-                    .next()
-                    .map(|(key, _)| key.clone());
-                let Some(id) = key else {
-                    phase = 2;
-                    cursor.clear();
-                    inclusive = false;
-                    continue;
-                };
-                examined += 1;
-                cursor = id.clone();
-                let e = &s.events[&id];
-                let expiry = s
-                    .retention
-                    .event_expires_at_ms
-                    .get(&id)
-                    .copied()
-                    .unwrap_or_else(|| {
-                        e.accepted_at_ms
-                            .saturating_add(i64::try_from(p.event_replay_ms).unwrap_or(i64::MAX))
-                    });
-                let protected = s.indexes.event_memberships.get(&id).is_some_and(|keys| {
-                    keys.iter().any(|key| {
-                        s.indexes.waiters.get(key).is_some_and(|waiters| {
-                            waiters.iter().any(|target| {
-                                if let Some(intent) = target.strip_prefix("intent:") {
-                                    s.intents.get(intent).is_some_and(|i| {
-                                        !matches!(
-                                            i.status,
-                                            IntentStatus::Completed
-                                                | IntentStatus::Rejected
-                                                | IntentStatus::Cancelled
-                                        )
-                                    })
-                                } else {
-                                    s.runs.get(target).is_some_and(|r| !r.status.terminal())
-                                }
-                            })
-                        })
-                    })
-                });
-                let unknown_handle = s
-                    .indexes
-                    .uncertain_completion_contracts
-                    .get(&crate::indexes::trigger_key(
-                        &e.envelope.contract,
-                        &e.envelope.scope,
-                    )?)
-                    .is_some_and(|intents| !intents.is_empty());
-                if expiry > now
-                    || e.destinations.iter().any(|d| d.run.is_none())
-                    || protected
-                    || unknown_handle
-                {
-                    report.preserved += 1;
-                    continue;
-                }
-                let epoch = s.retention.event_epochs.get(&id).copied().unwrap_or(0);
-                let current = s
-                    .retention
-                    .producer_epochs
-                    .get(&e.envelope.producer)
-                    .copied()
-                    .unwrap_or(0);
-                let e = s.events.remove(&id).unwrap();
-                s.retention.replay_order.remove(&event_order_key(&e));
-                crate::indexes::unindex_contract_event(s, &e)?;
-                s.retention.event_epochs.remove(&id);
-                s.retention.event_expires_at_ms.remove(&id);
-                if epoch == current {
-                    s.retention.event_tombstones.insert(
-                        id.clone(),
-                        EventTombstone {
-                            producer: e.envelope.producer.clone(),
-                            epoch,
-                            digest: e.digest,
-                            disposed_at_ms: now,
-                        },
-                    );
-                }
-                if let Some(keys) = s.indexes.event_memberships.remove(&id) {
-                    for key in keys {
-                        if epoch == current {
-                            s.retention
-                                .expired_correlations
-                                .insert(key.clone(), (e.envelope.producer.clone(), epoch));
-                        }
-                        if let Some(events) = s.indexes.events.get_mut(&key) {
-                            events.retain(|_, value| value != &id);
-                            if events.is_empty() {
-                                s.indexes.events.remove(&key);
-                            }
-                        }
-                    }
-                }
-                s.retention.disposals.push(Disposal {
-                    kind: "event".into(),
-                    key: id,
-                    at_ms: now,
-                });
-                report.events += 1;
-            }
-            2 => {
-                let key = s
-                    .artifacts
-                    .range((
-                        std::ops::Bound::Excluded(cursor.clone()),
-                        std::ops::Bound::Unbounded,
-                    ))
-                    .next()
-                    .map(|(key, _)| key.clone());
-                let Some(id) = key else {
-                    phase = 3;
-                    break;
-                };
-                examined += 1;
-                cursor = id.clone();
-                if artifact_referenced(s, &id) {
-                    report.preserved += 1;
-                    continue;
-                }
-                s.artifacts.remove(&id);
-                s.retention.artifact_disposals.insert(id.clone(), now);
-                s.retention.disposals.push(Disposal {
-                    kind: "artifact".into(),
-                    key: id,
-                    at_ms: now,
-                });
-                report.artifacts += 1;
-            }
-            _ => break,
+        let key = s
+            .artifacts
+            .range((
+                std::ops::Bound::Excluded(cursor.clone()),
+                std::ops::Bound::Unbounded,
+            ))
+            .next()
+            .map(|(key, _)| key.clone());
+        let Some(id) = key else {
+            finished = true;
+            break;
+        };
+        examined += 1;
+        cursor = id.clone();
+        if artifact_referenced(s, &id) {
+            report.preserved += 1;
+            continue;
         }
+        s.artifacts.remove(&id);
+        s.retention.artifact_disposals.insert(id, now);
+        report.artifacts += 1;
     }
-    report.more = phase < 3;
+    report.more = !finished;
     s.retention.gc_cursor = if report.more {
         Some(
-            serde_json::to_string(&(phase, cursor, inclusive))
+            serde_json::to_string(&(GC_ARTIFACTS, cursor, false))
                 .map_err(|e| Error::Refused(e.to_string()))?,
         )
     } else {
@@ -2632,7 +2425,7 @@ pub(crate) fn gc(s: &mut State, now: i64, limit: usize) -> Result<GcReport> {
         .collect::<BTreeSet<_>>();
     revisions.insert(s.catalog_revision);
     for (revision, at_ms) in &s.catalog_history_at_ms {
-        if *at_ms >= cutoff(p.audit_ms) {
+        if *at_ms >= cutoff {
             revisions.insert(*revision);
         }
     }
@@ -2640,24 +2433,12 @@ pub(crate) fn gc(s: &mut State, now: i64, limit: usize) -> Result<GcReport> {
         .retain(|revision, _| revisions.contains(revision));
     s.catalog_history_at_ms
         .retain(|revision, _| revisions.contains(revision));
-    s.retention
-        .disposals
-        .retain(|d| d.at_ms >= cutoff(p.audit_ms));
-    s.retention
-        .artifact_disposals
-        .retain(|_, at| *at >= cutoff(p.audit_ms));
-    s.indexes.receipts.clear();
-    s.indexes.all_receipts.clear();
-    for (i, r) in s.receipts.iter().enumerate() {
-        s.indexes
-            .receipts
-            .entry(r.run.clone())
-            .or_default()
-            .insert(r.sequence, i);
-        s.indexes.all_receipts.insert(r.sequence, i);
-    }
+    s.retention.artifact_disposals.retain(|_, at| *at >= cutoff);
     Ok(report)
 }
+/// The artifact phase's number in the stored GC cursor (an older engine's
+/// phases 0 and 1 were its run and event removals).
+const GC_ARTIFACTS: u8 = 2;
 #[cfg(test)]
 mod window_tests {
     use super::*;

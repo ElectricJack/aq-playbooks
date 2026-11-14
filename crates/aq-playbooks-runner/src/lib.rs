@@ -1857,13 +1857,6 @@ fn next_id(s: &mut State, prefix: &str) -> String {
 }
 fn receipt(s: &mut State, run: &str, step: &str, now: i64, kind: &str, detail: Value) {
     s.sequence += 1;
-    if let Some(r) = s.runs.get(run) {
-        s.indexes
-            .root_last_activity
-            .entry(r.root.clone())
-            .and_modify(|at| *at = (*at).max(now))
-            .or_insert(now);
-    }
     let offset = s.receipts.len();
     s.indexes
         .receipts
@@ -3870,8 +3863,26 @@ impl<S: Storage> Engine<S> {
             Ok((from_ms, to_ms))
         })
     }
+    /// Not needed: every commit already does this work, a bounded amount
+    /// each (see `docs/implementation/0003-live-state-only.md`). Kept so
+    /// existing callers compile. One ordinary commit at host time `now_ms`
+    /// (the bounded settle, drain of an older engine's namespace, window
+    /// drop and eviction of every commit), plus a page of at most `limit`
+    /// artifacts examined for disposal (`1..=policy.gc_page_limit`); refused
+    /// if `now_ms` is before the previous call's. It removes no run without
+    /// its history and writes no tombstone, correlation fence or disposal
+    /// record. `more` says more bounded work is due.
     pub fn collect_garbage(&self, now_ms: i64, limit: usize) -> Result<GcReport> {
-        self.transaction_at(Some(now_ms), |s| retention::gc(s, now_ms, limit))
+        let (mut gc, commit) = self.transaction_report_at(Finish::Host(Some(now_ms)), |s| {
+            retention::gc(s, now_ms, limit).map(|gc| (gc, true))
+        })?;
+        gc.runs = commit.runs;
+        gc.events = commit.events;
+        gc.admissions = commit.admissions;
+        gc.receipts = commit.receipts;
+        gc.evicted = commit.evicted;
+        gc.more = gc.more || commit.more;
+        Ok(gc)
     }
     pub fn advance_producer_epoch(
         &self,

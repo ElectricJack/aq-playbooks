@@ -708,7 +708,7 @@ impl PostgresStorage {
             previous
         };
         tx.phase("artifact_locks");
-        let removals = aq_playbooks_runner::retention::verify_removals(&previous, state)?;
+        aq_playbooks_runner::retention::verify_removals(&previous, state)?;
         let addresses: std::collections::BTreeSet<_> = previous
             .artifacts
             .keys()
@@ -735,14 +735,7 @@ impl PostgresStorage {
         }
         tx.phase("retention");
         let drain_limit = self.tombstone_drain_limit(namespace, state);
-        let rows = retention::verify_and_record(
-            &mut tx,
-            namespace,
-            &previous,
-            state,
-            &removals,
-            drain_limit,
-        )?;
+        let rows = retention::verify_and_record(&mut tx, namespace, &previous, state, drain_limit)?;
         let items = aq_playbooks_runner::history_items(&state.settled);
         aq_playbooks_runner::history::check_not_live(state, &items)?;
         history::check_unrecorded(
@@ -882,7 +875,8 @@ impl PostgresStorage {
         (!drained).then_some(state.retention.policy.drain_entries_per_commit)
     }
     /// After a commit: remember that the rows are drained when its delete
-    /// found fewer than its bound, forget it when it wrote new ones.
+    /// found fewer than its bound (no engine writes such rows any more; a
+    /// new handle looks once more).
     pub(crate) fn tombstones_committed(
         &self,
         namespace: &str,
@@ -893,9 +887,7 @@ impl PostgresStorage {
             .tombstones_drained
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if rows.wrote {
-            drained.remove(namespace);
-        } else if let (Some(limit), Some(deleted)) = (limit, rows.deleted)
+        if let (Some(limit), Some(deleted)) = (limit, rows.deleted)
             && deleted < limit as u64
         {
             drained.insert(namespace.to_string());

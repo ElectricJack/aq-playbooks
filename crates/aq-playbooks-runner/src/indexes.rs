@@ -94,6 +94,9 @@ pub struct RuntimeIndexes {
     /// Every intent (terminal included) per root, for bounded history checks.
     #[serde(default)]
     pub root_intents: LazyMap<String, BTreeSet<String>>,
+    /// Deprecated: the latest receipt time of each root, read only by the
+    /// collector spec 0003 retired (its age test). No longer written; an
+    /// entry an older engine wrote leaves with its cohort.
     pub root_last_activity: LazyMap<String, i64>,
     pub run_roots: LazyMap<String, String>,
     pub intent_roots: LazyMap<String, String>,
@@ -973,14 +976,6 @@ pub(crate) fn rebuild(s: &mut State) -> Result<()> {
         .map(|(i, r)| (i, r.run.clone(), r.sequence))
         .collect::<Vec<_>>();
     for (i, run, seq) in receipts {
-        if let Some(r) = s.runs.get(&run) {
-            let at = s.receipts[i].at_ms;
-            s.indexes
-                .root_last_activity
-                .entry(r.root.clone())
-                .and_modify(|old| *old = (*old).max(at))
-                .or_insert(at);
-        }
         s.indexes.receipts.entry(run).or_default().insert(seq, i);
         s.indexes.all_receipts.insert(seq, i);
     }

@@ -569,7 +569,6 @@ impl PostgresStorage {
                 )?),
                 None => None,
             },
-            wrote: false,
         };
         let retired: Vec<&String> = staged.retired_event_tombstones.iter().collect();
         crate::retention::forget_event_tombstones(&mut tx, namespace, &retired)?;

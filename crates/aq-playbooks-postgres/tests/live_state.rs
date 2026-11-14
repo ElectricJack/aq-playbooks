@@ -2278,9 +2278,11 @@ fn a_pinned_clock_is_rebased_on_postgres() {
 // --- Task 8: max_tombstones is ignored ------------------------------------
 
 /// Legacy disposal tombstone rows beyond `max_tombstones` refuse no full
-/// commit, and a full commit that does not move the GC clock leaves them in
-/// place (no tombstone count, no cutoff deletes). The commit that moves the
-/// GC clock still runs the cutoff deletes. On f2 protected, f2 plain and f3.
+/// commit and are not counted. Rows of runs are left to the drain, never to
+/// the GC clock's cutoff deletes: a handle that has seen the namespace
+/// drained does not look again (here they were inserted behind its back),
+/// and a new handle deletes them `drain_entries_per_commit` per commit. On
+/// f2 protected, f2 plain and f3.
 #[test]
 fn legacy_tombstone_rows_beyond_max_tombstones_refuse_no_commit_and_are_not_scanned() {
     for (label, store) in [
@@ -2316,7 +2318,20 @@ fn legacy_tombstone_rows_beyond_max_tombstones_refuse_no_commit_and_are_not_scan
         let revision = store.compare_and_swap(&ns, "w", base, &next).unwrap();
         assert_eq!(tombstone_rows(&ns), 1_000, "{label}");
         next.retention.last_gc_at_ms = Some(20);
-        store.compare_and_swap(&ns, "w", revision, &next).unwrap();
+        let revision = store.compare_and_swap(&ns, "w", revision, &next).unwrap();
+        assert_eq!(tombstone_rows(&ns), 1_000, "{label}");
+        store.release(&ns, "w").unwrap();
+        let store = match label {
+            "f2" => support::protected(),
+            "f2_plain" => support::store(),
+            _ => support::records(),
+        };
+        store.acquire(&ns, "w2").unwrap();
+        next.sequence += 1;
+        let revision = store.compare_and_swap(&ns, "w2", revision, &next).unwrap();
+        assert_eq!(tombstone_rows(&ns), 500, "{label}");
+        next.sequence += 1;
+        store.compare_and_swap(&ns, "w2", revision, &next).unwrap();
         assert_eq!(tombstone_rows(&ns), 0, "{label}");
     }
 }
@@ -3197,34 +3212,6 @@ fn drained_tombstone_rows_cost_no_statement_per_commit() {
         e.release().unwrap();
     }
 }
-/// A legacy row a commit writes after the handle recorded the namespace's
-/// rows as drained (legacy GC's event removal with a tombstone) arms the
-/// delete again: the next commit deletes it.
-#[test]
-fn a_legacy_row_written_after_the_drain_is_deleted_by_the_next_commit() {
-    for (label, store) in both() {
-        let ns = support::namespace("rearm");
-        let mut state = State::default();
-        state.retention.clock_ms = Some(5);
-        state.retention.policy.event_replay_ms = 10;
-        state.events.insert("ev".into(), accepted_event("ev", 0));
-        store.acquire(&ns, "w").unwrap();
-        let revision = store.compare_and_swap(&ns, "w", 0, &state).unwrap();
-        // That commit found no row: drained for this handle. Now a legacy
-        // removal (the event, expired, with its tombstone) writes one.
-        let mut next = state.clone();
-        next.events.remove("ev");
-        next.retention.clock_ms = Some(20);
-        next.retention
-            .event_tombstones
-            .insert("ev".into(), tombstone("digest-ev"));
-        let revision = store.compare_and_swap(&ns, "w", revision, &next).unwrap();
-        assert_eq!(tombstone_rows(&ns), 1, "{label}");
-        next.sequence += 1;
-        store.compare_and_swap(&ns, "w", revision, &next).unwrap();
-        assert_eq!(tombstone_rows(&ns), 0, "{label}");
-    }
-}
 /// The fixture of the runner's tests: a namespace the engine aq-server
 /// vendors (0173673) wrote on its in-memory store (see that test).
 fn vendored_fixture() -> State {
@@ -3668,4 +3655,48 @@ fn rewriting_receipt_rows_over_rows_keyed_by_position_leaves_one_row_each() {
     let s = e.snapshot().unwrap();
     assert_eq!(receipt_index_rows(&ns), expected_receipt_index_rows(&s));
     receipt_queries_match(&e, &ns);
+}
+
+// --- Task 10, item B: collect_garbage writes no legacy record -----------------
+
+/// On protected format 2 and format 3, `collect_garbage` over an expired
+/// event writes no `disposal_tombstones` row and no tombstone, fence or
+/// disposal record: the event leaves by the commit's window drop, and a
+/// redelivery is new.
+#[test]
+fn collect_garbage_writes_no_disposal_tombstone_row_on_postgres() {
+    for (format, store) in both() {
+        let ns = support::namespace("gc_rows");
+        let e = Engine::new(store, &ns, "w").unwrap();
+        let mut content = support::artifact("a").content;
+        content
+            .registry
+            .events
+            .insert("test.signal".into(), pg_event_contract());
+        let a = aq_playbooks_model::Artifact::seal(content).unwrap();
+        let digest = a.digest.clone();
+        e.install(a).unwrap();
+        e.activate_at("a", &digest, pg_authority(), 0).unwrap();
+        e.set_retention_policy(RetentionPolicy {
+            event_replay_ms: 1,
+            audit_ms: 1,
+            ..RetentionPolicy::default()
+        })
+        .unwrap();
+        let first = e.admit_event("host", pg_event("gone"), 0).unwrap();
+        let report = e.collect_garbage(10_000, 100).unwrap();
+        assert_eq!(report.events, 1, "{format}");
+        let s = e.snapshot().unwrap();
+        assert!(!s.events.contains_key(&first.key), "{format}");
+        assert!(s.retention.event_tombstones.is_empty(), "{format}");
+        assert!(s.retention.expired_correlations.is_empty(), "{format}");
+        assert!(s.retention.disposals.is_empty(), "{format}");
+        assert_eq!(tombstone_rows(&ns), 0, "{format}");
+        assert!(
+            !e.admit_event("host", pg_event("gone"), 10_001)
+                .unwrap()
+                .duplicate,
+            "{format}"
+        );
+    }
 }

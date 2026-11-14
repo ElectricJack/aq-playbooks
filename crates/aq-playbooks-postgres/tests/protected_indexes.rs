@@ -571,7 +571,7 @@ fn artifact_gc_and_installation_race_preserves_shared_bytes_and_disposal_records
 }
 
 #[test]
-fn forged_disposal_cannot_erase_unresolved_children_or_external_effects() {
+fn a_disposal_record_licenses_no_removal_of_unresolved_children_or_external_effects() {
     let n = namespace("unresolved-gc");
     let original = boundary(&n);
     let s = store();
@@ -587,7 +587,12 @@ fn forged_disposal_cannot_erase_unresolved_children_or_external_effects() {
             at_ms: 100,
         });
     }
-    assert!(s.compare_and_swap(&n, "owner", 1, &next).is_err());
+    // Spec 0003: a disposal record licenses nothing; a run leaves only with
+    // its history.
+    assert_eq!(
+        s.compare_and_swap(&n, "owner", 1, &next),
+        Err(StorageError::Backend(retention::REFUSE_RUN_REMOVAL.into()))
+    );
     assert_same(&s.load(&n).unwrap().state, &original);
 }
 
@@ -642,8 +647,12 @@ fn enabling_protection_removes_plaintext_only_after_every_referencing_namespace_
     assert_same(&protected("old", false).load(&m).unwrap().state, &state);
 }
 
+/// Spec 0003: an expired event leaves with no tombstone and no
+/// `disposal_tombstones` row. After a restart a repeat of its identity
+/// carrying its producer time is stale; a retired epoch refuses it; an
+/// explicit new epoch has a new identity.
 #[test]
-fn event_gc_replay_tombstones_survive_restart_and_explicit_new_epoch_has_new_identity() {
+fn an_expired_event_identity_is_judged_by_time_after_restart_and_a_new_epoch_has_a_new_identity() {
     let n = namespace("event-retention");
     let mut content = artifact(&n).content;
     let contract = EventContract {
@@ -708,14 +717,27 @@ fn event_gc_replay_tombstones_survive_restart_and_explicit_new_epoch_has_new_ide
                 .duplicate
         );
         assert_eq!(engine.collect_garbage(now + 10, 100).unwrap().events, 1);
-        assert_eq!(client().query_one("SELECT count(*) FROM aq_playbooks.disposal_tombstones WHERE namespace=$1 AND kind='event'",&[&n]).unwrap().get::<_,i64>(0),1);
-        engine.release().unwrap();
-        engine = Engine::new(store(), &n, format!("restarted-{epoch}")).unwrap();
+        assert_eq!(client().query_one("SELECT count(*) FROM aq_playbooks.disposal_tombstones WHERE namespace=$1 AND kind='event'",&[&n]).unwrap().get::<_,i64>(0),0);
         assert!(
             engine
-                .admit_event_in_epoch("fixture.producer", event.clone(), epoch, now + 11)
-                .is_err()
+                .snapshot()
+                .unwrap()
+                .retention
+                .event_tombstones
+                .is_empty()
         );
+        engine.release().unwrap();
+        engine = Engine::new(store(), &n, format!("restarted-{epoch}")).unwrap();
+        assert!(matches!(
+            engine.admit_event_at(
+                "fixture.producer",
+                event.clone(),
+                epoch,
+                Some(now),
+                now + 11
+            ),
+            Err(Error::Stale { .. })
+        ));
         engine
             .advance_producer_epoch(
                 "fixture.producer",
