@@ -2046,6 +2046,7 @@ fn the_rows_run_as_cases(rows: &[(&str, Task, Expected)]) {
             start: CaseStart::Event {
                 event: "aq.work.route_needed".into(),
                 payload: json!({"subject": subject}),
+                correlation: BTreeMap::new(),
             },
             returns: BTreeMap::from([
                 (
@@ -2065,22 +2066,41 @@ fn the_rows_run_as_cases(rows: &[(&str, Task, Expected)]) {
                     }],
                 ),
             ]),
+            // Every call the run makes, each with its whole input: the read,
+            // the question, and the one route the document gives.
             expect: Expectation {
                 outcome: "routed".into(),
-                calls: vec![ExpectedCall {
-                    command: "work.route".into(),
-                    input: json!({"level": want.level, "harnesses": want.harnesses,
-                        "providers": [], "prefer": want.prefer, "hold": want.hold}),
-                }],
+                calls: vec![
+                    ExpectedCall {
+                        command: "work.read".into(),
+                        input: json!({"subject": subject}),
+                    },
+                    ExpectedCall {
+                        command: "judgment.assess".into(),
+                        input: ask_for(task),
+                    },
+                    ExpectedCall {
+                        command: "work.route".into(),
+                        input: route_for(task),
+                    },
+                ],
             },
         };
+        let route = &case.expect.calls[2].input;
+        assert_eq!(route["level"], want.level, "{name}");
+        assert_eq!(route["harnesses"], json!(want.harnesses), "{name}");
+        assert_eq!(route["prefer"], json!(want.prefer), "{name}");
+        assert_eq!(route["hold"], want.hold, "{name}");
         let report = run_case(&artifact, &case).unwrap();
         assert!(report.passed, "{name}: {report:#?}");
-        let route = report
+        // The full list of calls holds each row to exactly one route.
+        let routes: Vec<_> = report
             .calls
             .iter()
-            .find(|c| c.command == "work.route")
-            .unwrap();
+            .filter(|c| c.command == "work.route")
+            .collect();
+        assert_eq!(routes.len(), 1, "{name}");
+        let route = routes[0];
         let step = if task.labels.is_some() {
             "route"
         } else {
@@ -2089,4 +2109,29 @@ fn the_rows_run_as_cases(rows: &[(&str, Task, Expected)]) {
         assert_eq!(route.step, step, "{name}");
         assert_eq!(route.input, route_for(task), "{name}");
     }
+}
+
+/// The `ask` step's input for one task, as the draft writes it.
+fn ask_for(task: &Task) -> Value {
+    let ws = routing_workspace();
+    let input: Expr =
+        serde_json::from_value(ws.draft["steps"]["ask"]["op"]["input"].clone()).unwrap();
+    let facts = json!({"kind": task.filed_kind, "title": "A task", "description": "",
+        "origin": "owner", "level_hint": task.hint, "charged_failures": task.failures,
+        "ended_attempts": task.failures, "route": "none"});
+    let read = json!({"reference": "task-1@3", "subject": {"id": "task-1", "revision": 3},
+        "facts": facts});
+    let context = EvalContext::from([
+        ("task".into(), EvalValue::Known(read)),
+        (
+            "definitions".into(),
+            EvalValue::Known(json!(
+                ws.facts.into_iter().collect::<serde_json::Map<_, _>>()
+            )),
+        ),
+    ]);
+    let EvalValue::Known(ask) = eval(&input, &context, &EvalLimits::default()).unwrap() else {
+        panic!("the question is known")
+    };
+    ask
 }

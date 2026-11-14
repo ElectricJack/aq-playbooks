@@ -3,12 +3,17 @@
   "situation": "The owner chose who takes the task within the ten minutes",
   "start": {
     "kind": "event",
-    "event": "aq.work.route_needed",
+    "event": "aq.work.changed",
     "payload": {
+      "outcome": "ensured",
+      "reference": "task-40@2",
       "subject": {
         "id": "task-40",
         "revision": 2
       }
+    },
+    "correlation": {
+      "operation": "work-op-2"
     }
   },
   "returns": {

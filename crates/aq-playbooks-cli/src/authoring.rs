@@ -20,17 +20,30 @@ use aq_playbooks_compiler::draft::{
 };
 use aq_playbooks_model::{Artifact, Registry, canonical_bytes};
 use aq_playbooks_simulation::{
-    Case, CaseReport, MAX_CASES, MAX_QUESTION_BYTES, MAX_REASON_BYTES, MAX_SENTENCE_BYTES,
-    MAX_SENTENCES, MIN_CASES, OUTCOME_FILE, Outcome, Sentence, facts_digest, run_case, run_cases,
+    CASES_TRANSITION_BUDGET, Case, CaseReport, MAX_CASES, MAX_QUESTION_BYTES, MAX_REASON_BYTES,
+    MAX_SENTENCES, MIN_CASES, OUTCOME_FILE, Outcome, Sentence, facts_digest, quote, run_case,
+    run_cases,
 };
 use clap::Subcommand;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 const CASES_DIR: &str = "cases";
+/// What `seal --output` never writes over: the host's files and the outcome.
+const HOST_INPUTS: [&str; 9] = [
+    SOURCE_FILE,
+    RECORD_FILE,
+    CATALOG_FILE,
+    FACTS_FILE,
+    DRAFT_FILE,
+    PREVIOUS_FILE,
+    "previous",
+    CASES_DIR,
+    "out",
+];
 const PREVIOUS_FILE: &str = "previous.artifact.json";
 const MAX_CASE_BYTES: u64 = 65_536;
 const MAX_SOURCE_BYTES: u64 = 4_194_304;
@@ -64,18 +77,25 @@ pub enum Authoring {
     /// Check, seal, run every cases/*.json (5 to 40) and, when all pass,
     /// write out/outcome.json. A refused save writes nothing.
     Save,
-    /// Ask the owner a question about the document and end: name each
-    /// sentence it is about by its source.md line (--line, 1 to 16 times).
+    /// Ask the owner a question about the document and end. Name each
+    /// sentence it is about by its source.md line (`--line N`) or, when it
+    /// spans lines, by its first and last line (`--lines A-B`, at most 8
+    /// lines): 1 to 16 sentences, recorded in document order.
     Ask {
-        #[arg(long = "line", required = true)]
-        lines: Vec<u32>,
+        #[arg(long = "line")]
+        line: Vec<u32>,
+        #[arg(long = "lines")]
+        lines: Vec<String>,
         question: String,
     },
     /// Give up: the document cannot be turned into a playbook because of the
-    /// sentence on this source.md line, for this reason.
+    /// sentence on this source.md line (`--line N`) or these lines
+    /// (`--lines A-B`), for this reason.
     Unable {
-        #[arg(long)]
-        line: u32,
+        #[arg(long = "line")]
+        line: Option<u32>,
+        #[arg(long = "lines")]
+        lines: Option<String>,
         reason: String,
     },
 }
@@ -112,9 +132,12 @@ fn execute(command: Authoring) -> Result<(bool, Value)> {
                 Err(refusal) => return Ok(refusal),
             };
             if let Some(output) = &output {
+                let target = inside(&root, output)?;
+                let given = target.strip_prefix(&root).unwrap_or(&target);
                 anyhow::ensure!(
-                    inside(&root, output)? != root.join(OUTCOME_FILE),
-                    "{output}: only save, ask and unable write {OUTCOME_FILE}; write the artifact elsewhere."
+                    !HOST_INPUTS.iter().any(|input| given.starts_with(input)),
+                    "{output}: seal does not overwrite what the host gave the workspace or what save, ask and unable write ({}); write the artifact to a new name, such as sealed.artifact.json.",
+                    HOST_INPUTS.join(", ")
                 );
                 write_inside(&root, output, &canonical_bytes(&artifact)?)?;
             }
@@ -180,23 +203,36 @@ fn execute(command: Authoring) -> Result<(bool, Value)> {
             ))
         }
         Authoring::Save => save(&root),
-        Authoring::Ask { lines, question } => {
+        Authoring::Ask {
+            line,
+            lines,
+            question,
+        } => {
+            let named = line.len() + lines.len();
             anyhow::ensure!(
-                (1..=MAX_SENTENCES).contains(&lines.len()),
-                "--line is given {} times; a question names 1 to {MAX_SENTENCES} sentences of source.md. Name only the sentences the question is about.",
-                lines.len()
+                (1..=MAX_SENTENCES).contains(&named),
+                "--line and --lines name {named} sentences; a question names 1 to {MAX_SENTENCES} sentences of source.md. Name only the sentences the question is about."
             );
             bounded("the question", &question, MAX_QUESTION_BYTES)?;
-            let source = read_inside(&root, SOURCE_FILE, MAX_SOURCE_BYTES)?;
-            let mut seen = BTreeSet::new();
-            let mut sentences = vec![];
-            for line in lines {
-                anyhow::ensure!(
-                    seen.insert(line),
-                    "--line {line} is given twice; name each sentence once."
-                );
-                sentences.push(sentence(&source, line)?);
+            let mut ranges: Vec<(u32, Option<u32>)> = line.iter().map(|n| (*n, None)).collect();
+            for range in &lines {
+                ranges.push(parse_range(range)?);
             }
+            ranges.sort();
+            for pair in ranges.windows(2) {
+                let ((a, a_end), (b, b_end)) = (pair[0], pair[1]);
+                anyhow::ensure!(
+                    b > a_end.unwrap_or(a),
+                    "{} and {} overlap; name each sentence once, by lines of its own.",
+                    shown(a, a_end),
+                    shown(b, b_end)
+                );
+            }
+            let source = read_inside(&root, SOURCE_FILE, MAX_SOURCE_BYTES)?;
+            let sentences = ranges
+                .into_iter()
+                .map(|(line, end)| quote(&source, line, end).map_err(anyhow::Error::msg))
+                .collect::<Result<Vec<_>>>()?;
             finish(
                 &root,
                 Outcome::Question {
@@ -205,15 +241,31 @@ fn execute(command: Authoring) -> Result<(bool, Value)> {
                 },
             )
         }
-        Authoring::Unable { line, reason } => {
+        Authoring::Unable {
+            line,
+            lines,
+            reason,
+        } => {
+            let (line, end) = match (line, lines) {
+                (Some(line), None) => (line, None),
+                (None, Some(range)) => parse_range(&range)?,
+                _ => bail!(
+                    "name the sentence once: --line N for one line, or --lines A-B for a sentence over lines A to B."
+                ),
+            };
             bounded("the reason", &reason, MAX_REASON_BYTES)?;
             let source = read_inside(&root, SOURCE_FILE, MAX_SOURCE_BYTES)?;
-            let Sentence { line, text } = sentence(&source, line)?;
+            let Sentence {
+                line,
+                end_line,
+                text,
+            } = quote(&source, line, end).map_err(anyhow::Error::msg)?;
             finish(
                 &root,
                 Outcome::Unable {
                     reason,
                     line,
+                    end_line,
                     sentence: text,
                 },
             )
@@ -260,7 +312,7 @@ fn save(root: &Path) -> Result<(bool, Value)> {
     };
     let mut reports: Vec<CaseReport> = vec![];
     if reasons.is_empty() {
-        match run_cases(&artifact, &cases) {
+        match run_cases(&artifact, &cases, CASES_TRANSITION_BUDGET) {
             Ok(done) => reports = done,
             Err(e) => reasons.push(format!("{e:#}")),
         }
@@ -493,11 +545,23 @@ fn read_case(root: &Path, given: &str) -> Result<Case> {
 fn read_cases(root: &Path) -> std::result::Result<(Vec<String>, Vec<Case>), Vec<String>> {
     let dir = inside(root, CASES_DIR).map_err(|e| vec![format!("{e:#}")])?;
     let mut names = vec![];
-    if let Ok(entries) = fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".json") {
-                names.push(format!("{CASES_DIR}/{name}"));
+    match fs::symlink_metadata(&dir) {
+        Err(_) => {}
+        Ok(meta) if !meta.is_dir() => {
+            return Err(vec![format!(
+                "{CASES_DIR} is not a directory; put each case in its own file, {CASES_DIR}/<name>.json."
+            )]);
+        }
+        Ok(_) => {
+            let entries = fs::read_dir(&dir)
+                .map_err(|e| vec![format!("{CASES_DIR}/: cannot be read ({e}).")])?;
+            for entry in entries {
+                let entry =
+                    entry.map_err(|e| vec![format!("{CASES_DIR}/: cannot be read ({e}).")])?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".json") {
+                    names.push(format!("{CASES_DIR}/{name}"));
+                }
             }
         }
     }
@@ -535,27 +599,26 @@ fn bounded(what: &str, text: &str, max: usize) -> Result<()> {
     );
     Ok(())
 }
-/// Line `line` of `source.md`, which must hold a sentence.
-fn sentence(source: &str, line: u32) -> Result<Sentence> {
-    let lines: Vec<&str> = source.lines().collect();
-    let Some(text) = (line as usize).checked_sub(1).and_then(|i| lines.get(i)) else {
-        bail!(
-            "--line {line}: {SOURCE_FILE} has lines 1 to {}; name the line that holds the sentence.",
-            lines.len()
-        );
+/// `A-B`: the first and last line of a sentence (`None` when they are one).
+fn parse_range(range: &str) -> Result<(u32, Option<u32>)> {
+    let refused = || {
+        anyhow!(
+            "--lines {range}: write the first and last line of the sentence as A-B, such as --lines 21-22, with A no greater than B; use --line N for one line."
+        )
     };
-    anyhow::ensure!(
-        !text.trim().is_empty(),
-        "--line {line}: line {line} of {SOURCE_FILE} is blank; name the line that holds the sentence."
+    let (a, b) = range.split_once('-').ok_or_else(refused)?;
+    let (a, b): (u32, u32) = (
+        a.trim().parse().map_err(|_| refused())?,
+        b.trim().parse().map_err(|_| refused())?,
     );
-    anyhow::ensure!(
-        text.len() <= MAX_SENTENCE_BYTES,
-        "--line {line}: line {line} of {SOURCE_FILE} is longer than {MAX_SENTENCE_BYTES} bytes."
-    );
-    Ok(Sentence {
-        line,
-        text: (*text).to_string(),
-    })
+    anyhow::ensure!(a >= 1 && a <= b, refused());
+    Ok((a, (b != a).then_some(b)))
+}
+fn shown(line: u32, end: Option<u32>) -> String {
+    match end {
+        Some(end) => format!("lines {line}-{end}"),
+        None => format!("line {line}"),
+    }
 }
 
 /// The catalog `commands` and `events` describe: in a workspace, its
@@ -563,6 +626,10 @@ fn sentence(source: &str, line: u32) -> Result<Sentence> {
 /// `./catalog.json` when present. `None` leaves the default to the caller.
 pub fn workspace_registry(registry: Option<&Path>) -> Result<Option<Registry>> {
     let cwd = std::env::current_dir().context("the current directory cannot be read")?;
+    if !is_workspace(&cwd) && cwd.ancestors().skip(1).any(is_workspace) {
+        // In a subdirectory of a workspace: the same refusal as the tools.
+        workspace_root()?;
+    }
     let file = match registry {
         Some(path) if is_workspace(&cwd) => path
             .to_str()

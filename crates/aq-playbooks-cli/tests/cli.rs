@@ -50,7 +50,7 @@ fn offline_cli_round_trip_and_invalid_input_exit() {
         let out = cli(args);
         assert!(!out.status.success(), "{args:?}");
         assert!(
-            String::from_utf8_lossy(&out.stderr).contains("unrecognized subcommand"),
+            String::from_utf8_lossy(&out.stdout).contains("unrecognized subcommand"),
             "{args:?}"
         );
     }

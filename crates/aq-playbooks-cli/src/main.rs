@@ -342,8 +342,26 @@ fn catalog_file(path: Option<PathBuf>) -> Result<Registry> {
         .unwrap_or_else(|| Ok(catalog::catalog()))
 }
 fn main() {
-    if let Err(error) = execute(Cli::parse()) {
-        eprintln!("{error:#}");
+    // Argument errors are JSON on stdout, exit 2, for an agent reading stdout.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) if !error.use_stderr() => error.exit(),
+        Err(error) => {
+            println!("{}", json!({"error": error.render().to_string()}));
+            std::process::exit(2);
+        }
+    };
+    // Discovery is agent-facing too: its refusals are JSON on stdout.
+    let discovery = matches!(
+        cli.command,
+        Command::Commands { .. } | Command::Events { .. }
+    );
+    if let Err(error) = execute(cli) {
+        if discovery {
+            println!("{}", json!({"error": format!("{error:#}")}));
+        } else {
+            eprintln!("{error:#}");
+        }
         std::process::exit(1);
     }
 }

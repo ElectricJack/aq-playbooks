@@ -333,12 +333,29 @@
     }
   },
   "events": {
-    "aq.work.route_needed": {
-      "correlation_fields": [],
+    "aq.work.changed": {
+      "correlation_fields": [
+        "operation"
+      ],
       "max_payload_bytes": 65536,
-      "name": "aq.work.route_needed",
+      "name": "aq.work.changed",
       "payload": {
         "properties": {
+          "outcome": {
+            "max_length": 128,
+            "type": "string",
+            "values": [
+              "cancelled",
+              "changed",
+              "completed",
+              "ensured"
+            ]
+          },
+          "reference": {
+            "max_length": 4096,
+            "type": "string",
+            "values": []
+          },
           "subject": {
             "properties": {
               "id": {
@@ -360,6 +377,8 @@
           }
         },
         "required": [
+          "outcome",
+          "reference",
           "subject"
         ],
         "type": "object"

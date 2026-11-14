@@ -18,11 +18,24 @@
 //!   runs. A run that has returned and waits only for such an operation to
 //!   settle ends, for the case, with the outcome it returned.
 //! - A call the case gives no return for fails the case, naming the step.
+//! - A call the case does not list fails the case, and so does a listed
+//!   call the run does not make: `expect.calls` is every call the run makes,
+//!   in order, and each `input` must equal what the playbook sent. A return
+//!   the run never uses fails the case too.
+//! - A case starts from any event a trigger of the playbook names, with its
+//!   payload and the values of the event's correlation fields
+//!   (`start.correlation`), or from an entry with its input.
 //! - Events are built from their contract: its first trusted producer, ids
 //!   `case-<i>`, the playbook's scope, and the subject and revision read
-//!   from the payload at the contract's subject and revision fields. A
-//!   trigger event's correlation fields are read from the payload's
-//!   top-level fields of the same names.
+//!   from the payload at the contract's subject and revision fields.
+//! - [`run_cases`] runs a save's cases within one total transition budget
+//!   ([`CASES_TRANSITION_BUDGET`] by default) as well as the per-case cap.
+//!
+//! [`Outcome`] is what an agent's tools write. Every field of it is the
+//! agent's claim: a reader re-derives each one (seals the draft again from
+//! its own inputs, re-runs the cases, re-quotes each sentence from its own
+//! copy of the document with [`quote`], recomputes the digests) and never
+//! stores the agent's text or digests as fact.
 use aq_playbooks_model::{Artifact, ContractRef, EventEnvelope, Operation, Registry, digest};
 use aq_playbooks_runner::{
     Authority, DispatchResult, Engine, Host, InspectionKind, InspectionQuery, Intent, MemoryStorage,
@@ -40,6 +53,8 @@ pub const MAX_SITUATION_BYTES: usize = 1024;
 pub const MAX_RETURNS_PER_COMMAND: usize = 64;
 /// Engine transitions one case may take.
 pub const MAX_CASE_TRANSITIONS: usize = 10_000;
+/// Engine transitions all the cases of one save may take together.
+pub const CASES_TRANSITION_BUDGET: usize = 40_000;
 /// Times the clock may move on to a deadline in one case.
 const MAX_CASE_ROUNDS: usize = 256;
 
@@ -70,7 +85,12 @@ pub struct Case {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CaseStart {
     /// The run is started by this event, through the playbook's trigger on it.
-    Event { event: String, payload: Value },
+    Event {
+        event: String,
+        payload: Value,
+        #[serde(default)]
+        correlation: BTreeMap<String, String>,
+    },
     /// The run is started at this entry with this input.
     Entry { entry: String, input: Value },
 }
@@ -115,22 +135,17 @@ impl<'de> Deserialize<'de> for CaseReturn {
 pub struct Expectation {
     /// The entry outcome the run must end with.
     pub outcome: String,
-    /// Calls that must be made, in this order (other calls may come between).
-    #[serde(default)]
+    /// Every call the run makes, in order, each with its whole input.
+    /// Required: a case that expects no call writes `[]`.
     pub calls: Vec<ExpectedCall>,
 }
-/// A call matches when its command is `command` and its input contains
-/// `input`: an object matches an object holding at least its fields (each
-/// matched the same way); arrays and scalars must be equal.
+/// One call the run must make: its command, and its whole input, which
+/// must equal what the playbook sent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExpectedCall {
     pub command: String,
-    #[serde(default = "any_input")]
     pub input: Value,
-}
-fn any_input() -> Value {
-    json!({})
 }
 /// A command the run called: its step, its input, and the outcome the case
 /// answered with (`None` when the case gave no answer).
@@ -216,7 +231,34 @@ fn check_case(artifact: &Artifact, case: &Case) -> Vec<String> {
             }
             BTreeSet::from([entry.as_str()])
         }
-        CaseStart::Event { event, .. } => {
+        CaseStart::Event {
+            event, correlation, ..
+        } => {
+            if let Some(contract) = registry.events.get(event) {
+                let fields = &contract.correlation_fields;
+                let missing: Vec<&str> = fields
+                    .iter()
+                    .filter(|f| correlation.get(*f).is_none_or(|v| v.is_empty()))
+                    .map(String::as_str)
+                    .collect();
+                if !missing.is_empty() {
+                    p.push(format!(
+                        "start.correlation: {event} is correlated by {}; give each a value, such as \"correlation\": {{{}}}.",
+                        names(missing.iter().copied()),
+                        missing
+                            .iter()
+                            .map(|f| format!("\"{f}\": \"op-1\""))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                for extra in correlation.keys().filter(|k| !fields.contains(*k)) {
+                    p.push(format!(
+                        "start.correlation.{extra}: {event} has no correlation field {extra}; its correlation fields are: {}.",
+                        names(fields.iter().map(String::as_str))
+                    ));
+                }
+            }
             let started: BTreeSet<&str> = playbook
                 .triggers
                 .iter()
@@ -506,65 +548,131 @@ fn returned<S: aq_playbooks_runner::Storage>(
         .map(|(outcome, _)| outcome.clone()))
 }
 
-/// The first place `got` does not contain `want`, or `None`.
-fn mismatch(want: &Value, got: &Value, path: &str) -> Option<String> {
+/// Each place `got` differs from `want`, at most `limit` of them: the path,
+/// what the case expects there and what the call had.
+fn differences(want: &Value, got: &Value, path: &str, out: &mut Vec<String>, limit: usize) {
+    if out.len() >= limit || want == got {
+        return;
+    }
     match (want, got) {
-        (Value::Object(want), Value::Object(got)) => want.iter().find_map(|(key, w)| {
-            let at = format!("{path}.{key}");
-            match got.get(key) {
-                None => Some(format!("{at} is missing")),
-                Some(g) => mismatch(w, g, &at),
+        (Value::Object(w), Value::Object(g)) => {
+            let keys: BTreeSet<&String> = w.keys().chain(g.keys()).collect();
+            for key in keys {
+                let at = format!("{path}.{key}");
+                match (w.get(key), g.get(key)) {
+                    (Some(w), Some(g)) => differences(w, g, &at, out, limit),
+                    (Some(w), None) => out.push(format!(
+                        "{at}: the case expects {}; the call has nothing there",
+                        clip(w)
+                    )),
+                    (None, Some(g)) => out.push(format!(
+                        "{at}: the case does not list it; the call has {}",
+                        clip(g)
+                    )),
+                    (None, None) => {}
+                }
+                if out.len() >= limit {
+                    return;
+                }
             }
-        }),
-        _ if want == got => None,
-        _ => Some(format!(
-            "{path}: expected {}, found {}",
+        }
+        (Value::Array(w), Value::Array(g)) if w.len() == g.len() => {
+            for (i, (w, g)) in w.iter().zip(g).enumerate() {
+                differences(w, g, &format!("{path}[{i}]"), out, limit);
+            }
+        }
+        _ => out.push(format!(
+            "{path}: the case expects {}, the call has {}",
             clip(want),
             clip(got)
         )),
     }
 }
+/// The calls made must be exactly the calls the case lists, in order, each
+/// with exactly its input.
 fn expected_calls(expect: &[ExpectedCall], calls: &[Call], problems: &mut Vec<String>) {
-    let made = names(calls.iter().map(|c| c.command.as_str()));
-    let mut next = 0;
-    for (i, want) in expect.iter().enumerate() {
-        let found = calls[next..].iter().position(|c| {
-            c.command == want.command && mismatch(&want.input, &c.input, "input").is_none()
-        });
-        if let Some(at) = found {
-            next += at + 1;
-            continue;
+    let made = || {
+        names(
+            calls
+                .iter()
+                .map(|c| format!("{} at step {}", c.command, c.step))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(String::as_str),
+        )
+    };
+    for (i, pair) in expect.iter().zip(calls).enumerate() {
+        let (want, call) = pair;
+        if want.command != call.command {
+            problems.push(format!(
+                "expect.calls[{i}]: the case expects a call to {} here, but the run called {} at step {}. List every call the run makes, in order; the calls made were: {}.",
+                want.command,
+                call.command,
+                call.step,
+                made()
+            ));
+            // The rest no longer line up; one problem says it.
+            return;
         }
-        let later: Vec<&Call> = calls[next..]
-            .iter()
-            .filter(|c| c.command == want.command)
-            .collect();
-        let why = if let Some(first) = later.first() {
-            format!(
-                "the call at step {} differs: {}",
-                first.step,
-                mismatch(&want.input, &first.input, "input").unwrap_or_default()
-            )
-        } else if calls.iter().any(|c| c.command == want.command) {
-            format!(
-                "{} was called only before the calls expected ahead of it (expected calls are matched in order)",
-                want.command
-            )
-        } else {
-            format!("the playbook never called {}", want.command)
-        };
+        let mut found = vec![];
+        differences(&want.input, &call.input, "input", &mut found, 8);
+        if !found.is_empty() {
+            problems.push(format!(
+                "expect.calls[{i}].input: the call to {} at step {} differs from the case: {}.",
+                call.command,
+                call.step,
+                found.join("; ")
+            ));
+        }
+    }
+    if expect.len() > calls.len() {
         problems.push(format!(
-            "expect.calls[{i}]: no call to {} with an input containing {}: {why}. The calls made, in order: {made}.",
-            want.command,
-            clip(&want.input)
+            "expect.calls[{}]: the case expects a call to {} here, but the run made {} calls: {}.",
+            calls.len(),
+            expect[calls.len()].command,
+            calls.len(),
+            made()
+        ));
+    } else if calls.len() > expect.len() {
+        let extra = &calls[expect.len()];
+        problems.push(format!(
+            "expect.calls: the run called {} at step {} after the {} calls the case lists (it lists {}). List every call the run makes, in order, each with its whole input; the calls made were: {}.",
+            extra.command,
+            extra.step,
+            expect.len(),
+            expect.len(),
+            made()
         ));
     }
 }
 
-/// Runs one case on `artifact`. An `Err` is a fault of the artifact or the
-/// engine; everything about the case is in the report's `problems`.
+/// One case run within `limit` transitions: the report, the transitions it
+/// took, and whether it was stopped at `limit`.
+struct Ran {
+    report: CaseReport,
+    used: usize,
+    stopped: bool,
+}
+
+/// Runs one case on `artifact`, within [`MAX_CASE_TRANSITIONS`]. An `Err` is
+/// a fault of the artifact or the engine; everything about the case is in
+/// the report's `problems`.
 pub fn run_case(artifact: &Artifact, case: &Case) -> anyhow::Result<CaseReport> {
     artifact.verify()?;
+    let mut ran = run_within(artifact, case, MAX_CASE_TRANSITIONS)?;
+    if ran.stopped {
+        stopped_at_case_cap(&mut ran.report);
+    }
+    Ok(ran.report)
+}
+fn stopped_at_case_cap(report: &mut CaseReport) {
+    report.problems.push(format!(
+        "the run took more than {MAX_CASE_TRANSITIONS} transitions; look for a loop that never ends."
+    ));
+    report.passed = false;
+}
+
+fn run_within(artifact: &Artifact, case: &Case, limit: usize) -> anyhow::Result<Ran> {
     let mut report = CaseReport {
         name: case.name.clone(),
         situation: case.situation.clone(),
@@ -573,8 +681,13 @@ pub fn run_case(artifact: &Artifact, case: &Case) -> anyhow::Result<CaseReport> 
         calls: vec![],
         problems: check_case(artifact, case),
     };
+    let done = |report: CaseReport| Ran {
+        report,
+        used: 0,
+        stopped: false,
+    };
     if !report.problems.is_empty() {
-        return Ok(report);
+        return Ok(done(report));
     }
     let playbook = &artifact.content.playbook;
     let registry = &artifact.content.registry;
@@ -604,21 +717,17 @@ pub fn run_case(artifact: &Artifact, case: &Case) -> anyhow::Result<CaseReport> 
             .admit(&playbook.id, entry, input.clone(), authority, 0)
             .map(|_| ())
             .map_err(|e| format!("start.input: the entry {entry} refused it: {e}.")),
-        CaseStart::Event { event, payload } => (|| {
-            let contract = &registry.events[event];
-            let mut correlation = BTreeMap::new();
-            for name in &contract.correlation_fields {
-                let value = payload.get(name).and_then(Value::as_str).ok_or_else(|| {
-                    format!("start.payload.{name}: {event} is correlated by {name}, so the payload must give it as a string")
-                })?;
-                correlation.insert(name.clone(), value.to_string());
-            }
+        CaseStart::Event {
+            event,
+            payload,
+            correlation,
+        } => (|| {
             let event = envelope(
                 registry,
                 &playbook.scope,
                 event,
                 "case-0".into(),
-                correlation,
+                correlation.clone(),
                 payload.clone(),
             )
             .map_err(|e| format!("start.{e}"))?;
@@ -634,12 +743,13 @@ pub fn run_case(artifact: &Artifact, case: &Case) -> anyhow::Result<CaseReport> 
     };
     if let Err(problem) = started {
         report.problems.push(problem);
-        return Ok(report);
+        return Ok(done(report));
     }
     let mut clock = 0;
     let mut used = 0;
+    let mut stopped = false;
     for _ in 0..MAX_CASE_ROUNDS {
-        used += engine.drive(&mut host, clock, MAX_CASE_TRANSITIONS - used)?;
+        used += engine.drive(&mut host, clock, limit - used)?;
         let completions = std::mem::take(&mut host.completions);
         if !completions.is_empty() {
             for event in completions {
@@ -651,10 +761,8 @@ pub fn run_case(artifact: &Artifact, case: &Case) -> anyhow::Result<CaseReport> 
             }
             continue;
         }
-        if used >= MAX_CASE_TRANSITIONS {
-            host.problems.push(format!(
-                "the run took more than {MAX_CASE_TRANSITIONS} steps; look for a loop that never ends."
-            ));
+        if used >= limit {
+            stopped = true;
             break;
         }
         // Nothing more happens now: move the clock to the next deadline.
@@ -676,9 +784,7 @@ pub fn run_case(artifact: &Artifact, case: &Case) -> anyhow::Result<CaseReport> 
     let roots: Vec<&Value> = runs.iter().filter(|r| r["parent"].is_null()).collect();
     let at = |run: &Value| run["step"].as_str().unwrap_or_default().to_string();
     match roots.as_slice() {
-        [] => report
-            .problems
-            .push("start: no run started.".to_string()),
+        [] => report.problems.push("start: no run started.".to_string()),
         [run] => match run["status"].as_str() {
             Some("completed") => report.outcome = run["outcome"].as_str().map(String::from),
             Some("failed") => report.problems.push(format!(
@@ -688,17 +794,23 @@ pub fn run_case(artifact: &Artifact, case: &Case) -> anyhow::Result<CaseReport> 
             Some("cancelled") => report
                 .problems
                 .push(format!("the run was cancelled at step {}.", at(run))),
-            // It has returned, and waits only for an operation it started to
-            // settle (an answer the case leaves pending): it is still live,
-            // so the outcome it returned is read from the state.
-            Some("finishing") if returned(&engine, run)?.is_some() => {
-                report.outcome = returned(&engine, run)?
+            status => {
+                // A run that has returned and waits only for an operation it
+                // started to settle (an answer the case leaves pending) is
+                // still live, so the outcome it returned is read from the state.
+                let returned = match status {
+                    Some("finishing") => returned(&engine, run)?,
+                    _ => None,
+                };
+                match returned {
+                    Some(outcome) => report.outcome = Some(outcome),
+                    None => report.problems.push(format!(
+                        "the run did not finish: it is {} at step {}. A case runs until nothing more can happen; give the returns this step needs.",
+                        status.unwrap_or("unknown"),
+                        at(run)
+                    )),
+                }
             }
-            status => report.problems.push(format!(
-                "the run did not finish: it is {} at step {}. A case runs until nothing more can happen; give the returns this step needs.",
-                status.unwrap_or("unknown"),
-                at(run)
-            )),
         },
         many => report.problems.push(format!(
             "start: the event started {} runs; a case follows one run, so start it from an event one trigger names, or from an entry.",
@@ -715,13 +827,35 @@ pub fn run_case(artifact: &Artifact, case: &Case) -> anyhow::Result<CaseReport> 
         ));
     }
     expected_calls(&case.expect.calls, &report.calls, &mut report.problems);
+    // Every return the case gives is used by a call.
+    for (command, left) in &host.returns {
+        let given = case.returns.get(command).map_or(0, Vec::len);
+        for i in given - left.len()..given {
+            report.problems.push(format!(
+                "returns.{command:?}[{i}]: never used: the run called {command} {} time(s). Give one return per call the run makes.",
+                given - left.len()
+            ));
+        }
+    }
     report.passed = report.problems.is_empty();
-    Ok(report)
+    Ok(Ran {
+        report,
+        used,
+        stopped,
+    })
 }
 
 /// Runs the cases a playbook is saved with: at least [`MIN_CASES`], at most
-/// [`MAX_CASES`], each with its own name.
-pub fn run_cases(artifact: &Artifact, cases: &[Case]) -> anyhow::Result<Vec<CaseReport>> {
+/// [`MAX_CASES`], each with its own name. Together they may take at most
+/// `total_transitions` engine transitions ([`CASES_TRANSITION_BUDGET`] unless
+/// the caller sets another), and each at most [`MAX_CASE_TRANSITIONS`].
+/// Running out of the total is an `Err` naming the case it stopped at, never
+/// a case failure and never a hang.
+pub fn run_cases(
+    artifact: &Artifact,
+    cases: &[Case],
+    total_transitions: usize,
+) -> anyhow::Result<Vec<CaseReport>> {
     anyhow::ensure!(
         (MIN_CASES..=MAX_CASES).contains(&cases.len()),
         "a playbook is saved with at least {MIN_CASES} cases and at most {MAX_CASES}; {} were given. Write a case for each situation the document distinguishes.",
@@ -735,7 +869,32 @@ pub fn run_cases(artifact: &Artifact, cases: &[Case]) -> anyhow::Result<Vec<Case
             case.name
         );
     }
-    cases.iter().map(|case| run_case(artifact, case)).collect()
+    artifact.verify()?;
+    let mut left = total_transitions;
+    let mut reports = vec![];
+    for (k, case) in cases.iter().enumerate() {
+        let limit = left.min(MAX_CASE_TRANSITIONS);
+        let exceeded = || {
+            anyhow::anyhow!(
+                "the cases exceeded the total budget of {total_transitions} transitions at case {} ({:?}); together the cases may take at most that many. Make the cases or the playbook smaller.",
+                k + 1,
+                case.name
+            )
+        };
+        if limit == 0 {
+            return Err(exceeded());
+        }
+        let mut ran = run_within(artifact, case, limit)?;
+        if ran.stopped {
+            if limit < MAX_CASE_TRANSITIONS {
+                return Err(exceeded());
+            }
+            stopped_at_case_cap(&mut ran.report);
+        }
+        left -= ran.used;
+        reports.push(ran.report);
+    }
+    Ok(reports)
 }
 
 /// The digest of the facts a playbook was authored with (`facts.json`, as
@@ -744,12 +903,79 @@ pub fn facts_digest(facts: &BTreeMap<String, Value>) -> anyhow::Result<String> {
     Ok(digest(facts)?)
 }
 
-/// A line of `source.md` and its text.
+/// A sentence of `source.md`: its first line, its last line when it spans
+/// more than one (absent for a single line), and those lines as they stand,
+/// joined with newlines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sentence {
     pub line: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u32>,
     pub text: String,
+}
+/// A sentence spans at most this many lines.
+pub const MAX_SENTENCE_LINES: u32 = 8;
+/// Quotes lines `line` to `end_line` (or `line` alone) of `markdown`: every
+/// line must exist and hold text, at most [`MAX_SENTENCE_LINES`] of them.
+/// The tools quote with it, and a reader re-quotes an outcome's sentences
+/// from its own copy of the document with it.
+pub fn quote(markdown: &str, line: u32, end_line: Option<u32>) -> Result<Sentence, String> {
+    let lines: Vec<&str> = markdown.lines().collect();
+    let end = end_line.unwrap_or(line);
+    let range = if end == line {
+        format!("line {line}")
+    } else {
+        format!("lines {line}-{end}")
+    };
+    if line == 0 || end < line {
+        return Err(format!(
+            "{range}: name a sentence by its line N, or by its lines A-B with A no greater than B, counted from 1."
+        ));
+    }
+    if end - line + 1 > MAX_SENTENCE_LINES {
+        return Err(format!(
+            "{range}: a sentence spans at most {MAX_SENTENCE_LINES} lines; name the lines of one sentence."
+        ));
+    }
+    if end as usize > lines.len() {
+        return Err(format!(
+            "{range}: source.md has lines 1 to {}; name the lines that hold the sentence.",
+            lines.len()
+        ));
+    }
+    let quoted = &lines[line as usize - 1..end as usize];
+    if let Some(blank) = quoted.iter().position(|l| l.trim().is_empty()) {
+        return Err(format!(
+            "{range}: line {} of source.md is blank; a sentence does not cross a blank line. Name the lines that hold it.",
+            line as usize + blank
+        ));
+    }
+    let text = quoted.join("\n");
+    if text.len() > MAX_SENTENCE_BYTES {
+        return Err(format!(
+            "{range}: the sentence is longer than {MAX_SENTENCE_BYTES} bytes."
+        ));
+    }
+    Ok(Sentence {
+        line,
+        end_line: (end != line).then_some(end),
+        text,
+    })
+}
+/// The lines a sentence names must be a range [`quote`] accepts.
+fn lines_named(line: u32, end_line: Option<u32>) -> Result<u32, String> {
+    match end_line {
+        _ if line == 0 => Err("a sentence's line is zero".into()),
+        None => Ok(line),
+        Some(end) if end <= line => Err(format!(
+            "end_line {end} is not after line {line}; leave it out for a one-line sentence"
+        )),
+        Some(end) if end - line + 1 > MAX_SENTENCE_LINES => Err(format!(
+            "lines {line}-{end} span more than {MAX_SENTENCE_LINES} lines"
+        )),
+        Some(end) => Ok(end),
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -759,8 +985,14 @@ pub enum OutcomeKind {
     Unable,
 }
 /// `out/outcome.json`: how an authoring run ended. Data for the host to
-/// check again, never an instruction: a host re-seals the draft from its own
-/// record, catalog, facts and document, and re-runs the cases.
+/// check again, never an instruction. **Every field is the agent's claim**
+/// (the agent can write this file, and the files the tools read, itself).
+/// A reader re-derives each field and never stores the agent's value as
+/// fact: it re-seals `draft` from its own record, catalog, facts and
+/// document and compares the digest with `artifact`; re-runs `cases` on the
+/// artifact it sealed; recomputes `facts_digest` from the facts it holds;
+/// and re-quotes each sentence's `text` (or `sentence`) from its own copy of
+/// the document with [`quote`], keeping only the line numbers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Outcome {
@@ -778,10 +1010,12 @@ pub enum Outcome {
         sentences: Vec<Sentence>,
     },
     /// Why the document could not be turned into a playbook, and the
-    /// sentence it is about.
+    /// sentence it is about (its lines as in [`Sentence`]).
     Unable {
         reason: String,
         line: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_line: Option<u32>,
         sentence: String,
     },
 }
@@ -838,11 +1072,17 @@ impl Outcome {
                         sentences.len()
                     ));
                 }
-                let mut lines = BTreeSet::new();
+                // In document order, and apart.
+                let mut after = 0;
                 for s in sentences {
-                    if s.line == 0 || !lines.insert(s.line) {
-                        return Err(format!("sentence line {} is zero or named twice", s.line));
+                    let end = lines_named(s.line, s.end_line)?;
+                    if s.line <= after {
+                        return Err(format!(
+                            "the sentence at line {} is not after the one before it (sentences are in document order and do not overlap)",
+                            s.line
+                        ));
                     }
+                    after = end;
                     text("sentence text", &s.text, MAX_SENTENCE_BYTES)?;
                 }
                 Ok(())
@@ -850,12 +1090,11 @@ impl Outcome {
             Self::Unable {
                 reason,
                 line,
+                end_line,
                 sentence,
             } => {
                 text("reason", reason, MAX_REASON_BYTES)?;
-                if *line == 0 {
-                    return Err("line is zero".into());
-                }
+                lines_named(*line, *end_line)?;
                 text("sentence", sentence, MAX_SENTENCE_BYTES)
             }
         }
@@ -889,7 +1128,7 @@ impl Outcome {
 mod tests {
     use super::*;
     use aq_playbooks_compiler::draft::{SourceRecord, Workspace, seal};
-    use aq_playbooks_model::Registry;
+    use aq_playbooks_model::{EvalContext, EvalLimits, EvalValue, Expr, Registry, eval};
     use serde_json::json;
 
     const REGISTRY_2_2: &str = include_str!("../../../contracts/aq-host-2.2.0/registry.json");
@@ -899,11 +1138,30 @@ mod tests {
     fn strings(xs: &[&str]) -> std::collections::BTreeSet<String> {
         xs.iter().map(|s| s.to_string()).collect()
     }
-    /// The owner's routing document as a draft (the A4 feasibility draft),
-    /// sealed against catalog 2.2.0 with the owner's Settings as facts.
-    fn routing() -> Artifact {
+    fn facts() -> BTreeMap<String, Value> {
         let everyone = json!({"harnesses": ["claude", "codex", "gemini", "opencode"],
                               "providers": ["anthropic", "google", "ollama", "openai"]});
+        BTreeMap::from([
+            (
+                "levels".into(),
+                json!(["simple-high", "standard-high", "complex-high", "deep-high"]),
+            ),
+            (
+                "offers".into(),
+                json!({"simple-high": everyone, "standard-high": everyone,
+                       "complex-high": everyone, "deep-high": everyone}),
+            ),
+            (
+                "harnesses".into(),
+                json!(["claude", "codex", "gemini", "opencode"]),
+            ),
+            (
+                "providers".into(),
+                json!(["anthropic", "google", "ollama", "openai"]),
+            ),
+        ])
+    }
+    fn sealed(commands: &[&str], events: &[&str], capabilities: &[&str], draft: Value) -> Artifact {
         let ws = Workspace {
             markdown: "# Routing\n\nThe owner's routing document.\n".into(),
             record: SourceRecord {
@@ -911,42 +1169,40 @@ mod tests {
                 binding: "aq.routing".into(),
                 scope: "project".into(),
                 purpose: "Route each task".into(),
-                commands: strings(&["work.read", "work.route", "judgment.assess"]),
-                events: strings(&["aq.work.route_needed"]),
-                capabilities: strings(&[
-                    "work.read",
-                    "work.route",
-                    "judgment.assess",
-                    "operation.get",
-                ]),
+                commands: strings(commands),
+                events: strings(events),
+                capabilities: strings(capabilities),
                 facts_version: "settings-1".into(),
             },
             catalog: serde_json::from_str::<Registry>(REGISTRY_2_2).unwrap(),
-            facts: BTreeMap::from([
-                (
-                    "levels".into(),
-                    json!(["simple-high", "standard-high", "complex-high", "deep-high"]),
-                ),
-                (
-                    "offers".into(),
-                    json!({"simple-high": everyone, "standard-high": everyone,
-                           "complex-high": everyone, "deep-high": everyone}),
-                ),
-                (
-                    "harnesses".into(),
-                    json!(["claude", "codex", "gemini", "opencode"]),
-                ),
-                (
-                    "providers".into(),
-                    json!(["anthropic", "google", "ollama", "openai"]),
-                ),
-            ]),
-            draft: serde_json::from_str(ROUTING_DRAFT).unwrap(),
+            facts: facts(),
+            draft,
         };
         seal(&ws).unwrap_or_else(|d| panic!("{d:#?}"))
     }
+    /// The owner's routing document as a draft (the A4 feasibility draft),
+    /// sealed against catalog 2.2.0 with the owner's Settings as facts.
+    fn routing() -> Artifact {
+        sealed(
+            &["work.read", "work.route", "judgment.assess"],
+            &["aq.work.route_needed"],
+            &[
+                "work.read",
+                "work.route",
+                "judgment.assess",
+                "operation.get",
+            ],
+            serde_json::from_str(ROUTING_DRAFT).unwrap(),
+        )
+    }
     fn subject() -> Value {
         json!({"id": "task-1", "revision": 3})
+    }
+    fn output(r: &CaseReturn) -> Value {
+        match r {
+            CaseReturn::Answer { output, .. } => output.clone(),
+            CaseReturn::Pending { .. } => panic!("no output"),
+        }
     }
     fn observed(filed_kind: &str) -> CaseReturn {
         CaseReturn::Answer {
@@ -974,7 +1230,59 @@ mod tests {
                 "harnesses": [], "providers": [], "prefer": []}),
         }
     }
-    fn case(returns: Vec<(&str, Vec<CaseReturn>)>, outcome: &str) -> Case {
+    /// A step's input, evaluated as the draft writes it.
+    fn step_input(step: &str, roots: &[(&str, Value)]) -> Value {
+        let draft: Value = serde_json::from_str(ROUTING_DRAFT).unwrap();
+        let expr: Expr =
+            serde_json::from_value(draft["steps"][step]["op"]["input"].clone()).unwrap();
+        let mut context = EvalContext::from([(
+            "definitions".to_string(),
+            EvalValue::Known(json!(
+                facts().into_iter().collect::<serde_json::Map<_, _>>()
+            )),
+        )]);
+        for (root, value) in roots {
+            context.insert(root.to_string(), EvalValue::Known(value.clone()));
+        }
+        match eval(&expr, &context, &EvalLimits::default()).unwrap() {
+            EvalValue::Known(value) => value,
+            other => panic!("{step}: {other:?}"),
+        }
+    }
+    fn call(command: &str, input: Value) -> ExpectedCall {
+        ExpectedCall {
+            command: command.into(),
+            input,
+        }
+    }
+    /// Every call a run of the routing draft makes, each with its whole
+    /// input: read, ask, then `route` on an assessed answer or `assume`.
+    fn calls_for(read: &CaseReturn, answer: Option<&CaseReturn>) -> Vec<ExpectedCall> {
+        let task = output(read);
+        let route = match answer {
+            Some(answer) => step_input(
+                "route",
+                &[
+                    ("task", task.clone()),
+                    (
+                        "answer",
+                        json!({"c": {"participant": "op", "outcome": "assessed", "output": output(answer)}}),
+                    ),
+                ],
+            ),
+            None => step_input("assume", &[("task", task.clone())]),
+        };
+        vec![
+            call("work.read", json!({"subject": subject()})),
+            call("judgment.assess", step_input("ask", &[("task", task)])),
+            call("work.route", route),
+        ]
+    }
+    fn case(
+        returns: Vec<(&str, Vec<CaseReturn>)>,
+        outcome: &str,
+        calls: Vec<ExpectedCall>,
+    ) -> Case {
         Case {
             name: "a task".into(),
             situation: "A task needs a route".into(),
@@ -988,18 +1296,21 @@ mod tests {
                 .collect(),
             expect: Expectation {
                 outcome: outcome.into(),
-                calls: vec![],
+                calls,
             },
         }
     }
     fn classified(filed: &str, kind: &str, risk: &str, flags: &[&str]) -> Case {
+        let (read, answer) = (observed(filed), assessed(kind, risk, flags));
+        let calls = calls_for(&read, Some(&answer));
         case(
             vec![
-                ("work.read", vec![observed(filed)]),
-                ("judgment.assess", vec![assessed(kind, risk, flags)]),
+                ("work.read", vec![read]),
+                ("judgment.assess", vec![answer]),
                 ("work.route", vec![routed()]),
             ],
             "routed",
+            calls,
         )
     }
     fn route_call(report: &CaseReport) -> &Call {
@@ -1010,6 +1321,13 @@ mod tests {
             .collect();
         assert_eq!(routes.len(), 1, "{report:#?}");
         routes[0]
+    }
+    fn problem<'a>(report: &'a CaseReport, starts: &str) -> &'a str {
+        report
+            .problems
+            .iter()
+            .find(|p| p.starts_with(starts))
+            .unwrap_or_else(|| panic!("no problem starting {starts:?}: {report:#?}"))
     }
 
     #[test]
@@ -1032,7 +1350,6 @@ mod tests {
             ]
         );
         assert_eq!(report.calls[0].input, json!({"subject": subject()}));
-        assert_eq!(report.calls[1].input["subject"], subject());
         assert_eq!(
             report.calls[1].input["context"]["items"][0]["text"],
             "A task"
@@ -1041,7 +1358,6 @@ mod tests {
         assert_eq!(route["subject"], subject());
         assert_eq!(route["level"], "standard-high");
         assert_eq!(route["classification"]["labels"], json!(["feature", "low"]));
-        assert!(report.problems.is_empty(), "{report:#?}");
     }
 
     /// The A2 runtime proof: the route's level comes from the judgment's
@@ -1068,9 +1384,10 @@ mod tests {
     #[test]
     fn a_pending_answer_takes_the_timeout_path() {
         let artifact = routing();
-        let mut pending = case(
+        let read = observed("bugfix");
+        let pending = case(
             vec![
-                ("work.read", vec![observed("bugfix")]),
+                ("work.read", vec![read.clone()]),
                 (
                     "judgment.assess",
                     vec![CaseReturn::Pending { pending: true }],
@@ -1078,12 +1395,8 @@ mod tests {
                 ("work.route", vec![routed()]),
             ],
             "routed",
+            calls_for(&read, None),
         );
-        pending.expect.calls = vec![ExpectedCall {
-            command: "work.route".into(),
-            input: json!({"level": "standard-high", "harnesses": ["claude", "codex"],
-                          "classification": null}),
-        }];
         let report = run_case(&artifact, &pending).unwrap();
         assert!(report.passed, "{report:#?}");
         let ask = report
@@ -1094,6 +1407,8 @@ mod tests {
         assert_eq!(ask.outcome, None, "no answer came");
         let route = route_call(&report);
         assert_eq!(route.step, "assume");
+        assert_eq!(route.input["level"], "standard-high");
+        assert_eq!(route.input["classification"], Value::Null);
         let codes: Vec<&Value> = route.input["reasons"]
             .as_array()
             .unwrap()
@@ -1106,19 +1421,13 @@ mod tests {
     #[test]
     fn a_call_without_a_return_fails_the_case_and_names_the_step() {
         let artifact = routing();
-        let missing = case(
-            vec![
-                ("work.read", vec![observed("feature")]),
-                ("judgment.assess", vec![assessed("feature", "low", &[])]),
-            ],
-            "routed",
-        );
+        let mut missing = classified("feature", "feature", "low", &[]);
+        missing.returns.remove("work.route");
         let report = run_case(&artifact, &missing).unwrap();
         assert!(!report.passed, "{report:#?}");
-        assert!(
-            report.problems.iter().any(|p| p
-                .starts_with("step route called work.route but the case gives no return for it")),
-            "{report:#?}"
+        problem(
+            &report,
+            "step route called work.route but the case gives no return for it",
         );
         let route = route_call(&report);
         assert_eq!(route.outcome, None);
@@ -1128,55 +1437,113 @@ mod tests {
         );
     }
 
+    /// A case lists every call the run makes, in order: a call it does not
+    /// list fails it, and so does one it lists that the run does not make.
     #[test]
-    fn an_expected_call_matches_by_subset_and_order() {
+    fn every_call_the_run_makes_must_be_listed_in_order() {
         let artifact = routing();
-        let read = ExpectedCall {
-            command: "work.read".into(),
-            input: json!({"subject": {"id": "task-1"}}),
-        };
-        let route = ExpectedCall {
-            command: "work.route".into(),
-            input: json!({"level": "complex-high", "harnesses": ["claude", "codex"]}),
-        };
-        let mut c = classified("feature", "design", "low", &[]);
-        // An object is matched by subset, an array exactly, and in order.
-        c.expect.calls = vec![read.clone(), route.clone()];
-        let report = run_case(&artifact, &c).unwrap();
-        assert!(report.passed, "{report:#?}");
+        let full = classified("feature", "design", "low", &[]);
+        assert!(run_case(&artifact, &full).unwrap().passed);
+        // The review's probe: naming only the route, even with its whole
+        // input, no longer passes.
+        let mut only_route = full.clone();
+        only_route.expect.calls = vec![full.expect.calls[2].clone()];
+        let report = run_case(&artifact, &only_route).unwrap();
+        assert!(!report.passed);
+        let p = problem(&report, "expect.calls[0]");
+        assert!(p.contains("work.route") && p.contains("work.read"), "{p}");
+        // No calls listed at all.
+        let mut none = full.clone();
+        none.expect.calls = vec![];
+        let report = run_case(&artifact, &none).unwrap();
+        assert!(!report.passed);
+        let p = problem(
+            &report,
+            "expect.calls: the run called work.read at step read",
+        );
+        assert!(p.contains("lists 0"), "{p}");
         // Out of order.
-        c.expect.calls = vec![route.clone(), read.clone()];
-        let report = run_case(&artifact, &c).unwrap();
+        let mut swapped = full.clone();
+        swapped.expect.calls.swap(0, 1);
+        let report = run_case(&artifact, &swapped).unwrap();
         assert!(!report.passed);
+        problem(&report, "expect.calls[0]");
+        // One call more than the run makes.
+        let mut more = full.clone();
+        more.expect.calls.push(full.expect.calls[2].clone());
+        let report = run_case(&artifact, &more).unwrap();
+        assert!(!report.passed);
+        let p = problem(&report, "expect.calls[3]");
+        assert!(p.contains("made 3 calls"), "{p}");
+    }
+
+    #[test]
+    fn an_expected_input_must_equal_the_call_exactly() {
+        let artifact = routing();
+        let full = classified("feature", "design", "low", &[]);
+        // The review's probe: the level is wrong, and the case fails with
+        // the place, what it expects and what the call had.
+        let mut wrong = full.clone();
+        wrong.expect.calls[2].input["level"] = json!("deep-high");
+        let report = run_case(&artifact, &wrong).unwrap();
+        assert!(!report.passed);
+        let p = problem(&report, "expect.calls[2].input");
         assert!(
-            report
-                .problems
-                .iter()
-                .any(|p| p.starts_with("expect.calls[1]")),
-            "{report:#?}"
+            p.contains(
+                "input.level: the case expects \"deep-high\", the call has \"complex-high\""
+            ),
+            "{p}"
         );
-        // An array is not matched by subset.
-        let mut fewer = route.clone();
-        fewer.input["harnesses"] = json!(["claude"]);
-        c.expect.calls = vec![fewer];
-        let report = run_case(&artifact, &c).unwrap();
+        // A part of the input is not enough.
+        let mut part = full.clone();
+        part.expect.calls[2].input = json!({"level": "complex-high"});
+        let report = run_case(&artifact, &part).unwrap();
         assert!(!report.passed);
-        let problem = report
-            .problems
-            .iter()
-            .find(|p| p.starts_with("expect.calls[0]"))
-            .unwrap_or_else(|| panic!("{report:#?}"));
-        assert!(problem.contains("input.harnesses"), "{problem}");
-        // A scalar is matched exactly.
-        let mut other = route;
-        other.input["level"] = json!("deep-high");
-        c.expect.calls = vec![other];
-        let report = run_case(&artifact, &c).unwrap();
-        assert!(!report.passed);
+        let p = problem(&report, "expect.calls[2].input");
         assert!(
-            report.problems.iter().any(|p| p.contains("input.level")),
-            "{report:#?}"
+            p.contains(
+                "input.harnesses: the case does not list it; the call has [\"claude\",\"codex\"]"
+            ),
+            "{p}"
         );
+        // An array must be equal, not a part of it.
+        let mut fewer = full.clone();
+        fewer.expect.calls[2].input["harnesses"] = json!(["claude"]);
+        let report = run_case(&artifact, &fewer).unwrap();
+        assert!(!report.passed);
+        let p = problem(&report, "expect.calls[2].input");
+        assert!(p.contains("input.harnesses"), "{p}");
+    }
+
+    #[test]
+    fn a_return_the_run_never_uses_fails_the_case() {
+        let artifact = routing();
+        let mut extra = classified("feature", "design", "low", &[]);
+        extra.returns.get_mut("work.route").unwrap().push(routed());
+        let report = run_case(&artifact, &extra).unwrap();
+        assert!(!report.passed, "{report:#?}");
+        let p = problem(&report, "returns.\"work.route\"[1]");
+        assert!(p.contains("never used"), "{p}");
+    }
+
+    #[test]
+    fn the_calls_and_each_input_are_required() {
+        let case = serde_json::to_value(classified("feature", "design", "low", &[])).unwrap();
+        let mut no_calls = case.clone();
+        no_calls["expect"].as_object_mut().unwrap().remove("calls");
+        let error = serde_json::from_value::<Case>(no_calls)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("calls"), "{error}");
+        let mut no_input = case;
+        no_input["expect"]["calls"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("input");
+        let error = serde_json::from_value::<Case>(no_input)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("input"), "{error}");
     }
 
     #[test]
@@ -1186,22 +1553,74 @@ mod tests {
         c.start = CaseStart::Event {
             event: "aq.work.route_needed".into(),
             payload: json!({"subject": {"id": "task-1", "revision": 2}}),
+            correlation: BTreeMap::new(),
         };
+        c.expect.calls[0].input = json!({"subject": {"id": "task-1", "revision": 2}});
         let report = run_case(&artifact, &c).unwrap();
         assert!(report.passed, "{report:#?}");
-        // The trigger's input is the event's subject.
-        assert_eq!(
-            report.calls[0].input,
-            json!({"subject": {"id": "task-1", "revision": 2}})
-        );
         // An event the playbook has no trigger for starts nothing.
         c.start = CaseStart::Event {
             event: "aq.judgment.assessed".into(),
             payload: json!({}),
+            correlation: BTreeMap::new(),
         };
         let report = run_case(&artifact, &c).unwrap();
         assert!(!report.passed);
-        assert!(!report.problems.is_empty());
+        problem(&report, "start.event");
+    }
+
+    /// Any event a trigger names can start a case, with the correlation
+    /// values the case gives; `aq.work.changed` is correlated by `operation`.
+    #[test]
+    fn a_case_starts_from_any_trigger_event_with_its_correlation() {
+        let routing: Value = serde_json::from_str(ROUTING_DRAFT).unwrap();
+        let ret = |outcome: &str| {
+            json!({"op": {"kind": "return", "outcome": outcome,
+            "output": {"op": "literal", "value": null}}, "edges": {}, "on_error": null})
+        };
+        let draft = json!({
+            "entries": {"main": {"input": routing["entries"]["main"]["input"],
+                "outcomes": {"seen": {"type": "null"}, "failed": {"type": "null"}}, "start": "read"}},
+            "triggers": [{"id": "changed", "event": "aq.work.changed", "entry": "main",
+                "input": {"op": "object", "fields": {"task": {"op": "ref", "root": "event", "path": ["subject"]}}}}],
+            "steps": {
+                "read": {"op": {"kind": "invoke", "command": "work.read", "bind": "task", "retry": null,
+                    "input": {"op": "object", "fields": {"subject": {"op": "ref", "root": "input", "path": ["task"]}}}},
+                    "edges": {"observed": "seen", "refused": "failed"}, "on_error": "failed"},
+                "seen": ret("seen"),
+                "failed": ret("failed"),
+            },
+        });
+        let artifact = sealed(&["work.read"], &["aq.work.changed"], &["work.read"], draft);
+        let changed = |correlation: &[(&str, &str)]| Case {
+            name: "changed".into(),
+            situation: "A task changed".into(),
+            start: CaseStart::Event {
+                event: "aq.work.changed".into(),
+                payload: json!({"outcome": "changed", "reference": "task-1@3", "subject": subject()}),
+                correlation: correlation
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            },
+            returns: BTreeMap::from([("work.read".into(), vec![observed("feature")])]),
+            expect: Expectation {
+                outcome: "seen".into(),
+                calls: vec![call("work.read", json!({"subject": subject()}))],
+            },
+        };
+        let report = run_case(&artifact, &changed(&[("operation", "op-7")])).unwrap();
+        assert!(report.passed, "{report:#?}");
+        let report = run_case(&artifact, &changed(&[])).unwrap();
+        assert!(!report.passed);
+        assert!(problem(&report, "start.correlation").contains("operation"));
+        let report = run_case(
+            &artifact,
+            &changed(&[("operation", "op-7"), ("other", "x")]),
+        )
+        .unwrap();
+        assert!(!report.passed);
+        assert!(problem(&report, "start.correlation").contains("other"));
     }
 
     #[test]
@@ -1217,21 +1636,108 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         for n in [0, 4, 41] {
-            let error = run_cases(&artifact, &named(n)).unwrap_err().to_string();
+            let error = run_cases(&artifact, &named(n), CASES_TRANSITION_BUDGET)
+                .unwrap_err()
+                .to_string();
             assert!(
                 error.contains("at least 5") && error.contains("at most 40"),
                 "{error}"
             );
         }
         for n in [MIN_CASES, MAX_CASES] {
-            let reports = run_cases(&artifact, &named(n)).unwrap();
+            let reports = run_cases(&artifact, &named(n), CASES_TRANSITION_BUDGET).unwrap();
             assert_eq!(reports.len(), n);
             assert!(reports.iter().all(|r| r.passed));
         }
         // Each case has its own name.
         let mut twins = named(5);
         twins[1].name = twins[0].name.clone();
-        let error = run_cases(&artifact, &twins).unwrap_err().to_string();
+        let error = run_cases(&artifact, &twins, CASES_TRANSITION_BUDGET)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("case 0"), "{error}");
+    }
+
+    /// All the cases of a save share one transition budget, and running out
+    /// of it is its own failure, named by the case it stopped at.
+    #[test]
+    fn the_cases_share_a_total_transition_budget() {
+        let artifact = routing();
+        let one = classified("feature", "feature", "low", &[]);
+        let cases: Vec<Case> = (0..5)
+            .map(|i| Case {
+                name: format!("case {i}"),
+                ..one.clone()
+            })
+            .collect();
+        let error = run_cases(&artifact, &cases, 30).unwrap_err().to_string();
+        assert!(
+            error.starts_with("the cases exceeded the total budget of 30 transitions at case "),
+            "{error}"
+        );
+        assert!(error.contains("\"case 2\""), "{error}");
+        assert!(run_cases(&artifact, &cases, CASES_TRANSITION_BUDGET).is_ok());
+    }
+
+    #[test]
+    fn a_sentence_is_quoted_from_its_lines() {
+        let markdown = "# Title\n\n- Research is Standard, unless it is clearly harder,\n  in which case it is Complex.\n\nLast.\n";
+        let one = quote(markdown, 6, None).unwrap();
+        assert_eq!(
+            serde_json::to_value(&one).unwrap(),
+            json!({"line": 6, "text": "Last."})
+        );
+        let two = quote(markdown, 3, Some(4)).unwrap();
+        assert_eq!(
+            serde_json::to_value(&two).unwrap(),
+            json!({"line": 3, "end_line": 4,
+                   "text": "- Research is Standard, unless it is clearly harder,\n  in which case it is Complex."})
+        );
+        assert_eq!(quote(markdown, 6, Some(6)).unwrap(), one);
+        let past = quote(markdown, 6, Some(7)).unwrap_err();
+        assert!(past.contains("1 to 6"), "{past}");
+        assert!(quote(markdown, 2, None).unwrap_err().contains("blank"));
+        assert!(quote(markdown, 3, Some(5)).unwrap_err().contains("blank"));
+        assert!(quote(markdown, 4, Some(3)).is_err());
+        let long = "x\n".repeat(20);
+        assert!(quote(&long, 1, Some(8)).is_ok());
+        assert!(quote(&long, 1, Some(9)).unwrap_err().contains("8 lines"));
+        // The outcome holds its sentences in document order, apart.
+        let question = |sentences: Vec<Sentence>| Outcome::Question {
+            question: "Which?".into(),
+            sentences,
+        };
+        assert!(question(vec![two.clone(), one.clone()]).check().is_ok());
+        assert!(question(vec![one.clone(), two.clone()]).check().is_err());
+        assert!(
+            question(vec![two.clone(), quote(markdown, 4, None).unwrap()])
+                .check()
+                .is_err()
+        );
+        let bad = json!({"kind": "question", "question": "Which?",
+                         "sentences": [{"line": 6, "end_line": 6, "text": "Last."}]});
+        assert!(Outcome::from_bytes(&serde_json::to_vec(&bad).unwrap()).is_err());
+        let unable = json!({"kind": "unable", "reason": "No command does it.", "line": 3,
+            "end_line": 4, "sentence": two.text});
+        assert!(Outcome::from_bytes(&serde_json::to_vec(&unable).unwrap()).is_ok());
+    }
+
+    /// Run by hand in release: `cargo test --release -p aq-playbooks-simulation
+    /// -- --ignored forty_routing_cases --nocapture`.
+    #[test]
+    #[ignore = "a timing, run by hand in release"]
+    fn forty_routing_cases_take_this_long() {
+        let artifact = routing();
+        let one = classified("feature", "design", "low", &[]);
+        let cases: Vec<Case> = (0..MAX_CASES)
+            .map(|i| Case {
+                name: format!("case {i}"),
+                ..one.clone()
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let reports = run_cases(&artifact, &cases, CASES_TRANSITION_BUDGET).unwrap();
+        println!("40 routing cases: {:?}", started.elapsed());
+        assert!(reports.iter().all(|r| r.passed));
     }
 }

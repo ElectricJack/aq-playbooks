@@ -8,7 +8,7 @@
     "work.read"
   ],
   "events": [
-    "aq.work.route_needed"
+    "aq.work.changed"
   ],
   "capabilities": [
     "message.send",

@@ -20,7 +20,7 @@ use std::{
 /// `previous.artifact.json`, and the most steps its draft has.
 const EXAMPLES: [(&str, &str, usize); 2] = [
     ("escalate-on-judgment", "presentation", 12),
-    ("notify-when-ready", "executable", 8),
+    ("notify-when-ready", "executable", 9),
 ];
 const ON_DISK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/authoring/examples");
 
@@ -177,32 +177,6 @@ fn each_stuck_document_writes_the_outcome_it_shows() {
                 .map(|a| a.as_str().unwrap())
                 .collect();
             shown.insert(args[0].to_string());
-            let refused = run(&root, &args);
-            if !refused.status.success()
-                && String::from_utf8_lossy(&refused.stderr)
-                    .contains("unexpected argument '--lines'")
-            {
-                // `--lines A-B` (a sentence that spans lines) comes with the
-                // fix round of the case and question rules. Until then this
-                // runs the single-line form, `--line A`, which quotes line A
-                // only; once `--lines` runs, the exact outcome below is checked.
-                let at = args.iter().position(|a| *a == "--lines").unwrap();
-                let first = args[at + 1].split('-').next().unwrap().to_string();
-                let mut single = args.clone();
-                single[at] = "--line";
-                single[at + 1] = &first;
-                let printed = ok(&root, &single);
-                let wanted = &example["writes"]["sentences"][0];
-                assert_eq!(
-                    printed["outcome"]["question"],
-                    example["writes"]["question"]
-                );
-                let sentence = &printed["outcome"]["sentences"][0];
-                assert_eq!(sentence["line"], wanted["line"], "{path}");
-                let text = wanted["text"].as_str().unwrap();
-                assert_eq!(sentence["text"], text.split('\n').next().unwrap(), "{path}");
-                continue;
-            }
             let printed = ok(&root, &args);
             assert_eq!(printed["outcome"], example["writes"], "{path}");
             assert_eq!(

@@ -2,6 +2,7 @@
 //! holding the routing draft and catalog 2.2.0.
 use aq_playbooks_cli::catalog::{catalog_v2_2, strings};
 use aq_playbooks_compiler::draft::{SourceRecord, retain_registry};
+use aq_playbooks_model::{EvalContext, EvalLimits, EvalValue, Expr, eval};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -12,6 +13,8 @@ use std::{
 
 const ROUTING_DRAFT: &str = include_str!("data/routing_draft.json");
 const LINE_21: &str = "Research is Standard, high effort, unless it is clearly harder.";
+/// Line 22 continues the sentence of line 21, as a person wraps it.
+const LINE_22: &str = "  in which case it is Complex, high effort.";
 const LINE_51: &str = "Very high risk work is at least Complex, unless it is narrow and covered by a test, in which case Standard, high effort is enough.";
 
 struct Dir(PathBuf);
@@ -57,13 +60,14 @@ fn write(dir: &Path, name: &str, value: &Value) {
     fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
 }
 
-/// A source of 60 lines whose lines 21 and 51 are the two sentences the
-/// routing document leaves open.
+/// A source of 60 lines whose lines 21 (with 22) and 51 are the two
+/// sentences the routing document leaves open.
 fn markdown() -> String {
     (1..=60)
         .map(|n| match n {
             1 => "# Routing".to_string(),
             21 => LINE_21.to_string(),
+            22 => LINE_22.to_string(),
             51 => LINE_51.to_string(),
             n if n % 2 == 0 => String::new(),
             n => format!("Sentence {n} of the document."),
@@ -92,7 +96,45 @@ fn routed() -> Value {
     json!({"outcome": "routed", "output": {"reference": "route-1", "subject": subject(),
         "harnesses": [], "providers": [], "prefer": []}})
 }
+fn facts() -> Value {
+    let everyone = json!({"harnesses": ["claude", "codex", "gemini", "opencode"],
+                          "providers": ["anthropic", "google", "ollama", "openai"]});
+    json!({
+        "levels": ["simple-high", "standard-high", "complex-high", "deep-high"],
+        "offers": {"simple-high": everyone, "standard-high": everyone,
+                   "complex-high": everyone, "deep-high": everyone},
+        "harnesses": ["claude", "codex", "gemini", "opencode"],
+        "providers": ["anthropic", "google", "ollama", "openai"],
+    })
+}
+/// A step's input, evaluated as the draft writes it.
+fn step_input(step: &str, roots: &[(&str, Value)]) -> Value {
+    let draft: Value = serde_json::from_str(ROUTING_DRAFT).unwrap();
+    let expr: Expr = serde_json::from_value(draft["steps"][step]["op"]["input"].clone()).unwrap();
+    let mut context = EvalContext::from([("definitions".to_string(), EvalValue::Known(facts()))]);
+    for (root, value) in roots {
+        context.insert(root.to_string(), EvalValue::Known(value.clone()));
+    }
+    match eval(&expr, &context, &EvalLimits::default()).unwrap() {
+        EvalValue::Known(value) => value,
+        other => panic!("{step}: {other:?}"),
+    }
+}
+/// A case that lists every call the run makes, each with its whole input.
 fn routing_case(name: &str, kind: &str, risk: &str, level: &str) -> Value {
+    let task = observed()["output"].clone();
+    let answer = assessed(kind, risk)["output"].clone();
+    let route = step_input(
+        "route",
+        &[
+            ("task", task.clone()),
+            (
+                "answer",
+                json!({"c": {"participant": "op", "outcome": "assessed", "output": answer}}),
+            ),
+        ],
+    );
+    assert_eq!(route["level"], level, "{name}");
     json!({
         "name": name,
         "situation": format!("A {risk} risk {kind} task needs a route"),
@@ -100,8 +142,11 @@ fn routing_case(name: &str, kind: &str, risk: &str, level: &str) -> Value {
                   "payload": {"subject": subject()}},
         "returns": {"work.read": [observed()], "judgment.assess": [assessed(kind, risk)],
                     "work.route": [routed()]},
-        "expect": {"outcome": "routed",
-                   "calls": [{"command": "work.route", "input": {"level": level}}]},
+        "expect": {"outcome": "routed", "calls": [
+            {"command": "work.read", "input": {"subject": subject()}},
+            {"command": "judgment.assess", "input": step_input("ask", &[("task", task)])},
+            {"command": "work.route", "input": route},
+        ]},
     })
 }
 
@@ -130,19 +175,7 @@ fn workspace(name: &str) -> Dir {
     let (catalog, _) = retain_registry(&catalog_v2_2(), &record.commands, &record.events).unwrap();
     write(d, "record.json", &serde_json::to_value(&record).unwrap());
     write(d, "catalog.json", &serde_json::to_value(&catalog).unwrap());
-    let everyone = json!({"harnesses": ["claude", "codex", "gemini", "opencode"],
-                          "providers": ["anthropic", "google", "ollama", "openai"]});
-    write(
-        d,
-        "facts.json",
-        &json!({
-            "levels": ["simple-high", "standard-high", "complex-high", "deep-high"],
-            "offers": {"simple-high": everyone, "standard-high": everyone,
-                       "complex-high": everyone, "deep-high": everyone},
-            "harnesses": ["claude", "codex", "gemini", "opencode"],
-            "providers": ["anthropic", "google", "ollama", "openai"],
-        }),
-    );
+    write(d, "facts.json", &facts());
     fs::write(d.join("draft.json"), ROUTING_DRAFT).unwrap();
     for (file, kind, risk, level) in [
         ("chore", "chore", "low", "simple-high"),
@@ -189,10 +222,29 @@ fn check_try_compare_save_on_a_workspace() {
     let (ok, compared) = json_of(d, &["compare"]);
     assert!(ok, "{compared:#}");
     assert_eq!(compared, json!({"previous": null}));
-    let (ok, sealed) = json_of(d, &["seal", "--output", "previous.artifact.json"]);
+    // seal never overwrites what the host gave the workspace.
+    for input in [
+        "previous.artifact.json",
+        "draft.json",
+        "cases/x.json",
+        "out/sealed.json",
+    ] {
+        let (ok, refused) = json_of(d, &["seal", "--output", input]);
+        assert!(!ok, "{input}");
+        assert!(
+            refused["error"].as_str().unwrap().contains(input),
+            "{refused:#}"
+        );
+    }
+    let (ok, sealed) = json_of(d, &["seal", "--output", "sealed.artifact.json"]);
     assert!(ok, "{sealed:#}");
     let digest = sealed["artifact"].as_str().unwrap().to_string();
     assert!(digest.starts_with("sha256:"));
+    fs::copy(
+        d.join("sealed.artifact.json"),
+        d.join("previous.artifact.json"),
+    )
+    .unwrap();
     let (ok, compared) = json_of(d, &["compare"]);
     assert!(ok, "{compared:#}");
     assert_eq!(compared["change"], "identical");
@@ -252,7 +304,7 @@ fn save_refuses_a_failing_case_and_writes_no_outcome() {
     let ws = workspace("refuse");
     let d = &ws.0;
     let mut wrong = routing_case("design", "design", "low", "complex-high");
-    wrong["expect"]["calls"][0]["input"]["level"] = json!("standard-high");
+    wrong["expect"]["calls"][2]["input"]["level"] = json!("standard-high");
     write(d, "cases/design.json", &wrong);
     let (ok, refused) = json_of(d, &["save"]);
     assert!(!ok, "{refused:#}");
@@ -309,9 +361,27 @@ fn ask_and_unable_write_the_outcome_with_the_sentence() {
         outcome,
         json!({"kind": "unable", "reason": reason, "line": 51, "sentence": LINE_51})
     );
-    // A blank line is not a sentence.
-    let (ok, refused) = json_of(d, &["unable", "--line", "2", reason]);
-    assert!(!ok);
+    // A sentence over two lines.
+    let (ok, printed) = json_of(d, &["unable", "--lines", "21-22", reason]);
+    assert!(ok, "{printed:#}");
+    let outcome: Value =
+        serde_json::from_slice(&fs::read(d.join("out/outcome.json")).unwrap()).unwrap();
+    assert_eq!(
+        outcome,
+        json!({"kind": "unable", "reason": reason, "line": 21, "end_line": 22,
+               "sentence": format!("{LINE_21}\n{LINE_22}")})
+    );
+    // A blank line is not a sentence; one sentence is named once.
+    for args in [
+        &["unable", "--line", "2", reason][..],
+        &["unable", "--line", "21", "--lines", "21-22", reason],
+        &["unable", reason],
+    ] {
+        let (ok, refused) = json_of(d, args);
+        assert!(!ok, "{args:?}");
+        assert!(refused["error"].is_string(), "{refused:#}");
+    }
+    let (_, refused) = json_of(d, &["unable", "--line", "2", reason]);
     assert!(
         refused["error"].as_str().unwrap().contains("line 2"),
         "{refused:#}"
@@ -337,6 +407,34 @@ fn one_question_can_name_two_sentences() {
     assert!(!ok);
     let error = refused["error"].as_str().unwrap();
     assert!(error.contains("61") && error.contains("60"), "{error}");
+    assert_eq!(fs::read(d.join("out/outcome.json")).unwrap(), before);
+    // A sentence over lines 21-22, with another; recorded in document order.
+    let (ok, printed) = json_of(d, &["ask", "--line", "51", "--lines", "21-22", question]);
+    assert!(ok, "{printed:#}");
+    let outcome: Value =
+        serde_json::from_slice(&fs::read(d.join("out/outcome.json")).unwrap()).unwrap();
+    assert_eq!(
+        outcome["sentences"],
+        json!([{"line": 21, "end_line": 22, "text": format!("{LINE_21}\n{LINE_22}")},
+               {"line": 51, "text": LINE_51}])
+    );
+    let before = fs::read(d.join("out/outcome.json")).unwrap();
+    for (args, says) in [
+        (&["ask", "--lines", "41-50", question][..], "8 lines"),
+        (&["ask", "--lines", "51-53", question], "blank"),
+        (&["ask", "--lines", "22-21", question], "A-B"),
+        (&["ask", "--lines", "59-61", question], "1 to 60"),
+        (
+            &["ask", "--line", "21", "--lines", "21-22", question],
+            "overlap",
+        ),
+        (&["ask", "--lines", "21", question], "A-B"),
+    ] {
+        let (ok, refused) = json_of(d, args);
+        assert!(!ok, "{args:?}");
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains(says), "{args:?}: {error}");
+    }
     assert_eq!(fs::read(d.join("out/outcome.json")).unwrap(), before);
     // At most 16 sentences.
     let mut args = vec!["ask"];
@@ -441,6 +539,16 @@ fn the_tools_accept_only_paths_inside_the_workspace() {
         assert!(!outside.0.join("outcome.json").exists());
         fs::remove_file(d.join("out")).unwrap();
     }
+    // Discovery in a subdirectory of a workspace is refused too.
+    let (ok, refused) = json_of(&d.join("cases"), &["commands", "list"]);
+    assert!(!ok);
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("workspace directory itself"),
+        "{refused:#}"
+    );
     // Not in a workspace, or in a subdirectory of one: refused.
     for dir in [outside.0.clone(), d.join("cases")] {
         for args in [
@@ -457,4 +565,55 @@ fn the_tools_accept_only_paths_inside_the_workspace() {
             );
         }
     }
+}
+
+/// Argument errors are JSON on stdout too, with exit status 2 (1 is a
+/// refusal of the command itself).
+#[test]
+fn argument_errors_print_json_and_exit_2() {
+    let ws = workspace("usage");
+    let d = &ws.0;
+    for args in [
+        &["ask", "--line", "abc", "Why?"][..],
+        &["ask", "Why?", "--frobnicate"],
+        &["tri", "cases/chore.json"],
+    ] {
+        let out = run(d, args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let printed: Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("{args:?}: {e}: {}", String::from_utf8_lossy(&out.stdout)));
+        assert!(
+            printed["error"].as_str().unwrap().starts_with("error:"),
+            "{printed:#}"
+        );
+    }
+    // Help is still help.
+    let out = run(d, &["ask", "--help"]);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("--lines"));
+}
+
+#[test]
+fn a_cases_entry_that_is_not_a_directory_is_reported() {
+    let ws = workspace("not-a-dir");
+    let d = &ws.0;
+    fs::remove_dir_all(d.join("cases")).unwrap();
+    fs::write(d.join("cases"), "not a directory").unwrap();
+    let (ok, refused) = json_of(d, &["save"]);
+    assert!(!ok);
+    assert!(
+        refused["reasons"]
+            .to_string()
+            .contains("cases is not a directory"),
+        "{refused:#}"
+    );
+    fs::remove_file(d.join("cases")).unwrap();
+    let (ok, refused) = json_of(d, &["save"]);
+    assert!(!ok);
+    assert!(
+        refused["reasons"]
+            .to_string()
+            .contains("holds 0 case files"),
+        "{refused:#}"
+    );
 }

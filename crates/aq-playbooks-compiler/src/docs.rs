@@ -38,6 +38,7 @@ pub fn example_files() -> Vec<(&'static str, &'static str)> {
         "notify-when-ready/cases/owner-chose.json",
         "notify-when-ready/cases/still-waiting.json",
         "notify-when-ready/cases/taken-meanwhile.json",
+        "notify-when-ready/cases/task-finished.json",
         "notify-when-ready/cases/task-gone.json",
         "notify-when-ready/catalog.json",
         "notify-when-ready/draft.json",

@@ -22,10 +22,21 @@
               "id",
               "revision"
             ]
+          },
+          "change": {
+            "type": "string",
+            "max_length": 128,
+            "values": [
+              "cancelled",
+              "changed",
+              "completed",
+              "ensured"
+            ]
           }
         },
         "required": [
-          "task"
+          "task",
+          "change"
         ]
       },
       "outcomes": {
@@ -42,13 +53,13 @@
           "type": "null"
         }
       },
-      "start": "wait"
+      "start": "ready"
     }
   },
   "triggers": [
     {
-      "id": "task-ready",
-      "event": "aq.work.route_needed",
+      "id": "task-changed",
+      "event": "aq.work.changed",
       "entry": "main",
       "input": {
         "op": "object",
@@ -59,12 +70,47 @@
             "path": [
               "subject"
             ]
+          },
+          "change": {
+            "op": "ref",
+            "root": "event",
+            "path": [
+              "outcome"
+            ]
           }
         }
       }
     }
   ],
   "steps": {
+    "ready": {
+      "op": {
+        "kind": "decide",
+        "predicate": {
+          "op": "contains",
+          "collection": {
+            "op": "literal",
+            "value": [
+              "ensured",
+              "changed"
+            ]
+          },
+          "value": {
+            "op": "ref",
+            "root": "input",
+            "path": [
+              "change"
+            ]
+          }
+        }
+      },
+      "edges": {
+        "true": "wait",
+        "false": "gone",
+        "unknown": "failed"
+      },
+      "on_error": null
+    },
     "wait": {
       "op": {
         "kind": "wait",
@@ -220,6 +266,7 @@
     }
   },
   "source_map": {
+    "ready": 3,
     "wait": 3,
     "read": 6,
     "check": 6,

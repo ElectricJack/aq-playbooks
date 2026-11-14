@@ -13,6 +13,7 @@
     "sentences": [
       {
         "line": 17,
+        "end_line": 18,
         "text": "- High risk work is Deep, high effort, because mistakes there are costly,\n  and only Claude or Codex may take it."
       }
     ]
