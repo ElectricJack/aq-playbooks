@@ -1,7 +1,6 @@
-use anyhow::{Context, Result, bail};
-use aq_playbooks_cli::{catalog, pilots, simulation};
-use aq_playbooks_compiler::{CompileInput, compile, semantic_diff, validate};
-use aq_playbooks_model::{Artifact, Registry, canonical_bytes};
+use anyhow::{Context, Result};
+use aq_playbooks_cli::{catalog, simulation};
+use aq_playbooks_model::{Artifact, Registry};
 use aq_playbooks_postgres::PostgresStorage;
 use aq_playbooks_runner::{
     Authority, CatalogKind, CatalogQuery, Engine, InspectionKind, InspectionQuery, RetentionPolicy,
@@ -15,12 +14,13 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+mod authoring;
 
 #[derive(Parser)]
 #[command(
     name = "aq-playbooks",
     version,
-    about = "Compile, simulate, and inspect bounded policy workflows"
+    about = "Author, check, inspect and administer bounded policy workflows"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -28,19 +28,8 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Validate and package an exact source/proposal/catalog bundle.
-    Compile {
-        input: PathBuf,
-        #[arg(short, long)]
-        output: PathBuf,
-    },
-    Validate {
-        input: PathBuf,
-    },
-    Diff {
-        before: PathBuf,
-        after: PathBuf,
-    },
+    #[command(flatten)]
+    Authoring(authoring::Authoring),
     Artifact {
         #[command(subcommand)]
         action: ArtifactAction,
@@ -57,23 +46,11 @@ enum Command {
         #[command(subcommand)]
         action: CatalogAction,
     },
-    Interfaces {
-        artifact: PathBuf,
-        #[command(subcommand)]
-        action: CatalogAction,
-    },
-    /// Report the finite synthetic AQ pilot API surface.
-    Surface,
-    /// Generate runnable fake-host pilot artifacts and scenarios.
+    /// Write the worked authoring workspaces (each a directory to run the
+    /// authoring tools in) under DIR.
     Examples {
         #[arg(long)]
         output: PathBuf,
-    },
-    /// Uses an in-memory store, scripted fake responses, and a virtual clock.
-    Simulate {
-        scenario: Option<PathBuf>,
-        #[arg(long, conflicts_with = "scenario")]
-        pilot: Option<String>,
     },
     Install {
         artifact: PathBuf,
@@ -175,7 +152,7 @@ enum Command {
         #[command(flatten)]
         store: StoreArgs,
     },
-    /// Fence a retired authenticated producer epoch before compacting replay tombstones.
+    /// Fence a retired authenticated producer epoch: its events and requests are refused from then on.
     RetireProducer {
         producer: String,
         epoch: u64,
@@ -348,101 +325,94 @@ fn advance_until_settled(e: &Engine<PostgresStorage>, run: &str) -> Result<()> {
     }
     Ok(())
 }
+/// Lists or describes a contract. A contract that is the pinned catalog's
+/// own is described with the host's notes on it (`"notes"`), the same notes
+/// `CATALOG.md` renders.
 fn choose<T: Serialize>(
+    kind: &str,
     map: &std::collections::BTreeMap<String, T>,
     action: CatalogAction,
 ) -> Result<()> {
     match action {
         CatalogAction::List => print(&map.keys().collect::<Vec<_>>()),
-        CatalogAction::Describe { name } => print(
-            map.get(&name)
-                .with_context(|| format!("unknown registration: {name}"))?,
-        ),
+        CatalogAction::Describe { name } => {
+            let contract = map
+                .get(&name)
+                .with_context(|| format!("unknown registration: {name}"))?;
+            let mut described = serde_json::to_value(contract)?;
+            let pinned = aq_playbooks_compiler::docs::catalog_registry();
+            let same = match kind {
+                "commands" => pinned.commands.get(&name).map(serde_json::to_value),
+                _ => pinned.events.get(&name).map(serde_json::to_value),
+            };
+            if let (Some(Ok(pinned)), Some(notes)) =
+                (same, aq_playbooks_compiler::docs::notes(kind, &name))
+                && pinned == described
+                && let Some(object) = described.as_object_mut()
+            {
+                object.insert("notes".into(), notes);
+            }
+            print(&described)
+        }
     }
 }
 fn catalog_file(path: Option<PathBuf>) -> Result<Registry> {
+    if let Some(registry) = authoring::workspace_registry(path.as_deref())? {
+        return Ok(registry);
+    }
     path.map(|p| read(&p))
         .unwrap_or_else(|| Ok(catalog::catalog()))
 }
 fn main() {
-    if let Err(error) = execute(Cli::parse()) {
-        eprintln!("{error:#}");
+    // Argument errors are JSON on stdout, exit 2, for an agent reading stdout.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) if !error.use_stderr() => error.exit(),
+        Err(error) => {
+            println!("{}", json!({"error": error.render().to_string()}));
+            std::process::exit(2);
+        }
+    };
+    // Discovery is agent-facing too: its refusals are JSON on stdout.
+    let discovery = matches!(
+        cli.command,
+        Command::Commands { .. } | Command::Events { .. }
+    );
+    if let Err(error) = execute(cli) {
+        if discovery {
+            println!("{}", json!({"error": format!("{error:#}")}));
+        } else {
+            eprintln!("{error:#}");
+        }
         std::process::exit(1);
     }
 }
 fn execute(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Compile { input, output } => {
-            let input: CompileInput = read(&input)?;
-            match compile(&input) {
-                Ok(a) => {
-                    fs::write(output, canonical_bytes(&a)?)?;
-                    print(
-                        &json!({"artifact":a.digest,"executable_fingerprint":a.executable_fingerprint}),
-                    )
-                }
-                Err(d) => {
-                    print(&d)?;
-                    bail!("compilation refused")
-                }
-            }
-        }
-        Command::Validate { input } => {
-            let d = validate(&read(&input)?);
-            print(&d)?;
-            if !d.is_empty() {
-                bail!("proposal is not valid")
-            };
-            Ok(())
-        }
-        Command::Diff { before, after } => {
-            print(&semantic_diff(&artifact(&before)?, &artifact(&after)?)?)
-        }
+        Command::Authoring(command) => authoring::run(command),
         Command::Artifact {
             action: ArtifactAction::Inspect { path },
         } => print(&artifact(&path)?),
-        Command::Commands { registry, action } => choose(&catalog_file(registry)?.commands, action),
-        Command::Events { registry, action } => choose(&catalog_file(registry)?.events, action),
-        Command::Interfaces {
-            artifact: path,
-            action,
-        } => choose(&artifact(&path)?.content.playbook.entries, action),
-        Command::Surface => print(&catalog::describe_surface()),
-        Command::Examples { output } => {
-            fs::create_dir_all(&output)?;
-            for name in pilots::NAMES {
-                let scenario = pilots::scenario(name)?;
-                fs::write(
-                    output.join(format!("{name}.scenario.json")),
-                    serde_json::to_vec_pretty(&scenario)?,
-                )?;
-                for a in &scenario.artifacts {
-                    fs::write(
-                        output.join(format!("{}.artifact.json", a.content.playbook.id)),
-                        canonical_bytes(a)?,
-                    )?;
-                    let input = pilots::compile_input(a);
-                    fs::write(
-                        output.join(format!("{}.proposal.json", a.content.playbook.id)),
-                        serde_json::to_vec_pretty(&input)?,
-                    )?;
-                    fs::write(
-                        output.join(format!("{}.md", a.content.playbook.id)),
-                        &input.source,
-                    )?;
-                }
-            }
-            print(&json!({"directory":output,"pilots":pilots::NAMES}))
+        Command::Commands { registry, action } => {
+            choose("commands", &catalog_file(registry)?.commands, action)
         }
-        Command::Simulate { scenario, pilot } => {
-            let s = if let Some(name) = pilot {
-                pilots::scenario(&name)?
-            } else if let Some(path) = scenario {
-                read(&path)?
-            } else {
-                bail!("provide a scenario file or --pilot")
-            };
-            print(&simulation::simulate(&s)?)
+        Command::Events { registry, action } => {
+            choose("events", &catalog_file(registry)?.events, action)
+        }
+        Command::Examples { output } => {
+            let files = aq_playbooks_compiler::docs::example_files();
+            for (path, text) in &files {
+                let target = output.join(path);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&target, text)?;
+            }
+            let examples: std::collections::BTreeSet<&str> = files
+                .iter()
+                .filter_map(|(p, _)| p.split('/').next())
+                .collect();
+            print(&json!({"directory":output,"examples":examples}))
         }
         Command::Install {
             artifact: path,

@@ -10,7 +10,7 @@ The workspace contains five crates:
 | `aq-playbooks-compiler` | Source/proposal validation, outcome-sensitive type checking, deterministic packaging, semantic diffs |
 | `aq-playbooks-runner` | Atomic transitions, event admission, waits, effects/recovery, children/joins/cancellation, fair indexed scheduling, retention, controls, quotas, in-memory storage and simulation |
 | `aq-playbooks-postgres` | Private migrations, exclusive namespace ownership, transactional snapshots/indexes, protected persistence, key rotation and immutable artifact storage |
-| `aq-playbooks-cli` | Authoring tools, inspection, standalone administration, synthetic AQ catalog and four fake-host pilots |
+| `aq-playbooks-cli` | The authoring agent's tools (`check`, `seal`, `try`, `compare`, `facts`, `save`, `ask`, `unable`), inspection, standalone administration and the AQ host catalogs; its tests keep a stateful fake host and three pilots |
 
 ## Try it
 
@@ -20,17 +20,17 @@ Rust 1.96 was used for verification. Offline commands need no database or AQ che
 cargo test --workspace
 cargo run -p aq-playbooks-cli -- commands list
 cargo run -p aq-playbooks-cli -- examples --output .local/examples
-cargo run -p aq-playbooks-cli -- validate .local/examples/routing.proposal.json
-cargo run -p aq-playbooks-cli -- compile .local/examples/routing.proposal.json --output .local/routing.json
-cargo run -p aq-playbooks-cli -- simulate --pilot coding
-cargo run -p aq-playbooks-cli -- simulate --pilot report
+cd .local/examples/notify-when-ready
+cargo run -p aq-playbooks-cli -- check
+cargo run -p aq-playbooks-cli -- try cases/still-no-description.json
+cargo run -p aq-playbooks-cli -- compare
 ```
 
 Build into the checkout's own `target/` (leave `CARGO_TARGET_DIR` unset; in AQ, each slot keeps its own `target/`). The workspace dev/test profile keeps disk growth bounded: workspace crates get `line-tables-only` debuginfo (backtraces still report file:line), dependencies get none, and incremental compilation is off. Opt back in for a debugging session with `CARGO_INCREMENTAL=1` or `CARGO_PROFILE_DEV_DEBUG=2`.
 
-The generated examples include Markdown sources, explicit proposal bundles, canonical artifacts and scenarios. Pilots cover coding with bounded repair and independent follow-up, routing judgment, findings reconciliation, and supervisor reporting with fallback and late completion. Work creation is distinct from authoritative completion and assessment disposition. Missing mock results remain unresolved.
+`examples` writes the worked authoring workspaces of `crates/aq-playbooks-compiler/authoring-examples`: a document, the files the host places beside it, the finished draft, its cases, the previously active artifact, and documents the agent cannot turn into steps with the `ask` or `unable` it runs for them. The authoring tools run only with a workspace's root as the current directory. `tests/authoring_examples.rs` runs them on every example.
 
-`commands`, `events`, and `interfaces` support `list` and `describe`. `surface` reports the twelve synthetic host commands and their finite views/templates/change variants. `diff` compares artifacts. Run `--help` for exact arguments.
+`commands` and `events` support `list` and `describe`; in a workspace they read its `catalog.json`. Run `--help` for exact arguments.
 
 ## Durable administration
 

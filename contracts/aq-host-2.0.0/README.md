@@ -30,5 +30,5 @@ semantics and the compatibility decision. To verify:
 
 ```sh
 cargo test --locked -p aq-playbooks-cli --test catalog_v2_contract
-cargo test --locked -p aq-playbooks-cli --lib catalog_v2_async_judgment_and_check_compile_and_join
+cargo test --locked -p aq-playbooks-cli --test host_pilots catalog_v2_async_judgment_and_check_compile_and_join
 ```

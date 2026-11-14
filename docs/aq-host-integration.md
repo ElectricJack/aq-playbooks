@@ -50,13 +50,13 @@ Bounded embedding/isolation is not performance closure or a500-agent claim.
 | Candidates | Use the integration owner's public services and aq-git's immutable candidate/conditional publication contract; independently enforce evidence and destination preconditions |
 | Observations and findings | Frozen finite complete observations, pre-scan episode revisions, trusted evaluations, atomic finding changes and notification intents |
 | Messaging | Stable identities, scoped visibility, idempotent enqueue, separate acceptance/delivery/acknowledgment |
-| Delivery | Commit domain transition and event outbox together; retry stable producer/event/epoch identities until durable runner admission; retire epochs explicitly before compacting replay identities |
+| Delivery | Commit domain transition and event outbox together; retry stable producer/event/epoch identities until durable runner admission; the engine drops old replay identities by itself (the most recent `replay_keep` keys within their window), so retiring an epoch is not needed to free storage (it still refuses everything from older epochs) |
 | Runtime | Own one engine namespace, drive bounded ready/timer/effect queues, publish the scheduler's durable calendar occurrences, reconcile uncertain operations, and provide backups and configured protection keys; export process metrics to a retained telemetry backend |
 | Release | Pin released library and contract versions; run assembled-product acceptance without path dependencies on sibling source checkouts |
 
 The engine exposes `Host::authorize`, `dispatch`, `reconcile`, and `cancel`. Implementations dispatch only the exact registered command contract, preserve `Intent.id`, input digest and original authority, and return truthful typed outcomes. `Storage` provides atomic CAS, indexed discovery and bounded safe inspection. Readback/recovery remains host-authoritative even when an operator records an evidence-backed recovery request through the CLI.
 
-The synthetic contract catalog and stateful fake host in `aq-playbooks-cli` are executable integration fixtures. Their checks cover the four pilot workflows, source revisions, findings completeness, notification recovery, visibility, publication conflicts and late outcomes. They are not adapters for existing daemon endpoints.
+The synthetic contract catalog of `aq-playbooks-cli` and the stateful fake host in its test support (`crates/aq-playbooks-cli/tests/support`) are executable integration fixtures. Their checks cover the pilot workflows (the routing pilot was retired in favour of authored routing), source revisions, findings completeness, notification recovery, visibility, publication conflicts and late outcomes. They are not adapters for existing daemon endpoints.
 
 ## Live acceptance still required
 
@@ -189,7 +189,11 @@ The bridge publishes stable producer/event identities and causation references,
 with occurrence and observation times. Subject and revision in the envelope must
 match the specified payload paths. Owned-work and decision completions carry
 `correlation.operation = accepted.handle`. A duplicate event with the same identity
-and content is a replay; conflicting content refuses. Events do not grant the
+and content is a replay; conflicting content refuses. The engine recognises a
+duplicate only while it still remembers the identity (spec 0003: the most recent
+`replay_keep` keys within their window); a later re-send is refused as stale only
+when it carries a request time older than the window, and is otherwise admitted
+as new. Events do not grant the
 workflow new authority. Domain state and the outgoing event must commit atomically
 in the owning host service (D3 outbox), and delivery may retry until admitted.
 
@@ -360,3 +364,97 @@ returns the source from the host that prepared it. A policy binds
 
 The host still owns the OID format bound: lowercase hex, 40 characters for
 `sha1` and 64 for `sha256`.
+
+## AQ host catalog 2.2.0 (routing: task facts, routes, structured judgments)
+
+The [2.2.0 bundle](../contracts/aq-host-2.2.0/README.md) is published beside
+1.0.0, 2.0.0 and 2.1.0 and replaces none of them. Version `2.2.0` has
+fingerprint
+`sha256:ca3c3d68959d760cc761d0c39b8db8740a27b3e414ae54e76d64df944f9b677a`
+over `["2.2.0", registry]`. The manifest records the 2.1.0 version and
+fingerprint it supersedes, and lists `commands_added` and `events_added`.
+
+### Why
+
+Before 2.2.0, a playbook could not route:
+- reading a task returned no facts about it;
+- no command set a route;
+- no event started a run when a task needed one;
+- a judgment returned a single label.
+
+Spec 0013 §6 words the fix as changes to `context.read`, `work.change` and
+`judgment.request`. Every Host8 coding artifact pins those three
+fingerprints, so 2.2.0 adds new contracts instead.
+
+### Compatibility decision
+
+- **Additive only.** All twelve commands and nine events of 2.1.0 are
+  byte-identical. `fixtures.json#compatibility` pins:
+  - their fingerprints;
+  - the 2.1.0 registry file SHA-256;
+  - the fingerprints of the six additions.
+
+  An artifact sealed on 2.1.0 validates against 2.2.0 unchanged.
+- **New commands:** `work.read`, `work.route`, `work.unroutable` and
+  `judgment.assess`.
+  - Each requires the capability of the same name.
+  - `judgment.assess` declares `operation.get` as its reconciliation command.
+- **New events:** `aq.judgment.assessed`, the completion of
+  `judgment.assess`, and `aq.work.route_needed`, whose payload is
+  `{subject}` only.
+- **Consumers opt in with a new pin:** aq-server's Host9 profile, beside the
+  untouched Host8 (2.1.0) pin.
+
+### Bounds left to the host
+
+These are host semantics, not schema.
+
+- **The request bound:** 64 KiB.
+- **`judgment.assess` `assessed`:**
+  - one label per requested field, in field order;
+  - each label one of the field's declared choices;
+  - flags only from the declared flags, each once.
+
+  Otherwise the result is `failed` with `indeterminate`.
+- **Exactly one completion:** one final `aq.judgment.assessed` for every
+  accepted judgment, including at the host's own deadline.
+- **`work.route`:**
+  - It intersects `harnesses`, `providers` and `prefer` with what Settings
+    offers at the level, drops duplicates and drops `prefer` entries that are
+    not allowed. It reports what remained in `routed`.
+  - It refuses `not_offered` only when the level has no profile, or when a
+    non-empty list has nothing left. It then records the refused request in
+    the route history.
+  - It never replaces an owner route (`owner_route`).
+  - It answers `stale` when the task's revision moved since
+    `subject.revision`.
+- **`hold`:** pins the task to its lists, for sentences that tell work to
+  wait for an agent. A held task is routed: the unrouted alarm does not apply,
+  and the task view shows it held, with its reason and how long it has
+  waited. "Nothing available right now" is a wait for every task, never a
+  failure; the "no candidate" failure means none in Settings.
+- **One trigger per cause for "nothing could ever take it":**
+  - Settings: `work.route` refused `not_offered`. The host raises the task
+    itself, once. The playbook only ends.
+  - The document: `work.unroutable {subject, reasons}`. The host clears a
+    router route the task may have (never an owner route: `owner_route`),
+    leaves the task unrouted and visible, shows the reasons, raises it, and
+    does not re-emit `aq.work.route_needed` until the task or the active
+    playbook changes.
+
+  A playbook's entry outcome is never read as this signal.
+- **`work.read` facts:**
+  - They never include priority or provider load.
+  - `level_hint` is always present (`""` for none).
+  - `charged_failures` counts only failures charged to the task.
+- **`aq.work.route_needed`:**
+  - It is not emitted again for a task version while a run started for that
+    version is unfinished.
+  - Once a task is raised as unroutable it is not emitted again until the
+    task or the active playbook changes, or, after `not_offered`, Settings
+    change.
+
+`operation.get` 2.0.0 is unchanged, so its `completed` union does not include
+the `judgment.assess` outputs. A host reconciles a `judgment.assess` intent
+from its own record of the operation. A playbook reads the answer through the
+join, never through `operation.get`.

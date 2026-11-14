@@ -1,5 +1,8 @@
 #![cfg(feature = "postgres-tests")]
-use aq_playbooks_cli::{configuration::read_keyring, pilots};
+#[allow(dead_code)]
+#[path = "support/pilots.rs"]
+mod pilots;
+use aq_playbooks_cli::configuration::read_keyring;
 use aq_playbooks_postgres::PostgresStorage;
 use aq_playbooks_runner::{DispatchResult, Engine, Storage};
 use serde_json::{Value, json};
@@ -71,7 +74,7 @@ impl Drop for Fixture {
 #[test]
 fn current_catalog_requires_explicit_idle_ownership_and_never_admits_work() {
     let f = Fixture::new();
-    let scenario = pilots::scenario("routing").unwrap();
+    let scenario = pilots::scenario("watcher").unwrap();
     let artifact = scenario.artifacts.last().unwrap();
     let a = f.write(
         "catalog-artifact.json",
@@ -149,7 +152,7 @@ fn current_catalog_requires_explicit_idle_ownership_and_never_admits_work() {
 #[test]
 fn protected_admin_lifecycle_control_recovery_rotation_and_paged_inspection() {
     let f = Fixture::new();
-    let scenario = pilots::scenario("routing").unwrap();
+    let scenario = pilots::scenario("watcher").unwrap();
     let artifact = scenario.artifacts.last().unwrap();
     let a = f.write("artifact.json", serde_json::to_value(artifact).unwrap());
     let authority = f.write(
@@ -173,7 +176,7 @@ fn protected_admin_lifecycle_control_recovery_rotation_and_paged_inspection() {
     f.ok(
         &[
             "activate",
-            "routing",
+            "watcher",
             &artifact.digest,
             "--authority",
             authority.to_str().unwrap(),
@@ -181,12 +184,12 @@ fn protected_admin_lifecycle_control_recovery_rotation_and_paged_inspection() {
         Some(&keys_a),
     );
     f.ok(
-        &["controls", "routing", "--calls-enabled", "false"],
+        &["controls", "watcher", "--calls-enabled", "false"],
         Some(&keys_a),
     );
     let args = [
         "run",
-        "routing",
+        "watcher",
         "--input",
         input.to_str().unwrap(),
         "--authority",
@@ -194,7 +197,7 @@ fn protected_admin_lifecycle_control_recovery_rotation_and_paged_inspection() {
     ];
     assert!(!f.call(&args, Some(&keys_a)).status.success());
     f.ok(
-        &["controls", "routing", "--calls-enabled", "true"],
+        &["controls", "watcher", "--calls-enabled", "true"],
         Some(&keys_a),
     );
     let view = f.ok(&args, Some(&keys_a));

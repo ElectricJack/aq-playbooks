@@ -12,6 +12,7 @@ aq-playbooks-model.workspace = true
 aq-playbooks-compiler.workspace = true
 aq-playbooks-runner.workspace = true
 aq-playbooks-postgres.workspace = true
+aq-playbooks-simulation.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true

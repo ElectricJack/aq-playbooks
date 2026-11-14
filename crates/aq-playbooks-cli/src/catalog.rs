@@ -1,76 +1,7 @@
-//! Versioned AQ host contract, shared by synthetic pilots and production adapters.
+//! Versioned AQ host contracts, shared by the authoring tools, the test pilots
+//! and production adapters. The schema builders the tests write contracts
+//! with live in `tests/support/schemas.rs`.
 use aq_playbooks_model::*;
-use std::collections::BTreeSet;
-
-pub fn strings(items: &[&str]) -> BTreeSet<String> {
-    items.iter().map(|s| (*s).into()).collect()
-}
-pub fn object(fields: &[(&str, Schema)]) -> Schema {
-    Schema::object(fields.iter().cloned().map(|(k, v)| (k.into(), v)).collect())
-}
-pub fn enumeration(values: &[&str]) -> Schema {
-    Schema::String {
-        max_length: 128,
-        values: strings(values),
-    }
-}
-pub fn text() -> Schema {
-    Schema::string(4096)
-}
-pub fn revision() -> Schema {
-    Schema::Integer {
-        minimum: 0,
-        maximum: i64::MAX,
-    }
-}
-pub fn subject() -> Schema {
-    object(&[("id", text()), ("revision", revision())])
-}
-pub fn result() -> Schema {
-    object(&[("reference", text()), ("subject", subject())])
-}
-pub fn work_result() -> Schema {
-    object(&[
-        ("reference", text()),
-        ("subject", subject()),
-        (
-            "disposition",
-            enumeration(&["accepted", "changes_requested", "failed"]),
-        ),
-    ])
-}
-pub fn list(item: Schema) -> Schema {
-    Schema::Array {
-        items: Box::new(item),
-        max_items: 100,
-    }
-}
-pub const CONTEXT_VIEWS: &[&str] = &[
-    "work",
-    "project",
-    "execution_options",
-    "evidence",
-    "health_observations",
-];
-pub const WORK_KINDS: &[&str] = &[
-    "implementation",
-    "investigation",
-    "planning",
-    "review",
-    "repair",
-    "supervisor_authoring",
-    "spec_ingestion",
-    "fidelity_review",
-    "onboarding",
-];
-pub const CHANGE_VARIANTS: &[&str] = &[
-    "requirements",
-    "priority",
-    "dependencies",
-    "execution_constraints",
-    "hold",
-    "release_hold",
-];
 
 /// Exact executable schema bundle shared with revision-pinned production hosts.
 pub const VERSION: &str = "1.0.0";
@@ -97,13 +28,15 @@ pub const MANIFEST_2_1_JSON: &str = include_str!("../../../contracts/aq-host-2.1
 pub fn catalog_v2_1() -> Registry {
     serde_json::from_str(REGISTRY_2_1_JSON).expect("published AQ host registry 2.1.0")
 }
-pub fn describe_surface() -> serde_json::Value {
-    let mut manifest: serde_json::Value =
-        serde_json::from_str(MANIFEST_JSON).expect("AQ host manifest");
-    manifest["kind"] = "versioned_aq_host_contract".into();
-    manifest["commands"] = serde_json::json!(catalog().commands.keys().collect::<Vec<_>>());
-    manifest["production_adapters"] = false.into();
-    manifest
+/// Host catalog 2.2.0: 2.1.0 byte-identical, plus task facts (`work.read`),
+/// routes (`work.route`), structured judgments (`judgment.assess` and
+/// `aq.judgment.assessed`) and `aq.work.route_needed`. Additive only, so an
+/// artifact sealed on 2.1.0 pins the same contracts here.
+pub const VERSION_2_2: &str = "2.2.0";
+pub const REGISTRY_2_2_JSON: &str = include_str!("../../../contracts/aq-host-2.2.0/registry.json");
+pub const MANIFEST_2_2_JSON: &str = include_str!("../../../contracts/aq-host-2.2.0/manifest.json");
+pub fn catalog_v2_2() -> Registry {
+    serde_json::from_str(REGISTRY_2_2_JSON).expect("published AQ host registry 2.2.0")
 }
 
 #[cfg(test)]
