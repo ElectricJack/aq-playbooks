@@ -168,6 +168,10 @@ pub const REPLAY_EVICTIONS_PER_COMMIT: usize = 64;
 /// Refusal of a commit that evicts a window entry other than as
 /// [`evict`] does (see [`verify_removals`]).
 pub const REFUSE_EVICTION: &str = "window entry evicted without its licence";
+/// Refusal of a commit that changes an accepted event's identity (its key,
+/// sequence, digest, acceptance time or envelope); only its destinations
+/// change (fan-out).
+pub const REFUSE_EVENT_CHANGE: &str = "immutable accepted event changed";
 /// The `RetentionState::expiry` key of `member` expiring at
 /// `expires_at_ms`: the expiry as 16 lowercase hex digits of its
 /// order-preserving unsigned form, then the member. Byte order of keys is
@@ -672,6 +676,7 @@ pub fn verify_removals(
         &Stored {
             ordered: &|key| Ok(stored.contains_key(key)),
             memberships: &|key| Ok(previous.indexes.event_memberships.get(key).cloned()),
+            waiters: &|key| Ok(previous.indexes.waiters.get(key).cloned()),
         },
     )?;
     let removals = check_removals(
@@ -721,7 +726,8 @@ pub(crate) fn check_removals(
     }
     let mut removals = Removals::default();
     for (key, event) in &previous.events {
-        if next.events.contains_key(key) {
+        if let Some(kept) = next.events.get(key) {
+            check_event_change(event, kept)?;
             continue;
         }
         removal()?;
@@ -1215,7 +1221,17 @@ pub(crate) fn event_held(s: &State, key: &str) -> Result<bool> {
         return Ok(false);
     };
     let memberships = s.indexes.event_memberships.get(key);
-    event_hold(s, key, event, memberships.map(Vec::as_slice))
+    event_hold(s, key, event, memberships.map(Vec::as_slice), None)
+}
+/// The waiters and uncertain operations a stored State recorded, which a
+/// removal check adds to those of the State it judges: a hold is judged from
+/// the live records (wait records, operations), and a commit cannot release
+/// one by rewriting a derived index.
+pub struct StoredHolds<'a> {
+    /// The stored waiters of a correlation key (`indexes.waiters`).
+    pub waiters: StoredWaiters<'a>,
+    /// The stored uncertain completions by contract and scope.
+    pub uncertain: &'a BTreeMap<String, BTreeSet<String>>,
 }
 /// [`event_held`] for `event` (key `key`, correlation keys `memberships`),
 /// judged by the live work of `s`, which need not hold the event itself (a
@@ -1226,6 +1242,7 @@ fn event_hold(
     key: &str,
     event: &crate::AcceptedEvent,
     memberships: Option<&[String]>,
+    stored: Option<&StoredHolds<'_>>,
 ) -> Result<bool> {
     if event.destinations.iter().any(|d| d.run.is_none()) {
         let owner = format!("event:{key}");
@@ -1257,31 +1274,78 @@ fn event_hold(
             return Ok(true);
         }
     }
-    let live = |target: &String| {
+    // A waiter holds the event when its live record still waits on one of
+    // the event's correlation keys: a run waiting on a wait record whose key
+    // it is, or an unsettled operation waiting for its completion. The
+    // candidates come from the waiter index (and the stored one).
+    let waiting = |target: &str, k: &str| -> Result<bool> {
         if let Some(intent) = target.strip_prefix("intent:") {
-            s.intents
+            return Ok(s
+                .intents
                 .get(intent)
-                .is_some_and(|i| !intent_settled(&i.status))
-        } else {
-            s.runs.get(target).is_some_and(|r| !r.status.terminal())
+                .is_some_and(|i| !intent_settled(&i.status)));
         }
+        let Some(run) = s.runs.get(target) else {
+            return Ok(false);
+        };
+        let wait = match (&run.status, &run.pending) {
+            (crate::RunStatus::Waiting, Some(crate::Pending::Event { wait })) => wait,
+            _ => return Ok(false),
+        };
+        let Some(record) = s.waits.get(wait) else {
+            return Ok(false);
+        };
+        let Some(contract) = &record.event else {
+            return Ok(false);
+        };
+        Ok(crate::indexes::correlation_key(contract, &record.scope, &record.correlation)? == k)
     };
-    let waited = memberships.is_some_and(|keys| {
-        keys.iter().any(|k| {
-            s.indexes
-                .waiters
-                .get(k)
-                .is_some_and(|targets| targets.iter().any(live))
-        })
-    });
-    if waited {
-        return Ok(true);
+    for k in memberships.into_iter().flatten() {
+        let mut targets: BTreeSet<String> = s.indexes.waiters.get(k).cloned().unwrap_or_default();
+        if let Some(stored) = stored {
+            targets.extend((stored.waiters)(k)?.unwrap_or_default());
+        }
+        for target in &targets {
+            if waiting(target, k)? {
+                return Ok(true);
+            }
+        }
     }
+    // An operation whose admission handle is lost may complete through any
+    // event of its completion contract and scope.
     let contract = crate::indexes::trigger_key(&event.envelope.contract, &event.envelope.scope)?;
-    Ok(s.indexes
+    let mut uncertain: BTreeSet<String> = s
+        .indexes
         .uncertain_completion_contracts
         .get(&contract)
-        .is_some_and(|intents| !intents.is_empty()))
+        .cloned()
+        .unwrap_or_default();
+    if let Some(stored) = stored {
+        uncertain.extend(stored.uncertain.get(&contract).cloned().unwrap_or_default());
+    }
+    Ok(uncertain.iter().any(|id| {
+        s.intents.get(id).is_some_and(|i| {
+            i.command.asynchronous.is_some()
+                && i.handle.is_none()
+                && matches!(i.status, IntentStatus::Dispatched | IntentStatus::Unknown)
+        })
+    }))
+}
+/// An accepted event's identity (key, sequence, digest, acceptance time
+/// and envelope) never changes; only its destinations do (fan-out).
+pub fn check_event_change(
+    old: &crate::AcceptedEvent,
+    new: &crate::AcceptedEvent,
+) -> std::result::Result<(), StorageError> {
+    if old.key != new.key
+        || old.sequence != new.sequence
+        || old.digest != new.digest
+        || old.accepted_at_ms != new.accepted_at_ms
+        || old.envelope != new.envelope
+    {
+        return Err(refuse(REFUSE_EVENT_CHANGE));
+    }
+    Ok(())
 }
 /// Whether event `key` may leave at `clock`: its window has passed and
 /// nothing holds it.
@@ -1305,6 +1369,7 @@ fn remove_event(s: &mut State, key: &str, report: &mut CommitReport) -> Result<(
         return Ok(());
     };
     s.retention.replay_order.remove(&event_order_key(&event));
+    crate::indexes::unindex_contract_event(s, &event)?;
     s.retention.event_epochs.remove(key);
     s.retention.event_expires_at_ms.remove(key);
     if let Some(keys) = s.indexes.event_memberships.remove(key) {
@@ -1448,17 +1513,20 @@ fn drop_event(s: &mut State, key: &str, clock: i64, report: &mut CommitReport) -
 pub struct ReplayTouched {
     pub events: BTreeSet<String>,
     pub wait_keys: BTreeSet<String>,
+    /// Contract and scope keys whose uncertain completions changed.
+    pub contract_keys: BTreeSet<String>,
 }
 /// Put the window entries whose hold this commit may have ended or begun
 /// in or out of the eviction order: a keyed admission receipt joins it when
 /// its run leaves the record (in this commit's history); an event is judged
 /// again ([`event_held`]) when the commit accepted it, fanned it out, or
-/// changed the waiters of one of its correlation keys. O(touched).
+/// changed the waiters of one of its correlation keys or the uncertain
+/// operations of its contract and scope. O(touched).
 ///
-/// Not tracked: a hold that begins or ends through an uncertain completion
-/// (an operation whose admission handle is lost). Such an event is judged
-/// when it reaches the head of the order (never evicted while held), and
-/// otherwise leaves with its window.
+/// A hold through an uncertain completion (an operation whose admission
+/// handle is lost) begins or ends when the uncertain operations of a
+/// contract and scope change: every event of that contract and scope
+/// (`indexes.contract_events`) is judged again, O(those events).
 pub(crate) fn rejoin(s: &mut State) -> Result<()> {
     let runs: Vec<String> = s
         .settled
@@ -1481,6 +1549,11 @@ pub(crate) fn rejoin(s: &mut State) -> Result<()> {
     for key in touched.wait_keys {
         if let Some(ids) = s.indexes.events.get(&key) {
             events.extend(ids.values().cloned());
+        }
+    }
+    for key in touched.contract_keys {
+        if let Some(ids) = s.indexes.contract_events.get(&key) {
+            events.extend(ids.iter().cloned());
         }
     }
     for key in events {
@@ -1599,9 +1672,14 @@ pub struct Stored<'a> {
     pub ordered: &'a dyn Fn(&str) -> std::result::Result<bool, StorageError>,
     /// The stored correlation keys of event `key`.
     pub memberships: &'a dyn Fn(&str) -> std::result::Result<Option<Memberships>, StorageError>,
+    /// The stored waiters of a correlation key (`indexes.waiters`).
+    pub waiters: StoredWaiters<'a>,
 }
 /// An event's correlation keys (`indexes.event_memberships`).
 pub type Memberships = Vec<String>;
+/// The stored waiters of a correlation key (`indexes.waiters`).
+pub type StoredWaiters<'a> =
+    &'a dyn Fn(&str) -> std::result::Result<Option<BTreeSet<String>>, StorageError>;
 /// The evictions of a commit from `previous` to `next`, which a removal
 /// check then allows: each keyed admission receipt or event of `previous`
 /// that `next` no longer holds, whose expiry the clock has not reached, and
@@ -1671,7 +1749,11 @@ pub fn check_evictions(
             continue;
         }
         let memberships = (stored.memberships)(key)?;
-        if event_hold(next, key, event, memberships.as_deref())
+        let holds = StoredHolds {
+            waiters: stored.waiters,
+            uncertain: &previous.indexes.uncertain_completion_contracts,
+        };
+        if event_hold(next, key, event, memberships.as_deref(), Some(&holds))
             .map_err(|e| refuse(&e.to_string()))?
         {
             return Err(refusal(&ordered));
@@ -1977,6 +2059,7 @@ pub(crate) fn gc(s: &mut State, now: i64, limit: usize) -> Result<GcReport> {
                     .unwrap_or(0);
                 let e = s.events.remove(&id).unwrap();
                 s.retention.replay_order.remove(&event_order_key(&e));
+                crate::indexes::unindex_contract_event(s, &e)?;
                 s.retention.event_epochs.remove(&id);
                 s.retention.event_expires_at_ms.remove(&id);
                 if epoch == current {

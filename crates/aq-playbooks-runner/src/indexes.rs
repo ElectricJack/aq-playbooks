@@ -102,6 +102,10 @@ pub struct RuntimeIndexes {
     pub run_timer: LazyMap<String, String>,
     pub events: LazyMap<String, BTreeMap<u64, String>>,
     pub event_memberships: LazyMap<String, Vec<String>>,
+    /// The events of each contract and scope (`trigger_key`), so a change
+    /// of that contract's uncertain completions re-judges their holds.
+    #[serde(default)]
+    pub contract_events: LazyMap<String, BTreeSet<String>>,
     pub waiters: LazyMap<String, BTreeSet<String>>,
     pub run_subscriptions: LazyMap<String, Vec<String>>,
     pub dependents: LazyMap<String, BTreeSet<String>>,
@@ -122,6 +126,10 @@ pub struct RuntimeIndexes {
     /// once. Cohort removal takes a cohort's operations from it.
     #[serde(default)]
     pub root_intents_complete: bool,
+    /// `contract_events` holds every event. False in a State written before
+    /// the index existed; `Engine::new` then fills it once.
+    #[serde(default)]
+    pub contract_events_complete: bool,
 }
 pub fn correlation_key(
     contract: &ContractRef,
@@ -475,6 +483,44 @@ pub(crate) fn index_event(s: &mut State, id: &str) -> Result<()> {
         }
     }
     s.indexes.event_memberships.insert(id.into(), keys);
+    let contract = trigger_key(&e.envelope.contract, &e.envelope.scope)?;
+    s.indexes
+        .contract_events
+        .entry(contract)
+        .or_default()
+        .insert(id.into());
+    Ok(())
+}
+/// Take event `e` out of `contract_events`.
+pub(crate) fn unindex_contract_event(s: &mut State, e: &crate::AcceptedEvent) -> Result<()> {
+    let contract = trigger_key(&e.envelope.contract, &e.envelope.scope)?;
+    remove_lazy_member(&mut s.indexes.contract_events, &contract, &e.key);
+    Ok(())
+}
+/// A State written before `contract_events` existed: fill it once from the
+/// events (one pass over them).
+pub(crate) fn backfill_contract_events(s: &mut State) -> Result<()> {
+    if !s.indexes.initialized || s.indexes.contract_events_complete {
+        return Ok(());
+    }
+    let events: Vec<(String, String)> = s
+        .events
+        .iter()
+        .map(|(id, e)| {
+            Ok((
+                trigger_key(&e.envelope.contract, &e.envelope.scope)?,
+                id.clone(),
+            ))
+        })
+        .collect::<Result<_>>()?;
+    for (contract, id) in events {
+        s.indexes
+            .contract_events
+            .entry(contract)
+            .or_default()
+            .insert(id);
+    }
+    s.indexes.contract_events_complete = true;
     Ok(())
 }
 pub(crate) fn index_activation(s: &mut State, binding: &str) -> Result<()> {
@@ -681,9 +727,21 @@ fn refresh_run(s: &mut State, id: &str) -> Result<()> {
     Ok(())
 }
 fn refresh_intent(s: &mut State, id: &str) -> Result<()> {
-    if let Some(key) = s.indexes.uncertain_contract_membership.remove(id) {
-        remove_member(&mut s.indexes.uncertain_completion_contracts, &key, id);
+    let was_uncertain = s.indexes.uncertain_contract_membership.remove(id);
+    if let Some(key) = &was_uncertain {
+        remove_member(&mut s.indexes.uncertain_completion_contracts, key, id);
     }
+    let result = refresh_intent_indexes(s, id);
+    // A hold through an uncertain completion begins or ends: the events of
+    // that contract and scope are judged again (`retention::rejoin`).
+    let is_uncertain = s.indexes.uncertain_contract_membership.get(id).cloned();
+    if was_uncertain != is_uncertain {
+        s.replay_touched.contract_keys.extend(was_uncertain);
+        s.replay_touched.contract_keys.extend(is_uncertain);
+    }
+    result
+}
+fn refresh_intent_indexes(s: &mut State, id: &str) -> Result<()> {
     let token = format!("intent:{id}");
     if let Some(keys) = s.indexes.run_subscriptions.remove(&token) {
         for key in keys {
@@ -914,6 +972,7 @@ pub(crate) fn rebuild(s: &mut State) -> Result<()> {
     sync(s)?;
     s.indexes.initialized = true;
     s.indexes.root_intents_complete = true;
+    s.indexes.contract_events_complete = true;
     Ok(())
 }
 /// Once per namespace written before `root_intents` existed (pre-D10, whose

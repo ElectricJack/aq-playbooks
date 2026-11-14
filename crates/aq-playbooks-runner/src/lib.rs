@@ -741,6 +741,8 @@ impl<S: Storage> Engine<S> {
             // A State from before `root_intents` (pre-D10): cohort removal
             // needs every operation there, so fill it once.
             indexes::backfill_root_intents(s);
+            // Before `contract_events` (Task 8b): fill it once.
+            indexes::backfill_contract_events(s)?;
             Ok(())
         })?;
         Ok(e)

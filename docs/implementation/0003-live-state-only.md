@@ -485,13 +485,15 @@ bounds the record (about 120 entries; 132.7 KB at run 200).
   changes the waiters of one of its correlation keys (`State::replay_touched`,
   never stored, filled by the index sync and by cohort removal). Held, it is
   out of the order; unheld, in it.
-- **Not tracked:** a hold that begins or ends through an uncertain
-  completion (an operation whose admission handle is lost). Such an event,
-  if it was in the order, still counts until it reaches the head, where the
-  engine judges it, finds it held and takes it out (never evicting it); one
-  out of the order whose hold ends this way leaves with its window. So the
-  order's count can include, for a while, an entry whose hold began this
-  way: the "unheld count" is exactly the order's size.
+- A hold through an uncertain completion (an operation whose admission
+  handle is lost: its completion may be any event of its contract and
+  scope) begins or ends when that contract's uncertain operations change.
+  `indexes.contract_events` lists the events of each contract and scope;
+  the commit whose index sync changes the uncertain set judges all of them
+  again (O(events of that contract), rare: a lost handle and its
+  recovery). Held, they leave the order and do not count; released, they
+  rejoin at their acceptance positions. A State written before the index
+  existed fills it once on open.
 - `retention::evict`, in every commit that changes the State except a
   licensed admin commit, after the window drop: while the order holds more
   than `replay_keep`, take its head, at most `REPLAY_EVICTIONS_PER_COMMIT`
@@ -516,11 +518,22 @@ before its expiry, whose order key `next` no longer holds, is allowed only
 as `evict` makes it:
 
 - no live work in `next` holds it (a keyed receipt's run is not in `next`;
-  an event is judged by `next`'s waiters, runs, operations and
-  destinations);
+  an event is judged from the live records: a run of `next` still waiting
+  on a wait record whose correlation key is one of the event's, an
+  unsettled operation waiting for its completion, an uncertain operation of
+  its contract, a queued destination of the stored event; the candidate
+  waiters and uncertain operations are those of `next`'s index and of the
+  stored one, so a commit cannot release a hold by rewriting the index. Cost
+  per evicted event: its correlation keys × their waiters, one run and one
+  wait record each; at most 64 evicted events per commit);
 - at most 64 in the commit, and `next`'s order still holds at least
   `replay_keep` entries (the order held more before them);
 - oldest first: each evicted key is before every key `next`'s order holds.
+
+An accepted event's identity (key, sequence, digest, acceptance time,
+envelope) never changes: on every path a commit that rewrites it is refused
+with "immutable accepted event changed" (its destinations may change:
+fan-out). So an event cannot be moved to the head of the order.
 
 And every order key a commit adds must be the key of an item `next` holds,
 at that item's own acceptance sequence, that no live work holds, so the
@@ -551,23 +564,39 @@ adds their expiry-order keys.
 
 ## History is a rolling log (`history_keep`)
 
-History keeps the most recent `policy.history_keep` finished runs per
-namespace (default 10,000). Each commit that writes history deletes the
-oldest finished runs beyond that number: at most the runs it writes plus
-`HISTORY_TRIM_RUNS_PER_COMMIT` (64), so it keeps up with any commit (one
-settling up to 50 cohorts of any size) and a lowered `history_keep` is
-reached within a bounded number of commits. A run is deleted with all its
-items (effects and receipts) first and its `runs` row last, in the same
-transaction. `history_keep` 0 writes no history at all; inspection of
-finished runs then returns nothing, and what history there was is trimmed
-by the next commits that settle a cohort.
+History is three rolling sets of `policy.history_keep` (default 10,000)
+each, per namespace:
 
-"Oldest" is by finish time, then run id. A cohort's runs share its finish
-time.
+- finished runs, each with its effects and receipts;
+- the receipts of events (`event:<key>`: delivery receipts such as
+  `destination_blocked`), an event's receipts leaving together;
+- `admin` receipts (operator actions). They take `history_keep` too: a
+  separate constant would add a setting without a use, and operator actions
+  are far rarer than runs.
 
-Not trimmed by count: receipts that belong to no run (`admin`, and an
-event's `event:<key>` delivery receipts). They are few (operator actions,
-blocked deliveries) and `delete_history_before` removes them by time.
+Nothing in history is outside a set, so history holds at most
+`history_keep` finished runs (each with the items its playbook's own limits
+allow), `history_keep` event receipts and `history_keep` admin receipts.
+
+Each commit that writes history deletes the oldest of each set beyond
+`history_keep`: at most what it writes of that set plus
+`HISTORY_TRIM_RUNS_PER_COMMIT` (64), so it keeps up with any commit and a
+lowered `history_keep` is reached within a bounded number of commits. A run
+is deleted with all its items first and its `runs` row last, in the same
+transaction. The bound counts units, not rows: 64 runs of 1,500 receipts
+each are about 100,000 row deletions in one commit (each index-backed).
+`history_keep` 0 writes no history at all; inspection of finished runs
+then returns nothing, and what history there was is trimmed by the next
+commits that settle a cohort.
+
+**"Oldest" is by the namespace's sequence**, never by host time: a run row
+carries its run's terminal receipt's sequence (else its cohort's last
+receipt's), a receipt its own. A host clock that ran ahead therefore cannot
+make the newest runs the first to go (tested:
+`memory_storage_trims_by_sequence_not_finish_time` and the PostgreSQL
+`history_trims_by_sequence_and_bounds_receipts_of_no_run_on_postgres`).
+History rows written before this change carry sequence 0 for runs and are
+trimmed first.
 
 Inspection's page order, cursors and filters are unchanged. A page whose
 cursor's run is trimmed before the next page neither repeats nor skips a
@@ -575,26 +604,29 @@ remaining item: the next page starts after the cursor (tested:
 `a_page_across_a_trim_neither_repeats_nor_panics`).
 
 `delete_history_before` (host-called, by finish time) keeps working and
-keeps the run count right, so the trim after it is still exact.
+keeps the counts right, so the trim after it is still exact.
 
 ### PostgreSQL (migration 7)
 
-- `run_history_runs_by_finish`: a partial index on
-  `run_history(namespace, finished_at_ms, item_key) WHERE kind='runs'`. The
-  trim reads the oldest runs from it in order: no sort, no scan of the
-  table.
-- `run_history_counts(namespace, runs)`: the number of finished runs each
-  namespace's history holds, maintained by the transactions that insert,
-  trim and delete history, so nothing ever counts rows. The migration
-  fills it once from existing history. Writes need the namespace writer,
-  like `run_history`.
-- The trim: read the count; select the oldest `min(count - keep, written +
-  64)` runs through the partial index; delete their items through
-  `run_history_by_run`, then their `runs` rows through the primary key;
-  lower the count (tested with `EXPLAIN` over 90,000 history rows:
+- Three partial indexes on `run_history(namespace, sequence, item_key)`:
+  `run_history_runs_by_sequence` (`kind='runs'`),
+  `run_history_event_receipts_by_sequence` (`kind='receipts' AND run_id LIKE
+  'event:%'`) and `run_history_admin_receipts_by_sequence` (`kind='receipts'
+  AND run_id='admin'`). The trim reads the oldest of each set from them in
+  order: no sort, no scan of the table.
+- `run_history_counts(namespace, runs, event_receipts, admin_receipts)`:
+  what each namespace's history holds of each set, maintained by the
+  transactions that insert, trim and delete history, so nothing ever counts
+  rows. The migration fills it once from existing history. Writes need the
+  namespace writer, like `run_history`.
+- The trim: read the counts; take the oldest `min(count - keep, written +
+  64)` of each set through its index; delete a run's items through
+  `run_history_by_run` then its row through the primary key, an event's
+  receipts through `run_history_by_run`, admin receipts through the primary
+  key; lower the counts (tested with `EXPLAIN` over 120,000 rows:
   `history_trim_reads_and_deletes_through_indexes`).
 - **Privilege.** The migration runner applies pending migrations in one
-  transaction as the connecting role. Migration 7 creates an index on
+  transaction as the connecting role. Migration 7 creates indexes on
   `run_history` (which needs ownership of that table) and creates a table
   in schema `aq_playbooks` with a foreign key to `namespaces` and triggers
   on itself. That is exactly what migration 6 needs of the role that
@@ -605,6 +637,27 @@ keeps the run count right, so the trim after it is still exact.
   schema but not owning `run_history` is refused ("must be owner of table
   run_history"). Migrations 6 and 7 are both new on this branch, so a
   deployment applies them together, as one role, in one transaction.
+
+## With no limits
+
+Nothing refuses work for the size of the work in progress itself, so that
+size has a ceiling the engine does not guard. On protected format 2 (as
+aq-server runs) the whole record is one encrypted value: every step
+decodes, re-encodes, encrypts and rewrites it. So the time of every step
+grows with the work in progress (runs in progress, their receipts,
+operations and waits, and the events they hold), and the database's
+on-disk churn grows with it. At PostgreSQL's 1 GB limit on one field (or
+the process's memory, first) every commit fails, including those that
+finish or cancel runs, since each rewrites the record: the namespace can
+no longer move, and nothing inside the engine gets it out. This is a known
+boundary, not a guarded one. The host sees it coming from the record size
+and step time and can stop admitting work itself.
+
+The two remedies on record: compress the snapshot before encrypting it
+(record bytes, write volume and TOAST bloat shrink together; it needs a
+version flag in the protected envelope), and per-item storage (format 3)
+for protected namespaces, which has no single-value limit and writes only
+what a step touches.
 
 ## PostgreSQL: on-disk size of the namespace table
 

@@ -777,6 +777,11 @@ fn licensed_evictions(
                     .map(|b| serde_json::from_slice(&b).map_err(backend))
                     .transpose()
             },
+            waiters: &|key| {
+                get("indexes.waiters", key)?
+                    .map(|b| serde_json::from_slice(&b).map_err(backend))
+                    .transpose()
+            },
         },
     )?)
 }
@@ -871,6 +876,19 @@ fn stage(
                     }
                     if let Some(value) = new {
                         written.insert((name, encoded.clone()), value.clone());
+                    }
+                    // An accepted event's identity never changes.
+                    if name == "events"
+                        && let (Some(before), Some(new)) = (before, new)
+                        && before != new
+                    {
+                        let decode = |b: &[u8]| -> Result<
+                            aq_playbooks_runner::AcceptedEvent,
+                            StorageError,
+                        > {
+                            serde_json::from_slice(b).map_err(backend)
+                        };
+                        retention::check_event_change(&decode(before)?, &decode(new)?)?;
                     }
                     // A changed receipt is refused; a deleted one is a window
                     // removal (see below).

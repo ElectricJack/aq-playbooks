@@ -1110,7 +1110,9 @@ fn rebase_refusal_cases() -> Vec<Case> {
         ),
         (
             "rebase that also changes an event's contract to shrink its cap",
-            shortened,
+            // Task 8b fix round 1: an accepted event's envelope is immutable,
+            // so this is refused before its cap is judged.
+            retention::REFUSE_EVENT_CHANGE,
             Box::new(|n| {
                 rebased(n);
                 let mut e = n.events.get("ev-long").unwrap().clone();
@@ -2434,12 +2436,40 @@ fn event_entry(s: &mut State, key: &str, sequence: u64, in_order: bool) {
     );
 }
 fn hold_by_waiter(s: &mut State, key: &str) {
-    s.runs.insert("run-w".into(), running_run("run-w"));
+    let e = s.events.get(key).unwrap().clone();
+    let corr = indexes::correlation_key(
+        &e.envelope.contract,
+        &e.envelope.scope,
+        &e.envelope.correlation,
+    )
+    .unwrap();
+    let mut run = running_run("run-w");
+    run.status = RunStatus::Waiting;
+    run.pending = Some(Pending::Event {
+        wait: "wait-w".into(),
+    });
+    s.runs.insert("run-w".into(), run);
+    s.waits.insert(
+        "wait-w".into(),
+        WaitRecord {
+            id: "wait-w".into(),
+            run: "run-w".into(),
+            step: "wait".into(),
+            event: Some(e.envelope.contract.clone()),
+            scope: e.envelope.scope.clone(),
+            correlation: e.envelope.correlation.clone(),
+            minimum_revision: None,
+            deadline: EVICTION_WINDOW,
+            bind: "completion".into(),
+            winner: None,
+            expired: false,
+        },
+    );
     s.indexes
         .event_memberships
-        .insert(key.into(), vec!["corr".into()]);
+        .insert(key.into(), vec![corr.clone()]);
     s.indexes.waiters.insert(
-        "corr".into(),
+        corr,
         std::collections::BTreeSet::from(["run-w".to_string()]),
     );
 }
@@ -2533,7 +2563,7 @@ fn eviction_refusal_cases() -> Vec<EvictionCase> {
         (
             "an event a live waiter holds",
             licence,
-            held_event,
+            held_event.clone(),
             Box::new(|n| evict_event(n, "ew")),
         ),
         (
@@ -2603,6 +2633,37 @@ fn eviction_refusal_cases() -> Vec<EvictionCase> {
             }),
         ),
         (
+            "an event re-sequenced to the head",
+            retention::REFUSE_EVENT_CHANGE,
+            base.clone(),
+            Box::new(|n| {
+                let mut e = n.events.get("e4").unwrap().clone();
+                n.retention
+                    .replay_order
+                    .remove(&retention::event_order_key(&e));
+                e.sequence = 0;
+                n.retention
+                    .replay_order
+                    .insert(retention::event_order_key(&e), ());
+                n.events.insert("e4".into(), e);
+            }),
+        ),
+        (
+            "an event's envelope changed",
+            retention::REFUSE_EVENT_CHANGE,
+            base.clone(),
+            Box::new(|n| n.events.get_mut("e4").unwrap().envelope.payload = json!(1)),
+        ),
+        (
+            "a held event whose waiter index is dropped",
+            licence,
+            held_event.clone(),
+            Box::new(|n| {
+                n.indexes.waiters.clear();
+                evict_event(n, "ew");
+            }),
+        ),
+        (
             "more than 64 in one commit",
             licence,
             bulk_eviction_state(),
@@ -2616,6 +2677,7 @@ fn seed_eviction_state(store: &PostgresStorage, ns: &str, state: &State) -> u64 
     store.acquire(ns, "w").unwrap();
     let mut unheld = state.clone();
     unheld.runs.clear();
+    unheld.waits.clear();
     unheld.indexes.waiters.clear();
     let first = store.compare_and_swap(ns, "w", 0, &unheld).unwrap();
     store.compare_and_swap(ns, "w", first, state).unwrap()
@@ -2887,4 +2949,120 @@ fn the_trim_keeps_up_with_one_commit_on_postgres() {
         assert_eq!(history_rows(&ns), 10, "{label}");
         assert_eq!(history_count(&ns), Some(5), "{label}");
     }
+}
+/// Review I2 and I3 on f2 protected and f3: the trim keeps the newest runs
+/// by sequence after a host clock that ran ahead, and receipts owned by no
+/// run (blocked event deliveries, admin) are rolling sets of `history_keep`.
+#[test]
+fn history_trims_by_sequence_and_bounds_receipts_of_no_run_on_postgres() {
+    for (format, store) in both() {
+        let ns = support::namespace("rolling_all");
+        let e = Engine::new(store, &ns, "w").unwrap();
+        let a = support::artifact("a");
+        e.install(a.clone()).unwrap();
+        e.activate_at("a", &a.digest, pg_authority(), 0).unwrap();
+        // A trigger whose input is refused at acceptance: every event writes
+        // a `destination_blocked` receipt.
+        let mut trigger = support::artifact("trigger").content;
+        trigger
+            .registry
+            .events
+            .insert("test.signal".into(), pg_event_contract());
+        trigger.playbook.triggers.push(aq_playbooks_model::Trigger {
+            id: "on-signal".into(),
+            event: aq_playbooks_model::ContractRef {
+                name: "test.signal".into(),
+                fingerprint: pg_event_contract().fingerprint().unwrap(),
+            },
+            entry: "main".into(),
+            input: aq_playbooks_model::Expr::literal(Value::Null),
+        });
+        trigger.playbook.limits.max_payload_bytes = 1;
+        let trigger = aq_playbooks_model::Artifact::seal(trigger).unwrap();
+        e.install(trigger.clone()).unwrap();
+        e.activate_at("trigger", &trigger.digest, pg_authority(), 0)
+            .unwrap();
+        e.set_retention_policy(RetentionPolicy {
+            replay_keep: 5,
+            history_keep: 3,
+            ..RetentionPolicy::default()
+        })
+        .unwrap();
+        let run = |t: i64| {
+            let id = e
+                .admit("a", "main", Value::Null, pg_authority(), t)
+                .unwrap();
+            assert!(e.advance(&id, t).unwrap(), "{format}");
+            id
+        };
+        let pinned: Vec<String> = (0..3).map(|_| run(9_000_000_000_000)).collect();
+        let later: Vec<String> = (0..2).map(|_| run(1_000)).collect();
+        assert_eq!(
+            history_run_ids_by_sequence(&ns),
+            [pinned[2].clone(), later[0].clone(), later[1].clone()],
+            "{format}"
+        );
+        for i in 0..40 {
+            e.admit_event("host", pg_event(&format!("b{i:03}")), 2_000 + i)
+                .unwrap();
+        }
+        for i in 0..10 {
+            e.set_activation_controls("trigger", ActivationControls::default(), 3_000 + i)
+                .unwrap();
+        }
+        let count = |pattern: &str| -> i64 {
+            support::client()
+                .query_one(
+                    "SELECT count(*) FROM aq_playbooks.run_history WHERE namespace=$1 AND kind='receipts' AND run_id LIKE $2",
+                    &[&ns, &pattern],
+                )
+                .unwrap()
+                .get(0)
+        };
+        assert!(
+            (1..=3).contains(&count("event:%")),
+            "{format} {}",
+            count("event:%")
+        );
+        assert!(
+            (1..=3).contains(&count("admin")),
+            "{format} {}",
+            count("admin")
+        );
+        // The counts are those of the rows, also after a delete by time.
+        let counted = |ns: &str| -> (i64, i64, i64) {
+            let row = support::client()
+                .query_one(
+                    "SELECT runs,event_receipts,admin_receipts FROM aq_playbooks.run_history_counts WHERE namespace=$1",
+                    &[&ns],
+                )
+                .unwrap();
+            (row.get(0), row.get(1), row.get(2))
+        };
+        let actual = |ns: &str| -> (i64, i64, i64) {
+            (
+                history_run_ids_by_sequence(ns).len() as i64,
+                count("event:%"),
+                count("admin"),
+            )
+        };
+        assert_eq!(counted(&ns), actual(&ns), "{format}");
+        assert!(e.delete_history_before(2_020).unwrap() > 0, "{format}");
+        assert_eq!(counted(&ns), actual(&ns), "{format}");
+        assert!(e.delete_history_before(10_000).unwrap() > 0, "{format}");
+        // The run finished at the pinned time (later than 10,000) stays.
+        assert_eq!(actual(&ns), (1, 0, 0), "{format}");
+        assert_eq!(counted(&ns), actual(&ns), "{format}");
+    }
+}
+fn history_run_ids_by_sequence(ns: &str) -> Vec<String> {
+    support::client()
+        .query(
+            "SELECT item_key FROM aq_playbooks.run_history WHERE namespace=$1 AND kind='runs' ORDER BY sequence,item_key",
+            &[&ns],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect()
 }

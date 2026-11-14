@@ -61,6 +61,7 @@ impl State {
             ("indexes.run_timer", &mut i.run_timer),
             ("indexes.events", &mut i.events),
             ("indexes.event_memberships", &mut i.event_memberships),
+            ("indexes.contract_events", &mut i.contract_events),
             ("indexes.waiters", &mut i.waiters),
             ("indexes.run_subscriptions", &mut i.run_subscriptions),
             ("indexes.dependents", &mut i.dependents),
@@ -400,6 +401,37 @@ fn apply(data: &mut RecordData, patch: StatePatch) -> Result<()> {
     }
     Ok(())
 }
+/// An accepted event's identity never changes
+/// ([`crate::retention::check_event_change`]): each stored event the patch
+/// rewrites is compared with what it writes. O(rewritten events).
+fn verify_events(data: &RecordData, patch: &StatePatch) -> Result<()> {
+    let Some(old) = data.container("events") else {
+        return Ok(());
+    };
+    let decode = |bytes: &[u8]| -> Result<crate::AcceptedEvent> {
+        serde_json::from_slice(bytes).map_err(|e| backend(format!("events record: {e}")))
+    };
+    for (path, change) in &patch.changes {
+        if path.field != "events" {
+            continue;
+        }
+        let written: Vec<(&TreeKey, &Vec<u8>)> = match change {
+            ContainerChange::Entries(rows) => rows
+                .iter()
+                .filter_map(|(k, v)| v.as_ref().map(|v| (k, v)))
+                .collect(),
+            ContainerChange::Replace(rows) => rows.iter().map(|(k, v)| (k, v)).collect(),
+        };
+        for (key, new) in written {
+            if let Some(before) = old.get(key)
+                && before != new
+            {
+                crate::retention::check_event_change(&decode(before)?, &decode(new)?)?;
+            }
+        }
+    }
+    Ok(())
+}
 /// Keyed admission receipts are never rebound. Their removal is checked by
 /// [`verify_patch_removals`].
 fn verify_keyed_admissions(data: &RecordData, patch: &StatePatch) -> Result<()> {
@@ -712,6 +744,15 @@ fn verify_patch_removals(data: &RecordData, patch: &StatePatch, next: &State) ->
                 Ok(stored_order.is_some_and(|c| c.contains_key(&TreeKey::Str(key.to_string()))))
             },
             memberships: &memberships,
+            waiters: &|key| {
+                data.container("indexes.waiters")
+                    .and_then(|c| c.get(&TreeKey::Str(key.to_string())))
+                    .map(|bytes| {
+                        serde_json::from_slice(bytes)
+                            .map_err(|e| StorageError::Backend(format!("waiters record: {e}")))
+                    })
+                    .transpose()
+            },
         },
     )?;
     // `previous` holds only removed receipts.
@@ -963,6 +1004,7 @@ impl Storage for RecordStorage {
         crate::history::check_unrecorded(&ns.history, &crate::history::patch_live_keys(&patch)?)?;
         let accounting = stage(&ns.data, &ns.accounting, &patch)?;
         verify_keyed_admissions(&ns.data, &patch)?;
+        verify_events(&ns.data, &patch)?;
         verify_patch_removals(&ns.data, &patch, &state)?;
         source.check()?;
         crate::history::check_new(&ns.history, &items)?;

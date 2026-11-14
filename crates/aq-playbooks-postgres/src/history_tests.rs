@@ -182,10 +182,12 @@ fn a_commit_failing_after_the_history_insert_leaves_no_rows() {
     }
 }
 
-/// The trim (Task 8b R2) is index-backed: the oldest runs come from
-/// `run_history_runs_by_finish` in order (no sort, no other scan), their
-/// items are deleted through `run_history_by_run`, their run rows through
-/// the primary key. Over 90,000 history rows.
+/// The trim (Task 8b R2, fix round 1) is index-backed: the oldest runs,
+/// event receipts and admin receipts come from their partial sequence
+/// indexes in order (no sort, no other scan); a run's items and an event's
+/// receipts are deleted through `run_history_by_run`, run rows and admin
+/// receipts through the primary key. Over 90,000 run rows and items plus
+/// 30,000 event and admin receipts.
 #[test]
 fn history_trim_reads_and_deletes_through_indexes() {
     let (ns, store) = (
@@ -200,6 +202,7 @@ fn history_trim_reads_and_deletes_through_indexes() {
     let mut tx = c.transaction().unwrap();
     tx.query_one(WRITE_MARKER_SQL, &[&ns]).unwrap();
     tx.execute("INSERT INTO aq_playbooks.run_history(namespace,kind,item_key,run_id,root_id,sequence,finished_at_ms,public_value) SELECT $1,k,CASE k WHEN 'runs' THEN 'r'||lpad(i::text,6,'0') ELSE lpad(i::text,20,'0') END,'r'||lpad(i::text,6,'0'),'r'||lpad(i::text,6,'0'),i,i,jsonb_build_object('sequence',i) FROM generate_series(1,30000) i, unnest(ARRAY['runs','effects','receipts']) k",&[&ns]).unwrap();
+    tx.execute("INSERT INTO aq_playbooks.run_history(namespace,kind,item_key,run_id,root_id,sequence,finished_at_ms,public_value) SELECT $1,'receipts',lpad(i::text,20,'0'),CASE WHEN i<=50000 THEN 'event:e'||(i/2) ELSE 'admin' END,'x',i,i,'{}'::jsonb FROM generate_series(30001,60000) i",&[&ns]).unwrap();
     tx.commit().unwrap();
     c.batch_execute("ANALYZE aq_playbooks.run_history").unwrap();
     let mut plan = |sql: &str, params: &[&(dyn postgres::types::ToSql + Sync)]| -> Value {
@@ -209,13 +212,43 @@ fn history_trim_reads_and_deletes_through_indexes() {
     };
     let mut problems = vec![];
     for limit in [1_i64, 64, 1_000] {
-        let oldest = plan(history::OLDEST_RUNS_SQL, &[&ns, &limit]);
-        if !uses_index(&oldest, "run_history_runs_by_finish") {
-            problems.push(format!(
-                "oldest runs, limit {limit}: index not used: {oldest}"
-            ));
+        for (name, sql, index) in [
+            (
+                "runs",
+                history::OLDEST_RUNS_SQL,
+                "run_history_runs_by_sequence",
+            ),
+            (
+                "event receipts",
+                history::OLDEST_EVENT_RECEIPTS_SQL,
+                "run_history_event_receipts_by_sequence",
+            ),
+            (
+                "admin receipts",
+                history::OLDEST_ADMIN_RECEIPTS_SQL,
+                "run_history_admin_receipts_by_sequence",
+            ),
+        ] {
+            let oldest = plan(sql, &[&ns, &limit]);
+            if !uses_index(&oldest, index) {
+                problems.push(format!(
+                    "oldest {name}, limit {limit}: {index} not used: {oldest}"
+                ));
+            }
+            check_plan(&oldest, false, &mut problems);
         }
-        check_plan(&oldest, false, &mut problems);
+    }
+    let owners: Vec<String> = (15_001..15_065).map(|i| format!("event:e{i}")).collect();
+    let events = plan(history::TRIM_EVENT_RECEIPTS_SQL, &[&ns, &owners]);
+    if !uses_index(&events, "run_history_by_run") {
+        problems.push(format!("trim event receipts: run index not used: {events}"));
+    }
+    let admin: Vec<String> = (50_001..50_065).map(|i| format!("{i:020}")).collect();
+    let admin = plan(history::TRIM_ADMIN_RECEIPTS_SQL, &[&ns, &admin]);
+    if !uses_index(&admin, "run_history_pkey") {
+        problems.push(format!(
+            "trim admin receipts: primary key not used: {admin}"
+        ));
     }
     let victims: Vec<String> = (1..=64).map(|i| format!("r{i:06}")).collect();
     let items = plan(history::TRIM_ITEMS_SQL, &[&ns, &victims]);
@@ -226,7 +259,12 @@ fn history_trim_reads_and_deletes_through_indexes() {
     if !uses_index(&runs, "run_history_pkey") {
         problems.push(format!("trim runs: primary key not used: {runs}"));
     }
-    for (name, p) in [("items", &items), ("runs", &runs)] {
+    for (name, p) in [
+        ("items", &items),
+        ("runs", &runs),
+        ("event receipts", &events),
+        ("admin receipts", &admin),
+    ] {
         let mut found = vec![];
         no_sequential_scan(p, &mut found);
         problems.extend(found.into_iter().map(|f| format!("trim {name}: {f}")));

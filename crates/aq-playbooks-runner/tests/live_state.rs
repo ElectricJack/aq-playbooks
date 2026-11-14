@@ -1165,7 +1165,9 @@ fn rebase_refusal_cases() -> Vec<Case> {
         ),
         (
             "rebase that also changes an event's contract to shrink its cap",
-            shortened,
+            // Task 8b fix round 1: an accepted event's envelope is immutable,
+            // so this is refused before its cap is judged.
+            retention::REFUSE_EVENT_CHANGE,
             Box::new(|n| {
                 rebased(n);
                 let mut e = n.events.get("ev-long").unwrap().clone();
@@ -5157,15 +5159,99 @@ fn event_entry(s: &mut State, key: &str, sequence: u64, in_order: bool) {
         (),
     );
 }
-/// Event `key` held by the live waiter `run-w` on correlation key `corr`.
+/// Event `key` held by the live waiter `run-w`: a run waiting on a wait
+/// record whose correlation key is the event's, with the derived indexes.
 fn hold_by_waiter(s: &mut State, key: &str) {
-    s.runs.insert("run-w".into(), running_run("run-w"));
+    let e = s.events.get(key).unwrap().clone();
+    let corr = indexes::correlation_key(
+        &e.envelope.contract,
+        &e.envelope.scope,
+        &e.envelope.correlation,
+    )
+    .unwrap();
+    let mut run = running_run("run-w");
+    run.status = RunStatus::Waiting;
+    run.pending = Some(Pending::Event {
+        wait: "wait-w".into(),
+    });
+    s.runs.insert("run-w".into(), run);
+    s.waits.insert(
+        "wait-w".into(),
+        WaitRecord {
+            id: "wait-w".into(),
+            run: "run-w".into(),
+            step: "wait".into(),
+            event: Some(e.envelope.contract.clone()),
+            scope: e.envelope.scope.clone(),
+            correlation: e.envelope.correlation.clone(),
+            minimum_revision: None,
+            deadline: EVICTION_WINDOW,
+            bind: "completion".into(),
+            winner: None,
+            expired: false,
+        },
+    );
     s.indexes
         .event_memberships
-        .insert(key.into(), vec!["corr".into()]);
+        .insert(key.into(), vec![corr.clone()]);
     s.indexes
         .waiters
-        .insert("corr".into(), BTreeSet::from(["run-w".to_string()]));
+        .insert(corr, BTreeSet::from(["run-w".to_string()]));
+}
+/// "eu" at the head of the order, held by an operation of its contract
+/// whose admission handle is lost (an uncertain completion), `replay_keep`
+/// 4, then k0..k4.
+fn uncertain_event_state() -> State {
+    let mut s = held_event_state();
+    s.events.remove("ew");
+    s.retention.event_expires_at_ms.remove("ew");
+    s.retention.replay_order.clear();
+    s.runs.clear();
+    s.waits.clear();
+    s.indexes.waiters.clear();
+    s.indexes.event_memberships.clear();
+    s.retention.expiry.clear();
+    for i in 0..5 {
+        let r = s.keyed_admissions.get(&format!("k{i}")).unwrap().clone();
+        s.retention
+            .replay_order
+            .insert(retention::admission_order_key(&r), ());
+    }
+    event_entry(&mut s, "eu", 0, true);
+    let e = s.events.get("eu").unwrap().clone();
+    let mut op = intent("op-u", "run-u", IntentStatus::Unknown);
+    op.command.asynchronous = Some(AsyncContract {
+        completion_event: e.envelope.contract.name.clone(),
+        completion: Schema::Null,
+        correlation_field: "invocation".into(),
+        reconciliation_command: "test.command".into(),
+    });
+    s.intents.insert("op-u".into(), op);
+    s.runs.insert("run-u".into(), running_run("run-u"));
+    let contract = indexes::trigger_key(&e.envelope.contract, &e.envelope.scope).unwrap();
+    s.indexes
+        .uncertain_completion_contracts
+        .insert(contract.clone(), BTreeSet::from(["op-u".to_string()]));
+    s.indexes
+        .uncertain_contract_membership
+        .insert("op-u".into(), contract);
+    s
+}
+/// "ew" (held by its waiter) at the head of the order, `replay_keep` 4,
+/// then k0..k4.
+fn held_event_state() -> State {
+    let mut held_event = State::default();
+    held_event.retention.clock_ms = Some(500);
+    held_event.retention.policy.admission_replay_ms = EVICTION_WINDOW as u64;
+    held_event.retention.policy.event_replay_ms = EVICTION_WINDOW as u64;
+    held_event.retention.policy.replay_keep = 4;
+    event_entry(&mut held_event, "ew", 0, true);
+    hold_by_waiter(&mut held_event, "ew");
+    for i in 0..5 {
+        keyed_entry(&mut held_event, &format!("k{i}"), i + 1, false, true);
+    }
+    held_event.sequence = 20;
+    held_event
 }
 /// Evict keyed receipt `key` as `retention::evict` does: the item, its
 /// expiry record, its window key and its order key.
@@ -5357,6 +5443,63 @@ fn eviction_refusal_cases() -> Vec<EvictionCase> {
                 evict_keyed(n, "k1");
             }),
         ),
+        // Review C1 (round 1): an accepted event's identity never changes,
+        // so it cannot be moved to the head of the order and evicted.
+        (
+            "an event re-sequenced to the head",
+            retention::REFUSE_EVENT_CHANGE,
+            base.clone(),
+            Box::new(|n| {
+                let mut e = n.events.get("e4").unwrap().clone();
+                n.retention
+                    .replay_order
+                    .remove(&retention::event_order_key(&e));
+                e.sequence = 0;
+                n.retention
+                    .replay_order
+                    .insert(retention::event_order_key(&e), ());
+                n.events.insert("e4".into(), e);
+            }),
+        ),
+        (
+            "an event's digest changed",
+            retention::REFUSE_EVENT_CHANGE,
+            base.clone(),
+            Box::new(|n| n.events.get_mut("e4").unwrap().digest = "forged".into()),
+        ),
+        (
+            "an event's acceptance time changed",
+            retention::REFUSE_EVENT_CHANGE,
+            base.clone(),
+            Box::new(|n| n.events.get_mut("e4").unwrap().accepted_at_ms = 7),
+        ),
+        (
+            "an event's envelope changed",
+            retention::REFUSE_EVENT_CHANGE,
+            base.clone(),
+            Box::new(|n| n.events.get_mut("e4").unwrap().envelope.payload = json!(1)),
+        ),
+        // Review C2 (round 1): the hold is judged from the waiter's real wait
+        // record, so dropping the derived index does not release it.
+        (
+            "an event an uncertain completion holds, its index dropped",
+            licence,
+            uncertain_event_state(),
+            Box::new(|n| {
+                n.indexes.uncertain_completion_contracts.clear();
+                n.indexes.uncertain_contract_membership.clear();
+                evict_event(n, "eu");
+            }),
+        ),
+        (
+            "a held event whose waiter index entry is dropped",
+            licence,
+            held_event_state(),
+            Box::new(|n| {
+                n.indexes.waiters.clear();
+                evict_event(n, "ew");
+            }),
+        ),
         (
             "more than 64 in one commit",
             licence,
@@ -5377,7 +5520,11 @@ fn seed_eviction_state(store: &dyn Storage, ns: &str, state: &State) -> u64 {
     store.acquire(ns, "w").unwrap();
     let mut unheld = state.clone();
     unheld.runs.clear();
+    unheld.waits.clear();
+    unheld.intents.clear();
     unheld.indexes.waiters.clear();
+    unheld.indexes.uncertain_completion_contracts.clear();
+    unheld.indexes.uncertain_contract_membership.clear();
     let first = store.compare_and_swap(ns, "w", 0, &unheld).unwrap();
     store.compare_and_swap(ns, "w", first, state).unwrap()
 }
@@ -6057,4 +6204,207 @@ fn a_page_across_a_trim_neither_repeats_nor_panics() {
         .collect();
     assert_eq!(ids, [first[2].clone(), later[0].clone()]);
     assert!(ids.iter().all(|id| *id > cursor));
+}
+
+// --- Task 8b fix round 1 --------------------------------------------------
+
+/// Review I1: holds that begin and end through an uncertain completion are
+/// tracked. One contract holds most of the set (as on aq-server): while an
+/// operation of its completion contract has a lost admission handle, its
+/// events are out of the order and do not count, so no in-bound key of the
+/// other contract is forgotten; when the handle is known they rejoin at
+/// their acceptance positions (the oldest) and are evicted first.
+#[test]
+fn uncertain_completion_holds_are_tracked_both_ways() {
+    let e = keep_engine(4);
+    let (a, completion) = async_artifact();
+    install(&e, a, "async");
+    let held = |id: &str, op: &str| EventEnvelope {
+        correlation: BTreeMap::from([("operation".into(), op.into())]),
+        ..async_event(&completion, id)
+    };
+    let c: Vec<String> = (0..3)
+        .map(|i| {
+            e.admit_event("host", held(&format!("c{i}"), &format!("op-{i}")), i)
+                .unwrap()
+                .key
+        })
+        .collect();
+    let first = e
+        .admit_event("host", correlated_event("o0", "inv-0"), 3)
+        .unwrap()
+        .key;
+    assert_eq!(e.snapshot().unwrap().retention.replay_order.len(), 4);
+    // The operation's admission handle is lost: its completion contract is
+    // uncertain, and the three events of that contract are held.
+    let run = e
+        .admit("async", "main", Value::Null, authority(), 4)
+        .unwrap();
+    let mut host = FakeHost::default();
+    e.drive(&mut host, 4, 10).unwrap();
+    let s = e.snapshot().unwrap();
+    assert_eq!(order_members(&s), [format!("e:{first}")]);
+    let others: Vec<String> = (1..4)
+        .map(|i| {
+            e.admit_event(
+                "host",
+                correlated_event(&format!("o{i}"), &format!("inv-{i}")),
+                5 + i,
+            )
+            .unwrap()
+            .key
+        })
+        .collect();
+    let s = e.snapshot().unwrap();
+    assert!(
+        s.events.contains_key(&first),
+        "an in-bound key was forgotten"
+    );
+    assert!(c.iter().chain(&others).all(|k| s.events.contains_key(k)));
+    assert_eq!(s.retention.replay_order.len(), 4);
+    // The handle is found: the hold ends, the three rejoin as the oldest and
+    // are evicted; the other contract's four stay.
+    host.responses.insert(
+        "reconcile:test.command".into(),
+        vec![DispatchResult::Accepted {
+            handle: "server-operation".into(),
+        }],
+    );
+    e.recover(&mut host, 20).unwrap();
+    let s = e.snapshot().unwrap();
+    assert!(
+        c.iter().all(|k| !s.events.contains_key(k)),
+        "rejoined and evicted"
+    );
+    let mut kept = vec![first.clone()];
+    kept.extend(others);
+    let members: Vec<String> = kept.iter().map(|k| format!("e:{k}")).collect();
+    assert_eq!(order_members(&s), members);
+    let _ = run;
+}
+/// Review I2: the trim keeps the newest runs by the namespace's sequence,
+/// not by host finish time: after a host clock that ran ahead, the newest
+/// three finished runs survive.
+fn the_trim_orders_by_sequence_not_finish_time<S: Storage>(store: S) {
+    let e = history_keep_engine(store, 3);
+    let run = |t: i64| {
+        let id = e.admit("a", "main", Value::Null, authority(), t).unwrap();
+        assert!(e.advance(&id, t).unwrap());
+        id
+    };
+    let pinned: Vec<String> = (0..3).map(|_| run(9_000_000_000_000)).collect();
+    let later: Vec<String> = (0..2).map(|_| run(1_000)).collect();
+    let listed: Vec<String> = history_items(&e, InspectionKind::Runs)
+        .iter()
+        .map(|r| r["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        listed,
+        [pinned[2].clone(), later[0].clone(), later[1].clone()]
+    );
+}
+#[test]
+fn memory_storage_trims_by_sequence_not_finish_time() {
+    the_trim_orders_by_sequence_not_finish_time(MemoryStorage::default());
+}
+#[test]
+fn record_storage_trims_by_sequence_not_finish_time() {
+    the_trim_orders_by_sequence_not_finish_time(RecordStorage::new());
+}
+/// Review I3: nothing in history is exempt from the rolling bound. 1,000
+/// events whose destination is blocked (each writes a `destination_blocked`
+/// receipt, which goes to history when the event leaves) and 50 operator
+/// actions (admin receipts) leave at most `history_keep` of each.
+fn receipts_of_no_run_are_rolling_too<S: Storage>(store: S) {
+    let e = Engine::new(store, "test", "incarnation-1").unwrap();
+    install_on(&e, input_blocked_trigger_artifact(), "trigger");
+    e.set_retention_policy(RetentionPolicy {
+        replay_keep: 5,
+        history_keep: 10,
+        ..RetentionPolicy::default()
+    })
+    .unwrap();
+    for i in 0..1_000 {
+        e.admit_event("host", correlated_event(&format!("b{i:04}"), "x"), i)
+            .unwrap();
+    }
+    for i in 0..50 {
+        e.set_activation_controls("trigger", ActivationControls::default(), 2_000 + i)
+            .unwrap();
+    }
+    let receipts = history_items(&e, InspectionKind::Receipts);
+    let of = |prefix: &str| {
+        receipts
+            .iter()
+            .filter(|r| r["run"].as_str().unwrap().starts_with(prefix))
+            .count()
+    };
+    // At most 10 in history, plus those of the 5 events still remembered
+    // (live receipts, which leave with their event).
+    let live: usize = e.snapshot().unwrap().receipts.len();
+    assert_eq!(live, 5);
+    assert!(
+        of("event:") > live && of("event:") <= 10 + live,
+        "{}",
+        of("event:")
+    );
+    assert!(of("admin") > 0 && of("admin") <= 10, "{}", of("admin"));
+    assert!(receipts.len() <= 20 + live, "{}", receipts.len());
+    // The newest stay.
+    let newest = receipts
+        .iter()
+        .filter(|r| r["run"] == "admin")
+        .map(|r| r["sequence"].as_u64().unwrap())
+        .max()
+        .unwrap();
+    assert_eq!(newest, e.snapshot().unwrap().sequence);
+}
+#[test]
+fn memory_storage_receipts_of_no_run_are_rolling_too() {
+    receipts_of_no_run_are_rolling_too(MemoryStorage::default());
+}
+#[test]
+fn record_storage_receipts_of_no_run_are_rolling_too() {
+    receipts_of_no_run_are_rolling_too(RecordStorage::new());
+}
+/// An event of the async completion contract (copied from `semantics.rs`).
+fn async_event(c: &EventContract, id: &str) -> EventEnvelope {
+    EventEnvelope {
+        producer: "host".into(),
+        event_id: id.into(),
+        contract: ContractRef {
+            name: c.name.clone(),
+            fingerprint: c.fingerprint().unwrap(),
+        },
+        scope: "project".into(),
+        correlation: BTreeMap::from([("operation".into(), "server-operation".into())]),
+        subject: None,
+        revision: None,
+        causation: None,
+        occurred_at_ms: None,
+        observed_at_ms: None,
+        payload: json!({"outcome":"ok","output":null}),
+    }
+}
+/// Review I2: the trim keeps the run that finished last, not the one
+/// admitted last.
+fn the_trim_keeps_the_last_finished_run<S: Storage>(store: S) {
+    let e = history_keep_engine(store, 1);
+    let first = e.admit("a", "main", Value::Null, authority(), 0).unwrap();
+    let second = e.admit("a", "main", Value::Null, authority(), 0).unwrap();
+    assert!(e.advance(&second, 1).unwrap());
+    assert!(e.advance(&first, 2).unwrap());
+    let listed: Vec<String> = history_items(&e, InspectionKind::Runs)
+        .iter()
+        .map(|r| r["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(listed, [first]);
+}
+#[test]
+fn memory_storage_trim_keeps_the_last_finished_run() {
+    the_trim_keeps_the_last_finished_run(MemoryStorage::default());
+}
+#[test]
+fn record_storage_trim_keeps_the_last_finished_run() {
+    the_trim_keeps_the_last_finished_run(RecordStorage::new());
 }

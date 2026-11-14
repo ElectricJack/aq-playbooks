@@ -2,9 +2,10 @@
 //! that settles it and is handed to storage in that same commit, which writes
 //! its public inspection items once as history. History holds public
 //! projections only; it is inserted once and never updated. It is a rolling
-//! log: each commit that writes history deletes the oldest finished runs
-//! beyond `policy.history_keep` ([`HISTORY_TRIM_RUNS_PER_COMMIT`] more than
-//! it writes, at most), and the host may delete history by finish time.
+//! log: three rolling sets of `policy.history_keep` each (finished runs,
+//! event receipts, admin receipts), trimmed oldest first by sequence by each
+//! commit that writes history ([`HISTORY_TRIM_RUNS_PER_COMMIT`] more than it
+//! writes, at most); the host may also delete history by finish time.
 use crate::inspection::{self, InspectionKind, InspectionQuery, InspectionRow};
 use crate::lazy::{ContainerChange, TreeKey};
 use crate::transition::StatePatch;
@@ -36,6 +37,14 @@ pub struct SettledCohort {
 }
 impl SettledCohort {
     pub fn history_items(&self) -> Vec<HistoryItem> {
+        // A run row's sequence is its run's terminal receipt (else the
+        // cohort's last receipt): the order the history trim keeps, which
+        // host time cannot invert.
+        let last = self.receipts.iter().map(|r| r.sequence).max().unwrap_or(0);
+        let run_row = |run: &Run| InspectionRow {
+            sequence: run.terminal_sequence.unwrap_or(last),
+            ..inspection::run_row(run)
+        };
         let item = |row: InspectionRow| HistoryItem {
             kind: row.kind,
             key: row.key,
@@ -47,7 +56,7 @@ impl SettledCohort {
         };
         self.runs
             .iter()
-            .map(inspection::run_row)
+            .map(run_row)
             .chain(self.intents.iter().map(inspection::intent_row))
             .chain(self.receipts.iter().map(inspection::receipt_row))
             .map(item)
@@ -160,43 +169,82 @@ pub(crate) fn check_unrecorded(rows: &HistoryRows, keys: &[ItemKey]) -> Result<(
     Ok(())
 }
 
-/// A commit that writes history trims at most this many finished runs more
-/// than it writes (so the trim keeps up with any commit, and a lowered
-/// `history_keep` is reached within a bounded number of commits).
+/// A commit that writes history trims, of each rolling set (finished runs,
+/// event receipts, admin receipts), at most this many more than it writes
+/// (so the trim keeps up with any commit, and a lowered `history_keep` is
+/// reached within a bounded number of commits).
 pub const HISTORY_TRIM_RUNS_PER_COMMIT: usize = 64;
-/// The number of finished runs the trim of a commit that writes `written`
-/// runs to a history of `runs` may remove under `keep`.
-pub fn trim_budget(runs: u64, written: usize, keep: u64) -> usize {
-    let excess = usize::try_from(runs.saturating_sub(keep)).unwrap_or(usize::MAX);
+/// How many units of one rolling set holding `count` the trim of a commit
+/// that writes `written` of them may remove under `keep`.
+pub fn trim_budget(count: u64, written: usize, keep: u64) -> usize {
+    let excess = usize::try_from(count.saturating_sub(keep)).unwrap_or(usize::MAX);
     excess.min(written.saturating_add(HISTORY_TRIM_RUNS_PER_COMMIT))
 }
-/// The runs among `items`.
-pub fn runs_written(items: &[HistoryItem]) -> usize {
-    items
-        .iter()
-        .filter(|item| item.kind == InspectionKind::Runs)
-        .count()
+/// Which rolling set of history an item counts in. History is three
+/// rolling sets of `history_keep` each, trimmed oldest first by sequence:
+/// finished runs (a run's `runs` row, with its effects and receipts), the
+/// receipts of events (`event:<key>`: an event's receipts leave together),
+/// and admin receipts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryUnit {
+    /// A finished run's `runs` row.
+    Run,
+    /// A receipt of an event (`run` is `event:<key>`).
+    EventReceipt,
+    /// An `admin` receipt.
+    AdminReceipt,
+    /// An effect or receipt of a run: it leaves with its run.
+    OfRun,
+}
+pub fn history_unit(item: &HistoryItem) -> HistoryUnit {
+    match item.kind {
+        InspectionKind::Runs => HistoryUnit::Run,
+        InspectionKind::Receipts if item.run == "admin" => HistoryUnit::AdminReceipt,
+        InspectionKind::Receipts if item.run.starts_with("event:") => HistoryUnit::EventReceipt,
+        _ => HistoryUnit::OfRun,
+    }
+}
+/// How many of `items` count in each rolling set: (runs, event receipts,
+/// admin receipts).
+pub fn units_written(items: &[HistoryItem]) -> (usize, usize, usize) {
+    let of = |unit: HistoryUnit| items.iter().filter(|i| history_unit(i) == unit).count();
+    (
+        of(HistoryUnit::Run),
+        of(HistoryUnit::EventReceipt),
+        of(HistoryUnit::AdminReceipt),
+    )
 }
 
+type RowKey = (String, String);
 /// History rows of one namespace in the in-memory backends, by
-/// `(kind.key(), key)`, with the finished runs in finish order and each
-/// run's rows (what the PostgreSQL indexes give).
+/// `(kind.key(), key)`, with each rolling set in sequence order and each
+/// run's (or event's) rows (what the PostgreSQL indexes give).
 #[derive(Debug, Default)]
 pub(crate) struct HistoryRows {
-    pub(crate) rows: BTreeMap<(String, String), HistoryItem>,
-    /// Each run's `runs` row, oldest first: `(finished_at_ms, run)`.
-    runs: BTreeSet<(i64, String)>,
-    /// The rows of each run (`HistoryItem::run`).
-    by_run: BTreeMap<String, BTreeSet<(String, String)>>,
+    pub(crate) rows: BTreeMap<RowKey, HistoryItem>,
+    /// Each rolling set, oldest first: `(sequence, row)`.
+    runs: BTreeSet<(u64, RowKey)>,
+    events: BTreeSet<(u64, RowKey)>,
+    admin: BTreeSet<(u64, RowKey)>,
+    /// The rows of each run or event (`HistoryItem::run`).
+    by_run: BTreeMap<String, BTreeSet<RowKey>>,
 }
 impl HistoryRows {
-    fn contains_key(&self, key: &(String, String)) -> bool {
+    fn contains_key(&self, key: &RowKey) -> bool {
         self.rows.contains_key(key)
+    }
+    fn set(&mut self, unit: HistoryUnit) -> Option<&mut BTreeSet<(u64, RowKey)>> {
+        match unit {
+            HistoryUnit::Run => Some(&mut self.runs),
+            HistoryUnit::EventReceipt => Some(&mut self.events),
+            HistoryUnit::AdminReceipt => Some(&mut self.admin),
+            HistoryUnit::OfRun => None,
+        }
     }
     fn add(&mut self, item: HistoryItem) {
         let key = row_key(&item);
-        if item.kind == InspectionKind::Runs {
-            self.runs.insert((item.finished_at_ms, item.key.clone()));
+        if let Some(set) = self.set(history_unit(&item)) {
+            set.insert((item.sequence, key.clone()));
         }
         self.by_run
             .entry(item.run.clone())
@@ -204,10 +252,11 @@ impl HistoryRows {
             .insert(key.clone());
         self.rows.insert(key, item);
     }
-    fn remove(&mut self, key: &(String, String)) -> Option<HistoryItem> {
+    fn remove(&mut self, key: &RowKey) -> Option<HistoryItem> {
         let item = self.rows.remove(key)?;
-        if item.kind == InspectionKind::Runs {
-            self.runs.remove(&(item.finished_at_ms, item.key.clone()));
+        let sequence = item.sequence;
+        if let Some(set) = self.set(history_unit(&item)) {
+            set.remove(&(sequence, key.clone()));
         }
         if let Some(keys) = self.by_run.get_mut(&item.run) {
             keys.remove(key);
@@ -217,27 +266,49 @@ impl HistoryRows {
         }
         Some(item)
     }
-    /// Delete the oldest finished runs beyond `keep`, at most
-    /// [`trim_budget`] for a commit that wrote `written` runs: each run's
-    /// other rows, then its `runs` row. O(rows deleted).
-    fn trim(&mut self, keep: u64, written: usize) {
-        for _ in 0..trim_budget(self.runs.len() as u64, written, keep) {
-            let Some((_, run)) = self.runs.first().cloned() else {
+    /// Remove every row of run (or event) `owner`, its `runs` row last.
+    fn remove_owner(&mut self, owner: &str) -> usize {
+        let run_row = (InspectionKind::Runs.key().to_string(), owner.to_string());
+        let keys: Vec<RowKey> = self
+            .by_run
+            .get(owner)
+            .into_iter()
+            .flatten()
+            .filter(|key| **key != run_row)
+            .cloned()
+            .collect();
+        let mut removed = keys.len();
+        for key in keys {
+            self.remove(&key);
+        }
+        removed += usize::from(self.remove(&run_row).is_some());
+        removed
+    }
+    /// Delete the oldest of each rolling set beyond `keep`, at most
+    /// [`trim_budget`] for a commit that wrote `written` (runs, event
+    /// receipts, admin receipts) of them: a run with all its rows (its `runs`
+    /// row last), an event's receipts together, an admin receipt alone.
+    /// O(rows deleted).
+    fn trim(&mut self, keep: u64, written: (usize, usize, usize)) {
+        for _ in 0..trim_budget(self.runs.len() as u64, written.0, keep) {
+            let Some((_, (_, run))) = self.runs.first().cloned() else {
                 break;
             };
-            let run_row = (InspectionKind::Runs.key().to_string(), run.clone());
-            let keys: Vec<(String, String)> = self
-                .by_run
-                .get(&run)
-                .into_iter()
-                .flatten()
-                .filter(|key| **key != run_row)
-                .cloned()
-                .collect();
-            for key in keys {
-                self.remove(&key);
-            }
-            self.remove(&run_row);
+            self.remove_owner(&run);
+        }
+        let mut budget = trim_budget(self.events.len() as u64, written.1, keep);
+        while budget > 0 {
+            let Some((_, key)) = self.events.first().cloned() else {
+                break;
+            };
+            let owner = self.rows[&key].run.clone();
+            budget = budget.saturating_sub(self.remove_owner(&owner));
+        }
+        for _ in 0..trim_budget(self.admin.len() as u64, written.2, keep) {
+            let Some((_, key)) = self.admin.first().cloned() else {
+                break;
+            };
+            self.remove(&key);
         }
     }
 }
@@ -257,13 +328,13 @@ pub(crate) fn check_new(rows: &HistoryRows, items: &[HistoryItem]) -> Result<(),
     Ok(())
 }
 /// Write the history of a commit under `keep` (`policy.history_keep`): its
-/// items (none when `keep` is 0), then the trim of the oldest runs beyond
+/// items (none when `keep` is 0), then the trim of each rolling set beyond
 /// `keep`, when the commit has history to write.
 pub(crate) fn insert(rows: &mut HistoryRows, items: Vec<HistoryItem>, keep: u64) {
     if items.is_empty() {
         return;
     }
-    let written = runs_written(&items);
+    let written = units_written(&items);
     if keep > 0 {
         for item in items {
             rows.add(item);
