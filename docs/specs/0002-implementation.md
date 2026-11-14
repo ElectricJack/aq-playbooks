@@ -1,5 +1,7 @@
 # Implementation decisions
 
+2026-11-13: aligned with the rolling-records principle ([aq-server architecture 0006](../../../aq-server/docs/architecture/0006-records-are-rolling.md)) and [spec 0003](0003-live-state-only.md); implementation pending ("Retention and replay").
+
 This document records the concrete choices for the [Rust design](0001-aq-playbooks.md). The research catalog supplies scenarios, not legacy compatibility requirements. The five-crate workspace is independently buildable; the [AQ host integration boundary](../aq-host-integration.md) distinguishes component functionality from live product integration.
 
 ## Artifact and language
@@ -28,9 +30,9 @@ Operational telemetry uses fixed-size histograms and value-free counters exposed
 
 ## Retention and replay
 
-Retention policy specifies event replay, terminal-run and audit horizons plus a tombstone quota. Garbage collection examines bounded pages, preserves unsettled obligations, retained evidence correlations, active/blocked destination manifests and the complete artifact closure of active bindings. Terminal cohorts can be collected across pages. Disposal records and address checks prevent replacement under a retained immutable digest.
+Retention policy specifies the event replay and keyed admission windows, `replay_keep` and `history_keep`. A settled cohort leaves the state in the commit that settles it and is written to history rows; window entries past their expiry, or pushed out by newer keys, are dropped in every commit, a bounded number per commit; history beyond `history_keep` is deleted a bounded number per commit. Deletion preserves unsettled obligations, entries that live work still needs, active/blocked destination manifests and the complete artifact closure of active bindings. Address checks prevent replacement under a retained immutable digest. `collect_garbage` remains for existing callers and is not needed. `max_runs`, `max_receipts`, `max_state_bytes` and `max_tombstones` are accepted and ignored.
 
-Expired accepted events leave replay tombstones; unchanged or changed content under an expired identity cannot silently create new runs. An authenticated producer epoch fence provides explicit retirement of old delivery generations and safe tombstone compaction. The host must persist the epoch with its delivery record and must not relabel an old retry as a new generation. General waits whose required correlation history has expired are refused visibly. Quota pressure never evicts unresolved work.
+Expired accepted events leave no tombstone. A repeat under a forgotten identity is refused as stale when the request carries its time and that time is outside the window; otherwise it is accepted as new. An authenticated producer epoch fence still retires old delivery generations. The host must persist the epoch with its delivery record and must not relabel an old retry as a new generation. A general wait registered after its event's window has passed times out. Nothing is refused because finished records are many, and deletion never removes unresolved work.
 
 ## Protected persistence
 
