@@ -121,24 +121,26 @@ fn check_name(name: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// The engine's tables that have never been analyzed (`reltuples` is
-/// negative), as a fresh `pg_restore` leaves them: PostgreSQL 17 restores no
-/// planner statistics, and without them the planner may answer an indexed
-/// lookup by a prefix scan (the drain's receipt-row delete then reads every
-/// receipt row of the namespace per named row). Each gets one `ANALYZE` of
-/// its own, outside any commit, before the first commit. A table that has
-/// statistics is not touched, so this costs one catalog query after the
-/// first connection. `ANALYZE` takes SHARE UPDATE EXCLUSIVE, which blocks no
+/// The engine's tables without planner statistics: never analyzed
+/// (`reltuples` negative), or holding rows but no column statistics, as a
+/// fresh `pg_restore` leaves them (PostgreSQL 17 restores no statistics;
+/// its index builds set `reltuples`). An analyzed empty table (`reltuples`
+/// 0, no statistics to keep) is not one of them.
+const UNANALYZED_TABLES_SQL: &str = "SELECT c.relname FROM pg_class c WHERE c.relnamespace='aq_playbooks'::regnamespace AND c.relkind IN ('r','p') AND (c.reltuples<0 OR (c.reltuples>0 AND NOT EXISTS(SELECT 1 FROM pg_stats s WHERE s.schemaname='aq_playbooks' AND s.tablename=c.relname))) ORDER BY c.relname";
+/// Analyze the engine's tables that have no planner statistics
+/// ([`UNANALYZED_TABLES_SQL`]). Without them the planner may answer an
+/// indexed lookup by a prefix scan (the drain's receipt-row delete then
+/// reads every receipt row of the namespace per named row). Each gets one
+/// `ANALYZE` of its own, outside any commit, before the first commit. A
+/// table that has statistics is not touched, so this costs one catalog
+/// query after the first connection. `ANALYZE` takes SHARE UPDATE EXCLUSIVE, which blocks no
 /// reader or writer, and reads a bounded sample. It is best effort: a role
 /// that may not analyze a table it does not own gets a server warning and
 /// the table is skipped; any error (a statement or lock timeout, say) is
 /// reported on stderr, value-free, and ignored. Autovacuum analyzes such a
 /// table later anyway.
 fn analyze_unanalyzed(client: &mut Client) {
-    let tables: Vec<String> = match client.query(
-        "SELECT c.relname FROM pg_class c WHERE c.relnamespace='aq_playbooks'::regnamespace AND c.relkind IN ('r','p') AND c.reltuples<0 ORDER BY c.relname",
-        &[],
-    ) {
+    let tables: Vec<String> = match client.query(UNANALYZED_TABLES_SQL, &[]) {
         Ok(rows) => rows.iter().map(|row| row.get(0)).collect(),
         Err(error) => {
             eprintln!("aq-playbooks: could not list tables without statistics: {error}");
@@ -154,11 +156,8 @@ fn analyze_unanalyzed(client: &mut Client) {
         }
         // A role without the right gets only a server warning: say so.
         let skipped = client
-            .query_one(
-                "SELECT reltuples<0 FROM pg_class WHERE relnamespace='aq_playbooks'::regnamespace AND relname=$1",
-                &[&table],
-            )
-            .map(|row| row.get::<_, bool>(0))
+            .query(UNANALYZED_TABLES_SQL, &[])
+            .map(|rows| rows.iter().any(|row| row.get::<_, String>(0) == table))
             .unwrap_or(false);
         if skipped {
             eprintln!(

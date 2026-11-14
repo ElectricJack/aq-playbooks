@@ -3717,16 +3717,29 @@ fn own_database(label: &str) -> (String, String) {
         format!("{} dbname={name}", support::database()),
     )
 }
-/// As a fresh `pg_restore` leaves it (PostgreSQL 17 restores no
-/// statistics): every engine table never analyzed. Needs a superuser, as
-/// the disposable test server's `postgres` is.
+/// As a fresh `pg_restore` leaves it: PostgreSQL 17 restores no column
+/// statistics, while its index builds set `reltuples`. Needs a superuser,
+/// as the disposable test server's `postgres` is.
 fn forget_statistics(url: &str) {
     let mut c = postgres::Client::connect(url, postgres::NoTls).unwrap();
+    // `reltuples` as the restore's index builds set it, then no statistics.
+    c.batch_execute("ANALYZE aq_playbooks.runtime_index")
+        .unwrap();
     c.batch_execute(
-        "DELETE FROM pg_statistic WHERE starelid IN (SELECT oid FROM pg_class WHERE relnamespace='aq_playbooks'::regnamespace);
-         UPDATE pg_class SET reltuples=-1 WHERE relnamespace='aq_playbooks'::regnamespace AND relkind='r'",
+        "DELETE FROM pg_statistic WHERE starelid IN (SELECT oid FROM pg_class WHERE relnamespace='aq_playbooks'::regnamespace)",
     )
     .unwrap();
+}
+/// Whether `table` has column statistics.
+fn has_statistics(url: &str, table: &str) -> bool {
+    postgres::Client::connect(url, postgres::NoTls)
+        .unwrap()
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_stats WHERE schemaname='aq_playbooks' AND tablename=$1)",
+            &[&table],
+        )
+        .unwrap()
+        .get(0)
 }
 fn reltuples(url: &str, table: &str) -> f32 {
     postgres::Client::connect(url, postgres::NoTls)
@@ -3757,8 +3770,8 @@ fn receipt_delete_plan(url: &str, ns: &str) -> String {
 /// Review I1: the receipt-row delete stays an index lookup per named row
 /// only when `runtime_index` has statistics. A database restored without
 /// them (and not yet reached by autovacuum) is analyzed when the storage
-/// connects, before any commit: every engine table whose `reltuples` is
-/// negative (never analyzed) gets its own `ANALYZE`.
+/// connects, before any commit: every engine table never analyzed, or
+/// holding rows but no column statistics, gets its own `ANALYZE`.
 #[test]
 fn opening_the_storage_analyzes_engine_tables_that_have_no_statistics() {
     let (name, url) = own_database("analyze");
@@ -3783,12 +3796,16 @@ fn opening_the_storage_analyzes_engine_tables_that_have_no_statistics() {
     store.release(&ns, "w").unwrap();
     drop(store);
     forget_statistics(&url);
-    assert!(reltuples(&url, "runtime_index") < 0.0);
+    assert!(
+        reltuples(&url, "runtime_index") >= 4_000.0,
+        "as a restore leaves it"
+    );
+    assert!(!has_statistics(&url, "runtime_index"));
     // Without statistics the planner reads every receipt row per lookup.
     assert!(!receipt_delete_plan(&url, &ns).contains("runtime_correlated_sequence"));
     let store = PostgresStorage::connect(&url).unwrap();
-    assert!(reltuples(&url, "runtime_index") >= 4_000.0);
-    assert!(reltuples(&url, "run_history") >= 0.0);
+    assert!(has_statistics(&url, "runtime_index"));
+    assert!(reltuples(&url, "run_history") >= 0.0, "empty tables too");
     let plan = receipt_delete_plan(&url, &ns);
     assert!(plan.contains("runtime_correlated_sequence"), "{plan}");
     // Tables that have statistics are not analyzed again.
@@ -3829,13 +3846,16 @@ fn a_role_that_cannot_analyze_still_opens() {
          GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA aq_playbooks TO {role};"
     ))
     .unwrap();
-    forget_statistics(&url);
+    // Never analyzed, as a database the owner has not opened yet.
+    postgres::Client::connect(&url, postgres::NoTls)
+        .unwrap()
+        .batch_execute(
+            "UPDATE pg_class SET reltuples=-1 WHERE relnamespace='aq_playbooks'::regnamespace AND relkind='r'",
+        )
+        .unwrap();
     let writer = format!("{url} user={role} password=synthetic-writer");
     let store = PostgresStorage::connect(&writer).unwrap();
-    assert!(
-        reltuples(&url, "runtime_index") < 0.0,
-        "skipped, not analyzed"
-    );
+    assert!(reltuples(&url, "namespaces") < 0.0, "skipped, not analyzed");
     drop(store);
     drop(c);
     let mut admin = support::client();
