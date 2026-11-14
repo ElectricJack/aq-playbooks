@@ -1,6 +1,6 @@
 {
   "name": "still-no-description",
-  "situation": "A task a playbook created still has no description after ten minutes",
+  "situation": "A task a playbook filed still has no description after ten minutes",
   "start": {
     "kind": "event",
     "event": "aq.work.changed",
@@ -68,7 +68,7 @@
         "command": "message.send",
         "input": {
           "identity": "task-40@2",
-          "recipient": "group:coordinators",
+          "recipient": "user:owner-1",
           "visibility": "project",
           "body": "This task has had no description for ten minutes. Please add one, so that it can be worked on."
         }

@@ -68,7 +68,7 @@
         "command": "message.send",
         "input": {
           "identity": "task-40@3",
-          "recipient": "group:coordinators",
+          "recipient": "user:owner-1",
           "visibility": "project",
           "body": "This task has had no description for ten minutes. Please add one, so that it can be worked on."
         }

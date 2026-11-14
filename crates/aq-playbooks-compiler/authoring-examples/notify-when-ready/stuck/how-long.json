@@ -5,15 +5,15 @@
     "ask",
     "--line",
     "3",
-    "How long should a new or changed task wait before the coordinators are asked for its description?"
+    "How long should a new or changed task wait before you are sent a message asking for its description?"
   ],
   "writes": {
     "kind": "question",
-    "question": "How long should a new or changed task wait before the coordinators are asked for its description?",
+    "question": "How long should a new or changed task wait before you are sent a message asking for its description?",
     "sentences": [
       {
         "line": 3,
-        "text": "When a playbook creates or changes a task, wait a while first."
+        "text": "When a playbook files a task, or changes one, wait a while first."
       }
     ]
   }

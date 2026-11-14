@@ -964,6 +964,13 @@ fn a_reused_binding_name_is_reported_without_the_costly_read_check() {
         diagnostics.iter().any(|d| d.code == "binding"),
         "{diagnostics:#?}"
     );
+    // The fault names the other step that binds the name (fix round 2, N3).
+    let binding = diagnostics.iter().find(|d| d.code == "binding").unwrap();
+    assert!(
+        binding.message.contains("binds `work`, which step `")
+            && binding.message.contains("` already binds"),
+        "{binding:#?}"
+    );
     assert!(
         diagnostics
             .iter()

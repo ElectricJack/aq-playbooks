@@ -681,26 +681,37 @@ fn whole(source: &str, line: u32, end: Option<u32>) -> Result<()> {
             format!("--lines {}-{}", a + 1, b + 1)
         }
     };
-    if first > 0 {
-        let before = lines[first - 1];
-        if !before.trim().is_empty() && !ends(before) && !starts_block(lines[first]) {
-            bail!(
-                "line {}: the sentence starts on line {first}, which it goes on from. Name the whole sentence, from its first line, such as {}.",
-                first + 1,
-                shown(first - 1, last)
-            );
-        }
-    }
-    if let Some(after) = lines.get(last + 1)
-        && !after.trim().is_empty()
-        && !starts_block(after)
-        && !ends(lines[last])
+    // The sentence's whole extent, which the suggestion names, so that it is
+    // itself accepted.
+    let (mut start, mut finish) = (first, last);
+    while start > 0
+        && !lines[start - 1].trim().is_empty()
+        && !ends(lines[start - 1])
+        && !starts_block(lines[start])
     {
+        start -= 1;
+    }
+    while finish + 1 < lines.len()
+        && !lines[finish + 1].trim().is_empty()
+        && !starts_block(lines[finish + 1])
+        && !ends(lines[finish])
+    {
+        finish += 1;
+    }
+    if start < first {
+        bail!(
+            "line {}: the sentence starts on line {}, which it goes on from. Name the whole sentence, from its first line, such as {}.",
+            first + 1,
+            start + 1,
+            shown(start, finish)
+        );
+    }
+    if finish > last {
         bail!(
             "line {}: the sentence goes on in line {}. Name the whole sentence, to its last line, such as {}.",
             last + 1,
             last + 2,
-            shown(first, last + 1)
+            shown(start, finish)
         );
     }
     Ok(())

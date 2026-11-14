@@ -147,7 +147,7 @@ pub fn short_type(schema: &Schema) -> String {
             .iter()
             .map(short_type)
             .collect::<Vec<_>>()
-            .join(" | "),
+            .join(" or "),
     }
 }
 fn paragraphs(notes: &Value) -> String {

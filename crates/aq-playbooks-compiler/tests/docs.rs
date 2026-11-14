@@ -486,6 +486,34 @@ fn the_catalog_notes_cover_every_contract_of_the_pinned_catalog() {
     }
 }
 
+/// A union type must not break the Markdown tables of the rendered catalog:
+/// every table row has as many columns as its header (fix round 2, N1).
+#[test]
+fn every_table_row_of_the_rendered_catalog_has_its_header_columns() {
+    let registry = catalog_registry();
+    let commands = registry.commands.keys().cloned().collect();
+    let events = registry.events.keys().cloned().collect();
+    let all = catalog(&commands, &events).unwrap();
+    let columns = |row: &str| row.trim().trim_matches('|').split(" | ").count();
+    let mut header = 0;
+    let mut rows = 0;
+    let mut previous_was_row = false;
+    for line in all.lines() {
+        if !line.starts_with('|') {
+            previous_was_row = false;
+            continue;
+        }
+        if !previous_was_row {
+            header = columns(line);
+        } else {
+            assert_eq!(columns(line), header, "{line}");
+            rows += 1;
+        }
+        previous_was_row = true;
+    }
+    assert!(rows > 100, "{rows} rows");
+}
+
 #[test]
 fn the_guide_names_every_tool() {
     for tool in [

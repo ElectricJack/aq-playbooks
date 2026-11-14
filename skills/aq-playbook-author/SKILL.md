@@ -72,7 +72,7 @@ command before it prints, with `…` for text left out.
    ```
 
    ```json output
-   {"facts": {"coordinators": "group:coordinators"}, "facts_version": "settings-7", "use": "Read a fact in the draft as {\"op\": \"ref\", \"root\": \"definitions\", \"path\": [\"<name>\", …]}."}
+   {"facts": {"owner": "user:owner-1"}, "facts_version": "settings-7", "use": "Read a fact in the draft as {\"op\": \"ref\", \"root\": \"definitions\", \"path\": [\"<name>\", …]}."}
    ```
 
 2. The contracts, as JSON with the same notes as `CATALOG.md`:
@@ -90,6 +90,11 @@ command before it prints, with `…` for text left out.
    it, the data it tests, the command that does it. Decide now whether the
    document can be followed at all; see "When not to write a playbook". Ask
    or give up before you write anything.
+   A document that says a task is filed, made or added starts on
+   `aq.work.changed` with outcome `ensured`, which means the task exists
+   now and is sent whether the task was new or already there; it never says
+   which. Word the sentence so that either reading is what the owner means,
+   or ask.
 4. Read the worked example closest to the document (`examples/`). Then write
    `draft.json`. `LANGUAGE.md` lists every operation and expression. Write
    commands and events by their names; the tool fills in their identities.
@@ -231,11 +236,11 @@ aq-playbooks ask --lines 17-18 "The document gives high risk work Deep, high eff
 A line that does not hold its whole sentence is refused:
 
 ```sh notify-when-ready
-aq-playbooks ask --line 10 "Which coordinators?"
+aq-playbooks ask --line 10 "Which people?"
 ```
 
 ```json output
-{"error": "line 10: the sentence goes on in line 11. Name the whole sentence, to its last line, such as --lines 10-11."}
+{"error": "line 10: the sentence goes on in line 11. Name the whole sentence, to its last line, such as --lines 10-12."}
 ```
 
 ### How to give up
@@ -263,7 +268,7 @@ aq-playbooks unable --file catalog.json "record.json allows the command message.
 The run then ends; a second ending is refused:
 
 ```sh notify-when-ready doc=stuck/how-long.md
-aq-playbooks ask --line 3 "How long should a new or changed task wait before the coordinators are asked for its description?"
+aq-playbooks ask --line 3 "How long should a new or changed task wait before you are sent a message asking for its description?"
 aq-playbooks unable --line 3 "The document gives no time."
 ```
 
@@ -540,13 +545,13 @@ The fields:
 What `try` reports when a case and the run differ:
 
 ```json case notify-when-ready
-{"name": "listed-wrongly", "situation": "A task a playbook created still has no description after ten minutes",
+{"name": "listed-wrongly", "situation": "A task a playbook filed still has no description after ten minutes",
  "start": {"kind": "event", "event": "aq.work.changed", "payload": {"outcome": "ensured", "reference": "task-40@2", "subject": {"id": "task-40", "revision": 2}}, "correlation": {"operation": "work-op-1"}},
  "returns": {"work.read": [{"outcome": "observed", "output": {"reference": "task-40@2", "subject": {"id": "task-40", "revision": 2}, "facts": {"kind": "", "title": "Add a dark theme", "description": "", "origin": "owner", "level_hint": "", "charged_failures": 0, "ended_attempts": 0, "route": "none"}}}],
              "message.send": [{"outcome": "queued", "output": {"reference": "message-1", "subject": {"id": "task-40", "revision": 2}}}]},
  "expect": {"outcome": "reminded",
             "calls": [{"command": "work.read", "input": {"subject": {"id": "task-40", "revision": 2}}},
-                      {"command": "message.send", "input": {"identity": "task-40", "recipient": "group:coordinators", "visibility": "project", "body": "This task has had no description for ten minutes. Please add one, so that it can be worked on."}}]}}
+                      {"command": "message.send", "input": {"identity": "task-40", "recipient": "user:owner-1", "visibility": "project", "body": "This task has had no description for ten minutes. Please add one, so that it can be worked on."}}]}}
 ```
 
 ```json report

@@ -1804,7 +1804,7 @@ impl ArtifactContent {
             }))
             .collect();
         let mut item_names = BTreeSet::new();
-        let mut bound_names = BTreeSet::new();
+        let mut bound_names: BTreeMap<String, String> = BTreeMap::new();
         // (step, location) of expressions refused for depth: typing them would
         // report the same fault again.
         let mut too_deep = BTreeSet::new();
@@ -1836,17 +1836,24 @@ impl ArtifactContent {
                 | Operation::Join { bind, .. } => Some(bind),
                 _ => None,
             };
-            if let Some(bind) = bind
-                && (!valid_name(bind)
+            if let Some(bind) = bind {
+                let other = bound_names.get(bind).cloned();
+                if other.is_none() {
+                    bound_names.insert(bind.clone(), name.clone());
+                }
+                if !valid_name(bind)
                     || matches!(bind.as_str(), "input" | "event" | "definitions" | "vars")
-                    || !bound_names.insert(bind.clone()))
-            {
-                issue(
-                    &mut issues,
-                    "binding",
-                    &path,
-                    "bindings must be valid distinct roots, excluding reserved roots",
-                );
+                    || other.is_some()
+                {
+                    let message = match other {
+                        Some(other) => format!(
+                            "bindings must be valid distinct roots, excluding reserved roots: step `{name}` binds `{bind}`, which step `{other}` already binds"
+                        ),
+                        None => "bindings must be valid distinct roots, excluding reserved roots"
+                            .to_string(),
+                    };
+                    issue(&mut issues, "binding", &path, message);
+                }
             }
             if !matches!(step.op, Operation::Return { .. } | Operation::Decide { .. })
                 && step.on_error.is_none()

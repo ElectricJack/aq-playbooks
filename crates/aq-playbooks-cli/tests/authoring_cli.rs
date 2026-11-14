@@ -736,3 +736,27 @@ fn a_quote_must_hold_whole_sentences() {
     let (ok, printed) = json_of(d, &["ask", "--lines", "3-4", "--line", "6", "Who?"]);
     assert!(ok, "{printed:#}");
 }
+
+/// The range a refusal suggests is itself accepted, however many lines the
+/// sentence has and whichever of its lines was named (fix round 2, N2).
+#[test]
+fn the_suggested_range_is_accepted() {
+    let ws = workspace("suggested");
+    let d = &ws.0;
+    let text = "# Title\n\nWhen a task is made, send its\nowner a note and\nthen stop.\n\nDone.\n";
+    fs::write(d.join("source.md"), text).unwrap();
+    for args in [
+        &["ask", "--line", "3", "Who?"][..],
+        &["ask", "--line", "4", "Who?"],
+        &["ask", "--line", "5", "Who?"],
+        &["ask", "--lines", "3-4", "Who?"],
+        &["ask", "--lines", "4-5", "Who?"],
+    ] {
+        let (ok, refused) = json_of(d, args);
+        assert!(!ok, "{args:?}");
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains("such as --lines 3-5."), "{args:?}: {error}");
+    }
+    let (ok, printed) = json_of(d, &["ask", "--lines", "3-5", "Who?"]);
+    assert!(ok, "{printed:#}");
+}

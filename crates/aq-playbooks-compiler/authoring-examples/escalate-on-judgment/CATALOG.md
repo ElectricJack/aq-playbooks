@@ -12,9 +12,9 @@ A change that answers later: its `accepted` edge binds `{handle}`, and the answe
 
 | Input field | Type | Meaning |
 | --- | --- | --- |
-| `budget` | {deadline_ms, max_output_tokens} | `deadline_ms` (1000 to 600000), how long the host may take; `max_output_tokens`. 120000 ms and 2048 tokens are plenty for a classification. A budget above the host's caps is refused with `budget_exceeded`. |
+| `budget` | {deadline_ms, max_output_tokens} | `deadline_ms` (1000 to 600000), how long the host may take; `max_output_tokens`. 120000 ms and 2048 tokens are plenty for a classification. Today the host refuses a budget above its caps with `budget_exceeded`. |
 | `context` | {items} | `items`: at most 16 `{label, text}` the model sees, such as a task's title and description. |
-| `fields` | array ≤ 16 of {choices, description, id} | One entry per labelled question: `{id, description, choices}`, at most 16, with up to 64 choices of at most 128 bytes. Include a choice such as `unknown` when the document says what to do if it cannot be told. |
+| `fields` | array ≤ 16 of {choices, description, id} | Today the host has no adapter for this command yet, so it has not decided what it does with no fields and one flag: this is not yet decided by the host, so include at least one field. One entry per labelled question: `{id, description, choices}`, at most 16, with up to 64 choices of at most 128 bytes. Include a choice such as `unknown` when the document says what to do if it cannot be told. |
 | `flags` | array ≤ 32 of {description, id} | Yes/no questions: `{id, description}`, at most 32. The model says which hold. |
 | `question` | string ≤ 4096 B | What to judge, in the document's own words, with its definitions. |
 | `rationale_max_bytes` | integer 0..4096 | How long the model's explanation may be, 0 to 4096. |
@@ -25,9 +25,9 @@ A change that answers later: its `accepted` edge binds `{handle}`, and the answe
 | `accepted` | {handle} | The question is queued; the edge binds `{handle}`. Join the handle under a key, accepting only `assessed`. |
 | `assessed` | {flags, labels, provenance, rationale, reference, subject} | `labels` has exactly one label per field, in field order (`labels.0` answers `fields[0]`), each one of that field's choices; `flags` lists the flags that hold, each once; `rationale`; `reference` identifies the judgment. Read these only on the join's `completed` edge. |
 | `failed` | {reason, reference, subject} | No usable answer: `indeterminate`, `provider_error`, `provider_unavailable` or `deadline_exceeded`. Take the fallback the document gives. |
-| `refused` | {reason, reference, subject} | The request was not run: `invalid_request` (over 65536 bytes, duplicate field ids, a field without choices) or `budget_exceeded`. It can come at once, on the invoke's own `refused` edge, or through the join. Take the fallback the document gives. |
+| `refused` | {reason, reference, subject} | The request was not run. Today the host refuses it with `invalid_request` (over 65536 bytes, duplicate field ids, a field without choices) or `budget_exceeded`. It can come at once, on the invoke's own `refused` edge, or through the join. Take the fallback the document gives. |
 
-Every accepted judgment gets exactly one final answer from the host, at the latest `failed` with `deadline_exceeded` when the host's own deadline passes. The join's deadline only decides when the run stops waiting.
+Today the host gives every accepted judgment exactly one final answer, at the latest `failed` with `deadline_exceeded` when the host's own deadline passes. The join's deadline only decides when the run stops waiting.
 
 Write a fallback that reads nothing of the answer on every way the judgment can fail: the join's `no_match`, `timeout` and `on_error`, and the invoke's own outcome edges besides `accepted`.
 
@@ -48,7 +48,7 @@ A read: safe to repeat. The host answers within 60000 ms. Needs: `operation.get`
 | Outcome | Returns | When, and what next |
 | --- | --- | --- |
 | `cancelled` | {reference, subject} | It was cancelled. |
-| `completed` | {outcome, output} | {outcome, output} | {outcome, output} | {outcome, output} | It finished; `outcome` and `output` are its answer. |
+| `completed` | {outcome, output} or {outcome, output} or {outcome, output} or {outcome, output} | It finished; `outcome` and `output` are its answer. |
 | `failed` | {reference, subject} | Not stated. |
 | `indeterminate` | {reference, subject} | The host cannot tell. |
 | `refused` | {reference, subject} | Not stated. |
@@ -64,14 +64,14 @@ A read: safe to repeat. The host answers within 10000 ms. Needs: `work.read`.
 
 | Input field | Type | Meaning |
 | --- | --- | --- |
-| `subject` | {id, revision} | The task's `{id, revision}`. The host reads the task as it is now, whatever revision is given. |
+| `subject` | {id, revision} | The task's `{id, revision}`. Today the host reads the task as it is now, whatever revision is given. |
 
 | Outcome | Returns | When, and what next |
 | --- | --- | --- |
 | `observed` | {facts, reference, subject} | `subject` carries the task's current revision: pass this subject on, not the trigger's, so that a later write to a changed task is refused as stale. `reference` is `<id>@<revision>` of the task as read (one value per task version). `facts` holds what a document can test (below). |
-| `refused` | {reason, reference, subject} | `unknown_task` (there is no such task) or `not_on_router` (the task's project is not routed automatically). End the run: nothing is wrong with the playbook. |
+| `refused` | {reason, reference, subject} | Today the host refuses with `unknown_task` (there is no such task) or `not_on_router` (the task's project is not routed automatically). End the run: nothing is wrong with the playbook. |
 
-It answers only for a task in a project on the automatic router. If the document expects to read tasks of any project, ask the owner.
+Today the host answers only for a task in a project on the automatic router. If the document expects to read tasks of any project, ask the owner.
 
 `facts`, all always present: `kind` (the kind whoever filed the task gave, such as `bugfix`, or `""`; a claim, not a classification); `title` (at most 512 bytes); `description` (at most 8192 bytes); `origin` (`owner`, `agent`, `supervisor`, `playbook` or `unknown`: who filed it); `level_hint` (the level whoever filed it asked for, or `""`); `charged_failures` (earlier attempts that failed for a real reason and were charged to the task: escalate on this, and only this); `ended_attempts` (earlier attempts that ended for any reason, outages included: never escalate on it); `route` (`none`, `router` or `owner`: who set the current route).
 
@@ -100,11 +100,11 @@ A change, made once per call: a repeat of the same call returns the first result
 | `routed` | {harnesses, prefer, providers, reference, subject} | The route is written, with the lists as the host kept them. End. |
 | `stale` | {reference, subject} | The task changed after the read; nothing was written. End: the host asks again for the new version. |
 
-The host intersects `harnesses`, `providers` and `prefer` with what Settings offers at the level and drops the rest, so write the lists the document implies without filtering them yourself. Never decide from `definitions.offers` that nothing can take a task: write the route and let the host refuse it.
+Today the host intersects `harnesses`, `providers` and `prefer` with what Settings offers at the level and drops the rest, so write the lists the document implies without filtering them yourself. Never decide from `definitions.offers` that nothing can take a task: write the route and let the host refuse it.
 
 If the owner chose the route (`facts.route` is `owner`), end without writing one.
 
-These sentences need no step; the host does them: holding a task until something can take it, raising a task nothing could ever take, when a route is needed, never choosing by priority or load, which model a harness runs, which failures count (`charged_failures`), and recording the decision on the task.
+These sentences need no step; today the host does them: holding a task until something can take it, raising a task nothing could ever take, when a route is needed, never choosing by priority or load, which model a harness runs, which failures count (`charged_failures`), and recording the decision on the task.
 
 The worked example `escalate-on-judgment` reads, judges, looks the route up, writes it, and has a fallback route on every way the judgment fails.
 
@@ -140,13 +140,13 @@ Correlation fields: `operation`. Kept 86400000 ms.
 | Payload field | Type | Meaning |
 | --- | --- | --- |
 | `outcome` | one of `assessed`, `failed`, `refused` | `assessed`, `failed` or `refused`. |
-| `output` | {flags, labels, provenance, rationale, reference, subject} | {reason, reference, subject} | {reason, reference, subject} | That outcome's output. |
+| `output` | {flags, labels, provenance, rationale, reference, subject} or {reason, reference, subject} or {reason, reference, subject} | That outcome's output. |
 
 ### `aq.work.route_needed` 1.0.0
 
 A task needs a route.
 
-**Sent:** By the host on its own: for a ready task in a project on the automatic router that has no route; at once when the task changes to a new version, or is retried or reopened; again for the same version at most every two minutes while it stays unrouted, but not while a run started for that version is unfinished. After `not_offered` it is not sent again until the task, the active playbook or Settings changes; after `work.unroutable`, until the task or the active playbook changes.
+**Sent:** Today the host sends it on its own: for a ready task in a project on the automatic router that has no route; at once when the task changes to a new version, or is retried or reopened; again for the same version at most every two minutes while it stays unrouted, but not while a run started for that version is unfinished. After `not_offered` it is not sent again until the task, the active playbook or Settings changes; after `work.unroutable`, until the task or the active playbook changes.
 
 Correlation fields: none. Kept 86400000 ms.
 
