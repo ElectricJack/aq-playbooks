@@ -1,29 +1,35 @@
-//! Reusable, compiled pilot workflows with deterministic fake-host scenarios.
-use crate::{
+//! Reusable, compiled pilot workflows with deterministic fake-host scenarios,
+//! for tests only. Their artifacts' bytes are pinned by
+//! `tests/host_pilots.rs` (`the_coding_pilot_keeps_its_pinned_bytes`).
+#[allow(dead_code)]
+#[path = "schemas.rs"]
+pub mod schemas;
+use aq_playbooks_cli::{
     catalog::*,
     simulation::{Action, Scenario, Start},
 };
 use aq_playbooks_compiler::{COMPILER_VERSION, CompileInput, Proposal, compile};
 use aq_playbooks_model::*;
 use aq_playbooks_runner::{Authority, DispatchResult};
+use schemas::*;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-pub const NAMES: &[&str] = &["coding", "routing", "watcher", "report"];
-fn lit(v: Value) -> Expr {
+pub const NAMES: &[&str] = &["coding", "watcher", "report"];
+pub fn lit(v: Value) -> Expr {
     Expr::literal(v)
 }
-fn reference(root: &str, path: &[&str]) -> Expr {
+pub fn reference(root: &str, path: &[&str]) -> Expr {
     Expr::Ref {
         root: root.into(),
         path: path.iter().map(|s| (*s).into()).collect(),
     }
 }
-fn fields(items: &[(&str, Expr)]) -> Expr {
+pub fn fields(items: &[(&str, Expr)]) -> Expr {
     Expr::Object {
         fields: items.iter().cloned().map(|(k, v)| (k.into(), v)).collect(),
     }
 }
-fn edge(op: Operation, edges: &[(&str, &str)]) -> Step {
+pub fn edge(op: Operation, edges: &[(&str, &str)]) -> Step {
     Step {
         op,
         edges: edges
@@ -33,7 +39,7 @@ fn edge(op: Operation, edges: &[(&str, &str)]) -> Step {
         on_error: Some("failure".into()),
     }
 }
-fn ret(outcome: &str, output: Expr) -> Step {
+pub fn ret(outcome: &str, output: Expr) -> Step {
     Step {
         op: Operation::Return {
             outcome: outcome.into(),
@@ -43,7 +49,7 @@ fn ret(outcome: &str, output: Expr) -> Step {
         on_error: None,
     }
 }
-fn invoke(
+pub fn invoke(
     registry: &Registry,
     name: &str,
     input: Expr,
@@ -83,7 +89,7 @@ fn call(name: &str, input: Expr, mode: CallMode, bind: &str, edges: &[(&str, &st
         edges,
     )
 }
-fn build(
+pub fn build(
     id: &str,
     registry: Registry,
     input: Schema,
@@ -188,8 +194,6 @@ fn build(
         proposal: Proposal {
             playbook,
             source_map: BTreeMap::new(),
-            questions: vec![],
-            unsupported_features: vec![],
         },
         registry,
         dependencies,
@@ -199,7 +203,7 @@ fn build(
     compile(&input)
         .map_err(|d| anyhow::anyhow!("{id}: {}", serde_json::to_string_pretty(&d).unwrap()))
 }
-fn subject_value() -> Value {
+pub fn subject_value() -> Value {
     json!({"id":"candidate-1","revision":1})
 }
 fn output() -> Value {
@@ -393,7 +397,6 @@ fn work_child(id: &str, kind: &str) -> anyhow::Result<Artifact> {
 pub fn scenario(name: &str) -> anyhow::Result<Scenario> {
     match name {
         "coding" => coding(),
-        "routing" => routing(),
         "watcher" => watcher(),
         "report" => report(),
         _ => anyhow::bail!("unknown pilot {name}; choose {}", NAMES.join(", ")),
@@ -610,94 +613,6 @@ fn coding() -> anyhow::Result<Scenario> {
         vec![],
     ))
 }
-fn routing() -> anyhow::Result<Scenario> {
-    let r = catalog();
-    let steps = BTreeMap::from([
-        (
-            "context".into(),
-            invoke(
-                &r,
-                "context.read",
-                context("execution_options"),
-                "context",
-                &[("observed", "assess")],
-            ),
-        ),
-        (
-            "assess".into(),
-            edge(
-                Operation::Decide {
-                    predicate: reference("input", &["needs_judgment"]),
-                },
-                &[
-                    ("true", "judgment"),
-                    ("false", "default_change"),
-                    ("unknown", "failure"),
-                ],
-            ),
-        ),
-        (
-            "judgment".into(),
-            invoke(
-                &r,
-                "judgment.request",
-                lit(
-                    json!({"subject":subject_value(),"context":"snapshot-1","question":"Choose an eligible execution preference","choices":["permitted-default"]}),
-                ),
-                "assessment",
-                &[("assessed", "change")],
-            ),
-        ),
-        (
-            "default_change".into(),
-            invoke(
-                &r,
-                "work.change",
-                lit(
-                    json!({"variant":"execution_constraints","subject":subject_value(),"value":"permitted-default","hold_id":null}),
-                ),
-                "default_change_result",
-                &[("changed", "done")],
-            ),
-        ),
-        (
-            "change".into(),
-            invoke(
-                &r,
-                "work.change",
-                fields(&[
-                    ("variant", lit(json!("execution_constraints"))),
-                    ("subject", lit(subject_value())),
-                    ("value", reference("assessment", &["choice"])),
-                    ("hold_id", lit(Value::Null)),
-                ]),
-                "change",
-                &[("changed", "done")],
-            ),
-        ),
-        ("done".into(), ret("success", lit(Value::Null))),
-    ]);
-    let a = build(
-        "routing",
-        r,
-        object(&[("needs_judgment", Schema::Boolean)]),
-        Schema::Null,
-        "context",
-        steps,
-        &[],
-    )?;
-    Ok(base(
-        vec![a],
-        "routing",
-        BTreeMap::from([
-            ("context.read".into(), vec![observed()]),
-            ("judgment.request".into(), vec![done("assessed")]),
-            ("work.change".into(), vec![done("changed")]),
-        ]),
-        json!({"needs_judgment":true}),
-        vec![],
-    ))
-}
 fn watcher() -> anyhow::Result<Scenario> {
     let r = catalog();
     let steps = BTreeMap::from([
@@ -859,220 +774,4 @@ fn report() -> anyhow::Result<Scenario> {
             },
         ],
     ))
-}
-/// Reconstruct the exact generated source and explicit proposal for authoring examples.
-pub fn compile_input(artifact: &Artifact) -> CompileInput {
-    let c = &artifact.content;
-    let id = &c.playbook.id;
-    CompileInput {
-        source: format!(
-            "---aq-playbook\n{}\n---\n\n# {id}\n\nA synthetic bounded pilot. Domain services retain authority.\n",
-            serde_json::to_string(&c.source.header).unwrap()
-        ),
-        proposal: Proposal {
-            playbook: c.playbook.clone(),
-            source_map: c.source_map.clone(),
-            questions: vec![],
-            unsupported_features: vec![],
-        },
-        registry: c.registry.clone(),
-        dependencies: c.dependencies.clone(),
-        definitions: c.definitions.clone(),
-        compiler: c.compiler.clone(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn catalog_v2_async_judgment_and_check_compile_and_join() {
-        let r = catalog_v2();
-        let fixtures: Value = serde_json::from_str(include_str!(
-            "../../../contracts/aq-host-2.0.0/fixtures.json"
-        ))
-        .unwrap();
-        let input = |name: &str| {
-            fixtures["replay_cases"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|c| c["command"] == name)
-                .unwrap()["input"]
-                .clone()
-        };
-        let steps = BTreeMap::from([
-            (
-                "judgment".into(),
-                invoke(
-                    &r,
-                    "judgment.request",
-                    lit(input("judgment.request")),
-                    "judgment",
-                    &[("accepted", "check")],
-                ),
-            ),
-            (
-                "check".into(),
-                invoke(
-                    &r,
-                    "check.request",
-                    lit(input("check.request")),
-                    "check",
-                    &[("accepted", "wait")],
-                ),
-            ),
-            (
-                "wait".into(),
-                edge(
-                    Operation::Join {
-                        member_keys: vec![],
-                        members: vec![
-                            reference("judgment", &["handle"]),
-                            reference("check", &["handle"]),
-                        ],
-                        mode: JoinMode::All,
-                        accepted_outcomes: strings(&["assessed", "passed"]),
-                        deadline_ms: 60_000,
-                        remaining: RemainingPolicy::Track,
-                        bind: "results".into(),
-                    },
-                    &[
-                        ("completed", "done"),
-                        ("timeout", "failure"),
-                        ("no_match", "failure"),
-                    ],
-                ),
-            ),
-            ("done".into(), ret("success", lit(Value::Null))),
-        ]);
-        let artifact = build(
-            "v2-adapters",
-            r,
-            Schema::Null,
-            Schema::Null,
-            "judgment",
-            steps,
-            &[],
-        )
-        .unwrap();
-        let retained = &artifact.content.registry;
-        assert_eq!(retained.commands["judgment.request"].version, "2.0.0");
-        assert!(retained.events.contains_key("aq.judgment.completed"));
-        assert!(retained.events.contains_key("aq.check.receipted"));
-    }
-    fn prepared_source_check(r: Registry) -> anyhow::Result<Artifact> {
-        let check = json!({
-            "id": "unit",
-            "validator": {"id": "validator-1", "version": "1", "digest": format!("sha256:{}", "b".repeat(64))},
-        });
-        let steps = BTreeMap::from([
-            (
-                "prepare".into(),
-                invoke(
-                    &r,
-                    "candidate.prepare",
-                    lit(json!({"base": subject_value(), "sources": [subject_value()]})),
-                    "candidate",
-                    &[("prepared", "check")],
-                ),
-            ),
-            (
-                "check".into(),
-                invoke(
-                    &r,
-                    "check.request",
-                    fields(&[
-                        ("subject", reference("candidate", &["subject"])),
-                        ("check", lit(check)),
-                        ("source", reference("candidate", &["source"])),
-                    ]),
-                    "check",
-                    &[("accepted", "done")],
-                ),
-            ),
-            ("done".into(), ret("success", lit(Value::Null))),
-        ]);
-        build(
-            "prepared-source-check",
-            r,
-            Schema::Null,
-            Schema::Null,
-            "prepare",
-            steps,
-            &[],
-        )
-    }
-    #[test]
-    fn catalog_v2_1_check_binds_the_prepared_candidate_source() {
-        let artifact = prepared_source_check(catalog_v2_1()).unwrap();
-        let retained = &artifact.content.registry;
-        assert_eq!(retained.commands["candidate.prepare"].version, "2.1.0");
-        assert_eq!(retained.commands["check.request"].version, "2.0.0");
-        // 2.0.0 has no prepared source, so the same binding cannot compile.
-        let err = prepared_source_check(catalog_v2()).unwrap_err().to_string();
-        assert!(err.contains("unknown field source"), "{err}");
-    }
-    #[test]
-    fn all_four_pilots_compile_and_execute() {
-        for name in NAMES {
-            let s = scenario(name).unwrap();
-            let report = crate::simulation::simulate(&s).unwrap();
-            assert!(
-                report.complete,
-                "{name}: {}",
-                serde_json::to_string_pretty(&report).unwrap()
-            );
-            let roots = report.inspection["runs"].as_array().unwrap();
-            assert!(
-                roots
-                    .iter()
-                    .any(|r| r["id"] == report.roots[0] && r["outcome"] == "success"),
-                "{name}: {}",
-                serde_json::to_string_pretty(&report).unwrap()
-            );
-        }
-    }
-    #[test]
-    fn missing_mock_is_not_success() {
-        let mut s = scenario("routing").unwrap();
-        s.mocks.remove("judgment.request");
-        let report = crate::simulation::simulate(&s).unwrap();
-        assert!(!report.complete);
-        assert!(report.coverage.contains("unresolved"));
-    }
-    #[test]
-    fn coding_conflict_repairs_and_starts_independent_followup() {
-        let s = scenario("coding").unwrap();
-        let report = crate::simulation::simulate(&s).unwrap();
-        let effects = report.inspection["effects"].as_array().unwrap();
-        assert_eq!(
-            effects
-                .iter()
-                .filter(|e| e["command"] == "candidate.publish")
-                .count(),
-            2
-        );
-        assert!(
-            report.inspection["runs"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|r| r["origin"].is_string() && r["parent"].is_null())
-        );
-    }
-    #[test]
-    fn report_fallback_and_late_author_publish_once() {
-        let s = scenario("report").unwrap();
-        let report = crate::simulation::simulate(&s).unwrap();
-        assert_eq!(
-            report.inspection["effects"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|e| e["command"] == "message.send")
-                .count(),
-            1
-        );
-    }
 }

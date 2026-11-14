@@ -1,7 +1,6 @@
-use anyhow::{Context, Result, bail};
-use aq_playbooks_cli::{catalog, pilots, simulation};
-use aq_playbooks_compiler::{CompileInput, compile, semantic_diff, validate};
-use aq_playbooks_model::{Artifact, Registry, canonical_bytes};
+use anyhow::{Context, Result};
+use aq_playbooks_cli::{catalog, simulation};
+use aq_playbooks_model::{Artifact, Registry};
 use aq_playbooks_postgres::PostgresStorage;
 use aq_playbooks_runner::{
     Authority, CatalogKind, CatalogQuery, Engine, InspectionKind, InspectionQuery, RetentionPolicy,
@@ -15,12 +14,13 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+mod authoring;
 
 #[derive(Parser)]
 #[command(
     name = "aq-playbooks",
     version,
-    about = "Compile, simulate, and inspect bounded policy workflows"
+    about = "Author, check, inspect and administer bounded policy workflows"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -28,19 +28,8 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Validate and package an exact source/proposal/catalog bundle.
-    Compile {
-        input: PathBuf,
-        #[arg(short, long)]
-        output: PathBuf,
-    },
-    Validate {
-        input: PathBuf,
-    },
-    Diff {
-        before: PathBuf,
-        after: PathBuf,
-    },
+    #[command(flatten)]
+    Authoring(authoring::Authoring),
     Artifact {
         #[command(subcommand)]
         action: ArtifactAction,
@@ -57,23 +46,11 @@ enum Command {
         #[command(subcommand)]
         action: CatalogAction,
     },
-    Interfaces {
-        artifact: PathBuf,
-        #[command(subcommand)]
-        action: CatalogAction,
-    },
-    /// Report the finite synthetic AQ pilot API surface.
-    Surface,
-    /// Generate runnable fake-host pilot artifacts and scenarios.
+    /// Write the worked authoring workspaces (each a directory to run the
+    /// authoring tools in) under DIR.
     Examples {
         #[arg(long)]
         output: PathBuf,
-    },
-    /// Uses an in-memory store, scripted fake responses, and a virtual clock.
-    Simulate {
-        scenario: Option<PathBuf>,
-        #[arg(long, conflicts_with = "scenario")]
-        pilot: Option<String>,
     },
     Install {
         artifact: PathBuf,
@@ -158,20 +135,24 @@ enum Command {
         #[command(flatten)]
         store: StoreArgs,
     },
-    /// Collect one bounded page of safely expired state using the installed retention policy.
+    /// Not needed: every commit already deletes finished work and old
+    /// entries, a bounded amount each. Kept for existing scripts: runs one
+    /// more such commit (plus a page of unreferenced artifact disposal) and
+    /// prints what it did.
     Gc {
         #[arg(long, default_value_t = 100)]
         limit: usize,
         #[command(flatten)]
         store: StoreArgs,
     },
-    /// Set explicit retention horizons and replay tombstone quota from a JSON policy.
+    /// Set explicit retention windows from a JSON policy (the deprecated
+    /// `max_tombstones` and `terminal_run_ms` are accepted and ignored).
     Retention {
         policy: PathBuf,
         #[command(flatten)]
         store: StoreArgs,
     },
-    /// Fence a retired authenticated producer epoch before compacting replay tombstones.
+    /// Fence a retired authenticated producer epoch: its events and requests are refused from then on.
     RetireProducer {
         producer: String,
         epoch: u64,
@@ -179,6 +160,47 @@ enum Command {
         actor: String,
         #[arg(long)]
         reason: String,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Lower a retention clock that a far-future host time pinned (every
+    /// request with a request time is refused as stale while it is ahead).
+    /// Caps expiries and run timers written from the pin, records a stale
+    /// floor and an admin receipt. Run with --dry-run first; committing
+    /// needs --confirm-clock-rebase.
+    RebaseRetentionClock {
+        /// The corrected real time (ms): from now to a minute after it.
+        #[arg(long)]
+        to_ms: i64,
+        /// The last correct host time before the pin (ms, in the past): a
+        /// retry of a key the engine no longer remembers with a request time
+        /// at or before it is refused as stale.
+        #[arg(long)]
+        stale_floor_ms: i64,
+        #[arg(long)]
+        actor: String,
+        #[arg(long)]
+        reason: String,
+        /// Print what the rebase would change and commit nothing.
+        #[arg(long, conflicts_with = "confirm_clock_rebase")]
+        dry_run: bool,
+        #[arg(long, required_unless_present = "dry_run")]
+        confirm_clock_rebase: bool,
+        #[command(flatten)]
+        store: StoreArgs,
+    },
+    /// Lower a stale floor an earlier rebase set too high, accepting that
+    /// keys forgotten after the new floor may be re-admitted as new by a
+    /// retry with a request time in between. Needs --confirm-floor-lowering.
+    LowerStaleFloor {
+        #[arg(long)]
+        to_ms: i64,
+        #[arg(long)]
+        actor: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, required = true)]
+        confirm_floor_lowering: bool,
         #[command(flatten)]
         store: StoreArgs,
     },
@@ -291,101 +313,106 @@ fn engine(args: &StoreArgs) -> Result<Engine<PostgresStorage>> {
         ),
     )?)
 }
+/// Advance `run` until it makes no progress. A run whose cohort settled has
+/// left the State (it is in history), so `NotFound` also ends the loop.
+fn advance_until_settled(e: &Engine<PostgresStorage>, run: &str) -> Result<()> {
+    for _ in 0..1000 {
+        match e.advance(run, time()?) {
+            Ok(true) => {}
+            Ok(false) | Err(aq_playbooks_runner::Error::NotFound(_)) => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+/// Lists or describes a contract. A contract that is the pinned catalog's
+/// own is described with the host's notes on it (`"notes"`), the same notes
+/// `CATALOG.md` renders.
 fn choose<T: Serialize>(
+    kind: &str,
     map: &std::collections::BTreeMap<String, T>,
     action: CatalogAction,
 ) -> Result<()> {
     match action {
         CatalogAction::List => print(&map.keys().collect::<Vec<_>>()),
-        CatalogAction::Describe { name } => print(
-            map.get(&name)
-                .with_context(|| format!("unknown registration: {name}"))?,
-        ),
+        CatalogAction::Describe { name } => {
+            let contract = map
+                .get(&name)
+                .with_context(|| format!("unknown registration: {name}"))?;
+            let mut described = serde_json::to_value(contract)?;
+            let pinned = aq_playbooks_compiler::docs::catalog_registry();
+            let same = match kind {
+                "commands" => pinned.commands.get(&name).map(serde_json::to_value),
+                _ => pinned.events.get(&name).map(serde_json::to_value),
+            };
+            if let (Some(Ok(pinned)), Some(notes)) =
+                (same, aq_playbooks_compiler::docs::notes(kind, &name))
+                && pinned == described
+                && let Some(object) = described.as_object_mut()
+            {
+                object.insert("notes".into(), notes);
+            }
+            print(&described)
+        }
     }
 }
 fn catalog_file(path: Option<PathBuf>) -> Result<Registry> {
+    if let Some(registry) = authoring::workspace_registry(path.as_deref())? {
+        return Ok(registry);
+    }
     path.map(|p| read(&p))
         .unwrap_or_else(|| Ok(catalog::catalog()))
 }
 fn main() {
-    if let Err(error) = execute(Cli::parse()) {
-        eprintln!("{error:#}");
+    // Argument errors are JSON on stdout, exit 2, for an agent reading stdout.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) if !error.use_stderr() => error.exit(),
+        Err(error) => {
+            println!("{}", json!({"error": error.render().to_string()}));
+            std::process::exit(2);
+        }
+    };
+    // Discovery is agent-facing too: its refusals are JSON on stdout.
+    let discovery = matches!(
+        cli.command,
+        Command::Commands { .. } | Command::Events { .. }
+    );
+    if let Err(error) = execute(cli) {
+        if discovery {
+            println!("{}", json!({"error": format!("{error:#}")}));
+        } else {
+            eprintln!("{error:#}");
+        }
         std::process::exit(1);
     }
 }
 fn execute(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Compile { input, output } => {
-            let input: CompileInput = read(&input)?;
-            match compile(&input) {
-                Ok(a) => {
-                    fs::write(output, canonical_bytes(&a)?)?;
-                    print(
-                        &json!({"artifact":a.digest,"executable_fingerprint":a.executable_fingerprint}),
-                    )
-                }
-                Err(d) => {
-                    print(&d)?;
-                    bail!("compilation refused")
-                }
-            }
-        }
-        Command::Validate { input } => {
-            let d = validate(&read(&input)?);
-            print(&d)?;
-            if !d.is_empty() {
-                bail!("proposal is not valid")
-            };
-            Ok(())
-        }
-        Command::Diff { before, after } => {
-            print(&semantic_diff(&artifact(&before)?, &artifact(&after)?)?)
-        }
+        Command::Authoring(command) => authoring::run(command),
         Command::Artifact {
             action: ArtifactAction::Inspect { path },
         } => print(&artifact(&path)?),
-        Command::Commands { registry, action } => choose(&catalog_file(registry)?.commands, action),
-        Command::Events { registry, action } => choose(&catalog_file(registry)?.events, action),
-        Command::Interfaces {
-            artifact: path,
-            action,
-        } => choose(&artifact(&path)?.content.playbook.entries, action),
-        Command::Surface => print(&catalog::describe_surface()),
-        Command::Examples { output } => {
-            fs::create_dir_all(&output)?;
-            for name in pilots::NAMES {
-                let scenario = pilots::scenario(name)?;
-                fs::write(
-                    output.join(format!("{name}.scenario.json")),
-                    serde_json::to_vec_pretty(&scenario)?,
-                )?;
-                for a in &scenario.artifacts {
-                    fs::write(
-                        output.join(format!("{}.artifact.json", a.content.playbook.id)),
-                        canonical_bytes(a)?,
-                    )?;
-                    let input = pilots::compile_input(a);
-                    fs::write(
-                        output.join(format!("{}.proposal.json", a.content.playbook.id)),
-                        serde_json::to_vec_pretty(&input)?,
-                    )?;
-                    fs::write(
-                        output.join(format!("{}.md", a.content.playbook.id)),
-                        &input.source,
-                    )?;
-                }
-            }
-            print(&json!({"directory":output,"pilots":pilots::NAMES}))
+        Command::Commands { registry, action } => {
+            choose("commands", &catalog_file(registry)?.commands, action)
         }
-        Command::Simulate { scenario, pilot } => {
-            let s = if let Some(name) = pilot {
-                pilots::scenario(&name)?
-            } else if let Some(path) = scenario {
-                read(&path)?
-            } else {
-                bail!("provide a scenario file or --pilot")
-            };
-            print(&simulation::simulate(&s)?)
+        Command::Events { registry, action } => {
+            choose("events", &catalog_file(registry)?.events, action)
+        }
+        Command::Examples { output } => {
+            let files = aq_playbooks_compiler::docs::example_files();
+            for (path, text) in &files {
+                let target = output.join(path);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&target, text)?;
+            }
+            let examples: std::collections::BTreeSet<&str> = files
+                .iter()
+                .filter_map(|(p, _)| p.split('/').next())
+                .collect();
+            print(&json!({"directory":output,"examples":examples}))
         }
         Command::Install {
             artifact: path,
@@ -424,12 +451,8 @@ fn execute(cli: Cli) -> Result<()> {
                 read::<Authority>(&authority)?,
                 time()?,
             )?;
-            for _ in 0..1000 {
-                if !e.advance(&id, time()?)? {
-                    break;
-                }
-            }
-            let view = simulation::inspect(&e.snapshot()?, Some(&id));
+            advance_until_settled(&e, &id)?;
+            let view = simulation::inspect(&e, Some(&id))?;
             e.release()?;
             print(&view)
         }
@@ -580,6 +603,43 @@ fn execute(cli: Cli) -> Result<()> {
             e.release()?;
             print(&json!({"producer":producer,"epoch":epoch}))
         }
+        Command::RebaseRetentionClock {
+            to_ms,
+            stale_floor_ms,
+            actor,
+            reason,
+            dry_run,
+            confirm_clock_rebase,
+            store,
+        } => {
+            anyhow::ensure!(
+                dry_run || confirm_clock_rebase,
+                "--confirm-clock-rebase or --dry-run required"
+            );
+            let e = engine(&store)?;
+            let report = if dry_run {
+                e.rebase_retention_clock_dry_run(to_ms, stale_floor_ms, &actor, &reason, time()?)
+            } else {
+                e.rebase_retention_clock(to_ms, stale_floor_ms, &actor, &reason, time()?)
+            };
+            e.release()?;
+            let report = report?;
+            print(&json!({"dry_run":dry_run,"report":report}))
+        }
+        Command::LowerStaleFloor {
+            to_ms,
+            actor,
+            reason,
+            confirm_floor_lowering,
+            store,
+        } => {
+            anyhow::ensure!(confirm_floor_lowering, "--confirm-floor-lowering required");
+            let e = engine(&store)?;
+            let lowered = e.lower_stale_floor(to_ms, &actor, &reason, time()?);
+            e.release()?;
+            let (from_ms, to_ms) = lowered?;
+            print(&json!({"from_ms":from_ms,"to_ms":to_ms}))
+        }
         Command::RotateKeys { store } => {
             anyhow::ensure!(
                 store.protection_keys.is_some(),
@@ -593,12 +653,8 @@ fn execute(cli: Cli) -> Result<()> {
         Command::Cancel { run, store } => {
             let e = engine(&store)?;
             e.cancel(&run, time()?)?;
-            for _ in 0..1000 {
-                if !e.advance(&run, time()?)? {
-                    break;
-                }
-            }
-            let view = simulation::inspect(&e.snapshot()?, Some(&run));
+            advance_until_settled(&e, &run)?;
+            let view = simulation::inspect(&e, Some(&run))?;
             e.release()?;
             print(&view)
         }
@@ -612,6 +668,24 @@ fn execute(cli: Cli) -> Result<()> {
                 let e = engine(&store)?;
                 if let Some(run) = run {
                     let state = e.snapshot()?;
+                    if !state.intents.contains_key(&request.intent) {
+                        // An operation that left with its finished run is
+                        // in history: it is settled, nothing to recover.
+                        let finished = e
+                            .inspect(&InspectionQuery {
+                                kind: InspectionKind::Effects,
+                                run: Some(run.clone()),
+                                after: None,
+                                limit: 1000,
+                            })?
+                            .items
+                            .iter()
+                            .any(|item| item["id"] == request.intent.as_str());
+                        anyhow::ensure!(
+                            !finished,
+                            "recovery intent has finished with its run; nothing to recover"
+                        );
+                    }
                     anyhow::ensure!(
                         state
                             .intents

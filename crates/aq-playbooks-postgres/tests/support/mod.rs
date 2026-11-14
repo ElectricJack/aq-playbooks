@@ -22,6 +22,24 @@ pub fn namespace(label: &str) -> String {
 pub fn store() -> PostgresStorage {
     PostgresStorage::connect(&database()).unwrap()
 }
+/// Protected writer format 2, one test key (`[7; 32]`).
+#[allow(dead_code)] // live_state only
+pub fn protected() -> PostgresStorage {
+    PostgresStorage::connect_protected(
+        &database(),
+        aq_playbooks_postgres::ProtectionKeyring::new(
+            "test",
+            BTreeMap::from([("test".into(), [7; 32])]),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+/// New namespaces use writer format 3 (records).
+#[allow(dead_code)] // live_state only
+pub fn records() -> PostgresStorage {
+    PostgresStorage::connect_records(&database()).unwrap()
+}
 pub fn client() -> Client {
     Client::connect(&database(), NoTls).unwrap()
 }
@@ -167,6 +185,7 @@ pub fn boundary(label: &str) -> State {
             cancel_dispatched: false,
             late_results: vec![],
             completion_event: None,
+            dispatch_sequence: None,
             handle: Some("host-operation".into()),
             result: None,
             reason: None,

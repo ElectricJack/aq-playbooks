@@ -84,7 +84,7 @@ fn setup<S: Storage>(store: S) -> (Engine<S>, KeyedAdmissionRequest) {
 }
 #[test]
 fn replay_is_read_only_and_changed_payload_authority_and_revision_conflict() {
-    let (e, r) = setup(MemoryStorage::default());
+    let (e, r) = setup(MemoryStorage::retaining_settled());
     let first = e.admit_once(r.clone(), 10).unwrap();
     assert!(!first.duplicate);
     let before = e.store.load("keyed").unwrap().revision;
@@ -111,7 +111,7 @@ fn replay_is_read_only_and_changed_payload_authority_and_revision_conflict() {
 }
 #[test]
 fn first_admission_fences_future_revision_and_revoked_authority_but_history_remains() {
-    let (e, r) = setup(MemoryStorage::default());
+    let (e, r) = setup(MemoryStorage::retaining_settled());
     let mut future = r.clone();
     future.expected_activation_revision += 1;
     assert!(matches!(e.admit_once(future, 1), Err(Error::Conflict(_))));
@@ -127,18 +127,20 @@ fn first_admission_fences_future_revision_and_revoked_authority_but_history_rema
     assert!(matches!(e.admit_once(fresh, 4), Err(Error::Refused(_))));
     assert_eq!(e.snapshot().unwrap().runs.len(), 1);
 }
+/// Task 8b (no limits): a host's deprecated limits refuse nothing; a new
+/// key is admitted and an exact replay is still a read-only lookup.
 #[test]
-fn full_quotas_refuse_new_atomic_admission_without_blocking_exact_lookup() {
-    let (mut e, r) = setup(MemoryStorage::default());
+fn deprecated_limits_refuse_no_admission_and_replay_stays_read_only() {
+    let (mut e, r) = setup(MemoryStorage::retaining_settled());
     let first = e.admit_once(r.clone(), 1).unwrap();
     let state = e.snapshot().unwrap();
     e.config.max_receipts = state.receipts.len() + state.keyed_admissions.len();
+    e.config.max_state_bytes = 1024;
     let mut new = r.clone();
     new.key = "second".into();
-    assert!(matches!(e.admit_once(new, 2), Err(Error::Refused(_))));
-    assert_eq!(e.snapshot().unwrap().runs.len(), 1);
-    assert_eq!(e.snapshot().unwrap().keyed_admissions.len(), 1);
-    e.config.max_state_bytes = 1024;
+    assert!(!e.admit_once(new, 2).unwrap().duplicate);
+    assert_eq!(e.snapshot().unwrap().runs.len(), 2);
+    assert_eq!(e.snapshot().unwrap().keyed_admissions.len(), 2);
     let before = e.store.load("keyed").unwrap().revision;
     assert_eq!(e.admit_once(r, 3).unwrap().receipt, first.receipt);
     assert_eq!(before, e.store.load("keyed").unwrap().revision);
@@ -149,6 +151,24 @@ struct Fault {
     mode: Arc<AtomicU8>,
 }
 impl Storage for Fault {
+    fn persists_history(&self) -> bool {
+        self.store.persists_history()
+    }
+    fn history_page(
+        &self,
+        n: &str,
+        q: &InspectionQuery,
+    ) -> std::result::Result<Vec<HistoryItem>, StorageError> {
+        self.store.history_page(n, q)
+    }
+    fn delete_history(
+        &self,
+        n: &str,
+        o: &str,
+        before_ms: i64,
+    ) -> std::result::Result<u64, StorageError> {
+        self.store.delete_history(n, o, before_ms)
+    }
     fn load(&self, n: &str) -> std::result::Result<storage::VersionedState, StorageError> {
         self.store.load(n)
     }
@@ -206,7 +226,7 @@ fn before_cas_refusal_is_atomic_and_after_commit_unknown_replays_after_restart()
 }
 #[test]
 fn gc_and_direct_storage_cas_cannot_forget_or_rebind_a_key() {
-    let (e, r) = setup(MemoryStorage::default());
+    let (e, r) = setup(MemoryStorage::retaining_settled());
     let first = e.admit_once(r.clone(), 1).unwrap();
     e.advance(&first.receipt.run_id, 2).unwrap();
     e.set_retention_policy(RetentionPolicy {
@@ -214,8 +234,23 @@ fn gc_and_direct_storage_cas_cannot_forget_or_rebind_a_key() {
         audit_ms: 1,
         event_replay_ms: 1,
         max_tombstones: 100,
+        ..RetentionPolicy::default()
     })
     .unwrap();
+    // The finished run left the State as history in the commit that
+    // finished it; the receipt stays (its window has not passed).
+    assert!(e.snapshot().unwrap().runs.is_empty());
+    assert_eq!(
+        e.store
+            .settled_run("keyed", &first.receipt.run_id)
+            .unwrap()
+            .status,
+        RunStatus::Completed
+    );
+    assert_eq!(
+        e.admission_receipt(&r.key).unwrap(),
+        Some(first.receipt.clone())
+    );
     for _ in 0..10 {
         e.collect_garbage(100, 1000).unwrap();
     }
@@ -240,7 +275,7 @@ fn gc_and_direct_storage_cas_cannot_forget_or_rebind_a_key() {
 }
 #[test]
 fn bounds_and_activation_ceiling_refuse_before_retention() {
-    let (e, r) = setup(MemoryStorage::default());
+    let (e, r) = setup(MemoryStorage::retaining_settled());
     let mut bad = r.clone();
     bad.key = "x".repeat(257);
     assert!(e.admit_once(bad, 1).is_err());
@@ -264,6 +299,24 @@ struct Racing {
     barrier: Arc<std::sync::Barrier>,
 }
 impl Storage for Racing {
+    fn persists_history(&self) -> bool {
+        self.store.persists_history()
+    }
+    fn history_page(
+        &self,
+        n: &str,
+        q: &InspectionQuery,
+    ) -> std::result::Result<Vec<HistoryItem>, StorageError> {
+        self.store.history_page(n, q)
+    }
+    fn delete_history(
+        &self,
+        n: &str,
+        o: &str,
+        before_ms: i64,
+    ) -> std::result::Result<u64, StorageError> {
+        self.store.delete_history(n, o, before_ms)
+    }
     fn load(&self, n: &str) -> std::result::Result<storage::VersionedState, StorageError> {
         let loaded = self.store.load(n)?;
         if self
@@ -294,7 +347,7 @@ impl Storage for Racing {
 #[test]
 fn simultaneous_same_key_cas_has_one_commit_and_exact_recovery() {
     let backend = Racing {
-        store: MemoryStorage::default(),
+        store: MemoryStorage::retaining_settled(),
         remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         barrier: Arc::new(std::sync::Barrier::new(2)),
     };

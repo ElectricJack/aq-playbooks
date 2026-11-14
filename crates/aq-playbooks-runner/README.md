@@ -68,16 +68,26 @@ Asynchronous admission follows an explicit `accepted` edge and binds `{handle}`;
 completion matching remains pinned after that step has continued. Invalid results
 block only the affected operation and retain a safe diagnostic.
 
-`EngineConfig` bounds namespace runs, events, queued destinations, receipts and
-bytes. Artifacts bound payloads, visits, nested iterations, history, duration,
-children, depth and concurrent work. Execution-budget exhaustion settles owned
-work and fails once. Quota refusal preserves existing obligations.
+A namespace has no limits. The record holds work in progress; finished work
+is deleted when it finishes; remembered keys and history are rolling sets of
+fixed size (`replay_keep` and `history_keep` in `RetentionPolicy`). Nothing is
+ever refused because a namespace holds too much. `EngineConfig`'s fields
+(`max_runs`, `max_events`, `max_queued_destinations`, `max_receipts`,
+`max_state_bytes`) are deprecated: accepted and ignored. Artifacts bound their
+own runs: payloads, visits, nested iterations, history, duration, children,
+depth and concurrent work. Execution-budget exhaustion settles owned work and
+fails once.
 
-`RetentionPolicy` declares event replay, terminal-run and audit horizons plus a
-bounded tombstone quota. Bounded GC pages persist their scan cursor, preserve
-unsettled cohorts and transitive artifact closures, and record disposal. Replay
-identities become tombstones rather than reusable IDs. Explicit monotonic producer
-epoch retirement fences old requests and permits bounded tombstone compaction.
+`RetentionPolicy` declares event replay, keyed admission and audit windows. Its
+`terminal_run_ms` and `max_tombstones` are deprecated: accepted and ignored.
+Every commit does the bounded deletion work (settled cohorts to history,
+expired and evicted window entries, the drain of an older engine's
+namespace); its per-commit bounds are policy fields. `collect_garbage` is not
+needed: it is one more such commit plus a bounded page of artifact disposal
+that preserves transitive artifact closures. An expired replay identity is
+forgotten (no tombstone): a repeat with a stale producer time is refused, one
+without is new. Explicit monotonic producer epoch retirement fences old
+requests.
 Use `admit_event_in_epoch` after retiring legacy epoch zero. Captured replay
 horizons cannot be shortened by later policy edits. Root/child audit records and
 late result evidence retain their required artifacts until eligible disposal.

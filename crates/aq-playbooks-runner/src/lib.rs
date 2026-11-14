@@ -3,8 +3,10 @@
 pub mod admission;
 pub use admission::{KeyedAdmissionDisposition, KeyedAdmissionReceipt, KeyedAdmissionRequest};
 pub mod catalog_inspection;
+pub mod history;
 pub mod inspection;
 pub use catalog_inspection::{CatalogError, CatalogKind, CatalogPage, CatalogQuery, CatalogStamp};
+pub use history::{HistoryItem, SettledCohort, history_items};
 pub mod lazy;
 pub mod metrics;
 pub mod storage;
@@ -20,9 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 pub use storage::{MemoryStorage, Storage, StorageError, VersionedState};
-pub use transition::{
-    QuotaCounts, RecordStorage, TransitionOutcome, TransitionRequest, check_quota, quota_counts,
-};
+pub use transition::{RecordStorage, TransitionOutcome, TransitionRequest};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -38,8 +38,354 @@ pub enum Error {
     NotFound(String),
     #[error("execution budget exhausted: {0}")]
     Exhausted(String),
+    /// A request for a key the engine no longer remembers whose request time
+    /// is at or before `cutoff_ms`: the later of `max(now, clock) - window`
+    /// and the stale floor a clock rebase recorded. Its text starts with
+    /// [`STALE_REQUEST`]. Nothing was written.
+    #[error("{}", stale_message(*.requested_at_ms, *.cutoff_ms, *.clock_ms, *.now_ms, *.window_ms, *.floor_ms))]
+    Stale {
+        requested_at_ms: i64,
+        cutoff_ms: i64,
+        /// The retention clock when the request was judged.
+        clock_ms: Option<i64>,
+        /// The host time of the request.
+        now_ms: i64,
+        window_ms: u64,
+        /// The stale floor, when a clock rebase recorded one.
+        floor_ms: Option<i64>,
+    },
 }
 pub type Result<T> = std::result::Result<T, Error>;
+const INVARIANT: &str = "engine invariant violated: ";
+/// An engine fault (a record the State's own invariants guarantee is
+/// missing). It fails the commit; `advance` never turns it into a playbook
+/// error branch.
+pub(crate) fn invariant(what: String) -> Error {
+    Error::Conflict(format!("{INVARIANT}{what}"))
+}
+fn is_invariant(error: &Error) -> bool {
+    matches!(error, Error::Conflict(m) if m.starts_with(INVARIANT))
+}
+/// What [`Engine::rebase_retention_clock`] changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClockRebaseReport {
+    pub from_ms: i64,
+    pub to_ms: i64,
+    pub stale_floor_ms: i64,
+    pub capped_events: usize,
+    pub capped_admissions: usize,
+    /// Wait, join, retry and operation deadlines and run duration bases
+    /// capped at `to_ms` plus their declared duration.
+    pub capped_deadlines: usize,
+    /// The live runs whose timers were capped (an operation's run included).
+    pub adjusted_runs: Vec<String>,
+    /// Live runs with a deadline after `to_ms` whose declared duration
+    /// could not be found (an inconsistent State): left as they are, for the
+    /// operator to cancel.
+    pub needs_operator_action: Vec<String>,
+    /// Each capped timer with its original value, for audit: at most
+    /// [`REBASE_ADJUSTMENTS_LISTED`]; the rest are only counted.
+    pub adjustments: Vec<DeadlineAdjustment>,
+    pub adjustments_not_listed: usize,
+}
+/// At most this many [`DeadlineAdjustment`]s are listed in a rebase report
+/// and its receipt.
+pub const REBASE_ADJUSTMENTS_LISTED: usize = 1_000;
+/// One timer a clock rebase capped: of `run`, its `kind`
+/// (`duration_basis`, `wait`, `join`, `retry`, `operation`) on `item` (the
+/// run, wait or operation id), from `original_ms` to `capped_ms`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeadlineAdjustment {
+    pub run: String,
+    pub kind: String,
+    pub item: String,
+    pub original_ms: i64,
+    pub capped_ms: i64,
+}
+/// How a commit ends: with a host time (`None` for commits without one), or
+/// as a licensed admin commit.
+#[derive(Clone, Copy)]
+enum Finish {
+    Host(Option<i64>),
+    Licensed,
+}
+/// Of the windows in `policy`, the smallest (at least 1 ms).
+fn smallest_window(policy: &RetentionPolicy) -> i64 {
+    let ms = policy
+        .admission_replay_ms
+        .min(policy.event_replay_ms)
+        .max(1);
+    i64::try_from(ms).unwrap_or(i64::MAX)
+}
+/// How far past the host time a rebase target may be: a minute, or a tenth
+/// of the smallest window if that is less. Enough for clock skew between
+/// hosts; small enough that the rebased clock leaves nearly every window
+/// behind real time.
+fn rebase_slack(policy: &RetentionPolicy) -> i64 {
+    (smallest_window(policy) / 10).min(60_000)
+}
+/// The rebase of `s` to `to_ms` at host time `now_ms` (see
+/// [`Engine::rebase_retention_clock`]), without its receipt.
+fn rebase_plan(
+    s: &mut State,
+    to_ms: i64,
+    stale_floor_ms: i64,
+    now_ms: i64,
+) -> Result<ClockRebaseReport> {
+    let Some(from_ms) = s.retention.clock_ms else {
+        return Err(Error::Refused("no retention clock to rebase".into()));
+    };
+    let smallest = smallest_window(&s.retention.policy);
+    let ahead = from_ms.saturating_sub(now_ms);
+    if ahead <= smallest {
+        return Err(Error::Refused(format!(
+            "retention clock ({from_ms} ms) is not pinned: it is {ahead} ms ahead of host time \
+             ({now_ms} ms), not more than the smallest window ({smallest} ms)"
+        )));
+    }
+    let slack = rebase_slack(&s.retention.policy);
+    if to_ms < now_ms || to_ms > now_ms.saturating_add(slack) {
+        return Err(Error::Refused(format!(
+            "clock rebase target ({to_ms} ms) must be from host time ({now_ms} ms) to {slack} ms \
+             after it"
+        )));
+    }
+    if stale_floor_ms > now_ms {
+        return Err(Error::Refused(format!(
+            "stale floor ({stale_floor_ms} ms) must be in the past (host time {now_ms} ms)"
+        )));
+    }
+    let floor_ms = s
+        .retention
+        .stale_floor_ms
+        .map_or(stale_floor_ms, |old| old.max(stale_floor_ms));
+    if floor_ms > to_ms {
+        return Err(Error::Refused(format!(
+            "stale floor ({floor_ms} ms) is later than the rebase target ({to_ms} ms)"
+        )));
+    }
+    let (capped_events, capped_admissions) = retention::rebase_clock(s, to_ms);
+    let deadlines = rebase_deadlines(s, to_ms)?;
+    s.retention.stale_floor_ms = Some(floor_ms);
+    Ok(ClockRebaseReport {
+        from_ms,
+        to_ms,
+        stale_floor_ms: floor_ms,
+        capped_events,
+        capped_admissions,
+        capped_deadlines: deadlines.capped,
+        adjusted_runs: deadlines.adjusted.into_iter().collect(),
+        needs_operator_action: deadlines.unknown.into_iter().collect(),
+        adjustments_not_listed: deadlines.capped - deadlines.adjustments.len(),
+        adjustments: deadlines.adjustments,
+    })
+}
+#[derive(Default)]
+struct RebasedDeadlines {
+    capped: usize,
+    adjusted: BTreeSet<String>,
+    unknown: BTreeSet<String>,
+    adjustments: Vec<DeadlineAdjustment>,
+}
+impl RebasedDeadlines {
+    /// Count one capped timer, and list it while the list has room.
+    fn record(&mut self, run: &str, kind: &str, item: &str, original_ms: i64, capped_ms: i64) {
+        self.capped += 1;
+        if self.adjustments.len() < REBASE_ADJUSTMENTS_LISTED {
+            self.adjustments.push(DeadlineAdjustment {
+                run: run.into(),
+                kind: kind.into(),
+                item: item.into(),
+                original_ms,
+                capped_ms,
+            });
+        }
+    }
+}
+/// Cap every live run's timers that lie beyond `to_ms` plus their declared
+/// duration at that value: a run's duration basis (`admitted_at_ms`, for
+/// `limits.max_duration_ms`), a wait (`Wait.deadline_ms`), a join
+/// (`Join.deadline_ms`), a retry (`RetryPolicy.backoff_ms`), and an
+/// operation (`command.deadline_ms`). Every capped value is still at least
+/// its real registration plus its duration, because the registration was
+/// at or before `to_ms`. A deadline after `to_ms` whose duration cannot be
+/// found is left, and its run listed.
+fn rebase_deadlines(s: &mut State, to_ms: i64) -> Result<RebasedDeadlines> {
+    let mut out = RebasedDeadlines::default();
+    let cap = |duration: u64| to_ms.saturating_add(i64::try_from(duration).unwrap_or(i64::MAX));
+    let ids: Vec<String> = s.runs.keys().cloned().collect();
+    for id in ids {
+        let Some(mut r) = s.runs.get(&id).cloned() else {
+            continue;
+        };
+        if r.status.terminal() {
+            continue;
+        }
+        let playbook = s.artifacts.get(&r.artifact).map(|a| &a.content.playbook);
+        let step = playbook
+            .and_then(|p| p.steps.get(&r.step))
+            .map(|step| &step.op);
+        // (kind, item, original, capped) of this run's capped timers.
+        let mut capped: Vec<(&str, String, i64, i64)> = vec![];
+        let mut unknown = false;
+        // The duration basis: `admitted_at_ms + limits.max_duration_ms`.
+        if r.admitted_at_ms > to_ms {
+            if playbook.is_some() {
+                capped.push(("duration_basis", id.clone(), r.admitted_at_ms, to_ms));
+                r.admitted_at_ms = to_ms;
+            } else {
+                unknown = true;
+            }
+        }
+        let mut wait = None;
+        match &mut r.pending {
+            Some(Pending::Join { deadline, .. }) if *deadline > to_ms => match step {
+                Some(Operation::Join { deadline_ms, .. }) => {
+                    if *deadline > cap(*deadline_ms) {
+                        capped.push(("join", id.clone(), *deadline, cap(*deadline_ms)));
+                        *deadline = cap(*deadline_ms);
+                    }
+                }
+                _ => unknown = true,
+            },
+            Some(Pending::Retry { deadline }) if *deadline > to_ms => match step {
+                Some(Operation::Invoke {
+                    retry: Some(policy),
+                    ..
+                }) => {
+                    if *deadline > cap(policy.backoff_ms) {
+                        capped.push(("retry", id.clone(), *deadline, cap(policy.backoff_ms)));
+                        *deadline = cap(policy.backoff_ms);
+                    }
+                }
+                _ => unknown = true,
+            },
+            Some(Pending::Event { wait: id }) => wait = Some(id.clone()),
+            _ => {}
+        }
+        if let Some(wait_id) = wait
+            && let Some(mut w) = s.waits.get(&wait_id).cloned()
+            && w.deadline > to_ms
+        {
+            let declared = playbook
+                .and_then(|p| p.steps.get(&w.step))
+                .and_then(|step| match &step.op {
+                    Operation::Wait { deadline_ms, .. } => Some(*deadline_ms),
+                    _ => None,
+                });
+            match declared {
+                Some(duration) if w.deadline > cap(duration) => {
+                    capped.push(("wait", wait_id.clone(), w.deadline, cap(duration)));
+                    w.deadline = cap(duration);
+                    s.waits.insert(wait_id, w);
+                }
+                Some(_) => {}
+                None => unknown = true,
+            }
+        }
+        if unknown {
+            out.unknown.insert(id.clone());
+        }
+        if !capped.is_empty() {
+            for (kind, item, original_ms, capped_ms) in capped {
+                out.record(&id, kind, &item, original_ms, capped_ms);
+            }
+            s.runs.insert(id.clone(), r);
+            indexes::mark_run(s, &id);
+            out.adjusted.insert(id);
+        }
+    }
+    let intents: Vec<String> = s.intents.keys().cloned().collect();
+    for id in intents {
+        let Some(mut i) = s.intents.get(&id).cloned() else {
+            continue;
+        };
+        let limit = cap(i.command.deadline_ms);
+        if i.deadline_at_ms > limit {
+            let run = i.run.clone();
+            out.record(&run, "operation", &id, i.deadline_at_ms, limit);
+            i.deadline_at_ms = limit;
+            s.intents.insert(id.clone(), i);
+            indexes::mark_intent(s, &id);
+            indexes::mark_run(s, &run);
+            out.adjusted.insert(run);
+        }
+    }
+    Ok(out)
+}
+/// The start of the text of every [`Error::Stale`]: a request whose producer
+/// (request) time is older than its window.
+pub const STALE_REQUEST: &str = "stale request: producer time is older than the replay window";
+/// An admin operation's `actor` and `reason`: present and bounded.
+fn admin_text(actor: &str, reason: &str) -> Result<()> {
+    if actor.is_empty() || reason.is_empty() || actor.len() > 512 || reason.len() > 4096 {
+        return Err(Error::Refused(
+            "admin operation requires bounded actor and reason".into(),
+        ));
+    }
+    Ok(())
+}
+fn stale_message(
+    requested_at_ms: i64,
+    cutoff_ms: i64,
+    clock_ms: Option<i64>,
+    now_ms: i64,
+    window_ms: u64,
+    floor_ms: Option<i64>,
+) -> String {
+    let start = clock_ms.map_or(now_ms, |clock| clock.max(now_ms));
+    let mut message = format!(
+        "{STALE_REQUEST}: request time {requested_at_ms} ms is at or before the cut-off \
+         {cutoff_ms} ms (retention time {start} ms minus the {window_ms} ms window; host \
+         time {now_ms} ms"
+    );
+    if let Some(floor) = floor_ms {
+        message.push_str(&format!("; stale floor {floor} ms from a clock rebase"));
+    }
+    message.push(')');
+    if start > now_ms {
+        message.push_str(&format!(
+            "; the retention clock ({start} ms) is ahead of host time by {} ms, and while \
+             it is, every request that carries a real request time is refused as stale \
+             (a clock pinned by a far-future host time stays ahead until it is rebased)",
+            start.saturating_sub(now_ms)
+        ));
+    }
+    message
+}
+/// Refuse a request for a key the engine does not remember (absent, or
+/// expired and held by nothing) when its request time is at or before the
+/// cut-off: the window before `max(now, clock)`, the time expiry is judged
+/// against, or the stale floor if that is later. A request without a
+/// request time is not checked, and the window is not computed. The request
+/// time is only compared: it never moves the clock and is never stored.
+fn refuse_stale(
+    s: &State,
+    requested_at_ms: Option<i64>,
+    window_ms: impl FnOnce() -> u64,
+    now_ms: i64,
+) -> Result<()> {
+    let Some(requested_at_ms) = requested_at_ms else {
+        return Ok(());
+    };
+    let window_ms = window_ms();
+    let start = retention::window_start(s, now_ms);
+    let floor_ms = s.retention.stale_floor_ms;
+    let cutoff_ms = start
+        .saturating_sub(i64::try_from(window_ms).unwrap_or(i64::MAX))
+        .max(floor_ms.unwrap_or(i64::MIN));
+    if requested_at_ms > cutoff_ms {
+        return Ok(());
+    }
+    Err(Error::Stale {
+        requested_at_ms,
+        cutoff_ms,
+        clock_ms: s.retention.clock_ms,
+        now_ms,
+        window_ms,
+        floor_ms,
+    })
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Authority {
     pub actor: String,
@@ -206,6 +552,15 @@ pub struct Intent {
     pub late_results: Vec<(String, Value)>,
     #[serde(default)]
     pub completion_event: Option<String>,
+    /// The namespace sequence of the commit that first dispatched the
+    /// operation (its first `dispatch` receipt; a re-dispatch after recovery
+    /// keeps it). Its completion can only be an event accepted later, so an
+    /// operation whose admission handle is lost holds only those
+    /// (`retention::event_held`). Absent until dispatch: an operation never
+    /// dispatched holds nothing. Operations dispatched before Task 8b get it
+    /// on open from their own first `dispatch` receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_sequence: Option<u64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WaitRecord {
@@ -265,6 +620,14 @@ pub struct State {
     pub recovery_requests: BTreeMap<String, RecoveryRequest>,
     #[serde(skip)]
     pub protection_available: bool,
+    /// Cohorts this commit removes from the State, handed to storage as
+    /// history in the same commit. Never stored with the State.
+    #[serde(skip)]
+    pub settled: Vec<SettledCohort>,
+    /// What this commit may have changed the hold of, for the eviction
+    /// order (`retention::rejoin`). Never stored.
+    #[serde(skip)]
+    pub replay_touched: retention::ReplayTouched,
     #[serde(default)]
     pub indexes: RuntimeIndexes,
     pub artifacts: BTreeMap<String, Artifact>,
@@ -321,7 +684,14 @@ pub fn cancellation_key(intent: &Intent) -> Result<String> {
     Ok(digest(&(&intent.id, "cancel"))?)
 }
 /// A runner incarnation must be unique. Do not share its identifier between processes.
+///
+/// Deprecated: a namespace has no limits (spec 0003, "no limits"). These
+/// fields are accepted, so existing hosts compile and configurations decode,
+/// and ignored: nothing is ever refused because a namespace holds too much.
+/// The record is bounded by deletion alone (finished work at completion,
+/// `replay_keep` remembered keys, `history_keep` finished runs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EngineConfig {
     pub max_runs: usize,
     pub max_events: usize,
@@ -349,39 +719,55 @@ pub struct Engine<S: Storage> {
 }
 impl<S: Storage> Engine<S> {
     pub fn new(store: S, namespace: impl Into<String>, owner: impl Into<String>) -> Result<Self> {
+        Self::open(store, namespace, owner, EngineConfig::default())
+    }
+    /// Acquire the namespace and run the upgrade's bookkeeping commit (index
+    /// rebuild, `root_intents` and dispatch sequence fills). Like every
+    /// commit, it also takes the drain's first step on a namespace an older
+    /// engine wrote (`retention::drain_step`).
+    fn open(
+        store: S,
+        namespace: impl Into<String>,
+        owner: impl Into<String>,
+        config: EngineConfig,
+    ) -> Result<Self> {
+        // A backend (or wrapper) that would drop history fails closed.
+        if !store.persists_history() {
+            return Err(Error::Refused(
+                "storage backend does not persist run history".into(),
+            ));
+        }
         let e = Self {
             store,
             namespace: namespace.into(),
             owner: owner.into(),
-            config: EngineConfig::default(),
+            config,
             metrics: metrics::Metrics::default(),
         };
         e.store.acquire(&e.namespace, &e.owner)?;
-        e.transaction(|s| {
+        e.transaction_at(None, |s| {
             if !s.indexes.initialized {
                 indexes::rebuild(s)?;
             }
+            // A State from before `root_intents` (pre-D10): cohort removal
+            // needs every operation there, so fill it once.
+            indexes::backfill_root_intents(s);
+            // `contract_events` of a State written before it (Task 8b) is
+            // filled by the drain, a bounded number of events per commit.
+            // Before `Intent::dispatch_sequence` (Task 8b): fill it once.
+            indexes::backfill_dispatch_sequences(s);
             Ok(())
         })?;
         Ok(e)
     }
+    /// [`Self::new`] keeping `config`, whose (deprecated) limits are ignored.
     pub fn with_config(
         store: S,
         namespace: impl Into<String>,
         owner: impl Into<String>,
         config: EngineConfig,
     ) -> Result<Self> {
-        if config.max_runs == 0
-            || config.max_events == 0
-            || config.max_queued_destinations == 0
-            || config.max_state_bytes < 1024
-            || config.max_receipts == 0
-        {
-            return Err(Error::Refused("invalid namespace resource bounds".into()));
-        }
-        let mut e = Self::new(store, namespace, owner)?;
-        e.config = config;
-        Ok(e)
+        Self::open(store, namespace, owner, config)
     }
     fn measure_host<T>(&self, f: impl FnOnce() -> T) -> T {
         let started = std::time::Instant::now();
@@ -405,31 +791,96 @@ impl<S: Storage> Engine<S> {
         self.store
             .inspect_catalog(&self.namespace, &self.owner, query)
     }
-    fn transaction<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
-        self.transaction_choice(|state| f(state).map(|value| (value, true)))
+    /// Public inspection over this namespace's live state and run history.
+    pub fn inspect(&self, query: &InspectionQuery) -> Result<InspectionPage> {
+        Ok(self.store.inspect(&self.namespace, query)?)
     }
-    fn transaction_choice<T>(&self, f: impl FnOnce(&mut State) -> Result<(T, bool)>) -> Result<T> {
+    /// Delete the history of runs finished before `before_ms`; returns the
+    /// number of history items deleted. Host-callable and optional: history
+    /// is already a rolling log of `policy.history_keep` per set. Commits
+    /// no State and moves no clock; on PostgreSQL it needs this engine's
+    /// lease, which the engine holds.
+    pub fn delete_history_before(&self, before_ms: i64) -> Result<u64> {
+        Ok(self
+            .store
+            .delete_history(&self.namespace, &self.owner, before_ms)?)
+    }
+    /// One commit. `now_ms` is the host time the commit carries: when the plan
+    /// changes the State, the retention clock moves to it (never back). A
+    /// commit without host time leaves the clock where it is.
+    fn transaction_at<T>(
+        &self,
+        now_ms: Option<i64>,
+        f: impl FnOnce(&mut State) -> Result<T>,
+    ) -> Result<T> {
+        self.transaction_choice_at(now_ms, |state| f(state).map(|value| (value, true)))
+    }
+    fn transaction_choice_at<T>(
+        &self,
+        now_ms: Option<i64>,
+        f: impl FnOnce(&mut State) -> Result<(T, bool)>,
+    ) -> Result<T> {
+        self.transaction_report_at(Finish::Host(now_ms), f)
+            .map(|(value, _)| value)
+    }
+    /// One licensed admin commit (a clock rebase or a floor lowering): it
+    /// carries no host time, settles and drops nothing, and moves only its
+    /// own admin receipt to history, so it is exactly its licence.
+    fn transaction_licensed<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        self.transaction_report_at(Finish::Licensed, |state| {
+            f(state).map(|value| (value, true))
+        })
+        .map(|(value, _)| value)
+    }
+    /// One commit, and what its retention work moved out of the State. When
+    /// the plan changes the State, both paths run `candidate_roots`,
+    /// `indexes::sync`, `finish_commit` (clock, settled cohorts, admin
+    /// receipts) and `indexes::sync` again, so a cohort leaves in the commit
+    /// that settles it.
+    fn transaction_report_at<T>(
+        &self,
+        now_ms: Finish,
+        f: impl FnOnce(&mut State) -> Result<(T, bool)>,
+    ) -> Result<(T, retention::CommitReport)> {
+        // `started`: the namespace sequence the commit began at.
+        fn finish(
+            state: &mut State,
+            mode: Finish,
+            started: u64,
+        ) -> Result<retention::CommitReport> {
+            let Finish::Host(now_ms) = mode else {
+                indexes::sync(state)?;
+                let report = retention::finish_licensed_commit(state, started)?;
+                indexes::sync(state)?;
+                return Ok(report);
+            };
+            let candidates = retention::candidate_roots(state);
+            indexes::sync(state)?;
+            let report = retention::finish_commit(state, now_ms, candidates, started)?;
+            indexes::sync(state)?;
+            Ok(report)
+        }
         let protection = self.store.protection_available();
         let mut f = Some(f);
         let mut result = None;
-        let config = &self.config;
+        let mut report = retention::CommitReport::default();
         let metrics = &self.metrics;
         let mut plan = |state: &mut State| -> Result<bool> {
             let f = f
                 .take()
                 .ok_or_else(|| Error::Conflict("transition plan ran twice".into()))?;
             state.protection_available = protection;
+            let sequence = state.sequence;
             let started = std::time::Instant::now();
             let evaluated = f(state);
             metrics.record_time(metrics::Timing::Transition, started.elapsed());
             let (value, changed) = evaluated?;
             result = Some(value);
             if changed {
-                indexes::sync(state)?;
+                report = finish(state, now_ms, sequence)?;
             }
             Ok(changed)
         };
-        let validate = |_: &State, counts: &QuotaCounts| check_quota(config, counts);
         let started = std::time::Instant::now();
         let outcome = self.store.transition_v1(
             &self.namespace,
@@ -437,14 +888,15 @@ impl<S: Storage> Engine<S> {
             &mut TransitionRequest {
                 operation: "transaction",
                 plan: &mut plan,
-                validate: &validate,
             },
         );
         let outcome = outcome?;
         if outcome != TransitionOutcome::Unsupported {
             self.metrics
                 .record_time(metrics::Timing::Commit, started.elapsed());
-            return result.ok_or_else(|| Error::Conflict("transition plan did not run".into()));
+            let value =
+                result.ok_or_else(|| Error::Conflict("transition plan did not run".into()))?;
+            return Ok((value, report));
         }
         let f = f.ok_or_else(|| Error::Conflict("unsupported transition ran the plan".into()))?;
         let started = std::time::Instant::now();
@@ -456,16 +908,16 @@ impl<S: Storage> Engine<S> {
             indexes::rebuild(&mut v.state)?;
         }
         v.state.protection_available = protection;
+        let sequence = v.state.sequence;
         let started = std::time::Instant::now();
         let evaluated = f(&mut v.state);
         self.metrics
             .record_time(metrics::Timing::Transition, started.elapsed());
         let (result, changed) = evaluated?;
         if !changed {
-            return Ok(result);
+            return Ok((result, retention::CommitReport::default()));
         }
-        indexes::sync(&mut v.state)?;
-        check_quota(&self.config, &quota_counts(&v.state)?)?;
+        let report = finish(&mut v.state, now_ms, sequence)?;
         let started = std::time::Instant::now();
         let committed =
             self.store
@@ -473,11 +925,11 @@ impl<S: Storage> Engine<S> {
         self.metrics
             .record_time(metrics::Timing::Commit, started.elapsed());
         committed?;
-        Ok(result)
+        Ok((result, report))
     }
     pub fn install(&self, artifact: Artifact) -> Result<()> {
         artifact.verify()?;
-        self.transaction(|s| {
+        self.transaction_at(None, |s| {
             if let Some(old) = s.artifacts.get(&artifact.digest)
                 && old != &artifact
             {
@@ -488,15 +940,19 @@ impl<S: Storage> Engine<S> {
         })
     }
     pub fn activate(&self, binding: &str, artifact: &str, authority: Authority) -> Result<()> {
-        let now_ms = self
-            .store
-            .load(&self.namespace)?
-            .state
+        let state = self.store.load(&self.namespace)?.state;
+        let derived = state
             .receipts
             .last()
             .map(|receipt| receipt.at_ms)
             .unwrap_or(0);
-        self.activate_at(binding, artifact, authority, now_ms)
+        // Finished work leaves with its receipts; the clock still dates it.
+        let now_ms = state
+            .retention
+            .clock_ms
+            .map_or(derived, |clock| clock.max(derived));
+        // A derived time, not host time: the clock does not move.
+        self.activate_with(binding, artifact, authority, now_ms, None)
     }
     pub fn activate_at(
         &self,
@@ -505,7 +961,17 @@ impl<S: Storage> Engine<S> {
         authority: Authority,
         now_ms: i64,
     ) -> Result<()> {
-        self.transaction(|s| {
+        self.activate_with(binding, artifact, authority, now_ms, Some(now_ms))
+    }
+    fn activate_with(
+        &self,
+        binding: &str,
+        artifact: &str,
+        authority: Authority,
+        now_ms: i64,
+        host_ms: Option<i64>,
+    ) -> Result<()> {
+        self.transaction_at(host_ms, |s| {
             let a = s
                 .artifacts
                 .get(artifact)
@@ -544,7 +1010,7 @@ impl<S: Storage> Engine<S> {
         authority: Authority,
         now_ms: i64,
     ) -> Result<String> {
-        let result = self.transaction(|s| {
+        let result = self.transaction_at(Some(now_ms), |s| {
             let activation = s
                 .bindings
                 .get(binding)
@@ -575,7 +1041,7 @@ impl<S: Storage> Engine<S> {
         result
     }
     pub fn advance(&self, run_id: &str, now_ms: i64) -> Result<bool> {
-        let (progress, queued_ms) = self.transaction(|s| {
+        let (progress, queued_ms) = self.transaction_at(Some(now_ms), |s| {
             let queued_ms = s
                 .runs
                 .get(run_id)
@@ -589,7 +1055,7 @@ impl<S: Storage> Engine<S> {
         Ok(progress)
     }
     pub fn cancel(&self, run_id: &str, now_ms: i64) -> Result<()> {
-        self.transaction(|s| {
+        self.transaction_at(Some(now_ms), |s| {
             request_cancel(s, run_id, now_ms)?;
             Ok(())
         })
@@ -609,7 +1075,60 @@ impl<S: Storage> Engine<S> {
         epoch: u64,
         now_ms: i64,
     ) -> Result<EventDisposition> {
-        let result = self.transaction(|s| {
+        self.admit_event_at(authenticated_producer, event, epoch, None, now_ms)
+    }
+    /// [`Self::admit_event_in_epoch`] with the producer's request time (not
+    /// the event's `occurred_at_ms`, and not part of any digest). An event
+    /// the engine still remembers answers as before, whatever its request
+    /// time. Otherwise a request time older than
+    /// `max(now, clock) - max(policy.event_replay_ms, contract.retention_ms)`
+    /// is refused with [`STALE_REQUEST`] and nothing is written. `None` is
+    /// not checked: an expired event is then accepted as new.
+    pub fn admit_event_at(
+        &self,
+        authenticated_producer: &str,
+        event: EventEnvelope,
+        epoch: u64,
+        requested_at_ms: Option<i64>,
+        now_ms: i64,
+    ) -> Result<EventDisposition> {
+        // An expired event that nothing holds is accepted as new; it leaves in
+        // a commit of its own first (see `admit_once`).
+        let mut result = Err(Error::Conflict("event changed during admission".into()));
+        for _ in 0..2 {
+            match self.admit_event_commit(
+                authenticated_producer,
+                &event,
+                epoch,
+                requested_at_ms,
+                now_ms,
+            ) {
+                Ok(None) => continue,
+                Ok(Some(disposition)) => result = Ok(disposition),
+                Err(error) => result = Err(error),
+            }
+            break;
+        }
+        self.metrics.admission(
+            &result,
+            result
+                .as_ref()
+                .is_ok_and(|disposition| disposition.duplicate),
+        );
+        result
+    }
+    /// One commit of [`Self::admit_event_in_epoch`]: `None` when it only
+    /// removed the expired event of the key.
+    fn admit_event_commit(
+        &self,
+        authenticated_producer: &str,
+        event: &EventEnvelope,
+        epoch: u64,
+        requested_at_ms: Option<i64>,
+        now_ms: i64,
+    ) -> Result<Option<EventDisposition>> {
+        let event = event.clone();
+        self.transaction_at(Some(now_ms), |s| {
             if s.retention
                 .producer_epochs
                 .get(authenticated_producer)
@@ -637,26 +1156,32 @@ impl<S: Storage> Engine<S> {
                 return Err(Error::Refused("forged producer identity".into()));
             }
             if let Some(old) = s.events.get(&key) {
-                if s.retention
-                    .event_expires_at_ms
-                    .get(&key)
-                    .is_some_and(|expiry| now_ms > *expiry)
-                {
-                    return Err(Error::Refused(
-                        "event replay horizon expired; explicit new replay identity required"
-                            .into(),
-                    ));
+                // Past its window and held by nothing: it leaves first and
+                // is then new. A held one is still remembered, so it is
+                // answered as inside its window (SC-9).
+                let start = retention::window_start(s, now_ms);
+                if retention::event_droppable(s, &key, start)? {
+                    // Not remembered any more: a stale request is refused
+                    // before this commit forgets the expired event.
+                    refuse_stale(
+                        s,
+                        requested_at_ms,
+                        || retention::contract_event_window(s, &event.contract),
+                        now_ms,
+                    )?;
+                    retention::forget_event(s, &key)?;
+                    return Ok(None);
                 }
                 if old.digest != content {
                     return Err(Error::Conflict(
                         "event identity reused with changed content".into(),
                     ));
                 }
-                return Ok(EventDisposition {
+                return Ok(Some(EventDisposition {
                     key,
                     duplicate: true,
                     destinations: old.destinations.len(),
-                });
+                }));
             }
             let contract = find_event(s, &event.contract)?;
             if !contract.trusted_producers.contains(authenticated_producer)
@@ -664,6 +1189,12 @@ impl<S: Storage> Engine<S> {
             {
                 return Err(Error::Refused("event producer or scope".into()));
             }
+            let window_ms = s
+                .retention
+                .policy
+                .event_replay_ms
+                .max(contract.retention_ms);
+            refuse_stale(s, requested_at_ms, || window_ms, now_ms)?;
             validate_event(
                 &event,
                 &Registry {
@@ -712,8 +1243,18 @@ impl<S: Storage> Engine<S> {
                     }
                     let mut ctx = EvalContext::new();
                     ctx.insert("event".into(), EvalValue::Known(event.payload.clone()));
-                    let destination_key =
-                        digest(&(&key, &binding, activation.revision, &trigger.id))?;
+                    // The first sequence number this acceptance assigns (the
+                    // event's own, or its first blocked-destination
+                    // receipt's) keeps the run ids of an event accepted again
+                    // after its window apart (SC-7). Stored destinations keep
+                    // their keys, so existing run ids are unchanged.
+                    let destination_key = digest(&(
+                        &key,
+                        s.sequence + 1,
+                        &binding,
+                        activation.revision,
+                        &trigger.id,
+                    ))?;
                     let input = match known_expr(&trigger.input, &ctx).and_then(|input| {
                         a.content.playbook.entries[&trigger.entry]
                             .input
@@ -763,6 +1304,7 @@ impl<S: Storage> Engine<S> {
             }
             s.sequence += 1;
             let sequence = s.sequence;
+            s.replay_touched.events.insert(key.clone());
             s.events.insert(
                 key.clone(),
                 AcceptedEvent {
@@ -776,33 +1318,30 @@ impl<S: Storage> Engine<S> {
                 },
             );
             s.retention.event_epochs.insert(key.clone(), epoch);
-            s.retention.event_expires_at_ms.insert(
-                key.clone(),
-                deadline(
-                    now_ms,
-                    s.retention
-                        .policy
-                        .event_replay_ms
-                        .max(contract.retention_ms),
-                )?,
+            // From the later of host time and clock; a clock already near the
+            // end of time saturates rather than refusing the event.
+            let expires_at_ms = deadline(now_ms, window_ms)?.max(
+                retention::window_start(s, now_ms)
+                    .saturating_add(i64::try_from(window_ms).unwrap_or(i64::MAX)),
+            );
+            s.retention
+                .event_expires_at_ms
+                .insert(key.clone(), expires_at_ms);
+            retention::window_insert(
+                s,
+                expires_at_ms,
+                format!("{}{key}", retention::WINDOW_EVENT),
             );
             indexes::index_event(s, &key)?;
-            Ok(EventDisposition {
+            Ok(Some(EventDisposition {
                 key,
                 duplicate: false,
                 destinations: count,
-            })
-        });
-        self.metrics.admission(
-            &result,
-            result
-                .as_ref()
-                .is_ok_and(|disposition| disposition.duplicate),
-        );
-        result
+            }))
+        })
     }
     pub fn fanout(&self, event_key: &str, limit: usize, now_ms: i64) -> Result<usize> {
-        self.transaction(|s| {
+        self.transaction_at(Some(now_ms), |s| {
             let mut event = s
                 .events
                 .get(event_key)
@@ -853,13 +1392,14 @@ impl<S: Storage> Engine<S> {
                 count += 1;
             }
             s.events.insert(event_key.into(), event);
+            s.replay_touched.events.insert(event_key.into());
             Ok(count)
         })
     }
     /// Persist dispatch state before handing anything to a host. Crashes here leave
     /// a recoverable ambiguity rather than an apparently safe fresh invocation.
     pub fn dispatch_next(&self, host: &mut impl Host, now_ms: i64) -> Result<Option<String>> {
-        let cancellation = self.transaction(|s| {
+        let cancellation = self.transaction_at(Some(now_ms), |s| {
             let after = s.indexes.effect_cursor.get("cancel").cloned();
             let candidate = s
                 .indexes
@@ -907,7 +1447,7 @@ impl<S: Storage> Engine<S> {
         })?;
         if let Some(intent) = cancellation {
             let disposition = self.measure_host(|| host.cancel(&intent));
-            self.transaction(|s| {
+            self.transaction_at(Some(now_ms), |s| {
                 indexes::mark_intent(s, &intent.id);
                 if matches!(disposition, CancellationResult::Confirmed) {
                     s.intents.get_mut(&intent.id).unwrap().status = IntentStatus::Cancelled;
@@ -925,7 +1465,7 @@ impl<S: Storage> Engine<S> {
             return Ok(Some(intent.id));
         }
 
-        let selected = self.transaction(|s| {
+        let selected = self.transaction_at(Some(now_ms), |s| {
             let after = s.indexes.effect_cursor.get("dispatch").cloned();
             let Some(item) = s
                 .indexes
@@ -999,6 +1539,14 @@ impl<S: Storage> Engine<S> {
                 "dispatch",
                 json!({"operation":id}),
             );
+            // The first dispatch counts: a re-dispatch after recovery is the
+            // same idempotent effect, whose completion may answer the first.
+            let sequence = s.sequence;
+            s.intents
+                .get_mut(&id)
+                .unwrap()
+                .dispatch_sequence
+                .get_or_insert(sequence);
             Ok(Some(s.intents[&id].clone()))
         })?;
         let Some(intent) = selected else {
@@ -1017,7 +1565,9 @@ impl<S: Storage> Engine<S> {
         result: DispatchResult,
         now_ms: i64,
     ) -> Result<()> {
-        self.transaction(|s| record_result(s, intent_id, result, now_ms))
+        self.transaction_at(Some(now_ms), |s| {
+            record_result(s, intent_id, result, now_ms)
+        })
     }
     pub fn recover(&self, host: &mut impl Host, now_ms: i64) -> Result<usize> {
         let state = self.snapshot()?;
@@ -1044,7 +1594,7 @@ impl<S: Storage> Engine<S> {
             {
                 continue;
             }
-            self.transaction(|s| {
+            self.transaction_at(Some(now_ms), |s| {
                 s.indexes
                     .effect_item_cursor
                     .insert(format!("recovery:{}", item.scope), item.key.clone());
@@ -1066,7 +1616,7 @@ impl<S: Storage> Engine<S> {
                 let running = matches!(result, DispatchResult::Accepted { .. });
                 self.record_result(&intent.id, result, now_ms)?;
                 if running {
-                    self.transaction(|s| {
+                    self.transaction_at(Some(now_ms), |s| {
                         let current = s.intents.get_mut(&intent.id).unwrap();
                         current.cancel_dispatched = false;
                         indexes::mark_intent(s, &intent.id);
@@ -1102,7 +1652,7 @@ impl<S: Storage> Engine<S> {
                 Recovery::Observation
                 | Recovery::NaturallyIdempotent
                 | Recovery::KeyedIdempotent => {
-                    self.transaction(|s| {
+                    self.transaction_at(Some(now_ms), |s| {
                         let current = s.intents.get_mut(&intent.id).unwrap();
                         current.status = IntentStatus::Prepared;
                         indexes::mark_intent(s, &intent.id);
@@ -1113,7 +1663,7 @@ impl<S: Storage> Engine<S> {
                 }
                 Recovery::Reconcilable => {
                     if let Some(request) = authorized_request {
-                        self.transaction(|s| {
+                        self.transaction_at(Some(now_ms), |s| {
                             s.recovery_requests.get_mut(&request.id).unwrap().consumed = true;
                             Ok(())
                         })?;
@@ -1126,7 +1676,7 @@ impl<S: Storage> Engine<S> {
                         .values()
                         .find(|request| request.intent == intent.id && !request.consumed);
                     if let Some(request) = request {
-                        self.transaction(|s| {
+                        self.transaction_at(Some(now_ms), |s| {
                             s.recovery_requests.get_mut(&request.id).unwrap().consumed = true;
                             receipt(
                                 s,
@@ -1172,7 +1722,7 @@ impl<S: Storage> Engine<S> {
                 },
             )?;
             if !due.items.is_empty() || !completions.items.is_empty() {
-                self.transaction(|s| {
+                self.transaction_at(Some(now_ms), |s| {
                     process_completions(s, now_ms)?;
                     process_operation_deadlines(s, now_ms);
                     let timers = s
@@ -1222,13 +1772,15 @@ impl<S: Storage> Engine<S> {
             if item.is_none() && !has_effect {
                 break;
             }
-            let (effect_turn, queued_ms) = self.transaction(|s| {
+            let mut advancing = false;
+            let turn = self.transaction_at(Some(now_ms), |s| {
                 if has_effect && (s.indexes.dispatch_turn || item.is_none()) {
                     s.indexes.dispatch_turn = false;
                     Ok((true, None))
-                } else if let Some(item) = item {
+                } else if let Some(item) = item.clone() {
                     let mut queued_ms = None;
                     if s.indexes.ready_tokens.contains_key(&item.key) {
+                        advancing = true;
                         s.indexes.scope_cursor = Some(item.scope);
                         indexes::unqueue(s, &item.key);
                         let elapsed = s
@@ -1245,7 +1797,34 @@ impl<S: Storage> Engine<S> {
                 } else {
                     Ok((false, None))
                 }
-            })?;
+            });
+            let (effect_turn, queued_ms) = match turn {
+                Ok(turn) => turn,
+                Err(error) => {
+                    // A run whose step cannot commit (for example a cohort
+                    // whose settling commit is refused) must not hold the
+                    // head of its queue: it moves behind the other ready
+                    // runs, and the error still reaches the host. Lost
+                    // ownership and write races are not the run's fault.
+                    if advancing
+                        && let Some(item) = &item
+                        && !matches!(
+                            error,
+                            Error::Storage(StorageError::Conflict | StorageError::Ownership)
+                        )
+                    {
+                        let _ = self.transaction_at(Some(now_ms), |s| {
+                            if s.indexes.ready_tokens.contains_key(&item.key) {
+                                indexes::unqueue(s, &item.key);
+                                indexes::wake(s, &item.key);
+                                s.indexes.scope_cursor = Some(item.scope.clone());
+                            }
+                            Ok(())
+                        });
+                    }
+                    return Err(error);
+                }
+            };
             if let Some(elapsed) = queued_ms {
                 self.metrics.record_queue(elapsed);
             }
@@ -1281,13 +1860,6 @@ fn next_id(s: &mut State, prefix: &str) -> String {
 }
 fn receipt(s: &mut State, run: &str, step: &str, now: i64, kind: &str, detail: Value) {
     s.sequence += 1;
-    if let Some(r) = s.runs.get(run) {
-        s.indexes
-            .root_last_activity
-            .entry(r.root.clone())
-            .and_modify(|at| *at = (*at).max(now))
-            .or_insert(now);
-    }
     let offset = s.receipts.len();
     s.indexes
         .receipts
@@ -1530,6 +2102,9 @@ fn advance(s: &mut State, id: &str, now: i64) -> Result<bool> {
     let original = r.clone();
     let result = advance_inner(s, &mut r, now);
     if let Err(error) = result {
+        if is_invariant(&error) {
+            return Err(error);
+        }
         *s = checkpoint;
         r = original;
         let message = error.to_string();
@@ -1591,7 +2166,7 @@ fn advance_inner(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
         return Ok(());
     }
     if r.status == RunStatus::Finishing {
-        if settled(s, r) {
+        if settled(s, r)? {
             if r.pending_failure {
                 finish(s, r, RunStatus::Failed, None, None, now);
             } else {
@@ -1618,7 +2193,10 @@ fn advance_inner(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
         return Ok(());
     }
     let own_limits = &s.artifacts[&r.artifact].content.playbook.limits;
-    let root_run = &s.runs[&r.root];
+    let root_run = s
+        .runs
+        .get(&r.root)
+        .ok_or_else(|| invariant(format!("root {} of run {} is missing", r.root, r.id)))?;
     let root_limits = &s.artifacts[&root_run.artifact].content.playbook.limits;
     if now.saturating_sub(root_run.admitted_at_ms) >= root_limits.max_duration_ms as i64
         || now.saturating_sub(r.admitted_at_ms) > own_limits.max_duration_ms as i64
@@ -1665,9 +2243,15 @@ fn advance_inner(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
     }
     let a = s.artifacts[&r.artifact].clone();
     let limits = &a.content.playbook.limits;
-    let root = &s.runs[&r.root];
+    let root = s
+        .runs
+        .get(&r.root)
+        .ok_or_else(|| invariant(format!("root {} of run {} is missing", r.root, r.id)))?;
     let root_limits = &s.artifacts[&root.artifact].content.playbook.limits;
-    let budget = s.budgets.get_mut(&r.root).unwrap();
+    let budget = s
+        .budgets
+        .get_mut(&r.root)
+        .ok_or_else(|| invariant(format!("budget of root {} is missing", r.root)))?;
     if budget.visits >= root_limits.max_step_visits || r.visits >= limits.max_step_visits {
         return Err(Error::Exhausted("step visits".into()));
     }
@@ -1798,6 +2382,7 @@ fn advance_inner(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
                     reason: None,
                     late_results: vec![],
                     completion_event: None,
+                    dispatch_sequence: None,
                 },
             );
             indexes::mark_intent(s, &id);
@@ -1973,7 +2558,10 @@ fn advance_inner(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
             if r.depth + 1 > root_limits.max_depth || r.depth + 1 > limits.max_depth {
                 return Err(Error::Exhausted("child depth".into()));
             }
-            let budget = s.budgets.get_mut(&r.root).unwrap();
+            let budget = s
+                .budgets
+                .get_mut(&r.root)
+                .ok_or_else(|| invariant(format!("budget of root {} is missing", r.root)))?;
             if budget.children >= root_limits.max_children
                 || s.runs
                     .values()
@@ -2020,7 +2608,7 @@ fn advance_inner(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
                 Some(r.id.clone())
             };
             // Independent starts retain the original shared allocation ledger. They
-            // cannot replenish quotas by detaching, even after the origin finishes.
+            // cannot replenish budgets by detaching, even after the origin finishes.
             admit_run(
                 s,
                 id.clone(),
@@ -2121,7 +2709,7 @@ fn advance_inner(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
                 &output,
                 limits.max_payload_bytes.min(root_limits.max_payload_bytes),
             )?;
-            if settled(s, r) {
+            if settled(s, r)? {
                 finish(s, r, RunStatus::Completed, Some(outcome), Some(output), now);
             } else {
                 r.pending_return = Some((outcome, output));
@@ -2139,14 +2727,20 @@ fn deadline(now: i64, duration: u64) -> Result<i64> {
         .ok_or_else(|| Error::Refused("deadline overflow".into()))
 }
 fn reserve_iteration(s: &mut State, r: &Run, limits: &Limits) -> Result<()> {
-    let root = &s.runs[&r.root];
+    let root = s
+        .runs
+        .get(&r.root)
+        .ok_or_else(|| invariant(format!("root {} of run {} is missing", r.root, r.id)))?;
     let bound = s.artifacts[&root.artifact]
         .content
         .playbook
         .limits
         .max_iterations
         .min(limits.max_iterations);
-    let b = s.budgets.get_mut(&r.root).unwrap();
+    let b = s
+        .budgets
+        .get_mut(&r.root)
+        .ok_or_else(|| invariant(format!("budget of root {} is missing", r.root)))?;
     if b.iterations >= bound {
         return Err(Error::Exhausted("iterations".into()));
     }
@@ -2199,17 +2793,26 @@ fn finish(
     r.terminal_sequence = Some(s.sequence);
     indexes::wake_dependents(s, &r.id);
 }
-fn settled(s: &State, r: &Run) -> bool {
-    r.children.iter().all(|id| s.runs[id].status.terminal())
-        && match indexes::root_open_intents(s, &r.root) {
-            Some(open) => !open.iter().any(|id| s.intents[id].run == r.id),
-            None => s.intents.values().filter(|i| i.run == r.id).all(|i| {
-                matches!(
-                    i.status,
-                    IntentStatus::Completed | IntentStatus::Rejected | IntentStatus::Cancelled
-                )
-            }),
+fn settled(s: &State, r: &Run) -> Result<bool> {
+    // A cohort leaves only as a whole: a live run's children are live.
+    for id in &r.children {
+        let child = s
+            .runs
+            .get(id)
+            .ok_or_else(|| invariant(format!("child {id} of run {} is missing", r.id)))?;
+        if !child.status.terminal() {
+            return Ok(false);
         }
+    }
+    Ok(match indexes::root_open_intents(s, &r.root) {
+        Some(open) => !open.iter().any(|id| s.intents[id].run == r.id),
+        None => s.intents.values().filter(|i| i.run == r.id).all(|i| {
+            matches!(
+                i.status,
+                IntentStatus::Completed | IntentStatus::Rejected | IntentStatus::Cancelled
+            )
+        }),
+    })
 }
 fn poll_pending(s: &mut State, r: &mut Run, pending: Pending, now: i64) -> Result<()> {
     let step = s.artifacts[&r.artifact].content.playbook.steps[&r.step].clone();
@@ -2321,7 +2924,11 @@ fn poll_pending(s: &mut State, r: &mut Run, pending: Pending, now: i64) -> Resul
             }
         }
         Pending::Child { child, bind } => {
-            let c = s.runs[&child].clone();
+            let c = s
+                .runs
+                .get(&child)
+                .ok_or_else(|| invariant(format!("child {child} of run {} is missing", r.id)))?
+                .clone();
             if c.status.terminal() {
                 let outcome = c.outcome.unwrap_or_else(|| {
                     match c.status {
@@ -2652,7 +3259,7 @@ fn request_cancel(s: &mut State, id: &str, now: i64) -> Result<()> {
     Ok(())
 }
 fn settle_cancel(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
-    if settled(s, r) {
+    if settled(s, r)? {
         finish(s, r, RunStatus::Cancelled, None, None, now);
     } else if s.intents.values().any(|i| {
         i.run == r.id
@@ -2971,7 +3578,7 @@ fn fail_run(s: &mut State, r: &mut Run, reason: String, now: i64) -> Result<()> 
         "engine_failure",
         json!({"reason":reason}),
     );
-    if settled(s, r) {
+    if settled(s, r)? {
         finish(s, r, RunStatus::Failed, None, None, now);
     } else {
         r.status = RunStatus::Finishing;
@@ -3037,7 +3644,7 @@ impl<S: Storage> Engine<S> {
         controls: ActivationControls,
         now_ms: i64,
     ) -> Result<()> {
-        self.transaction(|s| {
+        self.transaction_at(Some(now_ms), |s| {
             let a = s
                 .bindings
                 .get_mut(binding)
@@ -3095,7 +3702,7 @@ impl<S: Storage> Engine<S> {
         revoked_capabilities: BTreeSet<String>,
         now_ms: i64,
     ) -> Result<()> {
-        self.transaction(|s| {
+        self.transaction_at(Some(now_ms), |s| {
             s.authority_revocations
                 .insert(digest(&(actor, scope))?, revoked_capabilities.clone());
             let ids = s
@@ -3140,28 +3747,146 @@ impl<S: Storage> Engine<S> {
             Ok(())
         })
     }
+    /// Store `policy`. Its windows must be positive. The deprecated
+    /// `max_tombstones` and `terminal_run_ms` are stored as given and never
+    /// read: there are no namespace limits, finished runs leave the State as
+    /// history, and no tombstone is written for them.
     pub fn set_retention_policy(&self, policy: RetentionPolicy) -> Result<()> {
-        if policy.event_replay_ms == 0
-            || policy.terminal_run_ms == 0
-            || policy.audit_ms == 0
-            || policy.max_tombstones == 0
+        if policy.event_replay_ms == 0 || policy.admission_replay_ms == 0 || policy.audit_ms == 0 {
+            return Err(Error::Refused("retention windows must be positive".into()));
+        }
+        if policy.replay_keep == 0 {
+            return Err(Error::Refused("replay_keep must be positive".into()));
+        }
+        if policy.drain_cohorts_per_commit == 0 || policy.drain_entries_per_commit == 0 {
+            return Err(Error::Refused("drain bounds must be positive".into()));
+        }
+        if policy.window_drops_per_commit == 0
+            || policy.replay_evictions_per_commit == 0
+            || policy.history_trim_per_commit == 0
+            || policy.gc_page_limit == 0
+            || policy.settle_cohorts_per_commit == 0
         {
             return Err(Error::Refused(
-                "retention horizons and tombstone quota must be positive".into(),
+                "per-commit retention bounds must be positive".into(),
             ));
         }
-        self.transaction(|s| {
-            if policy.max_tombstones < s.retention.event_tombstones.len() {
-                return Err(Error::Refused(
-                    "retention policy cannot evict existing replay tombstones".into(),
-                ));
-            }
+        self.transaction_at(None, |s| {
             s.retention.policy = policy;
             Ok(())
         })
     }
+    /// Recover from a retention clock that a far-future host time pinned
+    /// (see `docs/implementation/0003-live-state-only.md`, "If the clock was
+    /// pinned"). One licensed commit, refused unless the clock is ahead of
+    /// `now_ms` by more than the smallest window (it is pinned), `now_ms <=
+    /// to_ms <= now_ms + slack` (a minute, or a tenth of the smallest window
+    /// if less) and `stale_floor_ms <= now_ms`:
+    ///
+    /// - the clock becomes `to_ms` (the corrected real time);
+    /// - every recorded expiry later than `to_ms` plus its own window is
+    ///   capped there, so what the pin wrote expires in real time again and
+    ///   no entry is remembered for less than its window from `to_ms`;
+    /// - every live run's timer beyond `to_ms` plus its declared duration is
+    ///   capped there (a wait, a join, a retry, an operation deadline, the
+    ///   run's duration basis); the runs are listed in the report;
+    /// - the stale floor becomes the later of the old floor and
+    ///   `stale_floor_ms`: a request for a key the engine does not remember
+    ///   whose request time is at or before it is stale. Pass the last
+    ///   correct host time before the pin;
+    /// - an admin receipt (history) records all of it with `actor` and
+    ///   `reason`. Every backend lowers the clock or an expiry, or changes
+    ///   the floor, only in a commit that is exactly such a receipt's.
+    pub fn rebase_retention_clock(
+        &self,
+        to_ms: i64,
+        stale_floor_ms: i64,
+        actor: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<ClockRebaseReport> {
+        admin_text(actor, reason)?;
+        self.transaction_licensed(|s| {
+            let report = rebase_plan(s, to_ms, stale_floor_ms, now_ms)?;
+            receipt(
+                s,
+                "admin",
+                "retention",
+                now_ms,
+                retention::CLOCK_REBASE,
+                json!({"from_ms":report.from_ms,"to_ms":report.to_ms,"stale_floor_ms":report.stale_floor_ms,"capped_events":report.capped_events,"capped_admissions":report.capped_admissions,"capped_deadlines":report.capped_deadlines,"adjusted_runs":report.adjusted_runs,"needs_operator_action":report.needs_operator_action,"adjustments":report.adjustments,"adjustments_not_listed":report.adjustments_not_listed,"actor":actor,"reason":reason}),
+            );
+            Ok(report)
+        })
+    }
+    /// What [`Self::rebase_retention_clock`] would do, on a snapshot, with
+    /// the same checks; nothing is committed.
+    pub fn rebase_retention_clock_dry_run(
+        &self,
+        to_ms: i64,
+        stale_floor_ms: i64,
+        actor: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<ClockRebaseReport> {
+        admin_text(actor, reason)?;
+        let mut s = self.snapshot()?;
+        rebase_plan(&mut s, to_ms, stale_floor_ms, now_ms)
+    }
+    /// Undo a stale floor set too high by an earlier rebase: lower it to
+    /// `to_ms`, accepting that keys the engine forgot after `to_ms` may be
+    /// re-admitted as new by a retry with a request time in between. One
+    /// licensed commit with its own admin receipt; nothing else changes.
+    /// Returns the old and new floor.
+    pub fn lower_stale_floor(
+        &self,
+        to_ms: i64,
+        actor: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<(i64, i64)> {
+        admin_text(actor, reason)?;
+        self.transaction_licensed(|s| {
+            let Some(from_ms) = s.retention.stale_floor_ms else {
+                return Err(Error::Refused("no stale floor to lower".into()));
+            };
+            if to_ms >= from_ms {
+                return Err(Error::Refused(format!(
+                    "stale floor can only be lowered: {to_ms} ms is not below {from_ms} ms"
+                )));
+            }
+            s.retention.stale_floor_ms = Some(to_ms);
+            receipt(
+                s,
+                "admin",
+                "retention",
+                now_ms,
+                retention::STALE_FLOOR_LOWERED,
+                json!({"from_ms":from_ms,"to_ms":to_ms,"actor":actor,"reason":reason}),
+            );
+            Ok((from_ms, to_ms))
+        })
+    }
+    /// Not needed: every commit already does this work, a bounded amount
+    /// each (see `docs/implementation/0003-live-state-only.md`). Kept so
+    /// existing callers compile. One ordinary commit at host time `now_ms`
+    /// (the bounded settle, drain of an older engine's namespace, window
+    /// drop and eviction of every commit), plus a page of at most `limit`
+    /// artifacts examined for disposal (`1..=policy.gc_page_limit`); refused
+    /// if `now_ms` is before the previous call's. It removes no run without
+    /// its history and writes no tombstone, correlation fence or disposal
+    /// record. `more` says more bounded work is due.
     pub fn collect_garbage(&self, now_ms: i64, limit: usize) -> Result<GcReport> {
-        self.transaction(|s| retention::gc(s, now_ms, limit))
+        let (mut gc, commit) = self.transaction_report_at(Finish::Host(Some(now_ms)), |s| {
+            retention::gc(s, now_ms, limit).map(|gc| (gc, true))
+        })?;
+        gc.runs = commit.runs;
+        gc.events = commit.events;
+        gc.admissions = commit.admissions;
+        gc.receipts = commit.receipts;
+        gc.evicted = commit.evicted;
+        gc.more = gc.more || commit.more;
+        Ok(gc)
     }
     pub fn advance_producer_epoch(
         &self,
@@ -3176,7 +3901,7 @@ impl<S: Storage> Engine<S> {
                 "epoch retirement requires actor and reason".into(),
             ));
         }
-        self.transaction(|s|{let old=s.retention.producer_epochs.get(producer).copied().unwrap_or(0);if new_epoch<=old{return Err(Error::Refused("producer epoch must increase".into()))}s.retention.producer_epochs.insert(producer.into(),new_epoch);s.retention.event_tombstones.retain(|_,t|t.producer!=producer||t.epoch>=new_epoch);if s.indexes.root_active.values().all(BTreeSet::is_empty){s.retention.expired_correlations.retain(|_,(p,epoch)|p!=producer||*epoch>=new_epoch);}receipt(s,"admin","replay",now_ms,"producer_epoch_retired",json!({"producer":producer,"old_epoch":old,"new_epoch":new_epoch,"actor":actor,"reason":reason}));Ok(())})
+        self.transaction_at(Some(now_ms), |s|{let old=s.retention.producer_epochs.get(producer).copied().unwrap_or(0);if new_epoch<=old{return Err(Error::Refused("producer epoch must increase".into()))}s.retention.producer_epochs.insert(producer.into(),new_epoch);s.retention.event_tombstones.retain(|_,t|t.producer!=producer||t.epoch>=new_epoch);if s.indexes.root_active.values().all(BTreeSet::is_empty){s.retention.expired_correlations.retain(|_,(p,epoch)|p!=producer||*epoch>=new_epoch);}receipt(s,"admin","replay",now_ms,"producer_epoch_retired",json!({"producer":producer,"old_epoch":old,"new_epoch":new_epoch,"actor":actor,"reason":reason}));Ok(())})
     }
     pub fn request_recovery(
         &self,
@@ -3197,7 +3922,7 @@ impl<S: Storage> Engine<S> {
                 "recovery requires bounded actor, reason and evidence references".into(),
             ));
         }
-        self.transaction(|s| {
+        self.transaction_at(Some(now_ms), |s| {
             let i = s
                 .intents
                 .get(intent_id)

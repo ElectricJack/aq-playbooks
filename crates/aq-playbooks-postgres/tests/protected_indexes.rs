@@ -389,8 +389,12 @@ fn native_same_scope_recovery_head_rotates_and_unchanged_history_rows_are_not_re
     assert_eq!(client().query_one("SELECT count(*) FROM aq_playbooks.runtime_index WHERE namespace=$1 AND kind='effect:recovery'",&[&n]).unwrap().get::<_,i64>(0),1);
 }
 
+/// `max_tombstones` is accepted and ignored: a commit writing more disposal
+/// tombstone rows than it allows is not refused (before spec 0003 this test
+/// asserted that refusal). Expired unreferenced artifact metadata is still
+/// collected by the commits that move the GC clock.
 #[test]
-fn disposal_quota_refuses_atomically_and_expired_unreferenced_artifact_metadata_is_collected() {
+fn max_tombstones_is_ignored_and_expired_unreferenced_artifact_metadata_is_collected() {
     let n = namespace("gc-quota");
     let first = artifact(&n);
     let second = artifact(&format!("{n}-second"));
@@ -414,17 +418,10 @@ fn disposal_quota_refuses_atomically_and_expired_unreferenced_artifact_metadata_
         key: second.digest.clone(),
         at_ms: 100,
     });
-    assert!(
-        s.compare_and_swap(&n, "owner", 1, &next)
-            .unwrap_err()
-            .to_string()
-            .contains("quota")
-    );
-    assert_same(&s.load(&n).unwrap().state, &original);
-    next.retention.policy.max_tombstones = 10;
     next.retention.policy.audit_ms = 1;
     next.retention.last_gc_at_ms = Some(100);
     s.compare_and_swap(&n, "owner", 1, &next).unwrap();
+    assert_same(&s.load(&n).unwrap().state, &next);
     assert_eq!(
         client()
             .query_one(
@@ -574,7 +571,7 @@ fn artifact_gc_and_installation_race_preserves_shared_bytes_and_disposal_records
 }
 
 #[test]
-fn forged_disposal_cannot_erase_unresolved_children_or_external_effects() {
+fn a_disposal_record_licenses_no_removal_of_unresolved_children_or_external_effects() {
     let n = namespace("unresolved-gc");
     let original = boundary(&n);
     let s = store();
@@ -590,7 +587,12 @@ fn forged_disposal_cannot_erase_unresolved_children_or_external_effects() {
             at_ms: 100,
         });
     }
-    assert!(s.compare_and_swap(&n, "owner", 1, &next).is_err());
+    // Spec 0003: a disposal record licenses nothing; a run leaves only with
+    // its history.
+    assert_eq!(
+        s.compare_and_swap(&n, "owner", 1, &next),
+        Err(StorageError::Backend(retention::REFUSE_RUN_REMOVAL.into()))
+    );
     assert_same(&s.load(&n).unwrap().state, &original);
 }
 
@@ -645,8 +647,12 @@ fn enabling_protection_removes_plaintext_only_after_every_referencing_namespace_
     assert_same(&protected("old", false).load(&m).unwrap().state, &state);
 }
 
+/// Spec 0003: an expired event leaves with no tombstone and no
+/// `disposal_tombstones` row. After a restart a repeat of its identity
+/// carrying its producer time is stale; a retired epoch refuses it; an
+/// explicit new epoch has a new identity.
 #[test]
-fn event_gc_replay_tombstones_survive_restart_and_explicit_new_epoch_has_new_identity() {
+fn an_expired_event_identity_is_judged_by_time_after_restart_and_a_new_epoch_has_a_new_identity() {
     let n = namespace("event-retention");
     let mut content = artifact(&n).content;
     let contract = EventContract {
@@ -699,6 +705,7 @@ fn event_gc_replay_tombstones_survive_restart_and_explicit_new_epoch_has_new_ide
             terminal_run_ms: 1,
             audit_ms: 1,
             max_tombstones: 1,
+            ..retention::RetentionPolicy::default()
         })
         .unwrap();
     for epoch in 0..4 {
@@ -710,14 +717,27 @@ fn event_gc_replay_tombstones_survive_restart_and_explicit_new_epoch_has_new_ide
                 .duplicate
         );
         assert_eq!(engine.collect_garbage(now + 10, 100).unwrap().events, 1);
-        assert_eq!(client().query_one("SELECT count(*) FROM aq_playbooks.disposal_tombstones WHERE namespace=$1 AND kind='event'",&[&n]).unwrap().get::<_,i64>(0),1);
-        engine.release().unwrap();
-        engine = Engine::new(store(), &n, format!("restarted-{epoch}")).unwrap();
+        assert_eq!(client().query_one("SELECT count(*) FROM aq_playbooks.disposal_tombstones WHERE namespace=$1 AND kind='event'",&[&n]).unwrap().get::<_,i64>(0),0);
         assert!(
             engine
-                .admit_event_in_epoch("fixture.producer", event.clone(), epoch, now + 11)
-                .is_err()
+                .snapshot()
+                .unwrap()
+                .retention
+                .event_tombstones
+                .is_empty()
         );
+        engine.release().unwrap();
+        engine = Engine::new(store(), &n, format!("restarted-{epoch}")).unwrap();
+        assert!(matches!(
+            engine.admit_event_at(
+                "fixture.producer",
+                event.clone(),
+                epoch,
+                Some(now),
+                now + 11
+            ),
+            Err(Error::Stale { .. })
+        ));
         engine
             .advance_producer_epoch(
                 "fixture.producer",
@@ -923,7 +943,7 @@ fn actual_engine_requires_protection_before_admission_and_encrypts_sensitive_dis
             self.dispatch(i)
         }
     }
-    {
+    let root = {
         let engine = Engine::new(protected("old", false), &n, "protected").unwrap();
         engine.install(artifact.clone()).unwrap();
         engine
@@ -933,33 +953,21 @@ fn actual_engine_requires_protection_before_admission_and_encrypts_sensitive_dis
             .admit("sensitive", "main", input, authority, 0)
             .unwrap();
         let mut host = SecretHost { calls: 0 };
-        engine.drive(&mut host, 0, 20).unwrap();
+        // Up to the step after the result is bound, so the protected values
+        // are still live (a finished run leaves the State; history holds
+        // public projections only).
+        engine.advance(&root, 0).unwrap();
+        engine.dispatch_next(&mut host, 0).unwrap();
+        engine.advance(&root, 0).unwrap();
         let state = engine.snapshot().unwrap();
-        assert_eq!(state.runs[&root].outcome.as_deref(), Some("ok"));
+        assert_eq!(state.runs[&root].step, "return");
         assert_eq!(host.calls, 1);
         assert_eq!(
             state.runs[&root].variables["private_result"]["secret"],
             "SYNTHETIC_PROTECTED_SENTINEL"
         );
-        let page = engine
-            .store
-            .inspect(
-                &n,
-                &InspectionQuery {
-                    kind: InspectionKind::Receipts,
-                    run: Some(root),
-                    after: None,
-                    limit: 100,
-                },
-            )
-            .unwrap();
-        assert!(!contains_secret(&serde_json::to_vec(&page).unwrap()));
-        assert!(
-            page.items
-                .iter()
-                .all(|receipt| receipt["detail"].get("input_digest").is_none())
-        );
-    }
+        root
+    };
     let restored = Engine::new(protected("old", false), &n, "reopened").unwrap();
     assert_eq!(
         restored
@@ -975,6 +983,35 @@ fn actual_engine_requires_protection_before_admission_and_encrypts_sensitive_dis
             .1["secret"],
         "SYNTHETIC_PROTECTED_SENTINEL"
     );
+    restored.drive(&mut SecretHost { calls: 0 }, 1, 20).unwrap();
+    assert!(restored.snapshot().unwrap().runs.is_empty());
+    let query = |kind| InspectionQuery {
+        kind,
+        run: Some(root.clone()),
+        after: None,
+        limit: 100,
+    };
+    let runs = restored
+        .store
+        .inspect(&n, &query(InspectionKind::Runs))
+        .unwrap();
+    assert_eq!(runs.items[0]["outcome"], "ok");
+    let page = restored
+        .store
+        .inspect(&n, &query(InspectionKind::Receipts))
+        .unwrap();
+    assert!(!page.items.is_empty());
+    assert!(!contains_secret(&serde_json::to_vec(&page).unwrap()));
+    assert!(
+        page.items
+            .iter()
+            .all(|receipt| receipt["detail"].get("input_digest").is_none())
+    );
+    let effects = restored
+        .store
+        .inspect(&n, &query(InspectionKind::Effects))
+        .unwrap();
+    assert!(!contains_secret(&serde_json::to_vec(&effects).unwrap()));
     assert!(store().load(&n).is_err());
 }
 

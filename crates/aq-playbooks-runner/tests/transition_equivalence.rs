@@ -273,7 +273,7 @@ macro_rules! quiet {
 impl Pair {
     fn new(r: RecordStorage) -> Self {
         let mut p = Self {
-            m: Engine::new(MemoryStorage::default(), NS, "owner").unwrap(),
+            m: Engine::new(MemoryStorage::retaining_settled(), NS, "owner").unwrap(),
             r: Engine::new(r, NS, "owner").unwrap(),
             steps: 0,
         };
@@ -323,12 +323,55 @@ impl Pair {
             }
             panic!("step {}: canonical state differs after {step}", self.steps);
         }
-        let counts = quota_counts(&m.state).unwrap();
-        if self.r.store.stats.transitions.load(Ordering::Relaxed) > 0 {
+        // Settled cohorts leave both States: the history (and so every
+        // inspection page over live state plus history) is the same too.
+        for kind in [
+            InspectionKind::Runs,
+            InspectionKind::Effects,
+            InspectionKind::Receipts,
+        ] {
+            let query = InspectionQuery {
+                kind,
+                run: None,
+                after: None,
+                limit: 1000,
+            };
             assert_eq!(
-                self.r.store.accounting(NS).unwrap().counts(),
-                counts,
-                "step {}: maintained quota accounting after {step}",
+                self.m.inspect(&query).unwrap().items,
+                self.r.inspect(&query).unwrap().items,
+                "step {}: {kind:?} inspection after {step}",
+                self.steps
+            );
+        }
+        // The maintained record counts (what a bound container's `len`
+        // reads) are those of the complete State.
+        if self.r.store.stats.transitions.load(Ordering::Relaxed) > 0 {
+            let mut plain = m.state.clone();
+            let patch = aq_playbooks_runner::transition::take_patch(&mut plain).unwrap();
+            let counts: BTreeMap<&str, usize> = patch
+                .changes
+                .iter()
+                .filter_map(|(path, change)| match change {
+                    aq_playbooks_runner::lazy::ContainerChange::Replace(rows)
+                        if !rows.is_empty() =>
+                    {
+                        Some((path.field, rows.len()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let maintained: BTreeMap<&str, usize> = self
+                .r
+                .store
+                .accounting(NS)
+                .unwrap()
+                .fields
+                .into_iter()
+                .filter(|(_, count)| *count > 0)
+                .collect();
+            assert_eq!(
+                maintained, counts,
+                "step {}: maintained record counts after {step}",
                 self.steps
             );
         }
@@ -524,6 +567,7 @@ fn scenario(p: &mut Pair) {
         terminal_run_ms: 1,
         audit_ms: 1,
         max_tombstones: 4,
+        ..RetentionPolicy::default()
     }));
     for now in [10_000i64, 10_001, 20_000] {
         both!(p, |e| e.collect_garbage(now, 8));
@@ -545,6 +589,128 @@ fn scenario(p: &mut Pair) {
         authority("a"),
         i64::MIN
     ));
+    // The clock is pinned at i64::MAX. Rebase it, then a window drop and a
+    // deferral (a keyed receipt whose run is still live) on both paths.
+    both!(p, |e| e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 1_000,
+        ..RetentionPolicy::default()
+    }));
+    let rebased = both!(p, |e| e.rebase_retention_clock(
+        30_000,
+        30_000,
+        "operator",
+        "pinned at i64::MAX",
+        30_000
+    ));
+    assert!(rebased.starts_with("Ok("), "{rebased}");
+    let keyed = |binding: &str, key: &str, p: &Pair| KeyedAdmissionRequest {
+        key: key.into(),
+        binding: binding.into(),
+        expected_activation_revision: p.m.snapshot().unwrap().bindings[binding].revision,
+        entry: "main".into(),
+        input: Value::Null,
+        authority: authority("a"),
+    };
+    for i in 0..3 {
+        let request = keyed("a", &format!("after-rebase-{i}"), p);
+        both!(p, |e| e.admit_once(request.clone(), 30_000 + i));
+    }
+    let held = keyed("child", "held", p);
+    both!(p, |e| e.admit_once(held.clone(), 30_003));
+    both!(p, |e| e.drive(&mut host(), 30_010, 64));
+    let request = keyed("a", "after-window", p);
+    both!(p, |e| e.admit_once(request.clone(), 31_500));
+    let s = p.m.snapshot().unwrap();
+    assert!(
+        !s.keyed_admissions.contains_key("after-rebase-0"),
+        "dropped"
+    );
+    assert!(s.keyed_admissions.contains_key("held"), "deferred");
+    // No namespace limit refuses anything, on either path (spec 0003, "no
+    // limits"): with every deprecated limit at its smallest, root
+    // admissions, keyed admissions, an event, a child start and a cancel
+    // land.
+    for config in [&mut p.m.config, &mut p.r.config] {
+        *config = EngineConfig {
+            max_runs: 1,
+            max_events: 1,
+            max_queued_destinations: 1,
+            max_state_bytes: 1,
+            max_receipts: 1,
+        };
+    }
+    for i in 0..8 {
+        let request = keyed("a", &format!("fill-{i}"), p);
+        let landed = both!(p, |e| e.admit_once(request.clone(), 31_750));
+        assert!(landed.starts_with("Ok("), "{landed}");
+    }
+    let parent = both!(p, |e| e.admit(
+        "parent",
+        "main",
+        Value::Null,
+        authority("a"),
+        31_751
+    ));
+    assert!(parent.starts_with("Ok("), "{parent}");
+    let landed = both!(p, |e| e.admit_event_in_epoch(
+        "d10",
+        event("unlimited", "p"),
+        u64::MAX,
+        31_752
+    ));
+    assert!(landed.starts_with("Ok("), "{landed}");
+    let landed = both!(p, |e| e.drive(&mut host(), 31_760, 64));
+    assert!(landed.starts_with("Ok("), "{landed}");
+    let s = p.m.snapshot().unwrap();
+    let held_run = s.keyed_admissions["held"].run_id.clone();
+    assert!(s.runs.contains_key(&held_run));
+    let landed = both!(p, |e| e.cancel(&held_run, 31_802));
+    assert!(landed.starts_with("Ok("), "{landed}");
+    for config in [&mut p.m.config, &mut p.r.config] {
+        *config = EngineConfig::default();
+    }
+    // Repeat protection is a rolling set (Task 8b R1): lowering
+    // `replay_keep` evicts the oldest unheld entries (at most 64 a commit);
+    // each finished keyed run and each event then evicts the oldest, on
+    // both paths, compared at every step.
+    let unheld = p.m.snapshot().unwrap().retention.replay_order.len();
+    assert!(unheld > 3, "{unheld}");
+    // History is a rolling log too (R2): the history both paths keep
+    // (compared at every step) is trimmed to 6 finished runs.
+    both!(p, |e| e.set_retention_policy(RetentionPolicy {
+        admission_replay_ms: 1_000,
+        replay_keep: 3,
+        history_keep: 6,
+        ..RetentionPolicy::default()
+    }));
+    while p.m.snapshot().unwrap().retention.replay_order.len() > 3 {
+        both!(p, |e| e.drive(&mut host(), 31_900, 1));
+    }
+    for i in 0..5 {
+        let request = keyed("a", &format!("rolling-{i}"), p);
+        let admitted = both!(p, |e| e.admit_once(request.clone(), 31_910 + i));
+        assert!(admitted.starts_with("Ok("), "{admitted}");
+        both!(p, |e| e.drive(&mut host(), 31_910 + i, 8));
+        both!(p, |e| e.admit_event_in_epoch(
+            "d10",
+            event(&format!("rolling-{i}"), "p"),
+            u64::MAX,
+            31_910 + i
+        ));
+    }
+    let s = p.m.snapshot().unwrap();
+    assert_eq!(s.retention.replay_order.len(), 3);
+    assert!(!s.keyed_admissions.contains_key("rolling-0"), "evicted");
+    let runs =
+        p.m.inspect(&InspectionQuery {
+            kind: InspectionKind::Runs,
+            run: None,
+            after: None,
+            limit: 1000,
+        })
+        .unwrap()
+        .items;
+    assert!(runs.len() <= 6 + s.runs.len(), "{}", runs.len());
 }
 
 #[test]
@@ -555,6 +721,9 @@ fn transition_reference_equivalence() {
     scenario(&mut p);
     let transitions = stats.transitions.load(Ordering::Relaxed) - before;
     assert!(transitions > 100, "bounded path exercised: {transitions}");
+    // Cohorts settled and left through the bounded path (history compared
+    // at every step by `check`).
+    assert!(p.m.store.settled_cohorts(NS).len() > 1);
     // A steady-state event admission performs no full load and no full commit.
     let (loads, commits) = (
         stats.full_loads.load(Ordering::Relaxed),

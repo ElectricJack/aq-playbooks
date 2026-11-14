@@ -1,5 +1,8 @@
 #![cfg(feature = "postgres-tests")]
-use aq_playbooks_cli::{configuration::read_keyring, pilots};
+#[allow(dead_code)]
+#[path = "support/pilots.rs"]
+mod pilots;
+use aq_playbooks_cli::configuration::read_keyring;
 use aq_playbooks_postgres::PostgresStorage;
 use aq_playbooks_runner::{DispatchResult, Engine, Storage};
 use serde_json::{Value, json};
@@ -71,7 +74,7 @@ impl Drop for Fixture {
 #[test]
 fn current_catalog_requires_explicit_idle_ownership_and_never_admits_work() {
     let f = Fixture::new();
-    let scenario = pilots::scenario("routing").unwrap();
+    let scenario = pilots::scenario("watcher").unwrap();
     let artifact = scenario.artifacts.last().unwrap();
     let a = f.write(
         "catalog-artifact.json",
@@ -149,7 +152,7 @@ fn current_catalog_requires_explicit_idle_ownership_and_never_admits_work() {
 #[test]
 fn protected_admin_lifecycle_control_recovery_rotation_and_paged_inspection() {
     let f = Fixture::new();
-    let scenario = pilots::scenario("routing").unwrap();
+    let scenario = pilots::scenario("watcher").unwrap();
     let artifact = scenario.artifacts.last().unwrap();
     let a = f.write("artifact.json", serde_json::to_value(artifact).unwrap());
     let authority = f.write(
@@ -173,7 +176,7 @@ fn protected_admin_lifecycle_control_recovery_rotation_and_paged_inspection() {
     f.ok(
         &[
             "activate",
-            "routing",
+            "watcher",
             &artifact.digest,
             "--authority",
             authority.to_str().unwrap(),
@@ -181,12 +184,12 @@ fn protected_admin_lifecycle_control_recovery_rotation_and_paged_inspection() {
         Some(&keys_a),
     );
     f.ok(
-        &["controls", "routing", "--calls-enabled", "false"],
+        &["controls", "watcher", "--calls-enabled", "false"],
         Some(&keys_a),
     );
     let args = [
         "run",
-        "routing",
+        "watcher",
         "--input",
         input.to_str().unwrap(),
         "--authority",
@@ -194,7 +197,7 @@ fn protected_admin_lifecycle_control_recovery_rotation_and_paged_inspection() {
     ];
     assert!(!f.call(&args, Some(&keys_a)).status.success());
     f.ok(
-        &["controls", "routing", "--calls-enabled", "true"],
+        &["controls", "watcher", "--calls-enabled", "true"],
         Some(&keys_a),
     );
     let view = f.ok(&args, Some(&keys_a));
@@ -261,8 +264,13 @@ fn protected_admin_lifecycle_control_recovery_rotation_and_paged_inspection() {
         json!({"event_replay_ms":100,"terminal_run_ms":100,"audit_ms":100,"max_tombstones":1000}),
     );
     f.ok(&["retention", policy.to_str().unwrap()], Some(&keys_b));
+    // `gc` keeps working and says plainly that it is not needed: it is one
+    // more ordinary commit of the bounded work every commit does.
+    let help = f.call(&["gc", "--help"], None);
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Not needed"));
     let report = f.ok(&["gc", "--limit", "10"], Some(&keys_b));
     assert_eq!(report["runs"], 0); // unresolved effects survive aggressive retention
+    assert_eq!(report["admissions"], 0);
     f.ok(
         &[
             "retire-producer",
@@ -275,6 +283,43 @@ fn protected_admin_lifecycle_control_recovery_rotation_and_paged_inspection() {
         ],
         Some(&keys_b),
     );
+    // Cancel waits on the unresolved operation; once the host settles it, a
+    // second cancel finishes the run, which leaves the State. The view reads
+    // it from run history, and a later command for it is not found.
+    let view = f.ok(&["cancel", &run], Some(&keys_b));
+    assert_eq!(view["runs"][0]["status"], "cancelling");
+    let store =
+        PostgresStorage::connect_protected(&f.database, read_keyring(&keys_b).unwrap()).unwrap();
+    let e = Engine::new(store, &f.namespace, "test-host-settle").unwrap();
+    e.record_result(
+        &intent,
+        DispatchResult::Rejected {
+            reason: "private-host-detail".into(),
+        },
+        2,
+    )
+    .unwrap();
+    e.release().unwrap();
+    drop(e);
+    let view = f.ok(&["cancel", &run], Some(&keys_b));
+    assert_eq!(view["runs"][0]["id"], run.as_str());
+    assert_eq!(view["runs"][0]["status"], "cancelled");
+    assert!(!view["receipts"].as_array().unwrap().is_empty());
+    let state = PostgresStorage::connect_protected(&f.database, read_keyring(&keys_b).unwrap())
+        .unwrap()
+        .load(&f.namespace)
+        .unwrap()
+        .state;
+    assert!(!state.runs.contains_key(&run));
+    assert!(!f.call(&["cancel", &run], Some(&keys_b)).status.success());
+    // Recovery for its operation, which left with it, says so.
+    let refused = f.call(
+        &["reconcile", &run, "--request", request.to_str().unwrap()],
+        Some(&keys_b),
+    );
+    assert!(!refused.status.success());
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(message.contains("finished with its run"), "{message}");
 }
 #[test]
 fn key_file_permissions_and_invalid_configuration_fail_closed() {
@@ -300,4 +345,118 @@ fn key_file_permissions_and_invalid_configuration_fail_closed() {
         fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(read_keyring(&key).is_err());
     }
+}
+/// Ruling 3: the clock rebase needs explicit confirmation, offers a dry
+/// run that commits nothing, refuses a target too far from the host time,
+/// and lowers a pinned clock with an admin receipt in history. A floor set
+/// too high can be lowered with its own confirmation.
+#[test]
+fn rebase_retention_clock_requires_confirmation_and_lowers_a_pinned_clock() {
+    let f = Fixture::new();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let pinned = now + 10 * 365 * 86_400_000;
+    let e = Engine::new(
+        PostgresStorage::connect(&f.database).unwrap(),
+        &f.namespace,
+        "test-host",
+    )
+    .unwrap();
+    // One far-future host time pins the clock.
+    e.advance_producer_epoch("producer", 1, "operator", "pin", pinned)
+        .unwrap();
+    e.release().unwrap();
+    drop(e);
+    let to = (now + 30_000).to_string();
+    let floor = (now - 1_000).to_string();
+    let run = |extra: &[&str], to: &str| {
+        let mut args = vec![
+            "rebase-retention-clock",
+            "--to-ms",
+            to,
+            "--stale-floor-ms",
+            &floor,
+            "--actor",
+            "operator",
+            "--reason",
+            "host clock jumped",
+        ];
+        args.extend_from_slice(extra);
+        f.call(&args, None)
+    };
+    let clock = || {
+        PostgresStorage::connect(&f.database)
+            .unwrap()
+            .load(&f.namespace)
+            .unwrap()
+            .state
+            .retention
+    };
+    assert!(!run(&[], &to).status.success());
+    // The dry run reports and commits nothing.
+    let output = run(&["--dry-run"], &to);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let preview: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(preview["dry_run"], true);
+    assert_eq!(preview["report"]["from_ms"], pinned);
+    assert_eq!(preview["report"]["to_ms"], now + 30_000);
+    assert_eq!(clock().clock_ms, Some(pinned));
+    assert!(
+        !run(&["--dry-run", "--confirm-clock-rebase"], &to)
+            .status
+            .success()
+    );
+    let past = (pinned + 1).to_string();
+    let refused = run(&["--confirm-clock-rebase"], &past);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("clock rebase target"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let output = run(&["--confirm-clock-rebase"], &to);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["dry_run"], false);
+    assert_eq!(report["report"]["from_ms"], pinned);
+    assert_eq!(report["report"]["stale_floor_ms"], now - 1_000);
+    let r = clock();
+    assert_eq!(r.clock_ms, Some(now + 30_000));
+    assert_eq!(r.stale_floor_ms, Some(now - 1_000));
+    let receipts = f.ok(&["inspect", "admin", "--kind", "receipts"], None);
+    assert!(
+        receipts["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["kind"] == "retention_clock_rebased"),
+        "{receipts}"
+    );
+    // Lowering the floor needs its own confirmation.
+    let lower = (now - 2_000).to_string();
+    let args = [
+        "lower-stale-floor",
+        "--to-ms",
+        &lower,
+        "--actor",
+        "operator",
+        "--reason",
+        "floor too high",
+    ];
+    assert!(!f.call(&args, None).status.success());
+    let mut confirmed = args.to_vec();
+    confirmed.push("--confirm-floor-lowering");
+    let lowered = f.ok(&confirmed, None);
+    assert_eq!(lowered["from_ms"], now - 1_000);
+    assert_eq!(clock().stale_floor_ms, Some(now - 2_000));
 }

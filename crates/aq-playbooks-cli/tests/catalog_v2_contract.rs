@@ -1,5 +1,12 @@
 //! Host catalog 2.0.0 conformance: D6 asynchronous judgment and registered check
 //! execution, published beside a byte-frozen 1.0.0.
+/// The stateful synthetic host, test support only (`tests/support`).
+#[allow(dead_code)]
+#[path = "support/fake_host.rs"]
+mod fake_host;
+#[allow(dead_code)]
+#[path = "support/schemas.rs"]
+mod schemas;
 use aq_playbooks_cli::catalog;
 use aq_playbooks_model::{Registry, canonical_bytes, digest, hash_bytes};
 use serde_json::{Value, json};
@@ -48,9 +55,9 @@ fn catalog_v2_manifest_schemas_and_fixtures_are_pinned() {
         event.payload.validate_definition().unwrap();
         assert_eq!(
             event.trusted_producers,
-            catalog::strings(&["aq.host.bridge@1"])
+            schemas::strings(&["aq.host.bridge@1"])
         );
-        assert_eq!(event.correlation_fields, catalog::strings(&["operation"]));
+        assert_eq!(event.correlation_fields, schemas::strings(&["operation"]));
     }
     for name in ["judgment.request", "check.request"] {
         let command = &registry.commands[name];
@@ -58,7 +65,7 @@ fn catalog_v2_manifest_schemas_and_fixtures_are_pinned() {
         assert!(command.asynchronous.is_some());
         assert_eq!(
             command.capabilities,
-            catalog::strings(&[&format!("{name}.v2")]),
+            schemas::strings(&[&format!("{name}.v2")]),
             "2.0.0 effects need a new grant, never an inherited 1.0.0 capability"
         );
     }
@@ -139,7 +146,7 @@ fn catalog_v2_preserves_1_0_0_bytes_and_unchanged_bindings() {
 
 #[test]
 fn catalog_v2_replay_fixtures_retain_admission_and_reject_conflicting_reuse() {
-    use aq_playbooks_cli::fake_host::FakeHost;
+    use crate::fake_host::FakeHost;
     use aq_playbooks_runner::{Authority, DispatchResult, Host, Intent, IntentStatus};
     let registry = catalog::catalog_v2();
     let capabilities: std::collections::BTreeSet<String> = registry
@@ -169,6 +176,7 @@ fn catalog_v2_replay_fixtures_retain_admission_and_reject_conflicting_reuse() {
             cancel_dispatched: false,
             late_results: vec![],
             completion_event: None,
+            dispatch_sequence: None,
             handle: None,
             result: None,
             reason: None,

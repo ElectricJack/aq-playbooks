@@ -63,7 +63,7 @@ fn authority() -> Authority {
 
 #[test]
 fn exact_metadata_and_controls_are_owned_bounded_and_private_values_are_omitted() {
-    let engine = Engine::new(MemoryStorage::default(), "catalog", "owner").unwrap();
+    let engine = Engine::new(MemoryStorage::retaining_settled(), "catalog", "owner").unwrap();
     let mut value = artifact("policy", &"é".repeat(3000));
     value.content.definitions.insert(
         "private".into(),
@@ -124,7 +124,7 @@ fn exact_metadata_and_controls_are_owned_bounded_and_private_values_are_omitted(
 
 #[test]
 fn unrelated_state_progress_preserves_stamp_but_catalog_changes_refuse_old_pages() {
-    let storage = MemoryStorage::default();
+    let storage = MemoryStorage::retaining_settled();
     let engine = Engine::new(storage.clone(), "catalog", "owner").unwrap();
     for name in ["one", "two"] {
         let value = artifact(name, "public");
@@ -159,7 +159,7 @@ fn unrelated_state_progress_preserves_stamp_but_catalog_changes_refuse_old_pages
 
 #[test]
 fn byte_limited_pages_preserve_every_item_and_never_download_unbounded_metadata() {
-    let engine = Engine::new(MemoryStorage::default(), "catalog", "owner").unwrap();
+    let engine = Engine::new(MemoryStorage::retaining_settled(), "catalog", "owner").unwrap();
     for index in 0..26 {
         let value = artifact(&format!("policy-{index}"), &"\0".repeat(4096));
         engine
@@ -223,7 +223,7 @@ fn release_and_reacquire_even_same_owner_refuse_previous_incarnation() {
 
 #[test]
 fn unsupported_metadata_does_not_change_existing_state_mutation_semantics() {
-    let storage = MemoryStorage::default();
+    let storage = MemoryStorage::retaining_settled();
     let engine = Engine::new(storage.clone(), "catalog", "owner").unwrap();
     let mut state = engine.snapshot().unwrap();
     state.bindings.insert(

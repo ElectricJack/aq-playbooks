@@ -2,32 +2,21 @@
 //!
 //! A backend that implements the capability runs the engine's transition plan
 //! against a State whose retained-history containers are bound to the
-//! backend's authoritative records (see [`crate::lazy`]), validates quota from
-//! exact maintained accounting, and commits only the touched records in one
+//! backend's authoritative records (see [`crate::lazy`]), keeps an exact count
+//! of each container's records, and commits only the touched records in one
 //! atomic revision. Backends without the capability return
 //! [`TransitionOutcome::Unsupported`] before running the plan, and the engine
 //! then uses the full `load`/`compare_and_swap` path unchanged.
 use crate::lazy::{
-    Changes, ContainerChange, ContainerPath, LazyField, RecordSource, Shape, TreeKey,
-    container_bytes, header_bytes, record_bytes,
+    Changes, ContainerChange, ContainerPath, LazyField, RecordSource, Shape, TreeKey, header_bytes,
 };
 use crate::storage::{Storage, StorageError, VersionedState};
-use crate::{AcceptedEvent, EngineConfig, Error, Result, State};
+use crate::{Error, Result, State};
 use std::collections::BTreeMap;
 use std::panic::Location;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Exact quota inputs; the full path derives them from the materialized State.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct QuotaCounts {
-    pub runs: usize,
-    pub events: usize,
-    pub queued_destinations: usize,
-    /// Retained receipts plus keyed admission receipts.
-    pub receipts: usize,
-    pub state_bytes: usize,
-}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionOutcome {
     /// Capability unavailable for this namespace; the plan was not run.
@@ -42,41 +31,6 @@ pub struct TransitionRequest<'a> {
     pub operation: &'static str,
     /// Runs the engine transition on the bound State; returns whether it changed.
     pub plan: &'a mut dyn FnMut(&mut State) -> Result<bool>,
-    /// Shared quota validation, given the exact post-transition counts.
-    pub validate: &'a dyn Fn(&State, &QuotaCounts) -> Result<()>,
-}
-
-const QUOTA_REFUSAL: &str = "namespace retention/admission quota exhausted";
-pub fn check_quota(config: &EngineConfig, c: &QuotaCounts) -> Result<()> {
-    if c.runs > config.max_runs
-        || c.events > config.max_events
-        || c.queued_destinations > config.max_queued_destinations
-        || c.receipts > config.max_receipts
-        || c.state_bytes > config.max_state_bytes
-    {
-        return Err(Error::Refused(QUOTA_REFUSAL.into()));
-    }
-    Ok(())
-}
-pub fn queued_destinations(event: &AcceptedEvent) -> usize {
-    event
-        .destinations
-        .iter()
-        .filter(|d| d.run.is_none())
-        .count()
-}
-/// Reference quota counts from a fully materialized State.
-pub fn quota_counts(state: &State) -> Result<QuotaCounts> {
-    Ok(QuotaCounts {
-        runs: state.runs.len(),
-        events: state.events.len(),
-        queued_destinations: state.events.values().map(queued_destinations).sum(),
-        receipts: state
-            .receipts
-            .len()
-            .saturating_add(state.keyed_admissions.len()),
-        state_bytes: aq_playbooks_model::canonical_bytes(state)?.len(),
-    })
 }
 
 impl State {
@@ -107,6 +61,7 @@ impl State {
             ("indexes.run_timer", &mut i.run_timer),
             ("indexes.events", &mut i.events),
             ("indexes.event_memberships", &mut i.event_memberships),
+            ("indexes.contract_events", &mut i.contract_events),
             ("indexes.waiters", &mut i.waiters),
             ("indexes.run_subscriptions", &mut i.run_subscriptions),
             ("indexes.dependents", &mut i.dependents),
@@ -122,6 +77,13 @@ impl State {
             ),
             ("retention.event_tombstones", &mut r.event_tombstones),
             ("retention.disposals", &mut r.disposals),
+            ("retention.expiry", &mut r.expiry),
+            (
+                "retention.admission_expires_at_ms",
+                &mut r.admission_expires_at_ms,
+            ),
+            ("retention.replay_order", &mut r.replay_order),
+            ("retention.replay_held", &mut r.replay_held),
         ]
     }
 }
@@ -218,64 +180,26 @@ pub fn assemble_state(
     serde_json::from_value(value).map_err(|e| backend(format!("state assemble: {e}")))
 }
 
-/// Per-container record sums: `pairs` is Σ record bytes (see [`record_bytes`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ContainerStats {
-    pub count: usize,
-    pub pairs: usize,
-}
-/// Exact maintained accounting for one namespace revision.
+/// The number of records of each container of one namespace revision
+/// (what a bound container's `len` reads), and the header's length.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Accounting {
     pub header_len: usize,
-    pub fields: BTreeMap<&'static str, ContainerStats>,
-    pub queued_destinations: usize,
-}
-fn queued_bytes(bytes: &[u8]) -> Result<usize> {
-    let event: AcceptedEvent = serde_json::from_slice(bytes).map_err(backend)?;
-    Ok(queued_destinations(&event))
+    pub fields: BTreeMap<&'static str, usize>,
 }
 impl Accounting {
-    pub fn counts(&self) -> QuotaCounts {
-        let count = |f: &str| self.fields.get(f).map_or(0, |s| s.count);
-        let state_bytes = self.header_len
-            + self
-                .fields
-                .values()
-                .map(|s| container_bytes(s.pairs, s.count) - 2)
-                .sum::<usize>();
-        QuotaCounts {
-            runs: count("runs"),
-            events: count("events"),
-            queued_destinations: self.queued_destinations,
-            receipts: count("receipts").saturating_add(count("keyed_admissions")),
-            state_bytes,
-        }
+    /// Records of `field`.
+    pub fn count(&self, field: &str) -> usize {
+        self.fields.get(field).copied().unwrap_or(0)
     }
-    /// Account one record write: `old`/`new` are canonical value bytes.
-    pub fn record(
-        &mut self,
-        field: &'static str,
-        key: &TreeKey,
-        old: Option<&[u8]>,
-        new: Option<&[u8]>,
-    ) -> Result<()> {
-        let shape = shape_of(field).ok_or_else(|| backend(format!("unknown field {field}")))?;
-        let stats = self.fields.entry(field).or_default();
-        if let Some(old) = old {
-            stats.count -= 1;
-            stats.pairs -= record_bytes(shape, key, old);
-            if field == "events" {
-                self.queued_destinations -= queued_bytes(old)?;
-            }
-        }
-        if let Some(new) = new {
-            stats.count += 1;
-            stats.pairs += record_bytes(shape, key, new);
-            if field == "events" {
-                self.queued_destinations += queued_bytes(new)?;
-            }
-        }
+    /// Account one record write: whether the record existed before and
+    /// whether it exists after.
+    pub fn record(&mut self, field: &'static str, old: bool, new: bool) -> Result<()> {
+        shape_of(field).ok_or_else(|| backend(format!("unknown field {field}")))?;
+        let count = self.fields.entry(field).or_default();
+        *count = (*count + usize::from(new))
+            .checked_sub(usize::from(old))
+            .ok_or_else(|| backend(format!("{field}: record count underflow")))?;
         Ok(())
     }
 }
@@ -300,6 +224,7 @@ struct RecordNamespace {
     revision: u64,
     data: Arc<RecordData>,
     accounting: Accounting,
+    history: crate::history::HistoryRows,
 }
 /// Observability for the in-memory record backend.
 #[derive(Debug, Default)]
@@ -383,6 +308,8 @@ impl RecordSource for TxSource {
     ) -> std::result::Result<Vec<(TreeKey, Vec<u8>)>, String> {
         use std::ops::Bound::{Excluded, Unbounded};
         let Some(c) = self.container(path)? else {
+            // An empty page costs one read, as an absent record does.
+            self.stats.record_reads.fetch_add(1, Ordering::Relaxed);
             return Ok(Vec::new());
         };
         let rows: Vec<_> = match after {
@@ -436,16 +363,16 @@ fn stage(data: &RecordData, accounting: &Accounting, patch: &StatePatch) -> Resu
         match change {
             ContainerChange::Entries(rows) => {
                 for (key, new) in rows {
-                    let before = old.and_then(|c| c.get(key)).map(Vec::as_slice);
-                    next.record(field, key, before, new.as_deref())?;
+                    let before = old.is_some_and(|c| c.contains_key(key));
+                    next.record(field, before, new.is_some())?;
                 }
             }
             ContainerChange::Replace(rows) => {
-                for (key, bytes) in old.into_iter().flatten() {
-                    next.record(field, key, Some(bytes), None)?;
+                for _ in old.into_iter().flatten() {
+                    next.record(field, true, false)?;
                 }
-                for (key, bytes) in rows {
-                    next.record(field, key, None, Some(bytes))?;
+                for _ in rows {
+                    next.record(field, false, true)?;
                 }
             }
         }
@@ -474,7 +401,39 @@ fn apply(data: &mut RecordData, patch: StatePatch) -> Result<()> {
     }
     Ok(())
 }
-/// Incremental equivalent of `admission::verify_receipt_retention`.
+/// An accepted event's identity never changes
+/// ([`crate::retention::check_event_change`]): each stored event the patch
+/// rewrites is compared with what it writes. O(rewritten events).
+fn verify_events(data: &RecordData, patch: &StatePatch) -> Result<()> {
+    let Some(old) = data.container("events") else {
+        return Ok(());
+    };
+    let decode = |bytes: &[u8]| -> Result<crate::AcceptedEvent> {
+        serde_json::from_slice(bytes).map_err(|e| backend(format!("events record: {e}")))
+    };
+    for (path, change) in &patch.changes {
+        if path.field != "events" {
+            continue;
+        }
+        let written: Vec<(&TreeKey, &Vec<u8>)> = match change {
+            ContainerChange::Entries(rows) => rows
+                .iter()
+                .filter_map(|(k, v)| v.as_ref().map(|v| (k, v)))
+                .collect(),
+            ContainerChange::Replace(rows) => rows.iter().map(|(k, v)| (k, v)).collect(),
+        };
+        for (key, new) in written {
+            if let Some(before) = old.get(key)
+                && before != new
+            {
+                crate::retention::check_event_change(&decode(before)?, &decode(new)?)?;
+            }
+        }
+    }
+    Ok(())
+}
+/// Keyed admission receipts are never rebound. Their removal is checked by
+/// [`verify_patch_removals`].
 fn verify_keyed_admissions(data: &RecordData, patch: &StatePatch) -> Result<()> {
     let refuse = || {
         Error::Storage(StorageError::Backend(
@@ -491,21 +450,277 @@ fn verify_keyed_admissions(data: &RecordData, patch: &StatePatch) -> Result<()> 
         match change {
             ContainerChange::Entries(rows) => {
                 for (key, new) in rows {
-                    if let Some(before) = old.get(key)
-                        && new.as_ref() != Some(before)
+                    if let (Some(before), Some(new)) = (old.get(key), new)
+                        && new != before
                     {
                         return Err(refuse());
                     }
                 }
             }
             ContainerChange::Replace(rows) => {
-                let rows: BTreeMap<_, _> = rows.iter().map(|(k, v)| (k, v)).collect();
-                if old.iter().any(|(k, v)| rows.get(k) != Some(&v)) {
+                if rows
+                    .iter()
+                    .any(|(k, v)| old.get(k).is_some_and(|before| before != v))
+                {
                     return Err(refuse());
                 }
             }
         }
     }
+    Ok(())
+}
+/// A touched record key with its stored value and the value a patch writes.
+type Touch<'a> = (&'a TreeKey, Option<&'a Vec<u8>>, Option<&'a Vec<u8>>);
+/// Incremental equivalent of [`crate::retention::verify_removals`]: the same
+/// rules over the records `patch` deletes from `data` (and the expiry records
+/// it writes), checked against the bound `next`. Reads only the touched
+/// records, the operations and children of deleted runs, and (for a legacy
+/// run disposal) the disposal records.
+fn verify_patch_removals(data: &RecordData, patch: &StatePatch, next: &State) -> Result<()> {
+    use crate::retention::Window;
+    use std::collections::BTreeSet;
+    const FENCED: &[&str] = &["runs", "intents", "events", "keyed_admissions"];
+    let decode = |field: &str, bytes: &[u8]| -> Result<serde_json::Value> {
+        serde_json::from_slice(bytes).map_err(|e| backend(format!("{field} record: {e}")))
+    };
+    let at = |field: &str, bytes: &[u8]| -> Result<i64> {
+        serde_json::from_slice(bytes).map_err(|e| backend(format!("{field} record: {e}")))
+    };
+    // A licensed admin commit changes no header field its licence does not
+    // name, and adds no run, operation, event or keyed receipt. Its caps are
+    // computed from the stored header and the stored events.
+    let licensed = crate::retention::licence(next)?.is_some();
+    let mut caps = State::default();
+    if licensed {
+        caps = header_state(&data.header)?;
+        crate::retention::check_licensed_header(&caps, next)?;
+        for (path, change) in &patch.changes {
+            let field = field_name(path)?;
+            if !FENCED.contains(&field) {
+                continue;
+            }
+            let old = data.container(field);
+            let added = match change {
+                ContainerChange::Entries(rows) => rows
+                    .iter()
+                    .any(|(key, new)| new.is_some() && old.and_then(|c| c.get(key)).is_none()),
+                ContainerChange::Replace(rows) => rows
+                    .iter()
+                    .any(|(key, _)| old.and_then(|c| c.get(key)).is_none()),
+            };
+            if added {
+                return Err(backend(crate::retention::REFUSE_LICENCE));
+            }
+        }
+        if let Some(stored) = data.container("events") {
+            for (path, change) in &patch.changes {
+                if field_name(path)? != "retention.event_expires_at_ms" {
+                    continue;
+                }
+                let keys: Vec<&TreeKey> = match change {
+                    ContainerChange::Entries(rows) => rows.iter().map(|(k, _)| k).collect(),
+                    ContainerChange::Replace(rows) => rows.iter().map(|(k, _)| k).collect(),
+                };
+                for key in keys {
+                    if let (TreeKey::Str(id), Some(bytes)) = (key, stored.get(key)) {
+                        let event: crate::AcceptedEvent = serde_json::from_slice(bytes)
+                            .map_err(|e| backend(format!("events record: {e}")))?;
+                        caps.events.insert(id.clone(), event);
+                    }
+                }
+            }
+        }
+    }
+    let mut removed: BTreeMap<&str, serde_json::Map<String, serde_json::Value>> = BTreeMap::new();
+    let mut removed_receipts: Vec<serde_json::Value> = vec![];
+    for (path, change) in &patch.changes {
+        let field = field_name(path)?;
+        let old = data.container(field);
+        // Each touched key: its stored value and the value the patch writes.
+        let touched: Vec<Touch<'_>> = match change {
+            ContainerChange::Entries(rows) => rows
+                .iter()
+                .map(|(key, new)| (key, old.and_then(|c| c.get(key)), new.as_ref()))
+                .collect(),
+            ContainerChange::Replace(rows) => {
+                let new: BTreeMap<&TreeKey, &Vec<u8>> = rows.iter().map(|(k, v)| (k, v)).collect();
+                let keys: BTreeSet<&TreeKey> = old
+                    .into_iter()
+                    .flatten()
+                    .map(|(k, _)| k)
+                    .chain(new.keys().copied())
+                    .collect();
+                keys.into_iter()
+                    .map(|key| (key, old.and_then(|c| c.get(key)), new.get(key).copied()))
+                    .collect()
+            }
+        };
+        let window = match field {
+            "retention.event_expires_at_ms" => Some(Window::Event),
+            "retention.admission_expires_at_ms" => Some(Window::Admission),
+            _ => None,
+        };
+        if let Some(window) = window {
+            for (key, before, after) in touched {
+                let TreeKey::Str(id) = key else {
+                    return Err(backend(format!("{field}: unexpected record key")));
+                };
+                let before = before.map(|b| at(field, b)).transpose()?;
+                let after = after.map(|b| at(field, b)).transpose()?;
+                if before != after {
+                    crate::retention::check_expiry_record(&caps, next, window, id, before, after)?;
+                }
+            }
+        } else if field == "receipts" {
+            // Positional: a receipt is removed when its sequence was at a
+            // touched position and the patch writes it nowhere.
+            let mut written = BTreeSet::new();
+            let mut stored = vec![];
+            for (_, before, after) in touched {
+                if let Some(after) = after {
+                    written.insert(decode(field, after)?["sequence"].as_u64());
+                }
+                if let Some(before) = before {
+                    stored.push(decode(field, before)?);
+                }
+            }
+            removed_receipts.extend(
+                stored
+                    .into_iter()
+                    .filter(|r| !written.contains(&r["sequence"].as_u64())),
+            );
+        } else if FENCED.contains(&field) {
+            for (key, before, after) in touched {
+                let (Some(before), None) = (before, after) else {
+                    continue;
+                };
+                let TreeKey::Str(id) = key else {
+                    return Err(backend(format!("{field}: unexpected record key")));
+                };
+                removed
+                    .entry(field)
+                    .or_default()
+                    .insert(id.clone(), decode(field, before)?);
+            }
+        }
+    }
+    // The State header (policy, clock, artifacts) plus the deleted records.
+    let mut previous = header_state(&data.header)?;
+    if !removed.is_empty() || !removed_receipts.is_empty() {
+        let expires = |field: &str, key: &str| -> Result<Option<serde_json::Value>> {
+            data.container(field)
+                .and_then(|c| c.get(&TreeKey::Str(key.to_string())))
+                .map(|bytes| decode(field, bytes))
+                .transpose()
+        };
+        let mut value = serde_json::to_value(&previous).map_err(backend)?;
+        for (field, records) in &removed {
+            let expiry_field = match *field {
+                "events" => Some(("event_expires_at_ms", "retention.event_expires_at_ms")),
+                "keyed_admissions" => Some((
+                    "admission_expires_at_ms",
+                    "retention.admission_expires_at_ms",
+                )),
+                _ => None,
+            };
+            if let Some((name, path)) = expiry_field {
+                for key in records.keys() {
+                    if let Some(at) = expires(path, key)? {
+                        value["retention"][name][key] = at;
+                    }
+                }
+            }
+            value[*field] = serde_json::Value::Object(records.clone());
+        }
+        value["receipts"] = serde_json::Value::Array(removed_receipts);
+        if let Some(runs) = removed.get("runs") {
+            // Children of removed runs, and every operation of a removed run.
+            let mut all_runs = runs.clone();
+            let stored = data.container("runs");
+            for run in runs.values() {
+                for child in run["children"].as_array().into_iter().flatten() {
+                    let Some(child) = child.as_str() else {
+                        continue;
+                    };
+                    if let Some(bytes) = stored.and_then(|c| c.get(&TreeKey::Str(child.into()))) {
+                        all_runs.insert(child.into(), decode("runs", bytes)?);
+                    }
+                }
+            }
+            value["runs"] = serde_json::Value::Object(all_runs);
+            let mut intents = removed.get("intents").cloned().unwrap_or_default();
+            for (key, bytes) in data.container("intents").into_iter().flatten() {
+                let intent = decode("intents", bytes)?;
+                if intent["run"]
+                    .as_str()
+                    .is_some_and(|run| runs.contains_key(run))
+                    && let TreeKey::Str(id) = key
+                {
+                    intents.insert(id.clone(), intent);
+                }
+            }
+            value["intents"] = serde_json::Value::Object(intents);
+        }
+        previous =
+            serde_json::from_value(value).map_err(|e| backend(format!("removed records: {e}")))?;
+    }
+    // Evictions: the order keys the patch adds, and the stored correlation
+    // keys of the events it removes.
+    let stored_order = data.container("retention.replay_order");
+    let mut added = vec![];
+    for (path, change) in &patch.changes {
+        if path.field != "retention.replay_order" {
+            continue;
+        }
+        let written: Vec<&TreeKey> = match change {
+            ContainerChange::Entries(rows) => rows
+                .iter()
+                .filter(|(_, new)| new.is_some())
+                .map(|(key, _)| key)
+                .collect(),
+            ContainerChange::Replace(rows) => rows.iter().map(|(key, _)| key).collect(),
+        };
+        for key in written {
+            if stored_order.is_none_or(|c| !c.contains_key(key))
+                && let TreeKey::Str(key) = key
+            {
+                added.push(key.clone());
+            }
+        }
+    }
+    let memberships = |key: &str| -> std::result::Result<Option<Vec<String>>, StorageError> {
+        data.container("indexes.event_memberships")
+            .and_then(|c| c.get(&TreeKey::Str(key.to_string())))
+            .map(|bytes| {
+                serde_json::from_slice(bytes)
+                    .map_err(|e| StorageError::Backend(format!("event memberships record: {e}")))
+            })
+            .transpose()
+    };
+    let evicted = crate::retention::check_evictions(
+        &previous,
+        next,
+        &mut added.into_iter(),
+        &crate::retention::Stored {
+            ordered: &|key| {
+                Ok(stored_order.is_some_and(|c| c.contains_key(&TreeKey::Str(key.to_string()))))
+            },
+            memberships: &memberships,
+            waiters: &|key| {
+                data.container("indexes.waiters")
+                    .and_then(|c| c.get(&TreeKey::Str(key.to_string())))
+                    .map(|bytes| {
+                        serde_json::from_slice(bytes)
+                            .map_err(|e| StorageError::Backend(format!("waiters record: {e}")))
+                    })
+                    .transpose()
+            },
+        },
+    )?;
+    // `previous` holds only removed receipts.
+    crate::retention::check_removals(&previous, next, &|_| false, &|window, key| {
+        evicted.contains(&(window, key.to_string()))
+    })?;
     Ok(())
 }
 fn assemble(data: &RecordData) -> Result<State> {
@@ -529,7 +744,7 @@ fn export(state: &State) -> Result<(RecordData, Accounting)> {
     Ok((data, accounting))
 }
 impl RecordStorage {
-    /// Maintained accounting for `namespace` (for quota proofs).
+    /// Maintained record counts of `namespace`.
     pub fn accounting(&self, namespace: &str) -> Result<Accounting> {
         Ok(self
             .lock()?
@@ -539,6 +754,39 @@ impl RecordStorage {
     }
 }
 impl Storage for RecordStorage {
+    fn persists_history(&self) -> bool {
+        true
+    }
+    fn history_page(
+        &self,
+        namespace: &str,
+        query: &crate::InspectionQuery,
+    ) -> std::result::Result<Vec<crate::HistoryItem>, StorageError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        match guard.get(namespace) {
+            Some(ns) => crate::history::page(&ns.history, query),
+            None => query.validate().map(|()| vec![]),
+        }
+    }
+    fn delete_history(
+        &self,
+        namespace: &str,
+        owner: &str,
+        before_ms: i64,
+    ) -> std::result::Result<u64, StorageError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        let ns = guard
+            .get_mut(namespace)
+            .filter(|ns| ns.owner.as_deref() == Some(owner))
+            .ok_or(StorageError::Ownership)?;
+        Ok(crate::history::delete_before(&mut ns.history, before_ms))
+    }
     fn load(&self, namespace: &str) -> std::result::Result<VersionedState, StorageError> {
         self.stats.full_loads.fetch_add(1, Ordering::Relaxed);
         let guard = self
@@ -580,12 +828,20 @@ impl Storage for RecordStorage {
             return Err(StorageError::Conflict);
         }
         let previous = assemble(&ns.data).map_err(to_storage)?;
-        crate::retention::verify_artifact_removals(&previous, state)?;
-        crate::admission::verify_receipt_retention(&previous, state)?;
+        crate::retention::verify_removals(&previous, state)?;
         let revision = expected_revision
             .checked_add(1)
             .ok_or_else(|| StorageError::Backend("revision exhausted".into()))?;
+        let items = crate::history_items(&state.settled);
+        crate::history::check_new(&ns.history, &items)?;
+        crate::history::check_not_live(state, &items)?;
+        crate::history::check_unrecorded(
+            &ns.history,
+            &crate::history::new_live_keys(&previous, state),
+        )?;
+        // `settled` is not part of the stored header (serde skip).
         let (data, accounting) = export(state).map_err(to_storage)?;
+        crate::history::insert(&mut ns.history, items, &state.retention.policy);
         ns.data = Arc::new(data);
         ns.accounting = accounting;
         ns.revision = revision;
@@ -693,14 +949,20 @@ impl Storage for RecordStorage {
         if !changed {
             return Ok(TransitionOutcome::Unchanged);
         }
+        // `settled` stays on the State for the removal check below.
+        let items = crate::history_items(&state.settled);
+        crate::history::check_not_live(&state, &items)?;
+        source.check()?;
         let patch = take_patch(&mut state)?;
         source.check()?;
+        crate::history::check_unrecorded(&ns.history, &crate::history::patch_live_keys(&patch)?)?;
         let accounting = stage(&ns.data, &ns.accounting, &patch)?;
-        (request.validate)(&state, &accounting.counts())?;
         verify_keyed_admissions(&ns.data, &patch)?;
-        let previous = header_state(&ns.data.header)?;
-        crate::retention::verify_artifact_removals(&previous, &state)?;
+        verify_events(&ns.data, &patch)?;
+        verify_patch_removals(&ns.data, &patch, &state)?;
         source.check()?;
+        crate::history::check_new(&ns.history, &items)?;
+        let policy = state.retention.policy.clone();
         drop(state);
         drop(source);
         let revision = ns
@@ -708,8 +970,22 @@ impl Storage for RecordStorage {
             .checked_add(1)
             .ok_or_else(|| backend("revision exhausted"))?;
         apply(Arc::make_mut(&mut ns.data), patch)?;
+        crate::history::insert(&mut ns.history, items, &policy);
         ns.accounting = accounting;
         ns.revision = revision;
         Ok(TransitionOutcome::Committed { revision })
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn delete_history_of_an_unknown_namespace_creates_no_entry() {
+        let store = RecordStorage::new();
+        assert_eq!(
+            store.delete_history("unknown", "w", 10),
+            Err(StorageError::Ownership)
+        );
+        assert!(!store.inner.lock().unwrap().contains_key("unknown"));
     }
 }

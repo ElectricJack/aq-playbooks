@@ -1,12 +1,11 @@
 use crate::backend;
 use crate::profiling::ObservedTransaction;
+use crate::projection::receipt_kind;
 #[cfg(test)]
 use aq_playbooks_runner::inspection;
 use aq_playbooks_runner::{EffectQueueKind, IndexItem, IndexPage, IndexQuery, State, StorageError};
 use postgres::Client;
-use serde_json::Value;
-#[cfg(test)]
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[cfg(test)]
 fn record(
@@ -133,7 +132,7 @@ fn native_rows(state: &State) -> Vec<Value> {
             rows.push(record(
                 "receipt",
                 run,
-                &offset.to_string(),
+                &crate::projection::receipt_item_key(*seq),
                 "",
                 *seq,
                 state.receipts.get(*offset).map(|r| r.at_ms),
@@ -144,7 +143,7 @@ fn native_rows(state: &State) -> Vec<Value> {
         rows.push(record(
             "all_receipt",
             "",
-            &offset.to_string(),
+            &crate::projection::receipt_item_key(*seq),
             "",
             *seq,
             state.receipts.get(*offset).map(|r| r.at_ms),
@@ -191,6 +190,17 @@ fn delta(previous: Vec<Value>, next: Vec<Value>, keys: &[&str]) -> (Vec<Value>, 
         .collect();
     (changed, deleted)
 }
+/// Delete the runtime-index rows of receipts named in `$2` (kind, run,
+/// sequence as `item_key`) by sequence, whatever key they are stored under;
+/// a row named with `keep` survives under exactly that key. With planner
+/// statistics this is one lookup of `runtime_correlated_sequence` per named
+/// row, then a delete by tuple id: the `OFFSET 0` keeps the planner from
+/// flattening the lookup into a hash join over a scan of the namespace's
+/// rows, which it otherwise prefers on small and mid-sized tables. Without
+/// statistics it may still answer each lookup by a primary-key prefix scan
+/// (no query shape avoids that), which is why opening the storage analyzes
+/// tables that have none (`analyze_unanalyzed`).
+pub(crate) const RECEIPT_ROWS_BY_SEQUENCE_DELETE: &str = "DELETE FROM aq_playbooks.runtime_index WHERE ctid=ANY(ARRAY(SELECT r.ctid FROM jsonb_to_recordset($2) AS d(kind text,lookup_key text,item_key text,keep boolean) CROSS JOIN LATERAL (SELECT old.ctid FROM aq_playbooks.runtime_index old WHERE old.namespace=$1 AND old.kind=d.kind AND old.lookup_key=d.lookup_key AND old.sequence=d.item_key::bigint AND (NOT d.keep OR old.item_key<>d.item_key) OFFSET 0) r))";
 pub(crate) fn sync(
     tx: &mut ObservedTransaction<'_>,
     namespace: &str,
@@ -198,6 +208,31 @@ pub(crate) fn sync(
     next: &State,
 ) -> Result<(), StorageError> {
     let (changed, deleted) = crate::projection::native_delta(previous, next);
+    let is_receipt = |row: &Value| row["kind"].as_str().is_some_and(receipt_kind);
+    // Receipt rows go by sequence, whatever their stored key: a row an
+    // engine before this keyed by the receipt's position is deleted when the
+    // receipt leaves, or when this commit writes the receipt's row (never a
+    // second row for one receipt). O(the receipts this commit adds or
+    // removes); no other receipt's row is touched.
+    let by_sequence: Vec<Value> = deleted
+        .iter()
+        .filter(|row| is_receipt(row))
+        .map(|row| json!({"kind":row["kind"],"lookup_key":row["lookup_key"],"item_key":row["item_key"],"keep":false}))
+        .chain(
+            changed
+                .iter()
+                .filter(|row| is_receipt(row))
+                .map(|row| json!({"kind":row["kind"],"lookup_key":row["lookup_key"],"item_key":row["item_key"],"keep":true})),
+        )
+        .collect();
+    if !by_sequence.is_empty() {
+        tx.execute(
+            RECEIPT_ROWS_BY_SEQUENCE_DELETE,
+            &[&namespace, &Value::Array(by_sequence)],
+        )
+        .map_err(backend)?;
+    }
+    let deleted: Vec<Value> = deleted.into_iter().filter(|row| !is_receipt(row)).collect();
     if !deleted.is_empty() {
         tx.execute("DELETE FROM aq_playbooks.runtime_index old USING jsonb_to_recordset($2) AS d(kind text,lookup_key text,item_key text) WHERE old.namespace=$1 AND (old.kind,old.lookup_key,old.item_key)=(d.kind,d.lookup_key,d.item_key)",&[&namespace,&Value::Array(deleted)]).map_err(backend)?;
     }
@@ -240,7 +275,7 @@ pub(crate) fn query(
         IndexQuery::CorrelatedEvents{key,after_sequence,..}=>{let after=i64::try_from(*after_sequence).map_err(|_|backend("index sequence exhausted"))?;client.query("SELECT item_key,scope,sequence,at_ms FROM aq_playbooks.runtime_index WHERE namespace=$1 AND kind='event' AND lookup_key=$2 AND sequence>$3 ORDER BY sequence,item_key LIMIT $4",&[&namespace,key,&after,&limit])},
         IndexQuery::Waiters{key,..}=>client.query("SELECT item_key,scope,sequence,at_ms FROM aq_playbooks.runtime_index WHERE namespace=$1 AND kind='waiter' AND lookup_key=$2 ORDER BY item_key LIMIT $3",&[&namespace,key,&limit]),
         IndexQuery::Runs{after,..}=>client.query("SELECT item_key,scope,sequence,at_ms FROM aq_playbooks.runtime_index WHERE namespace=$1 AND kind='run' AND ($2::text IS NULL OR item_key>$2) ORDER BY item_key LIMIT $3",&[&namespace,after,&limit]),
-        IndexQuery::Receipts{run,after_sequence,..}=>{let after=i64::try_from(*after_sequence).map_err(|_|backend("index sequence exhausted"))?;let kind=if run.is_some(){"receipt"}else{"all_receipt"};let lookup=run.as_deref().unwrap_or("");client.query("SELECT item_key,scope,sequence,at_ms FROM aq_playbooks.runtime_index WHERE namespace=$1 AND kind=$2 AND lookup_key=$3 AND sequence>$4 ORDER BY sequence,item_key LIMIT $5",&[&namespace,&kind,&lookup,&after,&limit])},
+        IndexQuery::Receipts{run,after_sequence,..}=>{let after=i64::try_from(*after_sequence).map_err(|_|backend("index sequence exhausted"))?;let kind=if run.is_some(){"receipt"}else{"all_receipt"};let lookup=run.as_deref().unwrap_or("");client.query("SELECT lpad(sequence::text,20,'0'),scope,sequence,at_ms FROM aq_playbooks.runtime_index WHERE namespace=$1 AND kind=$2 AND lookup_key=$3 AND sequence>$4 ORDER BY sequence,item_key LIMIT $5",&[&namespace,&kind,&lookup,&after,&limit])},
     }.map_err(backend)?;
     let items: Vec<_> = rows
         .into_iter()
@@ -403,6 +438,81 @@ mod projection_tests {
                 _ => unreachable!(),
             }
             equivalent(&old, &next);
+        }
+    }
+    /// `runs` live runs of `per_run` receipts each, in sequence order, with
+    /// the receipt indexes as the engine keeps them (positions in
+    /// `receipts`).
+    fn receipts_state(runs: usize, per_run: usize) -> State {
+        let mut s = State::default();
+        let mut sequence = 0;
+        for run in 0..runs {
+            for _ in 0..per_run {
+                sequence += 1;
+                s.receipts.push(Receipt {
+                    sequence,
+                    run: format!("run-{run:03}"),
+                    step: "s".into(),
+                    at_ms: sequence as i64,
+                    kind: "admitted".into(),
+                    detail: json!({}),
+                });
+            }
+        }
+        reindex_receipts(&mut s);
+        s
+    }
+    fn reindex_receipts(s: &mut State) {
+        s.indexes.receipts.clear();
+        s.indexes.all_receipts.clear();
+        let live: Vec<(String, u64)> = s
+            .receipts
+            .iter()
+            .map(|r| (r.run.clone(), r.sequence))
+            .collect();
+        for (offset, (run, sequence)) in live.into_iter().enumerate() {
+            s.indexes
+                .receipts
+                .entry(run)
+                .or_default()
+                .insert(sequence, offset);
+            s.indexes.all_receipts.insert(sequence, offset);
+        }
+    }
+    /// The rows of receipt kinds a commit changes or deletes.
+    fn receipt_rows(previous: &State, next: &State) -> (usize, usize) {
+        let receipt =
+            |row: &&Value| matches!(row["kind"].as_str(), Some("receipt" | "all_receipt"));
+        let (changed, deleted) = crate::projection::native_delta(previous, next);
+        (
+            changed.iter().filter(receipt).count(),
+            deleted.iter().filter(receipt).count(),
+        )
+    }
+    /// Task 9 review I1: removing the oldest cohort's receipts compacts
+    /// `receipts`, which moves every later receipt to a new position. The
+    /// runtime-index rows of receipts are keyed by sequence, so the commit
+    /// writes the rows of the receipts it removes or adds, not of every
+    /// receipt that moved.
+    #[test]
+    fn receipt_rows_change_only_for_the_receipts_a_commit_removes_or_adds() {
+        for runs in [10, 40] {
+            let previous = receipts_state(runs, 5);
+            let mut next = previous.clone();
+            next.receipts.retain(|r| r.run != "run-000");
+            reindex_receipts(&mut next);
+            // 5 receipts, one `receipt` and one `all_receipt` row each.
+            assert_eq!(receipt_rows(&previous, &next), (0, 10), "{runs} runs");
+            next.receipts.push(Receipt {
+                sequence: 10_000,
+                run: "run-001".into(),
+                step: "s".into(),
+                at_ms: 10_000,
+                kind: "admitted".into(),
+                detail: json!({}),
+            });
+            reindex_receipts(&mut next);
+            assert_eq!(receipt_rows(&previous, &next), (2, 10), "{runs} runs");
         }
     }
     #[test]

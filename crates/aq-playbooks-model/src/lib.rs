@@ -1,5 +1,7 @@
 //! Versioned, bounded portable workflow format. See FORMAT.md for canonical rules.
+mod draft;
 pub mod schedules;
+pub use draft::{DraftSize, MAX_DRAFT_EXPANSION, MAX_DRAFT_EXPANSION_TOTAL, MAX_DRAFT_SCOPE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -303,7 +305,36 @@ pub enum Expr {
         identity: Vec<String>,
         max_items: usize,
     },
+    /// Chooses by a run-time key from a literal table; `default` when no case matches.
+    Lookup {
+        key: Box<Expr>,
+        cases: Vec<LookupCase>,
+        default: Box<Expr>,
+    },
+    /// Sequential, single-assignment lexical bindings visible to later bindings and `body`.
+    Let {
+        bindings: Vec<LetBinding>,
+        body: Box<Expr>,
+    },
 }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LookupCase {
+    pub when: Value,
+    pub then: Expr,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LetBinding {
+    pub name: String,
+    pub value: Expr,
+}
+pub const MAX_LOOKUP_CASES: usize = 256;
+/// Canonical bytes of one lookup case's `when`.
+pub const MAX_LOOKUP_KEY_BYTES: usize = 1024;
+pub const MAX_LET_BINDINGS: usize = 16;
+/// Roots an expression's lexical names may never take.
+const RESERVED_ROOTS: [&str; 4] = ["input", "event", "definitions", "vars"];
 impl Expr {
     pub fn literal(value: impl Into<Value>) -> Self {
         Self::Literal {
@@ -970,6 +1001,9 @@ fn eval_inner(
                 ));
             }
             let mut result = vec![];
+            // An Unknown item is the result at once. A Missing item does not
+            // stop the loop, so a later Unknown is never hidden behind it.
+            let mut missing = false;
             for v in source {
                 let mut local = context.clone();
                 local.insert(item.clone(), EvalValue::Known(v.clone()));
@@ -987,8 +1021,12 @@ fn eval_inner(
                             result.push(m);
                         }
                     }
-                    unknown => return Ok(unknown),
+                    EvalValue::Missing => missing = true,
+                    unknown @ EvalValue::Unknown(_) => return Ok(unknown),
                 }
+            }
+            if missing {
+                return Ok(EvalValue::Missing);
             }
             known(Value::Array(result))
         }
@@ -1051,6 +1089,51 @@ fn eval_inner(
                 }
             }
             known(Value::Array(result))
+        }
+        Expr::Lookup {
+            key,
+            cases,
+            default,
+        } => {
+            // Every case costs one element, evaluated or not.
+            if cases.len() > MAX_LOOKUP_CASES || cases.len() > *budget {
+                return Err(ModelError::Expression("lookup case/element bound".into()));
+            }
+            *budget -= cases.len();
+            // An Unknown key is the result (conservative evidence, as for eq). A
+            // Missing key, such as an absent optional fact, takes the default.
+            let chosen = match eval_inner(key, context, limits, depth + 1, budget)? {
+                EvalValue::Known(key) => cases
+                    .iter()
+                    .find(|c| c.when == key)
+                    .map_or(&**default, |c| &c.then),
+                EvalValue::Missing => &**default,
+                unknown @ EvalValue::Unknown(_) => return Ok(unknown),
+            };
+            eval_inner(chosen, context, limits, depth + 1, budget)
+        }
+        Expr::Let { bindings, body } => {
+            if bindings.len() > MAX_LET_BINDINGS {
+                return Err(ModelError::Expression("let binding bound".into()));
+            }
+            let mut local = context.clone();
+            let mut unknown = None;
+            for b in bindings {
+                if local.contains_key(&b.name) {
+                    return Err(ModelError::Expression(
+                        "lexical binding shadows existing root".into(),
+                    ));
+                }
+                let value = eval_inner(&b.value, &local, limits, depth + 1, budget)?;
+                // Unknown is never dropped, used or not (as and(false, unknown)).
+                // Missing is bound as an observation that `exists` can test.
+                if unknown.is_none() && matches!(value, EvalValue::Unknown(_)) {
+                    unknown = Some(value.clone());
+                }
+                local.insert(b.name.clone(), value);
+            }
+            let result = eval_inner(body, &local, limits, depth + 1, budget)?;
+            Ok(unknown.unwrap_or(result))
         }
     }
 }
@@ -1711,12 +1794,30 @@ impl ArtifactContent {
                 _ => None,
             })
             .collect();
+        // Roots a let may not rename, wherever in the playbook they are bound.
+        let step_roots: BTreeSet<String> = all_bind_names
+            .iter()
+            .cloned()
+            .chain(p.steps.values().filter_map(|s| match &s.op {
+                Operation::ForEach { item, .. } => Some(item.clone()),
+                _ => None,
+            }))
+            .collect();
         let mut item_names = BTreeSet::new();
-        let mut bound_names = BTreeSet::new();
+        let mut bound_names: BTreeMap<String, String> = BTreeMap::new();
+        // (step, location) of expressions refused for depth: typing them would
+        // report the same fault again.
+        let mut too_deep = BTreeSet::new();
         for (name, step) in &p.steps {
             let path = format!("steps.{name}");
             if !valid_name(name) {
                 issue(&mut issues, "identifier", &path, "invalid step name");
+            }
+            for (at, e) in step_exprs(&step.op) {
+                check_expr_structure(e, &at, &step_roots, &mut vec![], &path, &mut issues);
+                if check_eval_bounds(e, &at, &path, &mut issues) {
+                    too_deep.insert((path.clone(), at));
+                }
             }
             for target in children(step) {
                 if !p.steps.contains_key(target) {
@@ -1735,17 +1836,24 @@ impl ArtifactContent {
                 | Operation::Join { bind, .. } => Some(bind),
                 _ => None,
             };
-            if let Some(bind) = bind
-                && (!valid_name(bind)
+            if let Some(bind) = bind {
+                let other = bound_names.get(bind).cloned();
+                if other.is_none() {
+                    bound_names.insert(bind.clone(), name.clone());
+                }
+                if !valid_name(bind)
                     || matches!(bind.as_str(), "input" | "event" | "definitions" | "vars")
-                    || !bound_names.insert(bind.clone()))
-            {
-                issue(
-                    &mut issues,
-                    "binding",
-                    &path,
-                    "bindings must be valid distinct roots, excluding reserved roots",
-                );
+                    || other.is_some()
+                {
+                    let message = match other {
+                        Some(other) => format!(
+                            "bindings must be valid distinct roots, excluding reserved roots: step `{name}` binds `{bind}`, which step `{other}` already binds"
+                        ),
+                        None => "bindings must be valid distinct roots, excluding reserved roots"
+                            .to_string(),
+                    };
+                    issue(&mut issues, "binding", &path, message);
+                }
             }
             if !matches!(step.op, Operation::Return { .. } | Operation::Decide { .. })
                 && step.on_error.is_none()
@@ -2023,6 +2131,15 @@ impl ArtifactContent {
         let mut trigger_ids = BTreeSet::new();
         for t in &p.triggers {
             let path = format!("triggers.{}", t.id);
+            check_expr_structure(
+                &t.input,
+                "input",
+                &step_roots,
+                &mut vec![],
+                &path,
+                &mut issues,
+            );
+            let trigger_too_deep = check_eval_bounds(&t.input, "input", &path, &mut issues);
             if !valid_name(&t.id) || !trigger_ids.insert(t.id.clone()) {
                 issue(
                     &mut issues,
@@ -2057,9 +2174,18 @@ impl ArtifactContent {
                             "event scope incompatible with playbook",
                         );
                     }
-                    if let Some(entry) = p.entries.get(&t.entry) {
+                    if let Some(entry) = p.entries.get(&t.entry)
+                        && !trigger_too_deep
+                    {
                         let roots = BTreeMap::from([("event".into(), e.payload.clone())]);
-                        check_expr_compat(&t.input, &roots, &entry.input, &path, &mut issues);
+                        check_expr_compat(
+                            &t.input,
+                            &roots,
+                            &entry.input,
+                            &path,
+                            "input",
+                            &mut issues,
+                        );
                     }
                 }
                 None => issue(&mut issues, "unknown_event", &path, "unknown trigger event"),
@@ -2070,7 +2196,7 @@ impl ArtifactContent {
             let mut local = BTreeSet::new();
             walk(&e.start, &p.steps, &mut local);
             reachable.extend(local.iter().cloned());
-            self.validate_types(name, e, &local, &mut issues);
+            self.validate_types(name, e, &local, &too_deep, &mut issues);
         }
         for name in p.steps.keys() {
             if !reachable.contains(name) {
@@ -2122,6 +2248,366 @@ impl ArtifactContent {
         issues
     }
 }
+/// Every expression of an operation, with its location inside the step.
+fn step_exprs(op: &Operation) -> Vec<(String, &Expr)> {
+    match op {
+        Operation::Invoke { input, .. } | Operation::Call { input, .. } => {
+            vec![("input".into(), input)]
+        }
+        Operation::Decide { predicate } => vec![("predicate".into(), predicate)],
+        Operation::Wait {
+            correlation,
+            minimum_revision,
+            ..
+        } => correlation
+            .iter()
+            .map(|(k, e)| (format!("correlation.{k}"), e))
+            .chain(
+                minimum_revision
+                    .iter()
+                    .map(|e| ("minimum_revision".into(), e)),
+            )
+            .collect(),
+        Operation::ForEach { collection, .. } => vec![("collection".into(), collection)],
+        Operation::Join { members, .. } => members
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (format!("members[{i}]"), e))
+            .collect(),
+        Operation::Return { output, .. } => vec![("output".into(), output)],
+    }
+}
+fn op_name(expr: &Expr) -> &'static str {
+    match expr {
+        Expr::Literal { .. } => "literal",
+        Expr::Ref { .. } => "ref",
+        Expr::Object { .. } => "object",
+        Expr::Array { .. } => "array",
+        Expr::Exists { .. } => "exists",
+        Expr::Not { .. } => "not",
+        Expr::And { .. } => "and",
+        Expr::Or { .. } => "or",
+        Expr::Eq { .. } => "eq",
+        Expr::Lt { .. } => "lt",
+        Expr::Contains { .. } => "contains",
+        Expr::Map { .. } => "map",
+        Expr::Filter { .. } => "filter",
+        Expr::Difference { .. } => "difference",
+        Expr::Lookup { .. } => "lookup",
+        Expr::Let { .. } => "let",
+    }
+}
+/// The location of `expr`'s operand `field` (".left", ".cases[0].then") below
+/// `at`. Object fields and array items need no operator name: `at.field`, `at[i]`.
+fn operand(at: &str, expr: &Expr, field: &str) -> String {
+    match expr {
+        Expr::Object { .. } | Expr::Array { .. } => format!("{at}{field}"),
+        _ => format!("{at}.{}{field}", op_name(expr)),
+    }
+}
+/// A JSON value shortened for a diagnostic.
+fn shown(value: &Value) -> String {
+    let text = value.to_string();
+    if text.len() <= 80 {
+        return text;
+    }
+    let mut end = 77;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+/// Bounds of lookup tables and let bindings, and the names a let may take.
+/// `step_roots` are the playbook's binds and iteration items; `lexical` holds
+/// the names of enclosing lets and collection items. `at` is the expression's
+/// location inside the step at `path`.
+fn check_expr_structure(
+    expr: &Expr,
+    at: &str,
+    step_roots: &BTreeSet<String>,
+    lexical: &mut Vec<String>,
+    path: &str,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let sub = |e: &Expr, field: &str, lexical: &mut Vec<String>, issues: &mut Vec<_>| {
+        check_expr_structure(
+            e,
+            &operand(at, expr, field),
+            step_roots,
+            lexical,
+            path,
+            issues,
+        )
+    };
+    match expr {
+        Expr::Literal { .. } | Expr::Ref { .. } => {}
+        Expr::Object { fields } => {
+            for (k, e) in fields {
+                sub(e, &format!(".{k}"), lexical, issues);
+            }
+        }
+        Expr::Array { items } => {
+            for (i, e) in items.iter().enumerate() {
+                sub(e, &format!("[{i}]"), lexical, issues);
+            }
+        }
+        Expr::Exists { value } | Expr::Not { value } => sub(value, ".value", lexical, issues),
+        Expr::And { values } | Expr::Or { values } => {
+            for (i, e) in values.iter().enumerate() {
+                sub(e, &format!(".values[{i}]"), lexical, issues);
+            }
+        }
+        Expr::Eq { left, right }
+        | Expr::Lt { left, right }
+        | Expr::Difference { left, right, .. } => {
+            sub(left, ".left", lexical, issues);
+            sub(right, ".right", lexical, issues);
+        }
+        Expr::Contains { collection, value } => {
+            sub(collection, ".collection", lexical, issues);
+            sub(value, ".value", lexical, issues);
+        }
+        Expr::Map {
+            collection,
+            item,
+            value,
+            ..
+        }
+        | Expr::Filter {
+            collection,
+            item,
+            predicate: value,
+            ..
+        } => {
+            sub(collection, ".collection", lexical, issues);
+            lexical.push(item.clone());
+            let field = if matches!(expr, Expr::Map { .. }) {
+                ".value"
+            } else {
+                ".predicate"
+            };
+            sub(value, field, lexical, issues);
+            lexical.pop();
+        }
+        Expr::Lookup {
+            key,
+            cases,
+            default,
+        } => {
+            if cases.len() > MAX_LOOKUP_CASES {
+                issue(
+                    issues,
+                    "expression_limit",
+                    path,
+                    format!(
+                        "{path}.{at}.lookup: has {} cases; a lookup has at most {MAX_LOOKUP_CASES}. Split the table, or compute part of the key first.",
+                        cases.len()
+                    ),
+                );
+            }
+            let mut seen = BTreeMap::new();
+            for (i, c) in cases.iter().enumerate() {
+                let when = format!("{path}.{at}.lookup.cases[{i}].when");
+                match canonical_bytes(&c.when) {
+                    Err(e) => issue(
+                        issues,
+                        "lookup_case",
+                        path,
+                        format!(
+                            "{when}: is not canonical JSON ({e}); use integers, strings, booleans, null, arrays or objects"
+                        ),
+                    ),
+                    Ok(bytes) => {
+                        if bytes.len() > MAX_LOOKUP_KEY_BYTES {
+                            issue(
+                                issues,
+                                "expression_limit",
+                                path,
+                                format!(
+                                    "{when}: is {} canonical bytes; a `when` has at most {MAX_LOOKUP_KEY_BYTES}",
+                                    bytes.len()
+                                ),
+                            );
+                        }
+                        if let Some(first) = seen.insert(bytes, i) {
+                            issue(
+                                issues,
+                                "lookup_case",
+                                path,
+                                format!(
+                                    "{when}: {} equals cases[{first}].when; each `when` must be distinct, so remove or merge one of the two cases",
+                                    shown(&c.when)
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            sub(key, ".key", lexical, issues);
+            for (i, c) in cases.iter().enumerate() {
+                sub(&c.then, &format!(".cases[{i}].then"), lexical, issues);
+            }
+            sub(default, ".default", lexical, issues);
+        }
+        Expr::Let { bindings, body } => {
+            if bindings.len() > MAX_LET_BINDINGS {
+                issue(
+                    issues,
+                    "expression_limit",
+                    path,
+                    format!(
+                        "{path}.{at}.let: has {} bindings; a let has at most {MAX_LET_BINDINGS}. Nest a second let in the body for the rest.",
+                        bindings.len()
+                    ),
+                );
+            }
+            let outer = lexical.len();
+            for (i, b) in bindings.iter().enumerate() {
+                sub(&b.value, &format!(".bindings[{i}].value"), lexical, issues);
+                let name = &b.name;
+                let refusal = if !valid_name(name) {
+                    Some("is not a valid name (1-128 of A-Z a-z 0-9 _ - .)")
+                } else if RESERVED_ROOTS.contains(&name.as_str()) {
+                    Some("is a reserved root (input, event, definitions, vars)")
+                } else if step_roots.contains(name) {
+                    Some("is already the name of a step binding or foreach item in this playbook")
+                } else if lexical.contains(name) {
+                    Some(
+                        "is already bound by an enclosing let, map or filter, or earlier in this let",
+                    )
+                } else {
+                    None
+                };
+                if let Some(refusal) = refusal {
+                    issue(
+                        issues,
+                        "binding",
+                        path,
+                        format!(
+                            "{path}.{at}.let.bindings[{i}].name: `{name}` {refusal}; choose another name"
+                        ),
+                    );
+                }
+                lexical.push(name.clone());
+            }
+            sub(body, ".body", lexical, issues);
+            lexical.truncate(outer);
+        }
+    }
+}
+/// Worst-case evaluation cost: nesting depth and elements charged to the budget.
+struct EvalCost {
+    depth: usize,
+    elements: usize,
+    lookup_or_let: bool,
+}
+fn eval_cost(expr: &Expr) -> EvalCost {
+    let mut depth = 0;
+    let mut lookup_or_let = matches!(expr, Expr::Lookup { .. } | Expr::Let { .. });
+    let mut visit = |e: &Expr| {
+        let c = eval_cost(e);
+        depth = depth.max(c.depth + 1);
+        lookup_or_let |= c.lookup_or_let;
+        c.elements
+    };
+    let sum = |es: &mut dyn Iterator<Item = &Expr>, visit: &mut dyn FnMut(&Expr) -> usize| {
+        es.fold(0usize, |n, e| n.saturating_add(visit(e)))
+    };
+    let below = match expr {
+        Expr::Literal { .. } | Expr::Ref { .. } => 0,
+        Expr::Object { fields } => sum(&mut fields.values(), &mut visit),
+        Expr::Array { items: values } | Expr::And { values } | Expr::Or { values } => {
+            sum(&mut values.iter(), &mut visit)
+        }
+        Expr::Exists { value } | Expr::Not { value } => visit(value),
+        Expr::Eq { left, right }
+        | Expr::Lt { left, right }
+        | Expr::Contains {
+            collection: left,
+            value: right,
+        } => visit(left).saturating_add(visit(right)),
+        Expr::Difference {
+            left,
+            right,
+            max_items,
+            ..
+        } => visit(left)
+            .saturating_add(visit(right))
+            .saturating_add(max_items.saturating_mul(2)),
+        // Each item evaluates the body once; eval refuses more than max_items.
+        Expr::Map {
+            collection,
+            value,
+            max_items,
+            ..
+        }
+        | Expr::Filter {
+            collection,
+            predicate: value,
+            max_items,
+            ..
+        } => visit(collection).saturating_add(max_items.saturating_mul(visit(value))),
+        // Every case is charged; one branch is evaluated.
+        Expr::Lookup {
+            key,
+            cases,
+            default,
+        } => {
+            let branch = cases
+                .iter()
+                .map(|c| &c.then)
+                .chain([&**default])
+                .map(&mut visit)
+                .max()
+                .unwrap_or(0);
+            cases
+                .len()
+                .saturating_add(visit(key))
+                .saturating_add(branch)
+        }
+        Expr::Let { bindings, body } => {
+            sum(&mut bindings.iter().map(|b| &b.value), &mut visit).saturating_add(visit(body))
+        }
+    };
+    EvalCost {
+        depth,
+        elements: below.saturating_add(1),
+        lookup_or_let,
+    }
+}
+/// An expression that uses lookup or let must fit the evaluator's limits on
+/// every path, so nothing validation accepts fails on depth or element budget at
+/// run time. Returns whether the depth was refused (typing then adds nothing).
+fn check_eval_bounds(expr: &Expr, at: &str, path: &str, issues: &mut Vec<ValidationIssue>) -> bool {
+    let cost = eval_cost(expr);
+    if !cost.lookup_or_let {
+        return false;
+    }
+    let limits = EvalLimits::default();
+    if cost.depth > limits.max_depth {
+        issue(
+            issues,
+            "expression_limit",
+            path,
+            format!(
+                "{path}.{at}: nests {} levels deep; evaluation stops past depth {}. Flatten it: move part of the work to an earlier step, or turn a chain of lookups into one table.",
+                cost.depth, limits.max_depth
+            ),
+        );
+    }
+    if cost.elements > limits.max_elements {
+        issue(
+            issues,
+            "expression_limit",
+            path,
+            format!(
+                "{path}.{at}: may charge up to {} elements; evaluation stops past {} (one per expression, one per lookup case, and a map or filter body once per item up to its max_items). Lower max_items or shrink the tables.",
+                cost.elements, limits.max_elements
+            ),
+        );
+    }
+    cost.depth > limits.max_depth
+}
 fn walk(name: &str, steps: &BTreeMap<String, Step>, seen: &mut BTreeSet<String>) {
     let mut pending = vec![name.to_owned()];
     while let Some(name) = pending.pop() {
@@ -2159,6 +2645,19 @@ fn unbounded_cycle(
     false
 }
 
+/// The item type of an empty array: no value has it, so it merges into any
+/// type and is assignable to any (an empty union). Only inference produces it;
+/// it never appears in a contract or an artifact.
+fn no_type() -> Schema {
+    Schema::Union { variants: vec![] }
+}
+fn is_no_type(schema: &Schema) -> bool {
+    matches!(schema, Schema::Union { variants } if variants.is_empty())
+}
+/// A boolean position also accepts a value of no type (an item of `[]`).
+fn is_boolean(schema: &Schema) -> bool {
+    *schema == Schema::Boolean || is_no_type(schema)
+}
 fn literal_schema(value: &Value) -> Result<Schema, String> {
     match value {
         Value::Null => Ok(Schema::Null),
@@ -2186,7 +2685,7 @@ fn literal_schema(value: &Value) -> Result<Schema, String> {
                 });
             }
             Ok(Schema::Array {
-                items: Box::new(item.unwrap_or(Schema::Null)),
+                items: Box::new(item.unwrap_or_else(no_type)),
                 max_items: a.len().max(1),
             })
         }
@@ -2198,8 +2697,11 @@ fn literal_schema(value: &Value) -> Result<Schema, String> {
     }
 }
 fn merge_schema(a: &Schema, b: &Schema) -> Option<Schema> {
-    if a == b {
+    if a == b || is_no_type(b) {
         return Some(a.clone());
+    }
+    if is_no_type(a) {
+        return Some(b.clone());
     }
     match (a, b) {
         (Schema::Null, b @ Schema::Nullable { .. })
@@ -2312,33 +2814,146 @@ fn union_schemas<'a>(schemas: impl Iterator<Item = &'a Schema>) -> Option<Schema
     }
     result
 }
+/// A typing error at the location (inside the step) of the innermost
+/// expression that caused it.
+#[derive(Debug)]
+struct TypeError {
+    at: Option<String>,
+    message: String,
+    /// The structural checks already reported this fault; typing adds nothing.
+    reported: bool,
+}
+impl From<String> for TypeError {
+    fn from(message: String) -> Self {
+        Self {
+            at: None,
+            message,
+            reported: false,
+        }
+    }
+}
+impl From<&str> for TypeError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+impl TypeError {
+    fn at(at: String, message: String) -> Self {
+        Self {
+            at: Some(at),
+            message,
+            reported: false,
+        }
+    }
+    fn render(&self, path: &str) -> String {
+        format!(
+            "{path}.{}: {}",
+            self.at.as_deref().unwrap_or_default(),
+            self.message
+        )
+    }
+}
+/// A schema in words, for diagnostics an author fixes a draft from.
+fn describe(schema: &Schema) -> String {
+    let text = match schema {
+        Schema::Null => "null".to_string(),
+        Schema::Boolean => "boolean".to_string(),
+        Schema::Integer { minimum, maximum } if minimum == maximum => {
+            format!("the integer {minimum}")
+        }
+        Schema::Integer {
+            minimum: i64::MIN,
+            maximum: i64::MAX,
+        } => "integer".to_string(),
+        Schema::Integer { minimum, maximum } => format!("integer {minimum}..{maximum}"),
+        Schema::String { max_length, values } if values.is_empty() => {
+            format!("string of at most {max_length} bytes")
+        }
+        Schema::String { values, .. } => {
+            let mut shown: Vec<_> = values.iter().take(12).map(|v| format!("{v:?}")).collect();
+            if values.len() > 12 {
+                shown.push(format!("and {} more", values.len() - 12));
+            }
+            format!("string, one of {}", shown.join(", "))
+        }
+        Schema::Array { items, .. } if is_no_type(items) => "empty array".to_string(),
+        Schema::Array { items, max_items } => {
+            format!("array of at most {max_items} ({})", describe(items))
+        }
+        Schema::Object {
+            properties,
+            required,
+        } => format!(
+            "object {{{}}}",
+            properties
+                .iter()
+                .map(|(k, v)| {
+                    let optional = if required.contains(k) { "" } else { "?" };
+                    format!("{k}{optional}: {}", describe(v))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Schema::Nullable { inner } => format!("null or {}", describe(inner)),
+        Schema::Union { variants } if variants.is_empty() => "no value".to_string(),
+        Schema::Union { variants } => format!(
+            "one of ({})",
+            variants
+                .iter()
+                .map(describe)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ),
+    };
+    if text.len() <= 400 {
+        return text;
+    }
+    let mut end = 397;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
 fn infer_expr(
     expr: &Expr,
     roots: &BTreeMap<String, Schema>,
     depth: usize,
-) -> Result<Schema, String> {
+    at: &str,
+) -> Result<Schema, TypeError> {
+    infer_node(expr, roots, depth, at).map_err(|mut e| {
+        e.at.get_or_insert_with(|| at.to_string());
+        e
+    })
+}
+fn infer_node(
+    expr: &Expr,
+    roots: &BTreeMap<String, Schema>,
+    depth: usize,
+    at: &str,
+) -> Result<Schema, TypeError> {
     if depth > 32 {
         return Err("expression nesting exceeds 32".into());
     }
-    let sub = |e: &Expr| infer_expr(e, roots, depth + 1);
+    let sub = |e: &Expr, field: &str| infer_expr(e, roots, depth + 1, &operand(at, expr, field));
     match expr {
-        Expr::Literal { value } => literal_schema(value),
+        Expr::Literal { value } => Ok(literal_schema(value)?),
         Expr::Ref { root, path } => {
             let current = roots
                 .get(root)
                 .ok_or_else(|| format!("unknown or unsupported typed root {root}"))?;
             schema_path(current, path)
+                .map_err(|error| unreadable_ref(root, path, current, error).into())
         }
         Expr::Object { fields } => Ok(Schema::object(
             fields
                 .iter()
-                .map(|(k, e)| Ok((k.clone(), sub(e)?)))
-                .collect::<Result<_, String>>()?,
+                .map(|(k, e)| Ok((k.clone(), sub(e, &format!(".{k}"))?)))
+                .collect::<Result<_, TypeError>>()?,
         )),
         Expr::Array { items } => {
             let mut s = None;
-            for e in items {
-                let x = sub(e)?;
+            for (i, e) in items.iter().enumerate() {
+                let x = sub(e, &format!("[{i}]"))?;
                 s = Some(match s {
                     None => x,
                     Some(old) => merge_schema(&old, &x)
@@ -2346,39 +2961,39 @@ fn infer_expr(
                 });
             }
             Ok(Schema::Array {
-                items: Box::new(s.unwrap_or(Schema::Null)),
+                items: Box::new(s.unwrap_or_else(no_type)),
                 max_items: items.len().max(1),
             })
         }
         Expr::Exists { value } => {
-            sub(value)?;
+            sub(value, ".value")?;
             Ok(Schema::Boolean)
         }
         Expr::Not { value } => {
-            if sub(value)? != Schema::Boolean {
+            if !is_boolean(&sub(value, ".value")?) {
                 return Err("not requires boolean expression".into());
             }
             Ok(Schema::Boolean)
         }
         Expr::And { values } | Expr::Or { values } => {
-            for e in values {
-                if sub(e)? != Schema::Boolean {
+            for (i, e) in values.iter().enumerate() {
+                if !is_boolean(&sub(e, &format!(".values[{i}]"))?) {
                     return Err("boolean logic requires booleans".into());
                 }
             }
             Ok(Schema::Boolean)
         }
         Expr::Eq { left, right } => {
-            let a = sub(left)?;
-            let b = sub(right)?;
+            let a = sub(left, ".left")?;
+            let b = sub(right, ".right")?;
             if merge_schema(&a, &b).is_none() {
                 return Err("equality compares incompatible types".into());
             }
             Ok(Schema::Boolean)
         }
         Expr::Lt { left, right } => {
-            let a = sub(left)?;
-            let b = sub(right)?;
+            let a = sub(left, ".left")?;
+            let b = sub(right, ".right")?;
             if !matches!(
                 (&a, &b),
                 (Schema::Integer { .. }, Schema::Integer { .. })
@@ -2389,10 +3004,10 @@ fn infer_expr(
             Ok(Schema::Boolean)
         }
         Expr::Contains { collection, value } => {
-            let Schema::Array { items, .. } = sub(collection)? else {
+            let Schema::Array { items, .. } = sub(collection, ".collection")? else {
                 return Err("membership requires bounded array".into());
             };
-            if merge_schema(&items, &sub(value)?).is_none() {
+            if merge_schema(&items, &sub(value, ".value")?).is_none() {
                 return Err("membership value has incompatible type".into());
             }
             Ok(Schema::Boolean)
@@ -2412,7 +3027,7 @@ fn infer_expr(
             let Schema::Array {
                 items,
                 max_items: bound,
-            } = sub(collection)?
+            } = sub(collection, ".collection")?
             else {
                 return Err("collection expression requires bounded array".into());
             };
@@ -2424,9 +3039,11 @@ fn infer_expr(
             }
             let mut local = roots.clone();
             local.insert(item.clone(), *items.clone());
-            let result = infer_expr(value, &local, depth + 1)?;
-            if matches!(expr, Expr::Filter { .. }) {
-                if result != Schema::Boolean {
+            let filter = matches!(expr, Expr::Filter { .. });
+            let field = if filter { ".predicate" } else { ".value" };
+            let result = infer_expr(value, &local, depth + 1, &operand(at, expr, field))?;
+            if filter {
+                if !is_boolean(&result) {
                     return Err("filter predicate requires boolean".into());
                 }
                 Ok(Schema::Array {
@@ -2449,14 +3066,14 @@ fn infer_expr(
             let Schema::Array {
                 items: a,
                 max_items: x,
-            } = sub(left)?
+            } = sub(left, ".left")?
             else {
                 return Err("difference requires bounded arrays".into());
             };
             let Schema::Array {
                 items: b,
                 max_items: y,
-            } = sub(right)?
+            } = sub(right, ".right")?
             else {
                 return Err("difference requires bounded arrays".into());
             };
@@ -2466,6 +3083,7 @@ fn infer_expr(
                 );
             }
             let roots = BTreeMap::from([("left".into(), *a.clone()), ("right".into(), *b)]);
+            let identity_at = operand(at, expr, ".identity");
             let a_key = infer_expr(
                 &Expr::Ref {
                     root: "left".into(),
@@ -2473,6 +3091,7 @@ fn infer_expr(
                 },
                 &roots,
                 depth + 1,
+                &identity_at,
             )?;
             let b_key = infer_expr(
                 &Expr::Ref {
@@ -2481,6 +3100,7 @@ fn infer_expr(
                 },
                 &roots,
                 depth + 1,
+                &identity_at,
             )?;
             if merge_schema(&a_key, &b_key).is_none() {
                 return Err("difference identities incompatible".into());
@@ -2490,20 +3110,167 @@ fn infer_expr(
                 max_items: x,
             })
         }
+        Expr::Lookup {
+            key,
+            cases,
+            default,
+        } => {
+            check_lookup_key(key, cases, roots, depth, at)?;
+            let mut results = vec![];
+            for (i, c) in cases.iter().enumerate() {
+                results.push((
+                    format!("cases[{i}].then"),
+                    sub(&c.then, &format!(".cases[{i}].then"))?,
+                ));
+            }
+            results.push(("default".into(), sub(default, ".default")?));
+            union_schemas(results.iter().map(|(_, s)| s)).ok_or_else(|| {
+                let branches: Vec<_> = results
+                    .iter()
+                    .map(|(branch, s)| format!("{branch}: {}", describe(s)))
+                    .collect();
+                TypeError::at(
+                    format!("{at}.lookup"),
+                    format!(
+                        "the results have more than 16 distinct types, so the lookup has no type. Make the branches the same kind of value. Branch types: {}",
+                        branches.join("; ")
+                    ),
+                )
+            })
+        }
+        Expr::Let { bindings, body } => {
+            let local = let_roots(bindings, roots, depth, at)?;
+            infer_expr(body, &local, depth + 1, &format!("{at}.let.body"))
+        }
     }
 }
+/// The key's type, loosened for matching: any integer and any string length
+/// can be a key's value, but a string enum, a kind and a shape are kept.
+fn matchable(schema: &Schema) -> Schema {
+    match schema {
+        Schema::Integer { .. } => Schema::Integer {
+            minimum: i64::MIN,
+            maximum: i64::MAX,
+        },
+        Schema::String { values, .. } => Schema::String {
+            max_length: usize::MAX,
+            values: values.clone(),
+        },
+        Schema::Array { items, max_items } => Schema::Array {
+            items: Box::new(matchable(items)),
+            max_items: *max_items,
+        },
+        Schema::Object {
+            properties,
+            required,
+        } => Schema::Object {
+            properties: properties
+                .iter()
+                .map(|(k, v)| (k.clone(), matchable(v)))
+                .collect(),
+            required: required.clone(),
+        },
+        Schema::Nullable { inner } => Schema::Nullable {
+            inner: Box::new(matchable(inner)),
+        },
+        Schema::Union { variants } => Schema::Union {
+            variants: variants.iter().map(matchable).collect(),
+        },
+        other => other.clone(),
+    }
+}
+/// Every `when` must be a value the key can take, so each case can match.
+fn check_lookup_key(
+    key: &Expr,
+    cases: &[LookupCase],
+    roots: &BTreeMap<String, Schema>,
+    depth: usize,
+    at: &str,
+) -> Result<(), TypeError> {
+    let key_at = format!("{at}.lookup.key");
+    let key_type = infer_expr(key, roots, depth + 1, &key_at)?;
+    let can_match = matchable(&key_type);
+    let never: Vec<_> = cases
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| can_match.validate(&c.when).is_err())
+        .collect();
+    let Some(((first, c), rest)) = never.split_first() else {
+        return Ok(());
+    };
+    let mut message = format!(
+        "`when` {} can never match: the key ({key_at}) has type {}",
+        shown(&c.when),
+        describe(&key_type)
+    );
+    if !rest.is_empty() {
+        let others: Vec<_> = rest
+            .iter()
+            .map(|(i, c)| format!("cases[{i}] ({})", shown(&c.when)))
+            .collect();
+        message.push_str(&format!("; nor can {}", others.join(", ")));
+    }
+    message.push_str(". Change the `when` to a value of the key's type, or change the key.");
+    Err(TypeError::at(
+        format!("{at}.lookup.cases[{first}].when"),
+        message,
+    ))
+}
+/// The roots visible to a let body: each binding typed with the bindings before it.
+fn let_roots(
+    bindings: &[LetBinding],
+    roots: &BTreeMap<String, Schema>,
+    depth: usize,
+    at: &str,
+) -> Result<BTreeMap<String, Schema>, TypeError> {
+    let mut local = roots.clone();
+    for (i, b) in bindings.iter().enumerate() {
+        if local.contains_key(&b.name) || !valid_name(&b.name) {
+            // check_expr_structure refuses every such name, with its reason.
+            return Err(TypeError {
+                at: Some(format!("{at}.let.bindings[{i}].name")),
+                message: format!("let binding `{}` shadows a root", b.name),
+                reported: true,
+            });
+        }
+        let schema = infer_expr(
+            &b.value,
+            &local,
+            depth + 1,
+            &format!("{at}.let.bindings[{i}].value"),
+        )?;
+        local.insert(b.name.clone(), schema);
+    }
+    Ok(local)
+}
+fn type_issue(issues: &mut Vec<ValidationIssue>, path: &str, e: TypeError) {
+    if !e.reported {
+        issue(issues, "expression_type", path, e.render(path));
+    }
+}
+/// Checks `expr`, at location `at` inside the step at `path`, against `target`.
 fn check_expr_compat(
     expr: &Expr,
     roots: &BTreeMap<String, Schema>,
     target: &Schema,
     path: &str,
+    at: &str,
     issues: &mut Vec<ValidationIssue>,
 ) {
     // Empty literals and arrays have no inherent element type; validate literal
     // values directly against the expected schema rather than inventing one.
     if let Expr::Literal { value } = expr {
-        if let Err(e) = target.validate(value) {
-            issue(issues, "schema_compatibility", path, e.to_string());
+        if target.validate(value).is_err() {
+            issue(
+                issues,
+                "schema_compatibility",
+                path,
+                format!(
+                    "{path}.{at}: literal {} is not a value of the target type {}",
+                    shown(value),
+                    describe(target)
+                ),
+            );
         }
         return;
     }
@@ -2515,19 +3282,28 @@ fn check_expr_compat(
         },
     ) = (expr, target)
     {
-        if required.iter().any(|k| !fields.contains_key(k))
-            || fields.keys().any(|k| !properties.contains_key(k))
-        {
+        let missing: Vec<_> = required
+            .iter()
+            .filter(|k| !fields.contains_key(*k))
+            .collect();
+        let unknown: Vec<_> = fields
+            .keys()
+            .filter(|k| !properties.contains_key(*k))
+            .collect();
+        if !missing.is_empty() || !unknown.is_empty() {
             issue(
                 issues,
                 "schema_compatibility",
                 path,
-                "expression object keys incompatible with closed target schema",
+                format!(
+                    "{path}.{at}: expression object keys incompatible with closed target schema: missing required {missing:?}, not allowed {unknown:?}; the target is {}",
+                    describe(target)
+                ),
             );
         }
         for (k, e) in fields {
             if let Some(t) = properties.get(k) {
-                check_expr_compat(e, roots, t, path, issues);
+                check_expr_compat(e, roots, t, path, &format!("{at}.{k}"), issues);
             }
         }
         return;
@@ -2545,26 +3321,73 @@ fn check_expr_compat(
                 issues,
                 "schema_compatibility",
                 path,
-                "expression array exceeds target bound",
+                format!(
+                    "{path}.{at}: expression array exceeds target bound: {} items, at most {max_items}",
+                    items.len()
+                ),
             );
         }
-        for e in items {
-            check_expr_compat(e, roots, target, path, issues);
+        for (i, e) in items.iter().enumerate() {
+            check_expr_compat(e, roots, target, path, &format!("{at}[{i}]"), issues);
         }
         return;
     }
-    match infer_expr(expr, roots, 0) {
+    // Each result of a lookup, and a let's body, meets the target directly, so a
+    // refused branch is named with its own type.
+    if let Expr::Lookup {
+        key,
+        cases,
+        default,
+    } = expr
+    {
+        if let Err(e) = check_lookup_key(key, cases, roots, 0, at) {
+            type_issue(issues, path, e);
+            return;
+        }
+        for (i, c) in cases.iter().enumerate() {
+            let at = format!("{at}.lookup.cases[{i}].then");
+            check_expr_compat(&c.then, roots, target, path, &at, issues);
+        }
+        check_expr_compat(
+            default,
+            roots,
+            target,
+            path,
+            &format!("{at}.lookup.default"),
+            issues,
+        );
+        return;
+    }
+    if let Expr::Let { bindings, body } = expr {
+        match let_roots(bindings, roots, 0, at) {
+            Ok(local) => check_expr_compat(
+                body,
+                &local,
+                target,
+                path,
+                &format!("{at}.let.body"),
+                issues,
+            ),
+            Err(e) => type_issue(issues, path, e),
+        }
+        return;
+    }
+    match infer_expr(expr, roots, 0, at) {
         Ok(source) => {
             if !source.assignable_to(target) {
                 issue(
                     issues,
                     "schema_compatibility",
                     path,
-                    "expression type/bounds not assignable to target schema",
+                    format!(
+                        "{path}.{at}: expression type/bounds not assignable to target schema: it has type {}, the target is {}",
+                        describe(&source),
+                        describe(target)
+                    ),
                 );
             }
         }
-        Err(e) => issue(issues, "expression_type", path, e),
+        Err(e) => type_issue(issues, path, e),
     }
 }
 impl ArtifactContent {
@@ -2573,6 +3396,7 @@ impl ArtifactContent {
         entry_name: &str,
         entry: &EntryPoint,
         reachable: &BTreeSet<String>,
+        too_deep: &BTreeSet<(String, String)>,
         issues: &mut Vec<ValidationIssue>,
     ) {
         let p = &self.playbook;
@@ -2649,7 +3473,8 @@ impl ArtifactContent {
                         },
                     ..
                 }) = p.steps.get(name)
-                    && let Ok(Schema::Array { items, .. }) = infer_expr(collection, &roots, 0)
+                    && let Ok(Schema::Array { items, .. }) =
+                        infer_expr(collection, &roots, 0, "collection")
                 {
                     roots.entry(item.clone()).or_insert(*items);
                 }
@@ -2677,46 +3502,47 @@ impl ArtifactContent {
             };
             roots.insert("vars".into(), vars);
             let path = format!("steps.{name}");
-            let infer = |e: &Expr, issues: &mut Vec<ValidationIssue>| {
-                if let Err(e) = infer_expr(e, &roots, 0) {
-                    issue(issues, "expression_type", &path, e);
+            let typed = |at: &str| !too_deep.contains(&(path.clone(), at.to_string()));
+            let check = |e: &Expr, at: &str, target: &Schema, issues: &mut Vec<_>| {
+                if typed(at) {
+                    check_expr_compat(e, &roots, target, &path, at, issues);
                 }
             };
             match &s.op {
                 Operation::Invoke { command, input, .. } => {
                     if let Some(c) = self.registry.commands.get(&command.name) {
-                        check_expr_compat(input, &roots, &c.input, &path, issues);
+                        check(input, "input", &c.input, issues);
                     }
                 }
                 Operation::Decide { predicate } => {
-                    check_expr_compat(predicate, &roots, &Schema::Boolean, &path, issues)
+                    check(predicate, "predicate", &Schema::Boolean, issues)
                 }
                 Operation::Wait {
                     correlation,
                     minimum_revision,
                     ..
                 } => {
-                    for e in correlation.values() {
-                        check_expr_compat(e, &roots, &Schema::string(1024), &path, issues);
-                    }
-                    if let Some(e) = minimum_revision {
-                        check_expr_compat(
+                    for (k, e) in correlation {
+                        check(
                             e,
-                            &roots,
-                            &Schema::Integer {
-                                minimum: 0,
-                                maximum: i64::MAX,
-                            },
-                            &path,
+                            &format!("correlation.{k}"),
+                            &Schema::string(1024),
                             issues,
                         );
+                    }
+                    if let Some(e) = minimum_revision {
+                        let revision = Schema::Integer {
+                            minimum: 0,
+                            maximum: i64::MAX,
+                        };
+                        check(e, "minimum_revision", &revision, issues);
                     }
                 }
                 Operation::ForEach {
                     collection,
                     max_items,
                     ..
-                } => match infer_expr(collection, &roots, 0) {
+                } if typed("collection") => match infer_expr(collection, &roots, 0, "collection") {
                     Ok(Schema::Array {
                         max_items: bound, ..
                     }) => {
@@ -2735,8 +3561,9 @@ impl ArtifactContent {
                         &path,
                         "foreach collection must be bounded array",
                     ),
-                    Err(e) => issue(issues, "expression_type", &path, e),
+                    Err(e) => type_issue(issues, &path, e),
                 },
+                Operation::ForEach { .. } => {}
                 Operation::Call {
                     dependency,
                     entry,
@@ -2748,17 +3575,22 @@ impl ArtifactContent {
                         .get(dependency)
                         .and_then(|d| d.interfaces.get(entry))
                     {
-                        check_expr_compat(input, &roots, &e.input, &path, issues);
+                        check(input, "input", &e.input, issues);
                     }
                 }
                 Operation::Join { members, .. } => {
-                    for e in members {
-                        infer(e, issues);
+                    for (i, e) in members.iter().enumerate() {
+                        let at = format!("members[{i}]");
+                        if typed(&at)
+                            && let Err(e) = infer_expr(e, &roots, 0, &at)
+                        {
+                            type_issue(issues, &path, e);
+                        }
                     }
                 }
                 Operation::Return { outcome, output } => {
                     if let Some(target) = entry.outcomes.get(outcome) {
-                        check_expr_compat(output, &roots, target, &path, issues);
+                        check(output, "output", target, issues);
                     } else {
                         issue(
                             issues,
@@ -2910,6 +3742,7 @@ fn schema_path(schema: &Schema, path: &[String]) -> Result<Schema, String> {
                 .map_err(|_| "array index must be nonnegative integer".to_string())?;
             schema_path(items, rest)
         }
+        Schema::Union { variants } if variants.is_empty() => Ok(no_type()),
         Schema::Union { variants } => {
             let schemas = variants
                 .iter()
@@ -2923,7 +3756,139 @@ fn schema_path(schema: &Schema, path: &[String]) -> Result<Schema, String> {
         )),
     }
 }
+fn dotted(root: &str, path: &[String]) -> String {
+    std::iter::once(root)
+        .chain(path.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+/// Why `root.path` cannot be read, said at the deepest part that can: what is
+/// there, and where the missing part would be readable.
+fn unreadable_ref(root: &str, path: &[String], schema: &Schema, error: String) -> String {
+    let mut at = schema.clone();
+    let mut parent = None;
+    let mut depth = 0;
+    while let Some(key) = path.get(depth) {
+        match schema_path(&at, std::slice::from_ref(key)) {
+            Ok(next) => {
+                parent = Some(std::mem::replace(&mut at, next));
+                depth += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    let Some(key) = path.get(depth) else {
+        return format!("`{}` cannot be read: {error}", dotted(root, path));
+    };
+    let prefix = dotted(root, &path[..depth]);
+    let fields = |properties: &BTreeMap<String, Schema>| {
+        properties.keys().cloned().collect::<Vec<_>>().join(", ")
+    };
+    // A named join's answer for one member: {participant, outcome, output}.
+    let join_answer = matches!(&parent, Some(Schema::Object { properties, .. })
+        if properties.keys().map(String::as_str).eq(["outcome", "output", "participant"]));
+    let why = match &at {
+        Schema::Object { properties, .. } => {
+            format!("{error}: `{prefix}` has fields {}", fields(properties))
+        }
+        Schema::Nullable { .. } if join_answer => format!(
+            "`{prefix}` may be null at this step, so `{key}` cannot be read. A join's \
+             answer (`outcome`, `output`) is present only on the join's `completed` edge, \
+             in mode `all` or `any_accepted`: read it in a step reached through that edge"
+        ),
+        Schema::Nullable { .. } => format!(
+            "`{prefix}` may be null at this step, so `{key}` cannot be read. Read it after \
+             an edge on which it is not null, or test it first with `exists`"
+        ),
+        Schema::Union { variants } => {
+            let objects: Vec<_> = variants
+                .iter()
+                .filter_map(|v| match v {
+                    Schema::Object { properties, .. } => Some(properties),
+                    _ => None,
+                })
+                .collect();
+            let common: Vec<_> = objects
+                .first()
+                .map(|first| {
+                    first
+                        .keys()
+                        .filter(|k| objects.iter().all(|o| o.contains_key(*k)))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let some = if objects.iter().any(|o| o.contains_key(key)) {
+                "only some"
+            } else {
+                "none"
+            };
+            format!(
+                "`{prefix}` has a different shape per alternative and {some} of them have \
+                 `{key}`; every alternative has {}. Read `{key}` after an edge that selects \
+                 an alternative that has it, or test it first with `exists`",
+                if common.is_empty() {
+                    "no common field".to_string()
+                } else {
+                    format!("fields {}", common.join(", "))
+                }
+            )
+        }
+        Schema::Array { .. } => {
+            format!("{error} (`{prefix}` is an array; `{key}` is not an index)")
+        }
+        other => format!(
+            "`{prefix}` is {}, which has no field `{key}`",
+            describe(other)
+        ),
+    };
+    format!("`{}` cannot be read: {why}", dotted(root, path))
+}
 impl ArtifactContent {
+    /// A join names an operation handle by the binding of the invoke that
+    /// admitted it, as the runner resolves members (`{"handle": h}`). Returns
+    /// the fix when `member` reads a path inside such a binding instead.
+    fn handle_member_path(&self, member: &Expr) -> Option<String> {
+        let Expr::Ref { root, path } = member else {
+            return None;
+        };
+        let (binding, rest) = match (root.as_str(), path.split_first()) {
+            ("vars", Some((binding, rest))) => (binding, rest),
+            ("vars", None) => return None,
+            _ => (root, path.as_slice()),
+        };
+        if rest.is_empty() {
+            return None;
+        }
+        let (step, command) = self
+            .playbook
+            .steps
+            .iter()
+            .find_map(|(name, s)| match &s.op {
+                Operation::Invoke { command, bind, .. } if bind == binding => {
+                    Some((name, &command.name))
+                }
+                _ => None,
+            })?;
+        let written = dotted(root, path);
+        if self
+            .registry
+            .commands
+            .get(command)
+            .is_some_and(|c| c.asynchronous.is_none())
+        {
+            return Some(format!(
+                "`{written}` is a result of step `{step}`, whose command {command} is \
+                 synchronous; only the handle of an asynchronous command can be joined. Use \
+                 the result directly on the step's outcome edges instead of joining it"
+            ));
+        }
+        Some(format!(
+            "`{written}` reads inside the operation handle bound by step `{step}` ({command}); \
+             a join names the handle by its binding alone: write \
+             {{\"op\":\"ref\",\"root\":\"{binding}\",\"path\":[]}}"
+        ))
+    }
     fn member_outcomes(&self, member: &Expr) -> Result<BTreeMap<String, Schema>, String> {
         let Expr::Ref { root, path } = member else {
             return Err("named join members must reference statically declared owned child or operation handles".into());
@@ -2952,6 +3917,9 @@ impl ArtifactContent {
                         .map(|entry| entry.outcomes.clone())
                         .ok_or_else(|| "join references unknown child interface".into());
                 }
+                // `["handle"]` types as the handle itself so that stored
+                // artifacts keep verifying; a new draft is refused it
+                // (`draft_issues`), and the runner refuses it at the join.
                 Operation::Invoke { command, bind, .. }
                     if bind == binding && (path.is_empty() || path == ["handle"]) =>
                 {
@@ -3003,8 +3971,10 @@ impl ArtifactContent {
         }
         let guaranteed_business = completed && *mode != JoinMode::AnyCompletion;
         let mut properties = BTreeMap::new();
-        for (key, member) in member_keys.iter().zip(members) {
-            let outcomes = self.member_outcomes(member)?;
+        for (i, (key, member)) in member_keys.iter().zip(members).enumerate() {
+            let outcomes = self
+                .member_outcomes(member)
+                .map_err(|e| format!("members[{i}] (key {key}): {e}"))?;
             let selected: BTreeMap<_, _> = outcomes
                 .iter()
                 .filter(|(outcome, _)| {

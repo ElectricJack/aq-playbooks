@@ -1,18 +1,28 @@
 //! Compiled pilot graphs driven by the domain-enforcing fake services, rather
 //! than queues of unconditional scripted command successes.
-use aq_playbooks_cli::{
-    catalog,
-    fake_host::{Episode, FakeHost, Observation, Subject},
-    pilots,
-};
-use aq_playbooks_runner::{Engine, IntentStatus, MemoryStorage, RunStatus};
+#[allow(dead_code)]
+#[path = "support/fake_host.rs"]
+mod fake_host;
+#[path = "support/fake_host_tests.rs"]
+mod fake_host_tests;
+#[allow(dead_code)]
+#[path = "support/pilots.rs"]
+mod pilots;
+#[path = "support/pilots_tests.rs"]
+mod pilots_tests;
+
+use aq_playbooks_cli::catalog;
+use aq_playbooks_compiler::COMPILER_VERSION;
+use aq_playbooks_model::{Artifact, canonical_bytes};
+use aq_playbooks_runner::{Engine, Error, Intent, IntentStatus, MemoryStorage, Run, RunStatus};
+use fake_host::{Episode, FakeHost, Observation, Subject};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
 fn setup(name: &str) -> (Engine<MemoryStorage>, FakeHost, String) {
     let scenario = pilots::scenario(name).unwrap();
     let engine = Engine::new(
-        MemoryStorage::default(),
+        MemoryStorage::retaining_settled(),
         format!("host-{name}"),
         "runtime-1",
     )
@@ -42,7 +52,6 @@ fn setup(name: &str) -> (Engine<MemoryStorage>, FakeHost, String) {
     host.subjects.insert("candidate-1".into(), 1);
     host.subjects.insert("main".into(), 1);
     let view = match name {
-        "routing" => "execution_options",
         "watcher" => "health_observations",
         _ => "project",
     };
@@ -91,7 +100,13 @@ fn drive_with_hook(
         let mut changed = false;
         let ids: Vec<_> = engine.snapshot().unwrap().runs.keys().cloned().collect();
         for id in ids {
-            changed |= engine.advance(&id, now).unwrap();
+            // An earlier advance in this pass may have settled the cohort
+            // of `id`, which then left the State.
+            match engine.advance(&id, now) {
+                Ok(progress) => changed |= progress,
+                Err(Error::NotFound(_)) => {}
+                Err(error) => panic!("advance {id}: {error}"),
+            }
         }
         for intent in engine
             .snapshot()
@@ -122,6 +137,23 @@ fn drive_with_hook(
         }
     }
     panic!("pilot exceeded integration transition bound");
+}
+
+/// A finished root's run as its cohort left the State (asserting it left).
+fn settled(engine: &Engine<MemoryStorage>, id: &str) -> Run {
+    assert!(
+        !engine.snapshot().unwrap().runs.contains_key(id),
+        "{id} is live"
+    );
+    engine.store.settled_run(&engine.namespace, id).unwrap()
+}
+/// Every run and operation that has left the State with a settled cohort.
+fn settled_items(engine: &Engine<MemoryStorage>) -> (Vec<Run>, Vec<Intent>) {
+    let cohorts = engine.store.settled_cohorts(&engine.namespace);
+    (
+        cohorts.iter().flat_map(|c| c.runs.clone()).collect(),
+        cohorts.iter().flat_map(|c| c.intents.clone()).collect(),
+    )
 }
 
 fn complete(
@@ -157,37 +189,13 @@ fn complete(
 }
 
 #[test]
-fn routing_uses_authorized_assessment_and_host_revision_preconditions() {
-    let (engine, mut host, root) = setup("routing");
-    drive(&engine, &mut host, 0, false, true);
-    let state = engine.snapshot().unwrap();
-    assert_eq!(state.runs[&root].outcome.as_deref(), Some("success"));
-    assert_eq!(host.subjects["candidate-1"], 2);
-    let change = state
-        .intents
-        .values()
-        .find(|intent| intent.command.name == "work.change")
-        .unwrap();
-    assert_eq!(change.input["value"], "permitted-default");
-    assert!(
-        state
-            .intents
-            .values()
-            .any(|intent| intent.command.name == "judgment.request")
-    );
-}
-
-#[test]
 fn watcher_reconciles_host_attested_observation_and_recovers_atomic_notifications() {
     let (engine, mut host, root) = setup("watcher");
     let findings = json!([{"key":"stuck-work","evidence":"work-1","expected_revision":0}]);
     host.record_evaluation("evaluation-1", "snapshot-1", &findings)
         .unwrap();
     drive(&engine, &mut host, 0, false, false);
-    assert_eq!(
-        engine.snapshot().unwrap().runs[&root].outcome.as_deref(),
-        Some("success")
-    );
+    assert_eq!(settled(&engine, &root).outcome.as_deref(), Some("success"));
     assert!(host.episodes["project-health/stuck-work"].active);
     assert_eq!(host.outbox.len(), 1);
     host.deliver_notifications(1, false).unwrap();
@@ -234,10 +242,7 @@ fn watcher_partial_positive_scan_keeps_unseen_episode_open() {
     )
     .unwrap();
     drive(&engine, &mut host, 0, false, false);
-    assert_eq!(
-        engine.snapshot().unwrap().runs[&root].outcome.as_deref(),
-        Some("success")
-    );
+    assert_eq!(settled(&engine, &root).outcome.as_deref(), Some("success"));
     assert!(host.episodes["project-health/stuck-work"].active);
     assert!(host.episodes["project-health/unseen"].active);
     assert_eq!(host.episodes["project-health/unseen"].revision, 3);
@@ -257,12 +262,15 @@ fn coding_admission_and_completed_review_with_changes_cannot_publish() {
     assert!(host.candidates.is_empty());
     complete(&engine, &mut host, "review", "changes_requested", 2);
     drive(&engine, &mut host, 2, true, false);
-    let state = engine.snapshot().unwrap();
-    assert_eq!(state.runs[&root].outcome.as_deref(), Some("escalated"));
+    assert_eq!(
+        settled(&engine, &root).outcome.as_deref(),
+        Some("escalated")
+    );
+    let (_, intents) = settled_items(&engine);
+    assert!(!intents.is_empty());
     assert!(
-        state
-            .intents
-            .values()
+        intents
+            .iter()
             .all(|intent| intent.command.name != "candidate.publish")
     );
     assert_eq!(host.subjects["main"], 1);
@@ -276,12 +284,12 @@ fn coding_requires_explicit_accepted_review_and_exact_check_before_independent_f
     drive(&engine, &mut host, 1, true, false);
     complete(&engine, &mut host, "review", "accepted", 2);
     drive(&engine, &mut host, 2, true, false);
-    let state = engine.snapshot().unwrap();
-    assert_eq!(state.runs[&root].outcome.as_deref(), Some("success"));
+    assert_eq!(settled(&engine, &root).outcome.as_deref(), Some("success"));
     assert_eq!(host.subjects["main"], 2);
     assert!(!host.evidence.is_empty());
     assert_eq!(host.messages.len(), 1);
-    assert!(state.runs.values().any(|run| run.origin.is_some()
+    let (runs, _) = settled_items(&engine);
+    assert!(runs.iter().any(|run| run.origin.is_some()
         && run.parent.is_none()
         && run.status == RunStatus::Completed));
     assert!(
@@ -328,8 +336,8 @@ fn coding_real_publication_conflict_observes_new_base_repairs_and_checks_new_can
     );
     complete(&engine, &mut host, "repair", "accepted", 3);
     drive(&engine, &mut host, 3, true, false);
-    let state = engine.snapshot().unwrap();
-    assert_eq!(state.runs[&root].outcome.as_deref(), Some("success"));
+    assert_eq!(settled(&engine, &root).outcome.as_deref(), Some("success"));
+    let (_, intents) = settled_items(&engine);
     assert_eq!(host.subjects["main"], 3);
     assert_eq!(host.candidates.len(), 2);
     assert_eq!(
@@ -349,9 +357,8 @@ fn coding_real_publication_conflict_observes_new_base_repairs_and_checks_new_can
         2
     );
     assert_eq!(
-        state
-            .intents
-            .values()
+        intents
+            .iter()
             .filter(|intent| intent.command.name == "candidate.publish")
             .count(),
         2
@@ -375,17 +382,27 @@ fn report_deadline_cancels_owned_author_and_late_completion_keeps_one_message() 
     assert_eq!(host.messages.len(), 1);
     let author = host.work.values().next().unwrap().clone();
     assert!(author.cancelled);
+    // The fallback finished the root; its cohort, with the cancelled author
+    // operation, has left the State.
+    assert_eq!(settled(&engine, &root).outcome.as_deref(), Some("success"));
+    let (_, intents) = settled_items(&engine);
+    assert!(
+        intents
+            .iter()
+            .filter(|intent| intent.command.name == "work.ensure")
+            .any(|intent| intent.status == IntentStatus::Cancelled && intent.cancel_requested)
+    );
     complete(&engine, &mut host, "supervisor_authoring", "accepted", 2000);
     drive(&engine, &mut host, 2000, false, false);
     assert_eq!(host.messages.len(), 1);
+    // The late completion finds no operation (spec 0003 ruling: a late
+    // result for a cancelled operation that left is not found); nothing is
+    // revived and history is unchanged.
     let state = engine.snapshot().unwrap();
-    assert_eq!(state.runs[&root].outcome.as_deref(), Some("success"));
-    assert!(
-        state
-            .intents
-            .values()
-            .filter(|intent| intent.command.name == "work.ensure")
-            .any(|intent| !intent.late_results.is_empty())
+    assert!(state.runs.is_empty() && state.intents.is_empty());
+    assert_eq!(
+        serde_json::to_value(settled_items(&engine).1).unwrap(),
+        serde_json::to_value(&intents).unwrap()
     );
 }
 
@@ -433,8 +450,106 @@ fn pilots_pass_on_reconciled_catalog() {
             .contains("aq.host.bridge@1")
     );
     every_pilot_uses_the_same_twelve_captured_host_contracts();
-    routing_uses_authorized_assessment_and_host_revision_preconditions();
     watcher_reconciles_host_attested_observation_and_recovers_atomic_notifications();
     coding_requires_explicit_accepted_review_and_exact_check_before_independent_followup();
     report_deadline_cancels_owned_author_and_late_completion_keeps_one_message();
+}
+
+/// A scripted cancel of a start that already finished (and left the
+/// engine's State as history) is a no-op, not a failed simulation. (Moved
+/// from the CLI's `simulation` module when the simulator became the
+/// `aq-playbooks-simulation` crate, which has no pilots.)
+#[test]
+fn cancelling_a_finished_start_is_a_no_op() {
+    use aq_playbooks_cli::simulation::{Action, simulate};
+    let mut scenario = pilots::scenario("watcher").unwrap();
+    let clock = scenario
+        .actions
+        .iter()
+        .map(|action| match action {
+            Action::Tick { at_ms }
+            | Action::Event { at_ms, .. }
+            | Action::Cancel { at_ms, .. }
+            | Action::Recover { at_ms } => *at_ms,
+        })
+        .max()
+        .unwrap_or(0);
+    scenario.actions.push(Action::Cancel {
+        at_ms: clock + 1,
+        start: 0,
+    });
+    let report = simulate(&scenario).unwrap();
+    assert!(report.complete);
+    let root = &report.roots[0];
+    let runs = report.inspection["runs"].as_array().unwrap();
+    assert!(
+        runs.iter()
+            .any(|run| &run["id"] == root && run["outcome"] == "success")
+    );
+    scenario.actions.push(Action::Cancel {
+        at_ms: clock + 2,
+        start: 7,
+    });
+    assert!(simulate(&scenario).is_err(), "an unknown start still fails");
+}
+
+/// The pilots are test support now, and `aq-playbooks examples` writes the
+/// worked authoring workspaces instead of them. Their bytes stay pinned: the
+/// coding pilot and its repair child seal to the exact artifacts the model's
+/// format test keeps (`aq-playbooks-model/tests/fixtures`), once stamped
+/// with the compiler version that wrote those (the stamp is part of the
+/// content, so a compiler release changes every digest and nothing else).
+#[test]
+fn the_coding_pilot_keeps_its_pinned_bytes() {
+    let artifacts = pilots::scenario("coding").unwrap().artifacts;
+    let pinned: [(&str, &[u8]); 2] = [
+        (
+            "coding",
+            include_bytes!("../../aq-playbooks-model/tests/fixtures/coding.artifact.json"),
+        ),
+        (
+            "repair",
+            include_bytes!("../../aq-playbooks-model/tests/fixtures/repair.artifact.json"),
+        ),
+    ];
+    let stamp = Artifact::from_canonical_bytes(pinned[0].1)
+        .unwrap()
+        .content
+        .compiler;
+    assert!(
+        artifacts
+            .iter()
+            .all(|a| a.content.compiler == COMPILER_VERSION)
+    );
+    // Seal every artifact again under the pinned stamp. An artifact names
+    // its dependencies by digest, so one pass per artifact carries the new
+    // digests through the deepest chain.
+    let mut digests: BTreeMap<String, String> = BTreeMap::new();
+    let mut stamped: Vec<Artifact> = vec![];
+    for _ in 0..artifacts.len() {
+        stamped = artifacts
+            .iter()
+            .map(|a| {
+                let mut content = a.content.clone();
+                content.compiler = stamp.clone();
+                let mut text = serde_json::to_string(&content).unwrap();
+                for (old, new) in &digests {
+                    text = text.replace(old, new);
+                }
+                Artifact::seal(serde_json::from_str(&text).unwrap()).unwrap()
+            })
+            .collect();
+        digests = artifacts
+            .iter()
+            .zip(&stamped)
+            .map(|(a, s)| (a.digest.clone(), s.digest.clone()))
+            .collect();
+    }
+    for (id, bytes) in pinned {
+        let artifact = stamped
+            .iter()
+            .find(|a| a.content.playbook.id == id)
+            .unwrap_or_else(|| panic!("the coding pilot has no {id} artifact"));
+        assert_eq!(canonical_bytes(artifact).unwrap(), bytes, "{id}");
+    }
 }

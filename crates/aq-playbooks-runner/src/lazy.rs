@@ -352,6 +352,10 @@ impl<K: LazyKey, V: Clone> Bound<K, V> {
     }
     /// First live key strictly after `after` in typed order.
     fn next_after(&self, after: Option<&K>) -> Option<K> {
+        self.next_after_paged(after, 16)
+    }
+    /// [`Self::next_after`], reading the source `page` records at a time.
+    fn next_after_paged(&self, after: Option<&K>, page: usize) -> Option<K> {
         let mut cache = lock(&self.cache);
         let overlay = match after {
             Some(a) => cache
@@ -365,7 +369,7 @@ impl<K: LazyKey, V: Clone> Bound<K, V> {
         };
         let mut cursor = after.map(LazyKey::to_tree);
         loop {
-            let page = match self.source.after(&self.path, cursor.as_ref(), 16) {
+            let page = match self.source.after(&self.path, cursor.as_ref(), page) {
                 Ok(page) => page,
                 Err(e) => {
                     self.source.fail(e);
@@ -577,6 +581,19 @@ impl<K: LazyKey, V: Record> LazyMap<K, V> {
                 None => m.keys().next().cloned(),
             },
             MapRepr::Bound(b) => b.next_after(after.map(|a| a.to_owned()).as_ref()),
+        }
+    }
+    /// [`Self::next_key`] reading one record at a time from a bound source,
+    /// for a caller that needs only the next key (the head of an order), so
+    /// its cost does not depend on how many records follow it.
+    pub fn next_key_by_one<Q>(&self, after: Option<&Q>) -> Option<K>
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized + ToOwned<Owned = K>,
+    {
+        match &self.0 {
+            MapRepr::Bound(b) => b.next_after_paged(after.map(|a| a.to_owned()).as_ref(), 1),
+            _ => self.next_key(after),
         }
     }
     /// Up to `limit` keys strictly after `after`, in typed order.
@@ -1174,18 +1191,6 @@ impl<T: Record> LazyField for LazySeq<T> {
     }
 }
 
-/// Exact canonical byte length of one container from its record sums:
-/// `pairs` is Σ(child bytes, plus quoted key and colon for objects).
-pub fn container_bytes(pairs: usize, count: usize) -> usize {
-    2 + pairs + count.saturating_sub(1)
-}
-/// Bytes one record contributes to `pairs` for a container of `shape`.
-pub fn record_bytes(shape: Shape, key: &TreeKey, value: &[u8]) -> usize {
-    match shape {
-        Shape::Map(_) | Shape::Nested(..) => key.json_key().len() + 1 + value.len(),
-        Shape::Set(_) | Shape::Seq => value.len(),
-    }
-}
 impl<K: LazyKey, V: Record> IntoIterator for LazyMap<K, V> {
     type Item = (K, V);
     type IntoIter = std::collections::btree_map::IntoIter<K, V>;

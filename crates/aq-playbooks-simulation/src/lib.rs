@@ -1,5 +1,14 @@
+//! Offline simulation of sealed playbooks, for the authoring tools and for a
+//! host that re-runs an author's cases: scripted [`Scenario`]s, and
+//! [`cases`], which record every command call with its input.
+pub mod cases;
+pub use cases::*;
+
 use aq_playbooks_model::{Artifact, CommandContract, EventEnvelope};
-use aq_playbooks_runner::{Authority, DispatchResult, Engine, Host, Intent, MemoryStorage, State};
+use aq_playbooks_runner::{
+    Authority, DispatchResult, Engine, Host, InspectionKind, InspectionQuery, Intent,
+    MemoryStorage, Storage,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
@@ -138,12 +147,24 @@ pub fn simulate(scenario: &Scenario) -> anyhow::Result<SimulationReport> {
                 engine.fanout(&accepted.key, 100, clock)?;
             }
             Action::Cancel { start, .. } => {
-                engine.cancel(
-                    roots
-                        .get(*start)
-                        .ok_or_else(|| anyhow::anyhow!("unknown start index"))?,
-                    clock,
-                )?;
+                let root = roots
+                    .get(*start)
+                    .ok_or_else(|| anyhow::anyhow!("unknown start index"))?;
+                match engine.cancel(root, clock) {
+                    // A start that already finished has left the State as
+                    // history: cancelling it is a no-op, as for a terminal run.
+                    Err(aq_playbooks_runner::Error::NotFound(_))
+                        if !engine
+                            .inspect(&InspectionQuery {
+                                kind: InspectionKind::Runs,
+                                run: Some(root.clone()),
+                                after: None,
+                                limit: 1,
+                            })?
+                            .items
+                            .is_empty() => {}
+                    result => result?,
+                }
             }
             Action::Recover { .. } => {
                 engine.recover(&mut host, clock)?;
@@ -165,19 +186,34 @@ pub fn simulate(scenario: &Scenario) -> anyhow::Result<SimulationReport> {
         .into(),
         transitions: used,
         roots,
-        inspection: inspect(&state, None),
+        inspection: inspect(&engine, None)?,
         invocations: host.invocations,
     })
 }
 
-/// Public inspection deliberately omits raw inputs, variables and command results.
-pub fn inspect(state: &State, run_id: Option<&str>) -> Value {
-    let rows = aq_playbooks_runner::inspection::rows(state);
-    let values = |kind| {
-        rows.iter()
-            .filter(|r| r.kind == kind && run_id.is_none_or(|id| r.run == id))
-            .map(|r| r.value.clone())
-            .collect::<Vec<_>>()
+/// Public inspection deliberately omits raw inputs, variables and command
+/// results. It reads through `Storage::inspect` (live state plus run
+/// history), so finished runs, which leave the State, are included.
+pub fn inspect<S: Storage>(engine: &Engine<S>, run_id: Option<&str>) -> anyhow::Result<Value> {
+    let values = |kind| -> anyhow::Result<Vec<Value>> {
+        let mut items = vec![];
+        let mut after = None;
+        loop {
+            let page = engine.inspect(&InspectionQuery {
+                kind,
+                run: run_id.map(String::from),
+                after,
+                limit: 1000,
+            })?;
+            items.extend(page.items);
+            match page.next {
+                Some(next) => after = Some(next),
+                None => return Ok(items),
+            }
+        }
     };
-    json!({"runs":values(aq_playbooks_runner::InspectionKind::Runs),"effects":values(aq_playbooks_runner::InspectionKind::Effects),"receipts":values(aq_playbooks_runner::InspectionKind::Receipts),"catalog_revision":state.catalog_revision})
+    let catalog_revision = engine.snapshot()?.catalog_revision;
+    Ok(
+        json!({"runs":values(InspectionKind::Runs)?,"effects":values(InspectionKind::Effects)?,"receipts":values(InspectionKind::Receipts)?,"catalog_revision":catalog_revision}),
+    )
 }

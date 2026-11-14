@@ -125,7 +125,26 @@ fn caller(id: &str, child: &Artifact) -> Artifact {
     a
 }
 fn engine() -> Engine<MemoryStorage> {
-    Engine::new(MemoryStorage::default(), "review", "owner-one").unwrap()
+    Engine::new(MemoryStorage::retaining_settled(), "review", "owner-one").unwrap()
+}
+/// A finished run as its cohort left the State (spec 0003: settled cohorts
+/// leave in the commit that settles them). Asserts that it has left.
+fn settled(e: &Engine<MemoryStorage>, id: &str) -> Run {
+    assert!(
+        !e.snapshot().unwrap().runs.contains_key(id),
+        "{id} is still live"
+    );
+    e.store
+        .settled_run(&e.namespace, id)
+        .unwrap_or_else(|| panic!("{id} is not in history"))
+}
+/// Every run that has left the State, oldest cohort first.
+fn settled_runs(e: &Engine<MemoryStorage>) -> Vec<Run> {
+    e.store
+        .settled_cohorts(&e.namespace)
+        .into_iter()
+        .flat_map(|cohort| cohort.runs)
+        .collect()
 }
 fn install(e: &Engine<MemoryStorage>, a: &Artifact, binding: &str) {
     e.install(a.clone()).unwrap();
@@ -203,11 +222,18 @@ fn t4_transitive_dependency_bytes_stay_pinned_after_activation_and_restart() {
     let e = Engine::new(store, "review", "owner-two").unwrap();
     let mut host = FakeHost::default();
     e.drive(&mut host, 1, 50).unwrap();
-    let s = e.snapshot().unwrap();
-    assert_eq!(s.runs[&id].status, RunStatus::Completed);
-    assert!(s.runs.values().any(|r| r.artifact == old.digest));
-    assert!(!s.runs.values().any(|r| r.artifact == new.digest));
-    assert!(s.runs[&id].dependencies.values().any(|d| d == &old.digest));
+    // The finished cohort is history; it ran the pinned bytes.
+    assert!(e.snapshot().unwrap().runs.is_empty());
+    let runs = settled_runs(&e);
+    assert_eq!(settled(&e, &id).status, RunStatus::Completed);
+    assert!(runs.iter().any(|r| r.artifact == old.digest));
+    assert!(!runs.iter().any(|r| r.artifact == new.digest));
+    assert!(
+        settled(&e, &id)
+            .dependencies
+            .values()
+            .any(|d| d == &old.digest)
+    );
 }
 #[test]
 fn t6_partial_fanout_restarts_with_frozen_destinations_and_no_duplicate_runs() {
@@ -354,10 +380,14 @@ fn t13_independent_calls_consume_origin_budget_without_becoming_owned() {
     assert_eq!(child.root, id);
     assert_eq!(child.status, RunStatus::Admitted);
 }
+/// T17, rewritten by Task 8b (no namespace limits): an event past the
+/// deprecated `max_events` is admitted; a refused event (forged producer)
+/// leaves the record byte for byte; the first event's artifacts and
+/// destination remain and fan out.
 #[test]
-fn t17_quota_refusal_retains_prior_event_artifacts_and_destinations() {
+fn t17_refused_event_retains_prior_event_artifacts_and_destinations() {
     let e = Engine::with_config(
-        MemoryStorage::default(),
+        MemoryStorage::retaining_settled(),
         "review",
         "owner-one",
         EngineConfig {
@@ -370,8 +400,13 @@ fn t17_quota_refusal_retains_prior_event_artifacts_and_destinations() {
     install(&e, &a, "retained");
     let first = e.admit_event("host", envelope("first"), 0).unwrap();
     let before = canonical_bytes(&e.snapshot().unwrap()).unwrap();
-    assert!(e.admit_event("host", envelope("second"), 1).is_err());
+    assert!(e.admit_event("intruder", envelope("forged"), 1).is_err());
     assert_eq!(canonical_bytes(&e.snapshot().unwrap()).unwrap(), before);
+    assert!(
+        !e.admit_event("host", envelope("second"), 1)
+            .unwrap()
+            .duplicate
+    );
     assert!(e.snapshot().unwrap().artifacts.contains_key(&a.digest));
     assert_eq!(e.fanout(&first.key, 1, 2).unwrap(), 1);
 }
@@ -445,9 +480,31 @@ fn t18_receipts_default_deny_result_fields_and_refuse_protected_inputs_before_in
         ..Default::default()
     };
     e.drive(&mut host, 0, 10).unwrap();
-    let s = e.snapshot().unwrap();
+    // The run finished and its receipts left as history: neither the
+    // receipts it settled with nor their public history items carry it.
+    let receipts: Vec<Receipt> = e
+        .store
+        .settled_cohorts("review")
+        .into_iter()
+        .flat_map(|cohort| cohort.receipts)
+        .collect();
+    assert!(receipts.iter().any(|r| r.kind == "command_result"));
     assert!(
-        !String::from_utf8(canonical_bytes(&s.receipts).unwrap())
+        !String::from_utf8(canonical_bytes(&receipts).unwrap())
+            .unwrap()
+            .contains("must-not-appear")
+    );
+    let history = e
+        .inspect(&InspectionQuery {
+            kind: InspectionKind::Receipts,
+            run: None,
+            after: None,
+            limit: 1000,
+        })
+        .unwrap();
+    assert!(!history.items.is_empty());
+    assert!(
+        !serde_json::to_string(&history)
             .unwrap()
             .contains("must-not-appear")
     );
@@ -535,12 +592,21 @@ fn t26_nested_captured_iteration_consumes_shared_budget_and_restores_lexical_roo
         .admit("nested", "main", Value::Null, authority(), 0)
         .unwrap();
     let mut host = FakeHost::default();
-    e.drive(&mut host, 0, 50).unwrap();
-    let s = e.snapshot().unwrap();
-    assert_eq!(s.runs[&id].outcome.as_deref(), Some("ok"));
-    assert_eq!(s.budgets[&id].iterations, 5);
-    assert!(!s.runs[&id].variables.contains_key("inner_item"));
-    assert!(!s.runs[&id].variables.contains_key("outer_item"));
+    // The budget leaves with the cohort: read it while the run is live.
+    let mut iterations = 0;
+    for _ in 0..50 {
+        if e.drive(&mut host, 0, 1).unwrap() == 0 {
+            break;
+        }
+        if let Some(budget) = e.snapshot().unwrap().budgets.get(&id) {
+            iterations = budget.iterations;
+        }
+    }
+    assert_eq!(iterations, 5);
+    let run = settled(&e, &id);
+    assert_eq!(run.outcome.as_deref(), Some("ok"));
+    assert!(!run.variables.contains_key("inner_item"));
+    assert!(!run.variables.contains_key("outer_item"));
 }
 #[test]
 fn ingress_rejects_missing_declared_subject_revision_and_correlation() {
@@ -807,20 +873,21 @@ fn named_heterogeneous_join_results_feed_a_typed_command_and_return() {
         ..Default::default()
     };
     e.drive(&mut host, 1, 100).unwrap();
-    let state = e.snapshot().unwrap();
-    assert_eq!(state.runs[&id].status, RunStatus::Completed);
-    assert_eq!(state.runs[&id].output, Some(expected.clone()));
+    let run = settled(&e, &id);
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(run.output, Some(expected.clone()));
     assert_eq!(host.dispatched.len(), 1);
-    let intent = state
+    let cohort = &e.store.settled_cohorts("review")[0];
+    let intent = cohort
         .intents
-        .values()
+        .iter()
         .find(|intent| intent.run == id)
         .unwrap();
     assert_eq!(intent.input, expected);
-    let joined = &state.runs[&id].variables["joined"];
+    let joined = &run.variables["joined"];
     for key in ["review", "check"] {
         let participant = joined[key]["participant"].as_str().unwrap();
-        assert!(state.runs[&id].children.iter().any(|id| id == participant));
+        assert!(run.children.iter().any(|id| id == participant));
     }
 }
 
@@ -863,12 +930,12 @@ fn catalog_dependencies_select_compatible_versions_once_then_pin_across_restart(
     let e = Engine::new(store, "review", "owner-after-catalog-restart").unwrap();
     let mut host = FakeHost::default();
     e.drive(&mut host, 2, 100).unwrap();
-    let state = e.snapshot().unwrap();
+    assert!(e.snapshot().unwrap().runs.is_empty());
+    let runs = settled_runs(&e);
     for (root, expected) in [(&first, &old.digest), (&second, &new.digest)] {
-        assert_eq!(state.runs[root].status, RunStatus::Completed);
-        let child = state
-            .runs
-            .values()
+        assert_eq!(settled(&e, root).status, RunStatus::Completed);
+        let child = runs
+            .iter()
             .find(|run| run.parent.as_ref() == Some(root))
             .unwrap();
         assert_eq!(&child.artifact, expected);
@@ -1164,6 +1231,7 @@ fn retired_producer_epochs_need_no_new_tombstones_for_late_gc() {
         terminal_run_ms: 1,
         audit_ms: 1,
         max_tombstones: 1,
+        ..RetentionPolicy::default()
     })
     .unwrap();
     e.admit_event("host", envelope("old-epoch"), 0).unwrap();
@@ -1193,7 +1261,7 @@ fn retired_producer_epochs_need_no_new_tombstones_for_late_gc() {
 }
 
 #[test]
-fn expired_replay_tombstones_and_retired_epochs_refuse_old_identities() {
+fn expired_replay_identities_are_judged_by_time_and_retired_epochs_refuse_old_ones() {
     let e = engine();
     let mut a = artifact(
         "replay-catalog",
@@ -1209,12 +1277,23 @@ fn expired_replay_tombstones_and_retired_epochs_refuse_old_identities() {
         terminal_run_ms: 1,
         audit_ms: 1,
         max_tombstones: 1,
+        ..RetentionPolicy::default()
     })
     .unwrap();
     e.admit_event("host", envelope("original"), 0).unwrap();
     e.collect_garbage(20_000, 10).unwrap();
-    assert_eq!(e.snapshot().unwrap().retention.event_tombstones.len(), 1);
-    assert!(e.admit_event("host", envelope("original"), 20_001).is_err());
+    // Spec 0003: the expired identity leaves with no tombstone. A repeat
+    // with its producer time is stale; without one it is new.
+    assert!(e.snapshot().unwrap().retention.event_tombstones.is_empty());
+    assert!(matches!(
+        e.admit_event_at("host", envelope("original"), 0, Some(0), 20_001),
+        Err(Error::Stale { .. })
+    ));
+    assert!(
+        !e.admit_event("host", envelope("original"), 20_001)
+            .unwrap()
+            .duplicate
+    );
     e.advance_producer_epoch("host", 1, "operator", "new explicit replay epoch", 20_002)
         .unwrap();
     assert!(e.admit_event("host", envelope("original"), 20_003).is_err());
@@ -1298,10 +1377,7 @@ fn retained_event_before_wait_is_driven_after_restart_without_manual_wakeup() {
     e.release().unwrap();
     let e = Engine::new(store, "review", "event-restart").unwrap();
     e.drive(&mut FakeHost::default(), 20, 20).unwrap();
-    assert_eq!(
-        e.snapshot().unwrap().runs[&id].outcome.as_deref(),
-        Some("ok")
-    );
+    assert_eq!(settled(&e, &id).outcome.as_deref(), Some("ok"));
     assert!(
         e.query(&IndexQuery::Ready {
             scope_after: None,
@@ -1346,10 +1422,7 @@ fn completed_children_before_join_remain_drivable_after_restart() {
     e.release().unwrap();
     let e = Engine::new(store, "review", "child-restart").unwrap();
     e.drive(&mut FakeHost::default(), 2, 20).unwrap();
-    assert_eq!(
-        e.snapshot().unwrap().runs[&id].outcome.as_deref(),
-        Some("ok")
-    );
+    assert_eq!(settled(&e, &id).outcome.as_deref(), Some("ok"));
 }
 
 #[test]
@@ -1369,12 +1442,32 @@ fn completed_cohort_gc_removes_ready_timer_and_dependency_index_residue() {
         .admit("joining", "main", Value::Null, authority(), 0)
         .unwrap();
     e.drive(&mut FakeHost::default(), 0, 50).unwrap();
-    assert_eq!(e.snapshot().unwrap().runs[&id].status, RunStatus::Completed);
+    assert_eq!(settled(&e, &id).status, RunStatus::Completed);
+    // The settling commit itself left no index residue.
+    let residue = |s: &State| {
+        assert!(s.runs.is_empty());
+        assert!(s.indexes.runs.is_empty());
+        assert!(s.indexes.ready_tokens.is_empty());
+        assert!(s.indexes.timers.is_empty());
+        assert!(
+            s.indexes.dependents.is_empty(),
+            "deleted members must not leave empty durable dependency keys"
+        );
+        assert!(s.indexes.waiters.is_empty());
+        assert!(s.indexes.run_dependencies.is_empty());
+        assert!(s.indexes.run_subscriptions.is_empty());
+        assert!(s.indexes.root_members.is_empty());
+        assert!(s.indexes.root_intents.is_empty());
+        assert!(s.indexes.intent_roots.is_empty());
+        assert!(s.indexes.run_roots.is_empty());
+    };
+    residue(&e.snapshot().unwrap());
     e.set_retention_policy(RetentionPolicy {
         event_replay_ms: 1,
         terminal_run_ms: 1,
         audit_ms: 1,
         max_tombstones: 10,
+        ..RetentionPolicy::default()
     })
     .unwrap();
     for _ in 0..20 {
@@ -1454,8 +1547,5 @@ fn execution_revocation_blocks_prepared_dispatch_without_discarding_the_intent()
     e.recover(&mut host, 2).unwrap();
     e.drive(&mut host, 2, 20).unwrap();
     assert_eq!(host.dispatched, vec![original]);
-    assert_eq!(
-        e.snapshot().unwrap().runs[&id].outcome.as_deref(),
-        Some("ok")
-    );
+    assert_eq!(settled(&e, &id).outcome.as_deref(), Some("ok"));
 }

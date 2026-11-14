@@ -24,7 +24,11 @@ are excluded. Public metadata inspection intentionally works without decryption
 keys; the host must authorize database roles and control-surface access.
 
 The authoritative snapshot is still serialized for CAS. Namespace size is bounded
-by runner admission/history quotas; native discovery and incremental index writes
+by deletion: finished work leaves at completion, and remembered keys and history
+are rolling sets of fixed size (there are no namespace limits). Each commit that
+writes history deletes the oldest finished runs beyond `history_keep`, through
+`run_history_runs_by_finish` and the per-namespace count `run_history_counts`
+(migration 7); native discovery and incremental index writes
 do not make snapshot serialization constant-time. A version-one database upgrades
 transactionally; its next exclusive owner initializes materialized indexes before
 scheduling or inspection. Reads refuse an uninitialized index rather than reporting
@@ -72,17 +76,19 @@ backups, exported files, and previously exposed plaintext are not retroactively
 encrypted; the operator must retire them under its migration and backup policy.
 Use protection from namespace creation when source constants are confidential.
 
-Garbage collection requires explicit runner disposal records. It preserves active
-and unresolved runs, children/effects, event destinations, callable dependency
-closures, and retained audit references. Replay tombstones survive event payload
-expiry. Only a recorded increase in the producer's replay epoch permits removal of
-that epoch's native event tombstones; stale delivery epochs remain refused. The
-injected monotonic GC clock and audit horizon permit compaction of settled
-run/operation disposal metadata and unreferenced artifact payload/catalog metadata.
-Shared artifact installation and disposal serialize on digest locks. Tombstone
-quota pressure refuses the transaction without deleting work. Artifact addresses
-remain content verified, including a byte digest while their disposal tombstone is
-retained.
+No host needs to call garbage collection: finished runs leave in the commit
+that finishes them (as history), and every commit deletes a bounded number of
+expired or evicted window entries. `collect_garbage` is one more such commit
+plus a page of unreferenced artifact disposal. No commit writes a
+`disposal_tombstones` row for a run, operation or event; rows an older engine
+wrote are deleted by the drain, a bounded number per commit, and refuse the
+reuse of their identity until then. A retired producer epoch still refuses
+stale delivery epochs. The GC clock and audit horizon permit compaction of
+unreferenced artifact payload/catalog metadata (artifact disposal rows only).
+Shared artifact installation and disposal serialize on digest locks. The
+disposal tombstone rows are not counted (`max_tombstones` is ignored).
+Artifact addresses remain content verified, including a byte digest while
+their disposal tombstone is retained.
 
 Run the required storage and protected CLI suites with an isolated Docker database:
 
