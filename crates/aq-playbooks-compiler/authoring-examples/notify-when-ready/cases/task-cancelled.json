@@ -1,6 +1,6 @@
 {
   "name": "task-cancelled",
-  "situation": "The event says the task was cancelled",
+  "situation": "The change that started the run cancelled the task",
   "start": {
     "kind": "event",
     "event": "aq.work.changed",

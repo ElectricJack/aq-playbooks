@@ -242,3 +242,222 @@ fn example_files_are_the_examples_on_disk() {
         }
     }
 }
+
+/// A fenced block of `GUIDE.md` or `LANGUAGE.md`: its info words, its text
+/// (fence indentation removed) and the line it starts on.
+struct Block {
+    info: Vec<String>,
+    body: String,
+    line: usize,
+}
+fn blocks(doc: &str) -> Vec<Block> {
+    let mut found = vec![];
+    let mut open: Option<(usize, Vec<String>, usize, Vec<String>)> = None;
+    for (i, line) in doc.lines().enumerate() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        match (&mut open, trimmed.strip_prefix("```")) {
+            (None, Some(info)) => {
+                let info = info.split_whitespace().map(String::from).collect();
+                open = Some((indent, info, i + 1, vec![]));
+            }
+            (Some(_), Some("")) => {
+                let (_, info, line, body) = open.take().unwrap();
+                found.push(Block {
+                    info,
+                    body: body.join("\n"),
+                    line,
+                });
+            }
+            (Some((indent, _, _, body)), _) => {
+                let cut = line.len() - line.trim_start().len();
+                body.push(line[cut.min(*indent)..].to_string());
+            }
+            (None, None) => {}
+        }
+    }
+    found
+}
+fn role(block: &Block) -> (&str, &str) {
+    (
+        block.info.first().map_or("", String::as_str),
+        block.info.get(1).map_or("", String::as_str),
+    )
+}
+fn option<'b>(block: &'b Block, key: &str) -> Option<&'b str> {
+    block
+        .info
+        .iter()
+        .find_map(|word| word.strip_prefix(key)?.strip_prefix('='))
+}
+/// `want` is in `got`: objects by their listed fields, arrays item by item,
+/// and a string with `…` as its pieces in order.
+fn fits(want: &Value, got: &Value) -> bool {
+    match (want, got) {
+        (Value::Object(w), Value::Object(g)) => {
+            w.iter().all(|(k, v)| g.get(k).is_some_and(|g| fits(v, g)))
+        }
+        (Value::Array(w), Value::Array(g)) => {
+            w.len() == g.len() && w.iter().zip(g).all(|(a, b)| fits(a, b))
+        }
+        (Value::String(w), Value::String(g)) if w.contains('…') => {
+            let mut rest = g.as_str();
+            w.split('…').all(|piece| match rest.find(piece) {
+                Some(at) => {
+                    rest = &rest[at + piece.len()..];
+                    true
+                }
+                None => false,
+            })
+        }
+        _ => want == got,
+    }
+}
+/// The words of a command line; `"…"` quotes one word.
+fn words(line: &str) -> Vec<String> {
+    let mut words = vec![];
+    let mut word = String::new();
+    let mut quoted = false;
+    let mut any = false;
+    for c in line.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                any = true;
+            }
+            ' ' if !quoted => {
+                if any || !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+                any = false;
+            }
+            c => word.push(c),
+        }
+    }
+    if any || !word.is_empty() {
+        words.push(word);
+    }
+    assert!(!quoted, "an unclosed quote in {line:?}");
+    words
+}
+const DOCUMENTS: [(&str, &str); 2] = [
+    ("GUIDE.md", aq_playbooks_compiler::docs::GUIDE),
+    ("LANGUAGE.md", aq_playbooks_compiler::docs::LANGUAGE),
+];
+
+/// Every command the two documents show runs in the worked example it names
+/// and prints what the document says it prints; every case they show runs
+/// under `try` as the document says; every case fragment parses; and every
+/// `aq-playbooks …` the prose names is one of the commands run.
+#[test]
+fn every_command_and_case_the_documents_show_runs_as_shown() {
+    use aq_playbooks_simulation::{CaseReturn, CaseStart};
+    let mut run_lines: Vec<Vec<String>> = vec![];
+    let mut shown = 0;
+    for (name, doc) in DOCUMENTS {
+        let found = blocks(doc);
+        for (i, block) in found.iter().enumerate() {
+            let at = format!("{name} line {}", block.line);
+            let next = found.get(i + 1);
+            let expected = |r: &str| {
+                next.filter(|b| role(b) == ("json", r)).map(|b| -> Value {
+                    serde_json::from_str(&b.body).unwrap_or_else(|e| panic!("{at}: {e}"))
+                })
+            };
+            match role(block) {
+                ("sh", example) => {
+                    let dir = written("docs");
+                    let root = dir.0.join(example);
+                    if let Some(document) = option(block, "doc") {
+                        fs::copy(root.join(document), root.join("source.md")).unwrap();
+                    }
+                    let cwd = option(block, "in").map_or(root.clone(), |sub| root.join(sub));
+                    let lines: Vec<&str> = block
+                        .body
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .collect();
+                    let want = expected("output");
+                    for (k, line) in lines.iter().enumerate() {
+                        let args = words(line);
+                        assert_eq!(args[0], "aq-playbooks", "{at}: {line}");
+                        let args: Vec<&str> = args[1..].iter().map(String::as_str).collect();
+                        let out = run(&cwd, &args);
+                        let printed: Value = serde_json::from_slice(&out.stdout)
+                            .unwrap_or_else(|e| panic!("{at}: {line} printed no JSON ({e})"));
+                        match (&want, k + 1 == lines.len()) {
+                            (Some(want), true) => assert!(
+                                fits(want, &printed),
+                                "{at}: {line} printed {printed:#}, not {want:#}"
+                            ),
+                            _ => assert!(out.status.success(), "{at}: {line} failed: {printed:#}"),
+                        }
+                        run_lines.push(words(line));
+                    }
+                    shown += 1;
+                }
+                ("json", "case") => {
+                    let example = block
+                        .info
+                        .get(2)
+                        .unwrap_or_else(|| panic!("{at}: name the example"));
+                    let case: Value =
+                        serde_json::from_str(&block.body).unwrap_or_else(|e| panic!("{at}: {e}"));
+                    let dir = written("docs-case");
+                    let root = dir.0.join(example);
+                    let file = format!("cases/{}.json", case["name"].as_str().unwrap());
+                    fs::write(root.join(&file), &block.body).unwrap();
+                    let out = run(&root, &["try", &file]);
+                    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+                    match expected("report") {
+                        Some(want) => assert!(fits(&want, &report), "{at}: try reports {report:#}"),
+                        None => assert_eq!(report["passed"], true, "{at}: {report:#}"),
+                    }
+                    shown += 1;
+                }
+                ("json", "start") => {
+                    serde_json::from_str::<CaseStart>(&block.body)
+                        .unwrap_or_else(|e| panic!("{at}: {e}"));
+                }
+                ("json", "returns") => {
+                    serde_json::from_str::<BTreeMap<String, Vec<CaseReturn>>>(&block.body)
+                        .unwrap_or_else(|e| panic!("{at}: {e}"));
+                }
+                ("json", _) | ("", _) => {}
+                (other, _) => panic!("{at}: a {other} block is not run by any test"),
+            }
+        }
+    }
+    assert!(shown >= 12, "only {shown} commands and cases were run");
+    // Every `aq-playbooks …` named in the text is a command run above, with
+    // `<…>` standing for any one word, or the first words of one.
+    for (name, doc) in DOCUMENTS {
+        let mut fenced = false;
+        for line in doc.lines() {
+            if line.trim_start().starts_with("```") {
+                fenced = !fenced;
+                continue;
+            }
+            if fenced {
+                continue;
+            }
+            for span in line.split('`').skip(1).step_by(2) {
+                let Some(rest) = span.strip_prefix("aq-playbooks ") else {
+                    continue;
+                };
+                let named = words(rest);
+                let matches = run_lines.iter().any(|ran| {
+                    ran.len() > named.len()
+                        && named
+                            .iter()
+                            .zip(&ran[1..])
+                            .all(|(n, r)| (n.starts_with('<') && n.ends_with('>')) || n == r)
+                });
+                assert!(
+                    matches,
+                    "{name}: `{span}` is not a command the documents run"
+                );
+            }
+        }
+    }
+}

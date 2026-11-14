@@ -1,6 +1,6 @@
 {
   "name": "task-finished",
-  "situation": "The event says the task was finished",
+  "situation": "The change that started the run finished the task",
   "start": {
     "kind": "event",
     "event": "aq.work.changed",

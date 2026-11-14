@@ -1,7 +1,7 @@
 # Ask for a description when a task has none
 
-When a task is created or changed, give it ten minutes first. A task that was
-finished or cancelled needs nothing.
+When a playbook creates or changes a task, give the task ten minutes first.
+A change that finishes or cancels a task needs nothing.
 
 Then look at the task again. If it has a description by then, there is
 nothing to do. If the task is gone, or cannot be read, there is nothing to do

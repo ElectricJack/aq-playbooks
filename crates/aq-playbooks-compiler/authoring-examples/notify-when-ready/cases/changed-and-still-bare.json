@@ -1,6 +1,6 @@
 {
   "name": "changed-and-still-bare",
-  "situation": "A task is changed, and ten minutes later it still has no description",
+  "situation": "A playbook changes a task, and ten minutes later it still has no description",
   "start": {
     "kind": "event",
     "event": "aq.work.changed",

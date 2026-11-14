@@ -36,6 +36,25 @@ All six new contracts share these properties:
 The two events come only from `aq.host.bridge@1` and are kept for 24 hours.
 Each command needs the capability of the same name.
 
+## Which events the host sends on its own
+
+A trigger starts a run only when its event is sent. Today, on aq-server:
+
+| Event | When it is sent |
+| --- | --- |
+| `aq.work.route_needed` | By the host on its own, for a ready task in a project on the automatic router that has no route (see its section below). |
+| `aq.work.changed` | Only as the effect of a playbook's own `work.ensure` or `work.change`, with outcome `ensured` or `changed`. It is not sent when a person creates, edits, finishes or cancels a task. |
+| `aq.operation.updated`, `aq.check.receipted`, `aq.decision.completed`, `aq.judgment.completed`, `aq.judgment.assessed` | Only as the completion of an operation a playbook started (`work.ensure`, `check.request`, `decision.request`, `judgment.request`, `judgment.assess`). Join the handle; do not start a playbook on them. |
+| `aq.artifact.recorded`, `aq.check.completed`, `aq.integration.changed`, `aq.signal.reported` | Not stated for this catalog's host profile. Do not author a trigger on them without asking the owner. |
+
+So a document that says "when a person creates a task" cannot be served by
+a trigger on `aq.work.changed`: such a playbook would never run. Ask the
+owner, or give up with `unable`.
+
+`work.read` answers only for a task in a project on the automatic router.
+For any other task it answers `refused` with `not_on_router`, whatever the
+playbook is for.
+
 ## Levels
 
 A level is a parent and an effort, written `<parent>-<effort>`:
@@ -104,6 +123,10 @@ task as it is now, whatever revision you pass.
 
 **Outcomes:**
 - `observed`: `{reference, subject, facts}`.
+  - `reference` is `<id>@<revision>` of the task as read, for example
+    `task-1@3`: one value per task version. A playbook may use it as the
+    identity of something it does once per version, such as
+    `message.send`'s `identity`.
   - `subject` carries the task's **current** revision. Pass this subject, not
     the trigger's, to `work.route` and `judgment.assess`. A change after this
     read then makes the route `stale`, instead of applying silently to a

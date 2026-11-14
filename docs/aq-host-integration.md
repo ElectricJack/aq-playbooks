@@ -50,7 +50,7 @@ Bounded embedding/isolation is not performance closure or a500-agent claim.
 | Candidates | Use the integration owner's public services and aq-git's immutable candidate/conditional publication contract; independently enforce evidence and destination preconditions |
 | Observations and findings | Frozen finite complete observations, pre-scan episode revisions, trusted evaluations, atomic finding changes and notification intents |
 | Messaging | Stable identities, scoped visibility, idempotent enqueue, separate acceptance/delivery/acknowledgment |
-| Delivery | Commit domain transition and event outbox together; retry stable producer/event/epoch identities until durable runner admission; retire epochs explicitly before compacting replay identities |
+| Delivery | Commit domain transition and event outbox together; retry stable producer/event/epoch identities until durable runner admission; the engine drops old replay identities by itself (the most recent `replay_keep` keys within their window), so retiring an epoch is not needed to free storage (it still refuses everything from older epochs) |
 | Runtime | Own one engine namespace, drive bounded ready/timer/effect queues, publish the scheduler's durable calendar occurrences, reconcile uncertain operations, and provide backups and configured protection keys; export process metrics to a retained telemetry backend |
 | Release | Pin released library and contract versions; run assembled-product acceptance without path dependencies on sibling source checkouts |
 

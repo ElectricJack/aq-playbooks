@@ -1,6 +1,6 @@
 {
   "name": "still-no-description",
-  "situation": "A new task still has no description after ten minutes",
+  "situation": "A task a playbook created still has no description after ten minutes",
   "start": {
     "kind": "event",
     "event": "aq.work.changed",

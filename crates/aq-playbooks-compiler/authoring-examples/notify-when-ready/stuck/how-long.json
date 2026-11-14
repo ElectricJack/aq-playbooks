@@ -13,7 +13,7 @@
     "sentences": [
       {
         "line": 3,
-        "text": "When a task is created or changed, wait a while first. A task that was finished"
+        "text": "When a playbook creates or changes a task, wait a while first."
       }
     ]
   }

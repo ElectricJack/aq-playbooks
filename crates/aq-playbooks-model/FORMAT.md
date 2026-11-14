@@ -218,11 +218,12 @@ reaching each step.
      field you need. A value built from the same name twice at every level
      doubles its type each time: fifteen levels are about 200 000 nodes,
      and sixteen are refused.
-   - A value that can have many shapes (literal rows with differing fields, a
-     lookup with many differently shaped results) costs one step to follow
-     for each shape at every read. A read counts at least that, and a draft
-     that follows more than 1 000 000 shapes in all is refused with
-     `draft_limit`.
+   - A value that can have many shapes costs one step to follow for each
+     shape at every read. A literal array or table has one shape for each
+     row, also when every row has the same fields; a lookup has one for each
+     result. A read counts at least that, and a draft that follows more than
+     1 000 000 shapes in all is refused with `draft_limit`: read a large
+     literal table in fewer places.
    - The scope count is, for each step an entry reaches, the type of that
      entry's `input`, the captured definitions, and the result type of every
      step that binds one. Ordinary typing copies these for every step, on every
