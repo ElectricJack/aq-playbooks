@@ -1,0 +1,20 @@
+{
+  "document": "stuck/how-long.md",
+  "why": "This version does not say how long to wait, and a wait needs a deadline. Do not pick one: ask the owner, name the sentence, and end.",
+  "run": [
+    "ask",
+    "--line",
+    "3",
+    "How long should a ready task wait before the coordinators are reminded?"
+  ],
+  "writes": {
+    "kind": "question",
+    "question": "How long should a ready task wait before the coordinators are reminded?",
+    "sentences": [
+      {
+        "line": 3,
+        "text": "When a task is ready but nobody has been chosen to take it yet, wait a while."
+      }
+    ]
+  }
+}

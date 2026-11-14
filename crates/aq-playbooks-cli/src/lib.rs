@@ -1,6 +1,4 @@
 pub mod catalog;
-pub mod fake_host;
-pub mod pilots;
 /// The simulator lives in its own crate, which hosts can call; this keeps
 /// the CLI's former module path.
 pub use aq_playbooks_simulation as simulation;

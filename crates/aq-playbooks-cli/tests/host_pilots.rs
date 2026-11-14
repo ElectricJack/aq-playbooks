@@ -1,11 +1,20 @@
 //! Compiled pilot graphs driven by the domain-enforcing fake services, rather
 //! than queues of unconditional scripted command successes.
-use aq_playbooks_cli::{
-    catalog,
-    fake_host::{Episode, FakeHost, Observation, Subject},
-    pilots,
-};
+#[allow(dead_code)]
+#[path = "support/fake_host.rs"]
+mod fake_host;
+#[path = "support/fake_host_tests.rs"]
+mod fake_host_tests;
+#[allow(dead_code)]
+#[path = "support/pilots.rs"]
+mod pilots;
+#[path = "support/pilots_tests.rs"]
+mod pilots_tests;
+
+use aq_playbooks_cli::catalog;
+use aq_playbooks_model::canonical_bytes;
 use aq_playbooks_runner::{Engine, Error, Intent, IntentStatus, MemoryStorage, Run, RunStatus};
+use fake_host::{Episode, FakeHost, Observation, Subject};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -42,7 +51,6 @@ fn setup(name: &str) -> (Engine<MemoryStorage>, FakeHost, String) {
     host.subjects.insert("candidate-1".into(), 1);
     host.subjects.insert("main".into(), 1);
     let view = match name {
-        "routing" => "execution_options",
         "watcher" => "health_observations",
         _ => "project",
     };
@@ -176,25 +184,6 @@ fn complete(
             .admit_event("aq.host.bridge@1", event, now)
             .unwrap()
             .duplicate
-    );
-}
-
-#[test]
-fn routing_uses_authorized_assessment_and_host_revision_preconditions() {
-    let (engine, mut host, root) = setup("routing");
-    drive(&engine, &mut host, 0, false, true);
-    assert_eq!(settled(&engine, &root).outcome.as_deref(), Some("success"));
-    assert_eq!(host.subjects["candidate-1"], 2);
-    let (_, intents) = settled_items(&engine);
-    let change = intents
-        .iter()
-        .find(|intent| intent.command.name == "work.change")
-        .unwrap();
-    assert_eq!(change.input["value"], "permitted-default");
-    assert!(
-        intents
-            .iter()
-            .any(|intent| intent.command.name == "judgment.request")
     );
 }
 
@@ -460,7 +449,6 @@ fn pilots_pass_on_reconciled_catalog() {
             .contains("aq.host.bridge@1")
     );
     every_pilot_uses_the_same_twelve_captured_host_contracts();
-    routing_uses_authorized_assessment_and_host_revision_preconditions();
     watcher_reconciles_host_attested_observation_and_recovers_atomic_notifications();
     coding_requires_explicit_accepted_review_and_exact_check_before_independent_followup();
     report_deadline_cancels_owned_author_and_late_completion_keeps_one_message();
@@ -473,7 +461,7 @@ fn pilots_pass_on_reconciled_catalog() {
 #[test]
 fn cancelling_a_finished_start_is_a_no_op() {
     use aq_playbooks_cli::simulation::{Action, simulate};
-    let mut scenario = pilots::scenario("routing").unwrap();
+    let mut scenario = pilots::scenario("watcher").unwrap();
     let clock = scenario
         .actions
         .iter()
@@ -502,4 +490,30 @@ fn cancelling_a_finished_start_is_a_no_op() {
         start: 7,
     });
     assert!(simulate(&scenario).is_err(), "an unknown start still fails");
+}
+
+/// The pilots are test support now, and `aq-playbooks examples` writes the
+/// worked authoring workspaces instead of them. Their bytes stay pinned: the
+/// coding pilot and its repair child seal to the exact artifacts the model's
+/// format test keeps (`aq-playbooks-model/tests/fixtures`).
+#[test]
+fn the_coding_pilot_keeps_its_pinned_bytes() {
+    let artifacts = pilots::scenario("coding").unwrap().artifacts;
+    let pinned: [(&str, &[u8]); 2] = [
+        (
+            "coding",
+            include_bytes!("../../aq-playbooks-model/tests/fixtures/coding.artifact.json"),
+        ),
+        (
+            "repair",
+            include_bytes!("../../aq-playbooks-model/tests/fixtures/repair.artifact.json"),
+        ),
+    ];
+    for (id, bytes) in pinned {
+        let artifact = artifacts
+            .iter()
+            .find(|a| a.content.playbook.id == id)
+            .unwrap_or_else(|| panic!("the coding pilot has no {id} artifact"));
+        assert_eq!(canonical_bytes(artifact).unwrap(), bytes, "{id}");
+    }
 }

@@ -26,45 +26,34 @@ fn offline_cli_round_trip_and_invalid_input_exit() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // The worked authoring workspaces (tests/authoring_examples.rs runs the
+    // tools in them).
+    for example in ["escalate-on-judgment", "notify-when-ready"] {
+        assert!(dir.join(example).join("draft.json").is_file(), "{example}");
+    }
     // `validate`, `compile` and `diff` took a whole CompileInput; the
     // authoring tools (`check`, `seal`, `compare`, tests/authoring_cli.rs)
-    // replace them, and they are refused now.
-    let proposal = dir.join("routing.proposal.json");
+    // replace them. `simulate` ran raw scenarios (`try` runs cases now),
+    // and `surface` and `interfaces` described the synthetic pilot surface
+    // and callable entries, which an authoring source is not offered. All
+    // of them are refused.
+    let draft = dir.join("notify-when-ready/draft.json");
+    let draft = draft.to_str().unwrap();
     for args in [
-        &["validate", proposal.to_str().unwrap()][..],
-        &["compile", proposal.to_str().unwrap(), "--output", "x.json"],
-        &[
-            "diff",
-            proposal.to_str().unwrap(),
-            proposal.to_str().unwrap(),
-        ],
+        &["validate", draft][..],
+        &["compile", draft, "--output", "x.json"],
+        &["diff", draft, draft],
+        &["simulate", "--pilot", "coding"],
+        &["surface"],
+        &["interfaces", draft, "list"],
     ] {
-        assert!(!cli(args).status.success(), "{args:?}");
+        let out = cli(args);
+        assert!(!out.status.success(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("unrecognized subcommand"),
+            "{args:?}"
+        );
     }
-    let output = cli(&[
-        "simulate",
-        dir.join("report.scenario.json").to_str().unwrap(),
-    ]);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(value["complete"], true);
-    // The finished runs have left the engine's State; the report's
-    // inspection reads them from run history.
-    let runs = value["inspection"]["runs"].as_array().unwrap();
-    assert!(!runs.is_empty());
-    assert!(runs.iter().all(|run| {
-        ["completed", "failed", "cancelled"].contains(&run["status"].as_str().unwrap())
-    }));
-    assert!(
-        !value["inspection"]["receipts"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
     fs::remove_dir_all(dir).unwrap();
 }
 #[test]
@@ -74,6 +63,4 @@ fn finite_catalog_and_required_explicit_store() {
     let names: Vec<String> = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(names.len(), 12);
     assert!(!cli(&["inspect"]).status.success());
-    let out = cli(&["simulate", "--pilot", "routing"]);
-    assert!(out.status.success());
 }

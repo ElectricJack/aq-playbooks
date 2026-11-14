@@ -1,0 +1,18 @@
+{
+  "id": "notify-when-ready",
+  "binding": "aq.notify-when-ready",
+  "scope": "project",
+  "purpose": "Remind the coordinators about ready tasks nobody has taken",
+  "commands": [
+    "message.send",
+    "work.read"
+  ],
+  "events": [
+    "aq.work.route_needed"
+  ],
+  "capabilities": [
+    "message.send",
+    "work.read"
+  ],
+  "facts_version": "settings-7"
+}

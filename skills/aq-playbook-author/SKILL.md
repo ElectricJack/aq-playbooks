@@ -3,9 +3,9 @@ name: aq-playbook-author
 description: Translate project policy into bounded aq-playbooks proposals, validate and simulate them, and package immutable artifacts. Use for authoring this engine's workflows, not general AQ administration.
 ---
 
-Read the repository's `docs/specs/0002-implementation.md` and model `FORMAT.md` for the executable format. Use `aq-playbooks --help` for the actual installed CLI, and inspect examples before constructing a proposal.
+Read the repository's `docs/specs/0002-implementation.md` and model `FORMAT.md` for the executable format. Use `aq-playbooks --help` for the actual installed CLI. Before writing a draft, write the worked workspaces with `aq-playbooks examples --output DIR` and read them: each holds a document, the draft made from it, its cases, and what to run (`ask` or `unable`) when a document cannot be turned into steps.
 
-Discover the available command/event catalog and callable artifacts. The bundled catalog is a synthetic pilot contract set; a production host must supply its actual registrations. Discovery does not grant execution authority.
+Discover the available command/event catalog with `aq-playbooks commands list` and `events list`; in a workspace they read its `catalog.json`. An authoring source is offered no callable playbooks. A production host supplies its actual registrations. Discovery does not grant execution authority.
 
 Bind the Markdown source and explicit semantic proposal. Resolve terms such as “ready,” “independent reviewer,” and “required checks” against captured definitions and registered contracts. When a consequential interpretation is unresolved, stop and ask the owner instead of packaging a guess; a proposal carries no questions, and compilation must not invent answers. Preserve source mappings where useful.
 

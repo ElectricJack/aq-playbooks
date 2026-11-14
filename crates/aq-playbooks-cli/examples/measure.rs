@@ -1,5 +1,9 @@
 //! Reproducible synthetic microbenchmark, deliberately separate from correctness tests.
-use aq_playbooks_cli::{pilots, simulation};
+// The pilots are test support; the benchmark borrows the coding pilot.
+#[allow(dead_code)]
+#[path = "../tests/support/pilots.rs"]
+mod pilots;
+use aq_playbooks_cli::simulation;
 use aq_playbooks_model::{EvalContext, EvalLimits, Expr, eval};
 use std::{hint::black_box, time::Instant};
 fn percentile(samples: &mut [u128], p: usize) -> u128 {

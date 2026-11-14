@@ -1,0 +1,43 @@
+{
+  "name": "task-gone",
+  "situation": "The task was deleted within the ten minutes",
+  "start": {
+    "kind": "event",
+    "event": "aq.work.route_needed",
+    "payload": {
+      "subject": {
+        "id": "task-40",
+        "revision": 2
+      }
+    }
+  },
+  "returns": {
+    "work.read": [
+      {
+        "outcome": "refused",
+        "output": {
+          "reference": "task-40@2",
+          "subject": {
+            "id": "task-40",
+            "revision": 2
+          },
+          "reason": "unknown_task"
+        }
+      }
+    ]
+  },
+  "expect": {
+    "outcome": "gone",
+    "calls": [
+      {
+        "command": "work.read",
+        "input": {
+          "subject": {
+            "id": "task-40",
+            "revision": 2
+          }
+        }
+      }
+    ]
+  }
+}

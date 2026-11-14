@@ -1,6 +1,6 @@
-use anyhow::{Context, Result, bail};
-use aq_playbooks_cli::{catalog, pilots, simulation};
-use aq_playbooks_model::{Artifact, Registry, canonical_bytes};
+use anyhow::{Context, Result};
+use aq_playbooks_cli::{catalog, simulation};
+use aq_playbooks_model::{Artifact, Registry};
 use aq_playbooks_postgres::PostgresStorage;
 use aq_playbooks_runner::{
     Authority, CatalogKind, CatalogQuery, Engine, InspectionKind, InspectionQuery, RetentionPolicy,
@@ -46,23 +46,11 @@ enum Command {
         #[command(subcommand)]
         action: CatalogAction,
     },
-    Interfaces {
-        artifact: PathBuf,
-        #[command(subcommand)]
-        action: CatalogAction,
-    },
-    /// Report the finite synthetic AQ pilot API surface.
-    Surface,
-    /// Generate runnable fake-host pilot artifacts and scenarios.
+    /// Write the worked authoring workspaces (each a directory to run the
+    /// authoring tools in) under DIR.
     Examples {
         #[arg(long)]
         output: PathBuf,
-    },
-    /// Uses an in-memory store, scripted fake responses, and a virtual clock.
-    Simulate {
-        scenario: Option<PathBuf>,
-        #[arg(long, conflicts_with = "scenario")]
-        pilot: Option<String>,
     },
     Install {
         artifact: PathBuf,
@@ -367,46 +355,20 @@ fn execute(cli: Cli) -> Result<()> {
         } => print(&artifact(&path)?),
         Command::Commands { registry, action } => choose(&catalog_file(registry)?.commands, action),
         Command::Events { registry, action } => choose(&catalog_file(registry)?.events, action),
-        Command::Interfaces {
-            artifact: path,
-            action,
-        } => choose(&artifact(&path)?.content.playbook.entries, action),
-        Command::Surface => print(&catalog::describe_surface()),
         Command::Examples { output } => {
-            fs::create_dir_all(&output)?;
-            for name in pilots::NAMES {
-                let scenario = pilots::scenario(name)?;
-                fs::write(
-                    output.join(format!("{name}.scenario.json")),
-                    serde_json::to_vec_pretty(&scenario)?,
-                )?;
-                for a in &scenario.artifacts {
-                    fs::write(
-                        output.join(format!("{}.artifact.json", a.content.playbook.id)),
-                        canonical_bytes(a)?,
-                    )?;
-                    let input = pilots::compile_input(a);
-                    fs::write(
-                        output.join(format!("{}.proposal.json", a.content.playbook.id)),
-                        serde_json::to_vec_pretty(&input)?,
-                    )?;
-                    fs::write(
-                        output.join(format!("{}.md", a.content.playbook.id)),
-                        &input.source,
-                    )?;
+            let files = aq_playbooks_compiler::docs::example_files();
+            for (path, text) in &files {
+                let target = output.join(path);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
                 }
+                fs::write(&target, text)?;
             }
-            print(&json!({"directory":output,"pilots":pilots::NAMES}))
-        }
-        Command::Simulate { scenario, pilot } => {
-            let s = if let Some(name) = pilot {
-                pilots::scenario(&name)?
-            } else if let Some(path) = scenario {
-                read(&path)?
-            } else {
-                bail!("provide a scenario file or --pilot")
-            };
-            print(&simulation::simulate(&s)?)
+            let examples: std::collections::BTreeSet<&str> = files
+                .iter()
+                .filter_map(|(p, _)| p.split('/').next())
+                .collect();
+            print(&json!({"directory":output,"examples":examples}))
         }
         Command::Install {
             artifact: path,

@@ -1,3 +1,7 @@
+/// The stateful synthetic host, test support only (`tests/support`).
+#[allow(dead_code)]
+#[path = "support/fake_host.rs"]
+mod fake_host;
 use aq_playbooks_cli::catalog;
 use aq_playbooks_model::{Effect, Recovery, Registry, canonical_bytes, digest};
 use serde_json::{Value, json};
@@ -87,15 +91,13 @@ fn published_catalog_manifest_schemas_and_fixtures_are_pinned() {
             .outcomes
             .contains_key("succeeded")
     );
-    assert_eq!(
-        catalog::describe_surface()["fingerprint"],
-        manifest["fingerprint"]
-    );
+    let published: Value = serde_json::from_str(catalog::MANIFEST_JSON).unwrap();
+    assert_eq!(published["fingerprint"], manifest["fingerprint"]);
 }
 
 #[test]
 fn published_replay_fixtures_retain_admission_and_reject_conflicting_reuse() {
-    use aq_playbooks_cli::fake_host::FakeHost;
+    use crate::fake_host::FakeHost;
     use aq_playbooks_runner::{Authority, DispatchResult, Host, Intent, IntentStatus};
     use std::collections::BTreeSet;
     let fixtures: Value =

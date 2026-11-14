@@ -1,0 +1,52 @@
+{
+  "name": "owner-chose",
+  "situation": "The owner chose who takes the task within the ten minutes",
+  "start": {
+    "kind": "event",
+    "event": "aq.work.route_needed",
+    "payload": {
+      "subject": {
+        "id": "task-40",
+        "revision": 2
+      }
+    }
+  },
+  "returns": {
+    "work.read": [
+      {
+        "outcome": "observed",
+        "output": {
+          "reference": "task-40@2",
+          "subject": {
+            "id": "task-40",
+            "revision": 2
+          },
+          "facts": {
+            "kind": "",
+            "title": "Add a dark theme",
+            "description": "",
+            "origin": "owner",
+            "level_hint": "",
+            "charged_failures": 0,
+            "ended_attempts": 0,
+            "route": "owner"
+          }
+        }
+      }
+    ]
+  },
+  "expect": {
+    "outcome": "taken",
+    "calls": [
+      {
+        "command": "work.read",
+        "input": {
+          "subject": {
+            "id": "task-40",
+            "revision": 2
+          }
+        }
+      }
+    ]
+  }
+}

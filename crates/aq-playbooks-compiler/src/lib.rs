@@ -4,6 +4,7 @@ use aq_playbooks_model::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod docs;
 pub mod draft;
 
 pub const COMPILER_VERSION: &str = concat!("aq-playbooks-compiler/", env!("CARGO_PKG_VERSION"));

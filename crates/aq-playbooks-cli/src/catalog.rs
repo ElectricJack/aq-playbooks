@@ -1,4 +1,5 @@
-//! Versioned AQ host contract, shared by synthetic pilots and production adapters.
+//! Versioned AQ host contracts, shared by the authoring tools, the test pilots
+//! and production adapters.
 use aq_playbooks_model::*;
 use std::collections::BTreeSet;
 
@@ -106,14 +107,6 @@ pub const REGISTRY_2_2_JSON: &str = include_str!("../../../contracts/aq-host-2.2
 pub const MANIFEST_2_2_JSON: &str = include_str!("../../../contracts/aq-host-2.2.0/manifest.json");
 pub fn catalog_v2_2() -> Registry {
     serde_json::from_str(REGISTRY_2_2_JSON).expect("published AQ host registry 2.2.0")
-}
-pub fn describe_surface() -> serde_json::Value {
-    let mut manifest: serde_json::Value =
-        serde_json::from_str(MANIFEST_JSON).expect("AQ host manifest");
-    manifest["kind"] = "versioned_aq_host_contract".into();
-    manifest["commands"] = serde_json::json!(catalog().commands.keys().collect::<Vec<_>>());
-    manifest["production_adapters"] = false.into();
-    manifest
 }
 
 #[cfg(test)]

@@ -56,7 +56,7 @@ Bounded embedding/isolation is not performance closure or a500-agent claim.
 
 The engine exposes `Host::authorize`, `dispatch`, `reconcile`, and `cancel`. Implementations dispatch only the exact registered command contract, preserve `Intent.id`, input digest and original authority, and return truthful typed outcomes. `Storage` provides atomic CAS, indexed discovery and bounded safe inspection. Readback/recovery remains host-authoritative even when an operator records an evidence-backed recovery request through the CLI.
 
-The synthetic contract catalog and stateful fake host in `aq-playbooks-cli` are executable integration fixtures. Their checks cover the four pilot workflows, source revisions, findings completeness, notification recovery, visibility, publication conflicts and late outcomes. They are not adapters for existing daemon endpoints.
+The synthetic contract catalog of `aq-playbooks-cli` and the stateful fake host in its test support (`crates/aq-playbooks-cli/tests/support`) are executable integration fixtures. Their checks cover the pilot workflows (the routing pilot was retired in favour of authored routing), source revisions, findings completeness, notification recovery, visibility, publication conflicts and late outcomes. They are not adapters for existing daemon endpoints.
 
 ## Live acceptance still required
 

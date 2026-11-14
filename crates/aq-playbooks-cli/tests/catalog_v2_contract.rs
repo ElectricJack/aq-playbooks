@@ -1,5 +1,9 @@
 //! Host catalog 2.0.0 conformance: D6 asynchronous judgment and registered check
 //! execution, published beside a byte-frozen 1.0.0.
+/// The stateful synthetic host, test support only (`tests/support`).
+#[allow(dead_code)]
+#[path = "support/fake_host.rs"]
+mod fake_host;
 use aq_playbooks_cli::catalog;
 use aq_playbooks_model::{Registry, canonical_bytes, digest, hash_bytes};
 use serde_json::{Value, json};
@@ -139,7 +143,7 @@ fn catalog_v2_preserves_1_0_0_bytes_and_unchanged_bindings() {
 
 #[test]
 fn catalog_v2_replay_fixtures_retain_admission_and_reject_conflicting_reuse() {
-    use aq_playbooks_cli::fake_host::FakeHost;
+    use crate::fake_host::FakeHost;
     use aq_playbooks_runner::{Authority, DispatchResult, Host, Intent, IntentStatus};
     let registry = catalog::catalog_v2();
     let capabilities: std::collections::BTreeSet<String> = registry

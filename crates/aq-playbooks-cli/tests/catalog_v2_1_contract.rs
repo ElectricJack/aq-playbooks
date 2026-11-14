@@ -1,5 +1,9 @@
 //! Host catalog 2.1.0 conformance: candidate.prepare returns the immutable
 //! candidate source OID that check.request binds, beside frozen 1.0.0 and 2.0.0.
+/// The stateful synthetic host, test support only (`tests/support`).
+#[allow(dead_code)]
+#[path = "support/fake_host.rs"]
+mod fake_host;
 use aq_playbooks_cli::catalog;
 use aq_playbooks_model::{Registry, digest, hash_bytes};
 use serde_json::{Value, json};
@@ -142,7 +146,7 @@ fn catalog_v2_1_preserves_2_0_0_bytes_and_unchanged_bindings() {
 
 #[test]
 fn catalog_v2_1_fake_host_returns_the_prepared_source_only_for_2_1_0() {
-    use aq_playbooks_cli::fake_host::FakeHost;
+    use crate::fake_host::FakeHost;
     use aq_playbooks_runner::{Authority, DispatchResult, Host, Intent, IntentStatus};
     let input = json!({"base": {"id": "work-1", "revision": 1}, "sources": []});
     let intent = |command: aq_playbooks_model::CommandContract| Intent {

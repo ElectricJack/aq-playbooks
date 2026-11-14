@@ -1,0 +1,73 @@
+{
+  "name": "still-waiting",
+  "situation": "Nobody has been chosen to take the task after ten minutes",
+  "start": {
+    "kind": "event",
+    "event": "aq.work.route_needed",
+    "payload": {
+      "subject": {
+        "id": "task-40",
+        "revision": 2
+      }
+    }
+  },
+  "returns": {
+    "work.read": [
+      {
+        "outcome": "observed",
+        "output": {
+          "reference": "task-40@2",
+          "subject": {
+            "id": "task-40",
+            "revision": 2
+          },
+          "facts": {
+            "kind": "",
+            "title": "Add a dark theme",
+            "description": "Follow the system setting.",
+            "origin": "owner",
+            "level_hint": "",
+            "charged_failures": 0,
+            "ended_attempts": 0,
+            "route": "none"
+          }
+        }
+      }
+    ],
+    "message.send": [
+      {
+        "outcome": "queued",
+        "output": {
+          "reference": "message-1",
+          "subject": {
+            "id": "task-40",
+            "revision": 2
+          }
+        }
+      }
+    ]
+  },
+  "expect": {
+    "outcome": "reminded",
+    "calls": [
+      {
+        "command": "work.read",
+        "input": {
+          "subject": {
+            "id": "task-40",
+            "revision": 2
+          }
+        }
+      },
+      {
+        "command": "message.send",
+        "input": {
+          "identity": "task-40@2",
+          "recipient": "group:coordinators",
+          "visibility": "project",
+          "body": "This task is ready and has waited ten minutes without anyone to take it."
+        }
+      }
+    ]
+  }
+}

@@ -41,5 +41,5 @@ verify:
 
 ```sh
 cargo test --locked -p aq-playbooks-cli --test catalog_v2_1_contract
-cargo test --locked -p aq-playbooks-cli --lib catalog_v2_1_check_binds_the_prepared_candidate_source
+cargo test --locked -p aq-playbooks-cli --test host_pilots catalog_v2_1_check_binds_the_prepared_candidate_source
 ```
