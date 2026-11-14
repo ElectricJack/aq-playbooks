@@ -746,11 +746,19 @@ storage handle stops issuing the delete for that namespace; a new handle
 
 **What an operator sees.** The drain starts by itself at the first open
 after the upgrade. Each commit moves up to 50 finished runs to history and
-handles up to 500 legacy entries; at aq-server's commit rate a namespace of
-a few thousand finished runs drains within its first hundred or so
-commits. Meanwhile the record shrinks with every commit, step time falls
-with it, the run list keeps showing every run, and `run_history` rows grow
-by the drained runs. It has finished when the State's
+handles up to 500 legacy entries. Measured (Task 9) on the 1,000-run
+benchmark namespace (protected format 2, a 10.7 MB record): the drain was
+complete at commit 21 after the open; those commits took 2.8, 3.7, 2.1 s,
+then less as the record shrank (25.8 s in all), against about 0.6 s for a
+step on that record before; then the record was about 104 KB and a step
+about 30 ms. Meanwhile the run list keeps showing every run, and
+`run_history` grows by the drained runs.
+
+Legacy keyed receipts get their expiry from the admission window of the
+policy stored when the drain reaches them (an older stored policy has none:
+the default, 7 days). A window lowered afterwards does not shorten those.
+They are still remembered only within `replay_keep`: newer keys push them
+out, oldest first. It has finished when the State's
 `retention.drain.done` is `true` (and `retention.drain` has no cursors),
 the record holds no finished run, and no `disposal_tombstones` row of kind
 `event`, `run` or `intent` is left for the namespace:
