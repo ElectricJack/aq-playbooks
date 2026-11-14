@@ -887,7 +887,7 @@ impl Storage for RecordStorage {
         )?;
         // `settled` is not part of the stored header (serde skip).
         let (data, accounting) = export(state).map_err(to_storage)?;
-        crate::history::insert(&mut ns.history, items, state.retention.policy.history_keep);
+        crate::history::insert(&mut ns.history, items, &state.retention.policy);
         ns.data = Arc::new(data);
         ns.accounting = accounting;
         ns.revision = revision;
@@ -1008,7 +1008,7 @@ impl Storage for RecordStorage {
         verify_patch_removals(&ns.data, &patch, &state)?;
         source.check()?;
         crate::history::check_new(&ns.history, &items)?;
-        let keep = state.retention.policy.history_keep;
+        let policy = state.retention.policy.clone();
         drop(state);
         drop(source);
         let revision = ns
@@ -1016,7 +1016,7 @@ impl Storage for RecordStorage {
             .checked_add(1)
             .ok_or_else(|| backend("revision exhausted"))?;
         apply(Arc::make_mut(&mut ns.data), patch)?;
-        crate::history::insert(&mut ns.history, items, keep);
+        crate::history::insert(&mut ns.history, items, &policy);
         ns.accounting = accounting;
         ns.revision = revision;
         Ok(TransitionOutcome::Committed { revision })

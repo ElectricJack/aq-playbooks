@@ -169,16 +169,18 @@ pub(crate) fn check_unrecorded(rows: &HistoryRows, keys: &[ItemKey]) -> Result<(
     Ok(())
 }
 
-/// A commit that writes history trims, of each rolling set (finished runs,
-/// event receipts, admin receipts), at most this many more than it writes
-/// (so the trim keeps up with any commit, and a lowered `history_keep` is
-/// reached within a bounded number of commits).
+/// The default of `RetentionPolicy::history_trim_per_commit`: a commit that
+/// writes history trims, of each rolling set (finished runs, event receipts,
+/// admin receipts), at most this many more than it writes (so the trim keeps
+/// up with any commit, and a lowered `history_keep` is reached within a
+/// bounded number of commits).
 pub const HISTORY_TRIM_RUNS_PER_COMMIT: usize = 64;
 /// How many units of one rolling set holding `count` the trim of a commit
-/// that writes `written` of them may remove under `keep`.
-pub fn trim_budget(count: u64, written: usize, keep: u64) -> usize {
-    let excess = usize::try_from(count.saturating_sub(keep)).unwrap_or(usize::MAX);
-    excess.min(written.saturating_add(HISTORY_TRIM_RUNS_PER_COMMIT))
+/// that writes `written` of them may remove under `policy`: its
+/// `history_keep`, and at most `history_trim_per_commit` more than written.
+pub fn trim_budget(count: u64, written: usize, policy: &crate::RetentionPolicy) -> usize {
+    let excess = usize::try_from(count.saturating_sub(policy.history_keep)).unwrap_or(usize::MAX);
+    excess.min(written.saturating_add(policy.history_trim_per_commit))
 }
 /// Which rolling set of history an item counts in. History is three
 /// rolling sets of `history_keep` each, trimmed oldest first by sequence:
@@ -289,14 +291,14 @@ impl HistoryRows {
     /// receipts, admin receipts) of them: a run with all its rows (its `runs`
     /// row last), an event's receipts together, an admin receipt alone.
     /// O(rows deleted).
-    fn trim(&mut self, keep: u64, written: (usize, usize, usize)) {
-        for _ in 0..trim_budget(self.runs.len() as u64, written.0, keep) {
+    fn trim(&mut self, policy: &crate::RetentionPolicy, written: (usize, usize, usize)) {
+        for _ in 0..trim_budget(self.runs.len() as u64, written.0, policy) {
             let Some((_, (_, run))) = self.runs.first().cloned() else {
                 break;
             };
             self.remove_owner(&run);
         }
-        let mut budget = trim_budget(self.events.len() as u64, written.1, keep);
+        let mut budget = trim_budget(self.events.len() as u64, written.1, policy);
         while budget > 0 {
             let Some((_, key)) = self.events.first().cloned() else {
                 break;
@@ -304,7 +306,7 @@ impl HistoryRows {
             let owner = self.rows[&key].run.clone();
             budget = budget.saturating_sub(self.remove_owner(&owner));
         }
-        for _ in 0..trim_budget(self.admin.len() as u64, written.2, keep) {
+        for _ in 0..trim_budget(self.admin.len() as u64, written.2, policy) {
             let Some((_, key)) = self.admin.first().cloned() else {
                 break;
             };
@@ -327,20 +329,24 @@ pub(crate) fn check_new(rows: &HistoryRows, items: &[HistoryItem]) -> Result<(),
     }
     Ok(())
 }
-/// Write the history of a commit under `keep` (`policy.history_keep`): its
-/// items (none when `keep` is 0), then the trim of each rolling set beyond
-/// `keep`, when the commit has history to write.
-pub(crate) fn insert(rows: &mut HistoryRows, items: Vec<HistoryItem>, keep: u64) {
+/// Write the history of a commit under `policy` (`history_keep`): its
+/// items (none when `history_keep` is 0), then the trim of each rolling set
+/// beyond `history_keep`, when the commit has history to write.
+pub(crate) fn insert(
+    rows: &mut HistoryRows,
+    items: Vec<HistoryItem>,
+    policy: &crate::RetentionPolicy,
+) {
     if items.is_empty() {
         return;
     }
     let written = units_written(&items);
-    if keep > 0 {
+    if policy.history_keep > 0 {
         for item in items {
             rows.add(item);
         }
     }
-    rows.trim(keep, written);
+    rows.trim(policy, written);
 }
 /// At most `limit + 1` items matching `query`, in key order.
 pub(crate) fn page(

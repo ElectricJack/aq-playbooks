@@ -57,7 +57,39 @@ pub struct RetentionPolicy {
     /// legacy tombstone rows deleted. Positive.
     #[serde(default = "default_drain_entries")]
     pub drain_entries_per_commit: usize,
+    /// At most this many expired window entries examined (dropped or
+    /// deferred) per commit ([`drop_expired`]). Positive.
+    #[serde(default = "default_window_drops")]
+    pub window_drops_per_commit: usize,
+    /// At most this many window entries evicted past `replay_keep` per
+    /// commit ([`evict`]); the removal fences allow no more. Positive.
+    #[serde(default = "default_replay_evictions")]
+    pub replay_evictions_per_commit: usize,
+    /// A commit that writes history trims, of each rolling set, at most
+    /// this many more than it writes ([`crate::history::trim_budget`]).
+    /// Positive.
+    #[serde(default = "default_history_trim")]
+    pub history_trim_per_commit: usize,
+    /// The largest page `collect_garbage` accepts (its `limit`), which also
+    /// bounds the PostgreSQL artifact catalog delete of a GC commit.
+    /// Positive.
+    #[serde(default = "default_gc_page_limit")]
+    pub gc_page_limit: usize,
 }
+fn default_window_drops() -> usize {
+    WINDOW_DROPS_PER_COMMIT
+}
+fn default_replay_evictions() -> usize {
+    REPLAY_EVICTIONS_PER_COMMIT
+}
+fn default_history_trim() -> usize {
+    crate::history::HISTORY_TRIM_RUNS_PER_COMMIT
+}
+fn default_gc_page_limit() -> usize {
+    GC_PAGE_LIMIT
+}
+/// The default of `RetentionPolicy::gc_page_limit`.
+pub const GC_PAGE_LIMIT: usize = 1_000;
 fn default_drain_cohorts() -> usize {
     50
 }
@@ -91,6 +123,10 @@ impl Default for RetentionPolicy {
             history_keep: default_history_keep(),
             drain_cohorts_per_commit: default_drain_cohorts(),
             drain_entries_per_commit: default_drain_entries(),
+            window_drops_per_commit: default_window_drops(),
+            replay_evictions_per_commit: default_replay_evictions(),
+            history_trim_per_commit: default_history_trim(),
+            gc_page_limit: default_gc_page_limit(),
         }
     }
 }
@@ -206,9 +242,10 @@ pub fn admission_order_key(receipt: &crate::KeyedAdmissionReceipt) -> String {
 pub fn event_order_key(event: &crate::AcceptedEvent) -> String {
     replay_key(event.sequence, &format!("{WINDOW_EVENT}{}", event.key))
 }
-/// At most this many entries at the head of the eviction order are examined
-/// (evicted, or taken out of the order because live work holds them) by one
-/// commit. Counted apart from the window drop's own bound.
+/// The default of `RetentionPolicy::replay_evictions_per_commit`: entries
+/// at the head of the eviction order examined (evicted, or taken out of the
+/// order because live work holds them) per commit. Counted apart from the
+/// window drop's own bound.
 pub const REPLAY_EVICTIONS_PER_COMMIT: usize = 64;
 /// Refusal of a commit that evicts a window entry other than as
 /// [`evict`] does (see [`verify_removals`]).
@@ -1232,8 +1269,8 @@ fn move_admin_receipts(s: &mut State, started: u64, report: &mut CommitReport) -
     });
     Ok(())
 }
-/// At most this many window entries are examined (dropped or deferred) by
-/// one commit, oldest expiry first.
+/// The default of `RetentionPolicy::window_drops_per_commit`: window
+/// entries examined (dropped or deferred) per commit, oldest expiry first.
 pub const WINDOW_DROPS_PER_COMMIT: usize = 64;
 /// The time a window entry written now counts from: the later of the
 /// commit's host time and the clock, so a backwards host time never
@@ -1837,7 +1874,8 @@ pub type StoredWaiters<'a> =
 ///
 /// - no live work in `next` holds the entry (a keyed receipt's run is not in
 ///   `next`; for an event, [`event_held`] judged by `next`);
-/// - at most [`REPLAY_EVICTIONS_PER_COMMIT`] in the commit, and `next`'s
+/// - at most `policy.replay_evictions_per_commit` (of `next`) in the
+///   commit, and `next`'s
 ///   order still holds at least `policy.replay_keep` entries (so the order
 ///   held more before them);
 /// - oldest first: every evicted key is before every key `next`'s order
@@ -1911,7 +1949,7 @@ pub fn check_evictions(
         return Ok(BTreeSet::new());
     }
     let first = |evicted: &[(String, Window, String)]| refusal(&evicted[0].0);
-    if evicted.len() > REPLAY_EVICTIONS_PER_COMMIT
+    if evicted.len() > next.retention.policy.replay_evictions_per_commit
         || order.len() < next.retention.policy.replay_keep
     {
         return Err(first(&evicted));
@@ -1950,9 +1988,11 @@ pub(crate) fn finish_commit(
     drain_step(s, started, &mut report)?;
     rejoin(s)?;
     if now_ms.is_some() {
-        drop_expired(s, WINDOW_DROPS_PER_COMMIT, &mut report)?;
+        let drops = s.retention.policy.window_drops_per_commit;
+        drop_expired(s, drops, &mut report)?;
     }
-    evict(s, REPLAY_EVICTIONS_PER_COMMIT, &mut report)?;
+    let evictions = s.retention.policy.replay_evictions_per_commit;
+    evict(s, evictions, &mut report)?;
     move_admin_receipts(s, started, &mut report)?;
     Ok(report)
 }
@@ -2324,8 +2364,9 @@ pub fn verify_artifact_removals(
     Ok(())
 }
 pub(crate) fn gc(s: &mut State, now: i64, limit: usize) -> Result<GcReport> {
-    if limit == 0 || limit > 1000 {
-        return Err(Error::Refused("GC page limit must be 1..1000".into()));
+    let most = s.retention.policy.gc_page_limit;
+    if limit == 0 || limit > most {
+        return Err(Error::Refused(format!("GC page limit must be 1..{most}")));
     }
     if s.retention
         .last_gc_at_ms

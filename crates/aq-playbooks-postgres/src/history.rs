@@ -56,24 +56,24 @@ fn count(
     tx.execute("UPDATE aq_playbooks.run_history_counts SET runs=runs+$2,event_receipts=event_receipts+$3,admin_receipts=admin_receipts+$4 WHERE namespace=$1",&[&namespace,&delta.0,&delta.1,&delta.2]).map_err(backend)?;
     Ok(())
 }
-/// Write a commit's history in its transaction under `keep`
-/// (`policy.history_keep`): insert `items` (none when `keep` is 0; a key
-/// already recorded fails the commit with [`ALREADY_RECORDED`]), then delete
-/// the oldest of each rolling set beyond `keep`, at most
-/// [`history::HISTORY_TRIM_RUNS_PER_COMMIT`] more than the commit writes of
-/// it: a run's items before its `runs` row, an event's receipts together.
+/// Write a commit's history in its transaction under `policy`: insert
+/// `items` (none when `history_keep` is 0; a key already recorded fails the
+/// commit with [`ALREADY_RECORDED`]), then delete the oldest of each rolling
+/// set beyond `history_keep`, at most `history_trim_per_commit` more than
+/// the commit writes of it ([`history::trim_budget`]): a run's items before
+/// its `runs` row, an event's receipts together.
 /// Every statement is index-backed; nothing counts rows.
 pub(crate) fn insert(
     tx: &mut ObservedTransaction<'_>,
     namespace: &str,
     items: &[HistoryItem],
-    keep: u64,
+    policy: &aq_playbooks_runner::RetentionPolicy,
 ) -> Result<(), StorageError> {
     if items.is_empty() {
         return Ok(());
     }
     let written = history::units_written(items);
-    if keep > 0 {
+    if policy.history_keep > 0 {
         write(tx, namespace, items)?;
         count(
             tx,
@@ -81,12 +81,12 @@ pub(crate) fn insert(
             (written.0 as i64, written.1 as i64, written.2 as i64),
         )?;
     }
-    trim(tx, namespace, keep, written)
+    trim(tx, namespace, policy, written)
 }
 fn trim(
     tx: &mut ObservedTransaction<'_>,
     namespace: &str,
-    keep: u64,
+    policy: &aq_playbooks_runner::RetentionPolicy,
     written: (usize, usize, usize),
 ) -> Result<(), StorageError> {
     let (runs, events, admin): (i64, i64, i64) = tx
@@ -97,7 +97,7 @@ fn trim(
         .map_err(backend)?
         .map_or((0, 0, 0), |row| (row.get(0), row.get(1), row.get(2)));
     let budget = |count: i64, written: usize| {
-        history::trim_budget(count.max(0) as u64, written, keep) as i64
+        history::trim_budget(count.max(0) as u64, written, policy) as i64
     };
     let mut trimmed = (0, 0, 0);
     tx.phase("history_trim");

@@ -750,12 +750,7 @@ impl PostgresStorage {
             namespace,
             &aq_playbooks_runner::history::new_live_keys(&previous, state),
         )?;
-        history::insert(
-            &mut tx,
-            namespace,
-            &items,
-            state.retention.policy.history_keep,
-        )?;
+        history::insert(&mut tx, namespace, &items, &state.retention.policy)?;
         for (digest, artifact) in &state.artifacts {
             tx.phase("artifact_compare");
             // Previous bytes were freshly read, authenticated and fully verified

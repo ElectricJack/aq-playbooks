@@ -3765,6 +3765,15 @@ impl<S: Storage> Engine<S> {
         if policy.drain_cohorts_per_commit == 0 || policy.drain_entries_per_commit == 0 {
             return Err(Error::Refused("drain bounds must be positive".into()));
         }
+        if policy.window_drops_per_commit == 0
+            || policy.replay_evictions_per_commit == 0
+            || policy.history_trim_per_commit == 0
+            || policy.gc_page_limit == 0
+        {
+            return Err(Error::Refused(
+                "per-commit retention bounds must be positive".into(),
+            ));
+        }
         self.transaction_at(None, |s| {
             s.retention.policy = policy;
             Ok(())
