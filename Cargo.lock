@@ -77,6 +77,7 @@ dependencies = [
  "aq-playbooks-model",
  "aq-playbooks-postgres",
  "aq-playbooks-runner",
+ "aq-playbooks-simulation",
  "clap",
  "serde",
  "serde_json",
@@ -126,6 +127,17 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+]
+
+[[package]]
+name = "aq-playbooks-simulation"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "aq-playbooks-model",
+ "aq-playbooks-runner",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

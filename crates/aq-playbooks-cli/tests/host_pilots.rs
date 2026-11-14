@@ -465,3 +465,41 @@ fn pilots_pass_on_reconciled_catalog() {
     coding_requires_explicit_accepted_review_and_exact_check_before_independent_followup();
     report_deadline_cancels_owned_author_and_late_completion_keeps_one_message();
 }
+
+/// A scripted cancel of a start that already finished (and left the
+/// engine's State as history) is a no-op, not a failed simulation. (Moved
+/// from the CLI's `simulation` module when the simulator became the
+/// `aq-playbooks-simulation` crate, which has no pilots.)
+#[test]
+fn cancelling_a_finished_start_is_a_no_op() {
+    use aq_playbooks_cli::simulation::{Action, simulate};
+    let mut scenario = pilots::scenario("routing").unwrap();
+    let clock = scenario
+        .actions
+        .iter()
+        .map(|action| match action {
+            Action::Tick { at_ms }
+            | Action::Event { at_ms, .. }
+            | Action::Cancel { at_ms, .. }
+            | Action::Recover { at_ms } => *at_ms,
+        })
+        .max()
+        .unwrap_or(0);
+    scenario.actions.push(Action::Cancel {
+        at_ms: clock + 1,
+        start: 0,
+    });
+    let report = simulate(&scenario).unwrap();
+    assert!(report.complete);
+    let root = &report.roots[0];
+    let runs = report.inspection["runs"].as_array().unwrap();
+    assert!(
+        runs.iter()
+            .any(|run| &run["id"] == root && run["outcome"] == "success")
+    );
+    scenario.actions.push(Action::Cancel {
+        at_ms: clock + 2,
+        start: 7,
+    });
+    assert!(simulate(&scenario).is_err(), "an unknown start still fails");
+}
