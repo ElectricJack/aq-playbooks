@@ -189,7 +189,11 @@ The bridge publishes stable producer/event identities and causation references,
 with occurrence and observation times. Subject and revision in the envelope must
 match the specified payload paths. Owned-work and decision completions carry
 `correlation.operation = accepted.handle`. A duplicate event with the same identity
-and content is a replay; conflicting content refuses. Events do not grant the
+and content is a replay; conflicting content refuses. The engine recognises a
+duplicate only while it still remembers the identity (spec 0003: the most recent
+`replay_keep` keys within their window); a later re-send is refused as stale only
+when it carries a request time older than the window, and is otherwise admitted
+as new. Events do not grant the
 workflow new authority. Domain state and the outgoing event must commit atomically
 in the owning host service (D3 outbox), and delivery may retry until admitted.
 

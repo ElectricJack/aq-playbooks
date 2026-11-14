@@ -257,7 +257,12 @@ struct Ask {
 /// Installs and admits the playbook, then drives it at time 0: the host admits
 /// the judgment request and the run waits (at the join, or at `hold`).
 fn ask(hold: bool) -> Ask {
-    let engine = Engine::new(MemoryStorage::default(), "async-answer", "owner-1").unwrap();
+    let engine = Engine::new(
+        MemoryStorage::retaining_settled(),
+        "async-answer",
+        "owner-1",
+    )
+    .unwrap();
     let artifact = playbook(r("j", &[]), hold);
     engine.install(artifact.clone()).unwrap();
     engine
@@ -294,22 +299,70 @@ impl Ask {
             .unwrap();
         self.engine.drive(&mut self.host, at_ms, 20).unwrap();
     }
+    /// The run while it is live.
     fn run(&self) -> Run {
-        self.engine.snapshot().unwrap().runs[&self.run].clone()
+        self.engine
+            .snapshot()
+            .unwrap()
+            .runs
+            .get(&self.run)
+            .cloned()
+            .unwrap_or_else(|| panic!("{} has left the state", self.run))
+    }
+    /// The finished run as its cohort left the state (spec 0003: a finished
+    /// run leaves in the commit that finishes it). Asserts that it has left.
+    fn finished(&self) -> Run {
+        assert!(
+            !self.engine.snapshot().unwrap().runs.contains_key(&self.run),
+            "{} is still live",
+            self.run
+        );
+        self.engine
+            .store
+            .settled_run(&self.engine.namespace, &self.run)
+            .unwrap_or_else(|| panic!("{} is not in history", self.run))
+    }
+    /// Every public inspection item of `kind` for this run (live state plus
+    /// history).
+    fn inspected(&self, kind: InspectionKind) -> Vec<Value> {
+        let mut items = vec![];
+        let mut after = None;
+        loop {
+            let page = self
+                .engine
+                .inspect(&InspectionQuery {
+                    kind,
+                    run: Some(self.run.clone()),
+                    after,
+                    limit: 1000,
+                })
+                .unwrap();
+            items.extend(page.items);
+            match page.next {
+                Some(next) => after = Some(next),
+                None => return items,
+            }
+        }
     }
     fn assert_finished(&self, outcome: &str) {
-        let run = self.run();
+        let run = self.finished();
         assert_eq!(run.status, RunStatus::Completed, "{run:?}");
         assert_eq!(run.outcome.as_deref(), Some(outcome), "{run:?}");
+        // Inspection serves the same outcome from history.
+        let inspected = self.inspected(InspectionKind::Runs);
+        assert_eq!(inspected.len(), 1, "{inspected:?}");
+        assert_eq!(inspected[0]["status"], "completed");
+        assert_eq!(inspected[0]["outcome"], outcome);
+        // The run and the operation it owned left together.
+        let s = self.engine.snapshot().unwrap();
+        assert!(!s.intents.values().any(|i| i.run == self.run));
         assert!(
             !self
-                .engine
-                .snapshot()
-                .unwrap()
-                .receipts
+                .inspected(InspectionKind::Receipts)
                 .iter()
-                .any(|r| r.kind == "engine_failure"),
+                .any(|r| r["kind"] == "engine_failure"),
         );
+        assert!(!s.receipts.iter().any(|r| r.kind == "engine_failure"));
     }
 }
 
@@ -319,13 +372,13 @@ fn an_assessed_answer_is_read_by_name_and_branches_on_its_choice() {
         let mut a = ask(false);
         a.complete(assessed(choice), 10);
         a.assert_finished(outcome);
-        let answer = &a.run().variables["answer"];
+        let answer = &a.finished().variables["answer"];
         assert_eq!(answer["c"]["outcome"], "assessed");
         assert_eq!(answer["c"]["output"]["choice"], choice);
         // `participant` is the operation the engine owns, not the host handle.
-        let s = a.engine.snapshot().unwrap();
-        let intent = s.intents.values().find(|i| i.run == a.run).unwrap();
-        assert_eq!(answer["c"]["participant"], intent.id.as_str());
+        let effects = a.inspected(InspectionKind::Effects);
+        assert_eq!(effects.len(), 1, "{effects:?}");
+        assert_eq!(answer["c"]["participant"], effects[0]["id"]);
     }
 }
 
@@ -336,20 +389,19 @@ fn a_failed_or_refused_answer_takes_no_match_without_reading_the_choice() {
         let mut a = ask(false);
         a.complete(payload, 10);
         a.assert_finished("unanswered");
-        let run = a.run();
+        let run = a.finished();
         // The playbook never reached the step that reads `choice`.
-        let s = a.engine.snapshot().unwrap();
+        let receipts = a.inspected(InspectionKind::Receipts);
         assert!(
-            !s.receipts
+            !receipts
                 .iter()
-                .any(|r| r.run == a.run && r.step == "decide"),
-            "{:?}",
-            s.receipts
+                .any(|r| r["run"] == a.run.as_str() && r["step"] == "decide"),
+            "{receipts:?}"
         );
         assert!(
-            s.receipts
+            receipts
                 .iter()
-                .any(|r| r.run == a.run && r.step == "unanswered")
+                .any(|r| r["run"] == a.run.as_str() && r["step"] == "unanswered")
         );
         assert_eq!(run.variables["answer"]["c"]["outcome"], outcome);
         assert!(
@@ -376,7 +428,7 @@ fn an_answer_that_arrives_before_the_join_is_reached_is_read_there() {
     a.engine.drive(&mut a.host, HOLD_MS as i64, 20).unwrap();
     a.assert_finished("approved");
     assert_eq!(
-        a.run().variables["answer"]["c"]["output"]["choice"],
+        a.finished().variables["answer"]["c"]["output"]["choice"],
         "approve"
     );
 }
@@ -402,7 +454,7 @@ fn an_answer_that_never_arrives_takes_the_timeout_edge_at_the_deadline() {
     // replace the recorded timeout.
     a.complete(assessed("approve"), JOIN_DEADLINE_MS as i64 + 10);
     a.assert_finished("late");
-    assert_eq!(a.run().variables["answer"], json!({}));
+    assert_eq!(a.finished().variables["answer"], json!({}));
 }
 
 #[test]
