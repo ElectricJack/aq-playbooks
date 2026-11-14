@@ -14,7 +14,7 @@ A change that answers later: its `accepted` edge binds `{handle}`, and the answe
 | --- | --- | --- |
 | `budget` | {deadline_ms, max_output_tokens} | `deadline_ms` (1000 to 600000), how long the host may take; `max_output_tokens`. 120000 ms and 2048 tokens are plenty for a classification. Today the host refuses a budget above its caps with `budget_exceeded`. |
 | `context` | {items} | `items`: at most 16 `{label, text}` the model sees, such as a task's title and description. |
-| `fields` | array ≤ 16 of {choices, description, id} | Today the host has no adapter for this command yet, so it has not decided what it does with no fields and one flag: this is not yet decided by the host, so include at least one field. One entry per labelled question: `{id, description, choices}`, at most 16, with up to 64 choices of at most 128 bytes. Include a choice such as `unknown` when the document says what to do if it cannot be told. |
+| `fields` | array ≤ 16 of {choices, description, id} | Today the host has no adapter for this command, and what it does with no fields is not decided: include at least one field. One entry per labelled question: `{id, description, choices}`, at most 16, with up to 64 choices of at most 128 bytes. Include a choice such as `unknown` when the document says what to do if it cannot be told. |
 | `flags` | array ≤ 32 of {description, id} | Yes/no questions: `{id, description}`, at most 32. The model says which hold. |
 | `question` | string ≤ 4096 B | What to judge, in the document's own words, with its definitions. |
 | `rationale_max_bytes` | integer 0..4096 | How long the model's explanation may be, 0 to 4096. |
@@ -27,7 +27,7 @@ A change that answers later: its `accepted` edge binds `{handle}`, and the answe
 | `failed` | {reason, reference, subject} | No usable answer: `indeterminate`, `provider_error`, `provider_unavailable` or `deadline_exceeded`. Take the fallback the document gives. |
 | `refused` | {reason, reference, subject} | The request was not run. Today the host refuses it with `invalid_request` (over 65536 bytes, duplicate field ids, a field without choices) or `budget_exceeded`. It can come at once, on the invoke's own `refused` edge, or through the join. Take the fallback the document gives. |
 
-Today the host gives every accepted judgment exactly one final answer, at the latest `failed` with `deadline_exceeded` when the host's own deadline passes. The join's deadline only decides when the run stops waiting.
+The host must give every accepted judgment exactly one final answer, at the latest `failed` with `deadline_exceeded` when the host's own deadline passes. The join's deadline only decides when the run stops waiting.
 
 Write a fallback that reads nothing of the answer on every way the judgment can fail: the join's `no_match`, `timeout` and `on_error`, and the invoke's own outcome edges besides `accepted`.
 
@@ -69,7 +69,7 @@ A read: safe to repeat. The host answers within 10000 ms. Needs: `work.read`.
 | Outcome | Returns | When, and what next |
 | --- | --- | --- |
 | `observed` | {facts, reference, subject} | `subject` carries the task's current revision: pass this subject on, not the trigger's, so that a later write to a changed task is refused as stale. `reference` is `<id>@<revision>` of the task as read (one value per task version). `facts` holds what a document can test (below). |
-| `refused` | {reason, reference, subject} | Today the host refuses with `unknown_task` (there is no such task) or `not_on_router` (the task's project is not routed automatically). End the run: nothing is wrong with the playbook. |
+| `refused` | {reason, reference, subject} | The host refuses with `unknown_task` (there is no such task) or `not_on_router` (the task's project is not routed automatically). End the run: nothing is wrong with the playbook. |
 
 Today the host answers only for a task in a project on the automatic router. If the document expects to read tasks of any project, ask the owner.
 

@@ -93,8 +93,9 @@ command before it prints, with `…` for text left out.
    A document that says a task is filed, made or added starts on
    `aq.work.changed` with outcome `ensured`, which means the task exists
    now and is sent whether the task was new or already there; it never says
-   which. Word the sentence so that either reading is what the owner means,
-   or ask.
+   which. Go on when what the sentence asks for also holds for a task that
+   already existed (as in notify-when-ready); ask when it depends on the
+   task being new.
 4. Read the worked example closest to the document (`examples/`). Then write
    `draft.json`. `LANGUAGE.md` lists every operation and expression. Write
    commands and events by their names; the tool fills in their identities.

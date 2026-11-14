@@ -35,7 +35,7 @@ A read: safe to repeat. The host answers within 10000 ms. Needs: `work.read`.
 | Outcome | Returns | When, and what next |
 | --- | --- | --- |
 | `observed` | {facts, reference, subject} | `subject` carries the task's current revision: pass this subject on, not the trigger's, so that a later write to a changed task is refused as stale. `reference` is `<id>@<revision>` of the task as read (one value per task version). `facts` holds what a document can test (below). |
-| `refused` | {reason, reference, subject} | Today the host refuses with `unknown_task` (there is no such task) or `not_on_router` (the task's project is not routed automatically). End the run: nothing is wrong with the playbook. |
+| `refused` | {reason, reference, subject} | The host refuses with `unknown_task` (there is no such task) or `not_on_router` (the task's project is not routed automatically). End the run: nothing is wrong with the playbook. |
 
 Today the host answers only for a task in a project on the automatic router. If the document expects to read tasks of any project, ask the owner.
 
