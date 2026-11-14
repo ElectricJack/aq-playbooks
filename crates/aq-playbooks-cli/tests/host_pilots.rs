@@ -12,7 +12,8 @@ mod pilots;
 mod pilots_tests;
 
 use aq_playbooks_cli::catalog;
-use aq_playbooks_model::canonical_bytes;
+use aq_playbooks_compiler::COMPILER_VERSION;
+use aq_playbooks_model::{Artifact, canonical_bytes};
 use aq_playbooks_runner::{Engine, Error, Intent, IntentStatus, MemoryStorage, Run, RunStatus};
 use fake_host::{Episode, FakeHost, Observation, Subject};
 use serde_json::json;
@@ -495,7 +496,9 @@ fn cancelling_a_finished_start_is_a_no_op() {
 /// The pilots are test support now, and `aq-playbooks examples` writes the
 /// worked authoring workspaces instead of them. Their bytes stay pinned: the
 /// coding pilot and its repair child seal to the exact artifacts the model's
-/// format test keeps (`aq-playbooks-model/tests/fixtures`).
+/// format test keeps (`aq-playbooks-model/tests/fixtures`), once stamped
+/// with the compiler version that wrote those (the stamp is part of the
+/// content, so a compiler release changes every digest and nothing else).
 #[test]
 fn the_coding_pilot_keeps_its_pinned_bytes() {
     let artifacts = pilots::scenario("coding").unwrap().artifacts;
@@ -509,8 +512,41 @@ fn the_coding_pilot_keeps_its_pinned_bytes() {
             include_bytes!("../../aq-playbooks-model/tests/fixtures/repair.artifact.json"),
         ),
     ];
+    let stamp = Artifact::from_canonical_bytes(pinned[0].1)
+        .unwrap()
+        .content
+        .compiler;
+    assert!(
+        artifacts
+            .iter()
+            .all(|a| a.content.compiler == COMPILER_VERSION)
+    );
+    // Seal every artifact again under the pinned stamp. An artifact names
+    // its dependencies by digest, so one pass per artifact carries the new
+    // digests through the deepest chain.
+    let mut digests: BTreeMap<String, String> = BTreeMap::new();
+    let mut stamped: Vec<Artifact> = vec![];
+    for _ in 0..artifacts.len() {
+        stamped = artifacts
+            .iter()
+            .map(|a| {
+                let mut content = a.content.clone();
+                content.compiler = stamp.clone();
+                let mut text = serde_json::to_string(&content).unwrap();
+                for (old, new) in &digests {
+                    text = text.replace(old, new);
+                }
+                Artifact::seal(serde_json::from_str(&text).unwrap()).unwrap()
+            })
+            .collect();
+        digests = artifacts
+            .iter()
+            .zip(&stamped)
+            .map(|(a, s)| (a.digest.clone(), s.digest.clone()))
+            .collect();
+    }
     for (id, bytes) in pinned {
-        let artifact = artifacts
+        let artifact = stamped
             .iter()
             .find(|a| a.content.playbook.id == id)
             .unwrap_or_else(|| panic!("the coding pilot has no {id} artifact"));
