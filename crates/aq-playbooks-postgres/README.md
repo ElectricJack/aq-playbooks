@@ -25,7 +25,10 @@ keys; the host must authorize database roles and control-surface access.
 
 The authoritative snapshot is still serialized for CAS. Namespace size is bounded
 by deletion: finished work leaves at completion, and remembered keys and history
-are rolling sets of fixed size (there are no namespace limits); native discovery and incremental index writes
+are rolling sets of fixed size (there are no namespace limits). Each commit that
+writes history deletes the oldest finished runs beyond `history_keep`, through
+`run_history_runs_by_finish` and the per-namespace count `run_history_counts`
+(migration 7); native discovery and incremental index writes
 do not make snapshot serialization constant-time. A version-one database upgrades
 transactionally; its next exclusive owner initializes materialized indexes before
 scheduling or inspection. Reads refuse an uninitialized index rather than reporting

@@ -424,6 +424,188 @@ finished before the upgrade until the drain moves them out (Task 9). They
 never make new work wait (tested:
 `a_legacy_namespace_holding_finished_runs_admits_new_work_and_drains`).
 
+## Repeat protection is a rolling set (`replay_keep`)
+
+Owner direction (spec 0003, "rolling bounds"). The engine remembers the most
+recent `policy.replay_keep` window entries (default 256; events and keyed
+admission receipts counted together) that no live work holds, and forgets an
+entry when its window passes *or* when newer entries push it out, whichever
+comes first.
+
+**What it guarantees.** A repeat is recognised (answered as a duplicate, or
+`Conflict` for changed content) while its window has not passed *and* fewer
+than `replay_keep` newer unheld keys have been accepted since. An entry that
+live work holds is never evicted, at any count:
+
+- a keyed admission receipt whose run is in the record;
+- an event with a live waiter on one of its correlation keys, a queued
+  destination its input does not block, or an uncertain completion of its
+  contract and scope (the same holds as the window's deferral, SC-9).
+
+**What it does not guarantee.** A repeat that arrives after `replay_keep`
+newer unheld keys is not recognised. It is treated exactly as a repeat of an
+expired key (Task 7's rule): refused as stale only if it carries a request
+time older than its window; otherwise accepted as new, so the work runs
+again. There is no "eviction floor": the owner chose bounded memory over
+catching every slow duplicate, and a floor would refuse legitimately new
+work whose request time is old.
+
+**It overrides a contract's `retention_ms` for unheld events.** Every event
+contract in the AQ host catalog declares 24 h retention, so the time window
+alone kept a day of events in the record. Count eviction removes an unheld
+event long before that. A wait registered after its event was evicted
+times out, as after an expired event (tested:
+`a_day_long_event_window_is_evicted_by_count`).
+
+**A host that needs stronger protection raises `replay_keep`** (the record
+then holds up to that many unheld entries, about 1 to 2 KB each), or sends a
+request time so a late repeat is refused as stale.
+
+**Measured** (Task 8b, `engine_growth` config `a`, protected format 2,
+10-minute windows, default `replay_keep` 256): with the clock frozen for
+1,000 runs (one event and one keyed admission each), the record grows to
+278.0 KB by run 200 and stays there (278.3 KB at run 500, 278.4 KB at run
+1,000), holding 128 events and 128 keyed receipts; the median step is
+25.6 ms at run 1,000. Before this change the same burst grew 2,014 B per
+run without end. At 10 s per run the 10-minute window, not the count,
+bounds the record (about 120 entries; 132.7 KB at run 200).
+
+### How it works
+
+- `RetentionState::replay_order` holds the unheld entries in acceptance
+  order, one record each, keyed `replay_key(sequence, member)`: 16 hex
+  digits of the acceptance sequence (an event's `sequence`; for a keyed
+  receipt, the sequence in its run id `run-<16 hex>`), then the member
+  (`e:<event key>` or `k:<admission key>`).
+- A keyed receipt is held by its live run from its acceptance:
+  `RetentionState::replay_held` maps the run id to the key, and the receipt
+  joins the order in the commit its run leaves the record (in its history).
+- An event is judged (`event_held`) in the commits that may change its hold:
+  the one that accepts it, the one that fans it out, and any commit that
+  changes the waiters of one of its correlation keys (`State::replay_touched`,
+  never stored, filled by the index sync and by cohort removal). Held, it is
+  out of the order; unheld, in it.
+- **Not tracked:** a hold that begins or ends through an uncertain
+  completion (an operation whose admission handle is lost). Such an event,
+  if it was in the order, still counts until it reaches the head, where the
+  engine judges it, finds it held and takes it out (never evicting it); one
+  out of the order whose hold ends this way leaves with its window. So the
+  order's count can include, for a while, an entry whose hold began this
+  way: the "unheld count" is exactly the order's size.
+- `retention::evict`, in every commit that changes the State except a
+  licensed admin commit, after the window drop: while the order holds more
+  than `replay_keep`, take its head, at most `REPLAY_EVICTIONS_PER_COMMIT`
+  (64) per commit (counted apart from the window drop's own 64). A held head
+  leaves the order; otherwise the entry is forgotten exactly as when its
+  window passes (item, expiry record, expiry-order key; for an event its
+  epoch, indexes and `event:<key>` receipts, which go to history). It never
+  refuses, never delays the commit and needs no host time. A commit with
+  nothing to evict compares one count; k evictions cost O(k) (tested on a
+  plain State and on bound records).
+- A commit lowers `replay_keep` (`set_retention_policy`); the excess leaves 64
+  per commit. `0` is refused ("replay_keep must be positive").
+
+### The eviction licence (the removal fences)
+
+`retention::check_evictions`, run by `verify_removals` on every complete
+path (memory and record CAS, PostgreSQL protected and plain format 2,
+format 3 CAS and heavy), by the record store's patch fence, and by the
+PostgreSQL format 3 bounded path while its transaction is still lent (so an
+eviction stays an incremental commit). A keyed receipt or event removed
+before its expiry, whose order key `next` no longer holds, is allowed only
+as `evict` makes it:
+
+- no live work in `next` holds it (a keyed receipt's run is not in `next`;
+  an event is judged by `next`'s waiters, runs, operations and
+  destinations);
+- at most 64 in the commit, and `next`'s order still holds at least
+  `replay_keep` entries (the order held more before them);
+- oldest first: each evicted key is before every key `next`'s order holds.
+
+And every order key a commit adds must be the key of an item `next` holds,
+at that item's own acceptance sequence, that no live work holds, so the
+count that licenses evictions counts real unheld entries. A violation is
+refused with "window entry evicted without its licence" (an entry the
+stored order did not hold: "window entry removed before its expiry"). An
+entry that joins the order and is evicted in the same commit (a keyed
+receipt whose run has just left, the oldest) is allowed. A removal whose
+order key stays is no eviction and is refused as early.
+
+### Stored shape
+
+Additive and defaulted: `RetentionPolicy::replay_keep` (256) and
+`history_keep` (10,000), `RetentionState::replay_order` and `replay_held`
+(two more lazy containers on format 3, `retention.replay_order` and
+`retention.replay_held`). States written before decode with the defaults.
+A namespace's snapshot bytes change on its next commit even when nothing is
+evicted: the policy serializes its two new fields, the two maps their
+entries (about 90 bytes per remembered entry in `replay_order`, plus the
+`replay_held` entry of each live keyed run).
+
+**Entries written before this change are not in the order.** They never
+count and are never evicted; they still leave by their window. The index
+rebuild on open judges every event (so a namespace opened with
+uninitialized indexes puts its unheld events in the order), but keyed
+receipts written before stay out. Task 9's drain should add them, as it
+adds their expiry-order keys.
+
+## History is a rolling log (`history_keep`)
+
+History keeps the most recent `policy.history_keep` finished runs per
+namespace (default 10,000). Each commit that writes history deletes the
+oldest finished runs beyond that number: at most the runs it writes plus
+`HISTORY_TRIM_RUNS_PER_COMMIT` (64), so it keeps up with any commit (one
+settling up to 50 cohorts of any size) and a lowered `history_keep` is
+reached within a bounded number of commits. A run is deleted with all its
+items (effects and receipts) first and its `runs` row last, in the same
+transaction. `history_keep` 0 writes no history at all; inspection of
+finished runs then returns nothing, and what history there was is trimmed
+by the next commits that settle a cohort.
+
+"Oldest" is by finish time, then run id. A cohort's runs share its finish
+time.
+
+Not trimmed by count: receipts that belong to no run (`admin`, and an
+event's `event:<key>` delivery receipts). They are few (operator actions,
+blocked deliveries) and `delete_history_before` removes them by time.
+
+Inspection's page order, cursors and filters are unchanged. A page whose
+cursor's run is trimmed before the next page neither repeats nor skips a
+remaining item: the next page starts after the cursor (tested:
+`a_page_across_a_trim_neither_repeats_nor_panics`).
+
+`delete_history_before` (host-called, by finish time) keeps working and
+keeps the run count right, so the trim after it is still exact.
+
+### PostgreSQL (migration 7)
+
+- `run_history_runs_by_finish`: a partial index on
+  `run_history(namespace, finished_at_ms, item_key) WHERE kind='runs'`. The
+  trim reads the oldest runs from it in order: no sort, no scan of the
+  table.
+- `run_history_counts(namespace, runs)`: the number of finished runs each
+  namespace's history holds, maintained by the transactions that insert,
+  trim and delete history, so nothing ever counts rows. The migration
+  fills it once from existing history. Writes need the namespace writer,
+  like `run_history`.
+- The trim: read the count; select the oldest `min(count - keep, written +
+  64)` runs through the partial index; delete their items through
+  `run_history_by_run`, then their `runs` rows through the primary key;
+  lower the count (tested with `EXPLAIN` over 90,000 history rows:
+  `history_trim_reads_and_deletes_through_indexes`).
+- **Privilege.** The migration runner applies pending migrations in one
+  transaction as the connecting role. Migration 7 creates an index on
+  `run_history` (which needs ownership of that table) and creates a table
+  in schema `aq_playbooks` with a foreign key to `namespaces` and triggers
+  on itself. That is exactly what migration 6 needs of the role that
+  applies it (it creates `run_history`), so the role that applied
+  migration 6 can apply migration 7, and nothing more is needed. Checked
+  by hand on PostgreSQL 17 with a `NOSUPERUSER NOCREATEDB NOCREATEROLE` role
+  owning the schema: 1-6 then 7 apply; a second role with `CREATE` on the
+  schema but not owning `run_history` is refused ("must be owner of table
+  run_history"). Migrations 6 and 7 are both new on this branch, so a
+  deployment applies them together, as one role, in one transaction.
+
 ## PostgreSQL: on-disk size of the namespace table
 
 On protected format 2 every transition rewrites the namespace's one wide,

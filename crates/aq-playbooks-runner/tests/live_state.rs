@@ -5570,7 +5570,15 @@ fn replay_keep_must_be_positive() {
     assert_eq!(RetentionPolicy::default().replay_keep, 256);
     let stored: RetentionPolicy =
         serde_json::from_value(json!({"event_replay_ms": 1, "audit_ms": 1})).unwrap();
-    assert_eq!(stored.replay_keep, 256);
+    assert_eq!((stored.replay_keep, stored.history_keep), (256, 10_000));
+    // A State written before the rolling bounds decodes with an empty order.
+    let legacy: State = serde_json::from_value(json!({
+        "artifacts": {}, "bindings": {}, "catalog_revision": 0, "runs": {},
+        "receipts": [], "intents": {}, "waits": {}, "events": {}, "budgets": {},
+        "sequence": 0,
+    }))
+    .unwrap();
+    assert!(legacy.retention.replay_order.is_empty() && legacy.retention.replay_held.is_empty());
 }
 /// With `replay_keep` 4: a duplicate inside the rolling set is recognised;
 /// the 5th distinct unheld key evicts the 1st (oldest first, its window not
