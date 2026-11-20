@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use aq_playbooks_cli::{catalog, simulation};
-use aq_playbooks_model::{Artifact, Registry};
+use aq_playbooks_model::{Artifact, CatalogExtension, Registry};
 use aq_playbooks_postgres::PostgresStorage;
 use aq_playbooks_runner::{
     Authority, CatalogKind, CatalogQuery, Engine, InspectionKind, InspectionQuery, RetentionPolicy,
@@ -331,6 +331,7 @@ fn advance_until_settled(e: &Engine<PostgresStorage>, run: &str) -> Result<()> {
 fn choose<T: Serialize>(
     kind: &str,
     map: &std::collections::BTreeMap<String, T>,
+    extensions: &[CatalogExtension],
     action: CatalogAction,
 ) -> Result<()> {
     match action {
@@ -340,14 +341,16 @@ fn choose<T: Serialize>(
                 .get(&name)
                 .with_context(|| format!("unknown registration: {name}"))?;
             let mut described = serde_json::to_value(contract)?;
-            let pinned = aq_playbooks_compiler::docs::catalog_registry();
-            let same = match kind {
-                "commands" => pinned.commands.get(&name).map(serde_json::to_value),
-                _ => pinned.events.get(&name).map(serde_json::to_value),
-            };
-            if let (Some(Ok(pinned)), Some(notes)) =
-                (same, aq_playbooks_compiler::docs::notes(kind, &name))
-                && pinned == described
+            if let Some(notes) = extensions
+                .iter()
+                .find_map(|extension| extension.notes().get(kind)?.get(&name))
+                && let Some(object) = described.as_object_mut()
+            {
+                object.insert("notes".into(), notes.clone());
+                return print(&described);
+            }
+            if let Some(notes) =
+                aq_playbooks_compiler::docs::published_notes(kind, &name, &described)
                 && let Some(object) = described.as_object_mut()
             {
                 object.insert("notes".into(), notes);
@@ -356,12 +359,14 @@ fn choose<T: Serialize>(
         }
     }
 }
-fn catalog_file(path: Option<PathBuf>) -> Result<Registry> {
+fn catalog_file(path: Option<PathBuf>) -> Result<(Registry, Vec<CatalogExtension>)> {
     if let Some(registry) = authoring::workspace_registry(path.as_deref())? {
         return Ok(registry);
     }
-    path.map(|p| read(&p))
-        .unwrap_or_else(|| Ok(catalog::catalog()))
+    let base = path
+        .map(|p| read(&p))
+        .unwrap_or_else(|| Ok(catalog::catalog()))?;
+    Ok((base, vec![]))
 }
 fn main() {
     // Argument errors are JSON on stdout, exit 2, for an agent reading stdout.
@@ -394,10 +399,12 @@ fn execute(cli: Cli) -> Result<()> {
             action: ArtifactAction::Inspect { path },
         } => print(&artifact(&path)?),
         Command::Commands { registry, action } => {
-            choose("commands", &catalog_file(registry)?.commands, action)
+            let (registry, extensions) = catalog_file(registry)?;
+            choose("commands", &registry.commands, &extensions, action)
         }
         Command::Events { registry, action } => {
-            choose("events", &catalog_file(registry)?.events, action)
+            let (registry, extensions) = catalog_file(registry)?;
+            choose("events", &registry.events, &extensions, action)
         }
         Command::Examples { output } => {
             let files = aq_playbooks_compiler::docs::example_files();
