@@ -32,6 +32,8 @@ Build into the checkout's own `target/` (leave `CARGO_TARGET_DIR` unset; in AQ, 
 
 `commands` and `events` support `list` and `describe`; in a workspace they read its `catalog.json`. Run `--help` for exact arguments.
 
+A local authoring workspace can include `extensions.json`, an array of registrations with `name`, `registry` and `notes`. Add the selected extension commands, events and capabilities to `record.json` as usual. To simulate a plugin call, supply its outcome and output in the case's `returns` map under the command name, such as `ext.test.echo`.
+
 ## Durable administration
 
 `install`, `activate`, `run`, `inspect`, `cancel`, `reconcile`, `controls`, `authority`, `retention`, `gc`, `retire-producer`, `metrics`, and `rotate-keys` require an explicit `--database-url` (or `AQ_PLAYBOOKS_DATABASE_URL`) and `--namespace`. Mutations acquire exclusive namespace ownership and refuse another active owner. Authority and run input are explicit JSON files. Activation and execution are separate from installation.
