@@ -141,13 +141,22 @@ impl CatalogExtension {
                 )));
             }
         }
-        if !notes.is_object()
-            || ["commands", "events"]
-                .into_iter()
-                .any(|key| notes.get(key).is_some_and(|value| !value.is_object()))
-        {
+        let known_notes = |kind| {
+            notes.get(kind).is_none_or(|map| {
+                map.as_object().is_some_and(|entries| {
+                    entries.iter().all(|(key, note)| {
+                        note.is_object()
+                            && match kind {
+                                "commands" => registry.commands.contains_key(key),
+                                _ => registry.events.contains_key(key),
+                            }
+                    })
+                })
+            })
+        };
+        if !notes.is_object() || !known_notes("commands") || !known_notes("events") {
             return Err(ModelError::Invalid(format!(
-                "extension {name}: catalog notes must be an object with command and event maps"
+                "extension {name}: catalog notes must describe its own registered commands and events"
             )));
         }
         Ok(Self {
