@@ -1,0 +1,26 @@
+name: Playbook checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Playbook tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.96.1 --profile minimal --component rustfmt
+          rustup override set 1.96.1
+      - run: cargo fmt --all --check
+      - run: cargo test --locked --workspace
+      - name: Exercise the PostgreSQL adapter and administration CLI
+        run: crates/aq-playbooks-postgres/scripts/test-postgres.sh
