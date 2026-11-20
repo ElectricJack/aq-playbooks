@@ -8,15 +8,66 @@ use aq_playbooks_model::schedules::{
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BindingSchedules {
-    pub event: ContractRef,
+    pub(super) configuration: ScheduleConfiguration,
     registrations: BTreeMap<String, Registration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(super) struct ScheduleConfiguration {
+    pub(super) event: ContractRef,
+    declarations: BTreeMap<String, BindingSchedule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeactivatedBinding {
+    revision: u64,
+    pub(super) configuration: Option<ScheduleConfiguration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Registration {
-    declaration: BindingSchedule,
     definition: FixedIntervalSchedule,
     cursor: ScheduleCursor,
+}
+
+impl BindingSchedules {
+    pub(super) fn register(
+        configuration: ScheduleConfiguration,
+        namespace: &str,
+        binding: &str,
+        activation: &Activation,
+        now_ms: i64,
+        previous: Option<Self>,
+    ) -> Result<Self> {
+        let mut registrations = BTreeMap::new();
+        for (key, declaration) in &configuration.declarations {
+            let existing = previous
+                .as_ref()
+                .filter(|old| {
+                    old.configuration.event == configuration.event
+                        && old.configuration.declarations.get(key) == Some(declaration)
+                })
+                .and_then(|old| old.registrations.get(key));
+            let registration = if let Some(existing) = existing {
+                existing.clone()
+            } else {
+                let id = digest(&("aq.binding.interval", namespace, binding, key))?;
+                let definition = declaration.register(
+                    id,
+                    activation.authority.scope.clone(),
+                    activation.revision.to_string(),
+                    now_ms,
+                )?;
+                let cursor = definition.cursor()?;
+                Registration { definition, cursor }
+            };
+            registrations.insert(key.clone(), registration);
+        }
+        Ok(Self {
+            configuration,
+            registrations,
+        })
+    }
 }
 
 pub(super) fn check_event(artifact: &Artifact, scope: &str, event: &ContractRef) -> Result<()> {
@@ -52,27 +103,33 @@ impl<S: Storage> Engine<S> {
         now_ms: i64,
     ) -> Result<bool> {
         BindingSchedule::validate_all(declarations)?;
+        let configuration = if declarations.is_empty() {
+            None
+        } else {
+            let event = event.ok_or_else(|| Error::Refused("interval event unavailable".into()))?;
+            Some(ScheduleConfiguration {
+                event,
+                declarations: declarations
+                    .iter()
+                    .map(|d| (d.key.clone(), d.clone()))
+                    .collect(),
+            })
+        };
         self.transaction_choice_at(Some(now_ms), |s| {
-            if s.deactivated_bindings.contains_key(binding) {
-                return Ok((false, false));
+            if let Some(disabled) = s.deactivated_bindings.get_mut(binding) {
+                let changed = disabled.configuration != configuration;
+                disabled.configuration = configuration;
+                return Ok((false, changed));
             }
             let active = s.bindings.get(binding);
             if active.is_some_and(|a| a.artifact != artifact || a.authority != authority) {
                 return Err(Error::Conflict("configured activation differs".into()));
             }
-            let unchanged = match s.binding_schedules.get(binding) {
-                Some(old) => {
-                    event.as_ref() == Some(&old.event)
-                        && old.registrations.len() == declarations.len()
-                        && declarations.iter().all(|d| {
-                            old.registrations
-                                .get(&d.key)
-                                .is_some_and(|r| r.declaration == *d)
-                        })
-                }
-                None => declarations.is_empty(),
-            };
-            if active.is_some() && unchanged {
+            let old_configuration = s
+                .binding_schedules
+                .get(binding)
+                .map(|old| &old.configuration);
+            if active.is_some() && old_configuration == configuration.as_ref() {
                 return Ok((true, false));
             }
             if !may_activate && (active.is_none() || !declarations.is_empty()) {
@@ -86,49 +143,23 @@ impl<S: Storage> Engine<S> {
                 activate_binding(s, binding, artifact, authority.clone(), now_ms)?;
             }
             let previous = s.binding_schedules.remove(binding);
-            if declarations.is_empty() {
-                return Ok((true, true));
+            if let Some(configuration) = configuration {
+                let activation = &s.bindings[binding];
+                check_event(
+                    &s.artifacts[artifact],
+                    &authority.scope,
+                    &configuration.event,
+                )?;
+                let registered = BindingSchedules::register(
+                    configuration,
+                    &self.namespace,
+                    binding,
+                    activation,
+                    now_ms,
+                    previous,
+                )?;
+                s.binding_schedules.insert(binding.into(), registered);
             }
-            let event = event.ok_or_else(|| Error::Refused("interval event unavailable".into()))?;
-            check_event(&s.artifacts[artifact], &authority.scope, &event)?;
-            let mut registrations = BTreeMap::new();
-            for declaration in declarations {
-                let existing = previous
-                    .as_ref()
-                    .filter(|old| old.event == event)
-                    .and_then(|old| old.registrations.get(&declaration.key))
-                    .filter(|r| r.declaration == *declaration);
-                let registration = if let Some(existing) = existing {
-                    existing.clone()
-                } else {
-                    let id = digest(&(
-                        "aq.binding.interval",
-                        &self.namespace,
-                        binding,
-                        &declaration.key,
-                    ))?;
-                    let definition = declaration.register(
-                        id,
-                        authority.scope.clone(),
-                        s.catalog_revision.to_string(),
-                        now_ms,
-                    )?;
-                    let cursor = definition.cursor()?;
-                    Registration {
-                        declaration: declaration.clone(),
-                        definition,
-                        cursor,
-                    }
-                };
-                registrations.insert(declaration.key.clone(), registration);
-            }
-            s.binding_schedules.insert(
-                binding.into(),
-                BindingSchedules {
-                    event,
-                    registrations,
-                },
-            );
             Ok((true, true))
         })
     }
@@ -137,15 +168,27 @@ impl<S: Storage> Engine<S> {
     /// Already accepted events and admitted runs keep their pinned snapshots.
     pub fn deactivate_binding(&self, binding: &str, revision: u64, now_ms: i64) -> Result<bool> {
         self.transaction_choice_at(Some(now_ms), |s| {
-            if s.deactivated_bindings.get(binding) == Some(&revision) {
+            if s.deactivated_bindings
+                .get(binding)
+                .is_some_and(|d| d.revision == revision)
+            {
                 return Ok((true, false));
             }
             if s.bindings.get(binding).map(|a| a.revision) != Some(revision) {
                 return Ok((false, false));
             }
             s.bindings.remove(binding);
-            s.binding_schedules.remove(binding);
-            s.deactivated_bindings.insert(binding.into(), revision);
+            let configuration = s
+                .binding_schedules
+                .remove(binding)
+                .map(|old| old.configuration);
+            s.deactivated_bindings.insert(
+                binding.into(),
+                DeactivatedBinding {
+                    revision,
+                    configuration,
+                },
+            );
             s.catalog_revision += 1;
             record_binding_change(s, binding, now_ms)?;
             Ok((true, true))
@@ -191,7 +234,11 @@ impl<S: Storage> Engine<S> {
                 let Some(occurrence) = plan.occurrences.into_iter().next() else {
                     continue;
                 };
-                let event = event_for(&r.declaration, schedules.event.clone(), occurrence);
+                let event = event_for(
+                    &schedules.configuration.declarations[&key],
+                    schedules.configuration.event.clone(),
+                    occurrence,
+                );
                 let producer = event.producer.clone();
                 let epoch = s
                     .retention

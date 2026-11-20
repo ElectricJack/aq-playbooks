@@ -19,7 +19,7 @@ use aq_playbooks_model::*;
 pub use indexes::{EffectQueueKind, IndexItem, IndexPage, IndexQuery, RuntimeIndexes};
 pub use lazy::{LazyMap, LazySeq, LazySet};
 pub use retention::{GcReport, RetentionPolicy, RetentionState};
-pub use schedules::BindingSchedules;
+pub use schedules::{BindingSchedules, DeactivatedBinding};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -637,7 +637,7 @@ pub struct State {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub binding_schedules: BTreeMap<String, BindingSchedules>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub deactivated_bindings: BTreeMap<String, u64>,
+    pub deactivated_bindings: BTreeMap<String, DeactivatedBinding>,
     pub catalog_revision: u64,
     pub runs: LazyMap<String, Run>,
     pub receipts: LazySeq<Receipt>,
@@ -978,7 +978,29 @@ impl<S: Storage> Engine<S> {
         host_ms: Option<i64>,
     ) -> Result<()> {
         self.transaction_at(host_ms, |s| {
-            activate_binding(s, binding, artifact, authority, now_ms)
+            activate_binding(s, binding, artifact, authority, now_ms)?;
+            if let Some(configuration) = s
+                .deactivated_bindings
+                .remove(binding)
+                .and_then(|d| d.configuration)
+            {
+                let activation = &s.bindings[binding];
+                schedules::check_event(
+                    &s.artifacts[artifact],
+                    &activation.authority.scope,
+                    &configuration.event,
+                )?;
+                let registered = BindingSchedules::register(
+                    configuration,
+                    &self.namespace,
+                    binding,
+                    activation,
+                    now_ms,
+                    None,
+                )?;
+                s.binding_schedules.insert(binding.into(), registered);
+            }
+            Ok(())
         })
     }
     pub fn admit(
@@ -1814,9 +1836,8 @@ fn activate_binding(
         .ok_or_else(|| Error::NotFound(artifact.into()))?;
     check_authority(a, &authority)?;
     if let Some(schedules) = s.binding_schedules.get(binding) {
-        schedules::check_event(a, &authority.scope, &schedules.event)?;
+        schedules::check_event(a, &authority.scope, &schedules.configuration.event)?;
     }
-    s.deactivated_bindings.remove(binding);
     s.catalog_revision += 1;
     let controls = s
         .bindings
