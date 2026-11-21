@@ -1,5 +1,7 @@
 # aq-playbooks
 
+> **Running AQ locally?** Start with aq-server's [getting started guide](https://github.com/ElectricJack/aq-server/blob/main/docs/getting-started.md): one sequence builds and runs the whole stack from sibling checkouts, this repository included.
+
 A standalone Rust workflow compiler and runner for repeatable project policy. AQ can embed the runner; host services retain authority over work, evidence, decisions, findings, and source control.
 
 The workspace contains five crates:
