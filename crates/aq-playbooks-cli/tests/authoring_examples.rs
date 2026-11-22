@@ -5,7 +5,7 @@
 //! writes an artifact that verifies, `compare` reports the kind of change the
 //! example shows, and `save` writes the outcome. Each document variant under
 //! `stuck/` writes exactly the outcome it shows. So the examples cannot rot.
-use aq_playbooks_cli::catalog::catalog_v2_2;
+use aq_playbooks_cli::catalog::{catalog_v2_2, catalog_v2_5};
 use aq_playbooks_compiler::docs::example_files;
 use aq_playbooks_compiler::draft::{SourceRecord, retain_registry};
 use aq_playbooks_model::{Artifact, Registry};
@@ -18,12 +18,25 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-/// Each example, the change `compare` reports against its
-/// `previous.artifact.json`, and the most steps its draft has.
-const EXAMPLES: [(&str, &str, usize); 2] = [
-    ("escalate-on-judgment", "presentation", 13),
-    ("notify-when-ready", "executable", 10),
+/// Each example, the catalog it pins, the change `compare` reports against its
+/// `previous.artifact.json` (`None`: it has none, and `compare` says so), and
+/// the most steps its draft has.
+const EXAMPLES: [(&str, Catalog, Option<&str>, usize); 3] = [
+    (
+        "escalate-on-judgment",
+        Catalog::V2_2,
+        Some("presentation"),
+        13,
+    ),
+    ("notify-when-ready", Catalog::V2_2, Some("executable"), 10),
+    ("route-to-environment", Catalog::V2_5, None, 17),
 ];
+/// The host catalog an example's `catalog.json` is kept from.
+#[derive(Clone, Copy)]
+enum Catalog {
+    V2_2,
+    V2_5,
+}
 const ON_DISK: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../aq-playbooks-compiler/authoring-examples"
@@ -72,7 +85,7 @@ fn ok(dir: &Path, args: &[&str]) -> Value {
 fn written(name: &str) -> Dir {
     let dir = temp(name);
     let printed = ok(&dir.0, &["examples", "--output", "."]);
-    let names: Vec<&str> = EXAMPLES.iter().map(|(name, _, _)| *name).collect();
+    let names: Vec<&str> = EXAMPLES.iter().map(|(name, _, _, _)| *name).collect();
     assert_eq!(printed["examples"], serde_json::json!(names));
     dir
 }
@@ -84,7 +97,7 @@ fn json_file(path: &Path) -> Value {
 #[test]
 fn every_worked_example_checks_saves_and_its_cases_pass() {
     let dir = written("tools");
-    for (name, change, max_steps) in EXAMPLES {
+    for (name, catalog_pin, change, max_steps) in EXAMPLES {
         let root = dir.0.join(name);
         let checked = ok(&root, &["check"]);
         assert_eq!(checked["ok"], true, "{name}: {checked:#}");
@@ -95,16 +108,20 @@ fn every_worked_example_checks_saves_and_its_cases_pass() {
             .len();
         assert!(steps <= max_steps, "{name} has {steps} steps");
 
-        // The catalog is the one the host places: catalog 2.2.0 kept to what
-        // the record allows.
+        // The catalog is the one the host places: the pinned catalog (2.2.0,
+        // or 2.5.0 for an environment example) kept to what the record allows.
         let record: SourceRecord =
             serde_json::from_value(json_file(&root.join("record.json"))).unwrap();
         let catalog: Registry =
             serde_json::from_value(json_file(&root.join("catalog.json"))).unwrap();
-        let (kept, _) = retain_registry(&catalog_v2_2(), &record.commands, &record.events).unwrap();
+        let pinned = match catalog_pin {
+            Catalog::V2_2 => catalog_v2_2(),
+            Catalog::V2_5 => catalog_v2_5(),
+        };
+        let (kept, _) = retain_registry(&pinned, &record.commands, &record.events).unwrap();
         assert_eq!(
             catalog, kept,
-            "{name}: catalog.json is not catalog 2.2.0 as the record keeps it"
+            "{name}: catalog.json is not the pinned catalog as the record keeps it"
         );
 
         // Every case passes, and is named after its file.
@@ -154,9 +171,15 @@ fn every_worked_example_checks_saves_and_its_cases_pass() {
         assert_eq!(sealed["artifact"], artifact.digest.as_str(), "{name}");
 
         let compared = ok(&root, &["compare"]);
-        assert_eq!(compared["change"], change, "{name}: {compared:#}");
-        assert_eq!(compared["abilities_changed"], false, "{name}");
-        assert_eq!(compared["diff"]["source_changed"], true, "{name}");
+        match change {
+            Some(change) => {
+                assert_eq!(compared["change"], change, "{name}: {compared:#}");
+                assert_eq!(compared["abilities_changed"], false, "{name}");
+                assert_eq!(compared["diff"]["source_changed"], true, "{name}");
+            }
+            // No playbook is active yet: there is nothing to compare with.
+            None => assert_eq!(compared, serde_json::json!({"previous": null}), "{name}"),
+        }
 
         let saved = ok(&root, &["save"]);
         assert_eq!(saved["saved"], true, "{name}: {saved:#}");
@@ -168,13 +191,72 @@ fn every_worked_example_checks_saves_and_its_cases_pass() {
     }
 }
 
+/// The environment a routing run writes: the `environment` of its
+/// `work.route` call, or `None` when it leaves the field out (the host keeps
+/// the task's environment) or writes no route.
+fn routed_environment(report: &Value) -> Option<String> {
+    let calls = report["calls"].as_array().unwrap();
+    let route = calls.iter().find(|c| c["command"] == "work.route")?;
+    route["input"]["environment"].as_str().map(String::from)
+}
+
+/// `route-to-environment` applies the rule of spec 0017 §5.4: the default
+/// environment when it provides every need, otherwise the allowed one that
+/// does with the fewest extra capabilities, otherwise the task is left for
+/// the owner. A tried task keeps its environment, and an owner's choice
+/// stands.
+#[test]
+fn the_routing_example_chooses_the_environment_by_the_rule() {
+    let dir = written("route-to-environment");
+    let root = dir.0.join("route-to-environment");
+    let chosen = |case: &str| {
+        let report = ok(&root, &["try", &format!("cases/{case}.json")]);
+        assert_eq!(report["passed"], true, "{case}: {report:#}");
+        report
+    };
+    let report = chosen("default_fits");
+    assert_eq!(routed_environment(&report).as_deref(), Some("rust-base"));
+    // The default lacks a need: the fewest extras win, not the first that fits.
+    let report = chosen("fewest_extras");
+    assert_eq!(routed_environment(&report).as_deref(), Some("rust-node"));
+    let report = chosen("no_default");
+    assert_eq!(routed_environment(&report).as_deref(), Some("small"));
+    // Nothing fits: no route is written, and the task is left for the owner.
+    let report = chosen("nothing_fits_holds");
+    assert_eq!(report["outcome"], "unroutable");
+    assert_eq!(routed_environment(&report), None);
+    assert!(
+        report["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["command"] != "work.route")
+    );
+    // The owner's choice stands: nothing is written.
+    let report = chosen("pinned_profile_wins");
+    assert_eq!(report["outcome"], "skipped");
+    assert_eq!(report["calls"].as_array().unwrap().len(), 1);
+    // A tried task writes its route without an environment: the host keeps
+    // the environment of the attempt it continues.
+    let report = chosen("continuation_keeps_environment");
+    assert_eq!(report["outcome"], "routed");
+    assert_eq!(routed_environment(&report), None);
+    assert!(
+        report["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["command"] == "work.route")
+    );
+}
+
 /// `stuck/<name>.json` shows a document the agent cannot turn into steps
 /// (`stuck/<name>.md`), the exact command the agent runs, and the outcome it
 /// writes. Run on a workspace holding that document, it writes exactly that.
 #[test]
 fn each_stuck_document_writes_the_outcome_it_shows() {
     let mut shown = BTreeSet::new();
-    for (name, _, _) in EXAMPLES {
+    for (name, _, _, _) in EXAMPLES {
         let stuck: Vec<&str> = example_files()
             .into_iter()
             .map(|(path, _)| path)
@@ -484,7 +566,7 @@ fn every_command_and_case_the_documents_show_runs_as_shown() {
 #[test]
 fn describe_carries_the_notes_catalog_md_renders() {
     let dir = written("describe");
-    for (name, _, _) in EXAMPLES {
+    for (name, _, _, _) in EXAMPLES {
         let root = dir.0.join(name);
         let catalog = fs::read_to_string(root.join("CATALOG.md")).unwrap();
         for (kind, list) in [("commands", "commands"), ("events", "events")] {
@@ -492,11 +574,14 @@ fn describe_carries_the_notes_catalog_md_renders() {
             for contract in names.as_array().unwrap() {
                 let contract = contract.as_str().unwrap();
                 let described = ok(&root, &[list, "describe", contract]);
-                assert_eq!(
-                    described["notes"],
-                    aq_playbooks_compiler::docs::notes(kind, contract).unwrap(),
-                    "{name}: {contract}"
-                );
+                // The notes of the catalog the example pins: a contract 2.5.0
+                // changed has the 2.5.0 notes.
+                let mut bare = described.clone();
+                bare.as_object_mut().unwrap().remove("notes");
+                let notes = aq_playbooks_compiler::docs::published_notes(kind, contract, &bare)
+                    .or_else(|| aq_playbooks_compiler::docs::notes(kind, contract))
+                    .unwrap();
+                assert_eq!(described["notes"], notes, "{name}: {contract}");
                 let section = catalog
                     .split(&format!("\n### `{contract}` "))
                     .nth(1)

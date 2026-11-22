@@ -38,7 +38,7 @@ const ADMIT_REFUSALS: [&str; 4] = [
     "unknown_task",
     "unreachable",
 ];
-const EXAMPLE: &str = "../aq-host-2.3.0/examples/deliver-by-playbook";
+const EXAMPLE: &str = "examples/deliver-with-environments";
 
 fn fixtures_file() -> Value {
     serde_json::from_str(include_str!(
@@ -1120,14 +1120,8 @@ fn example_json(name: &str) -> Value {
 }
 
 #[test]
-fn the_example_delivery_playbook_checks_and_seals_against_catalog_2_5_0() {
-    let mut record: SourceRecord = serde_json::from_value(example_json("record.json")).unwrap();
-    // The record may also use the environment contracts.
-    for name in ENVIRONMENT_COMMANDS {
-        record.commands.insert(name.into());
-        record.capabilities.insert(name.into());
-    }
-    record.events.insert(BASE_CHANGED.into());
+fn the_environment_delivery_example_checks_and_seals_against_catalog_2_5_0() {
+    let record: SourceRecord = serde_json::from_value(example_json("record.json")).unwrap();
     let (catalog, _) =
         retain_registry(&catalog::catalog_v2_5(), &record.commands, &record.events).unwrap();
     assert!(catalog.events.contains_key(COMPLETION));
@@ -1145,4 +1139,55 @@ fn the_example_delivery_playbook_checks_and_seals_against_catalog_2_5_0() {
     let sealed = seal(&ws).unwrap_or_else(|d| panic!("{d:#?}"));
     assert!(sealed.verify().is_ok());
     assert_eq!(sealed.content.validate_structure(), vec![]);
+    // The catalog file the example ships is the one the host places.
+    assert_eq!(
+        example_json("catalog.json"),
+        serde_json::to_value(&ws.catalog).unwrap()
+    );
+    // It builds before the merge, admits after it, and rebuilds on a new base.
+    let steps = ws.draft["steps"].as_object().unwrap();
+    let command = |step: &str| steps[step]["op"]["command"].as_str().unwrap().to_string();
+    assert_eq!(command("publish"), "branch.publish");
+    assert_eq!(
+        ws.draft["steps"]["await_publish"]["edges"]["completed"],
+        "build"
+    );
+    assert_eq!(command("build"), "environment.build");
+    assert_eq!(
+        steps["build"]["op"]["input"]["fields"]["subject"]["op"],
+        "object"
+    );
+    assert_eq!(command("merge"), "pull_request.merge");
+    assert_eq!(steps["await_merge"]["edges"]["completed"], "admit");
+    assert_eq!(command("admit"), "environment.admit");
+    assert_eq!(command("rb_build"), "environment.build");
+    assert_eq!(command("rb_admit"), "environment.admit");
+    assert!(
+        steps["rb_build"]["op"]["input"]["fields"]
+            .get("project")
+            .is_some()
+    );
+    assert_eq!(command("rb_notify"), "supervisor.notify");
+    let triggers: BTreeSet<&str> = ws.draft["triggers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        triggers,
+        BTreeSet::from(["aq.work.result_ready", BASE_CHANGED])
+    );
+    // A recipe that fails to build is sent back, not merged: nothing between
+    // a failed build and the merge opens a pull request.
+    assert_eq!(command("send_back_build"), "work.return");
+    assert_eq!(
+        steps["await_failure"]["edges"]["completed"],
+        "may_return_build"
+    );
+    // The strict rules still bite: the builds of a join that may be
+    // `unchanged` or `failed` cannot be read without the `built` edge.
+    let mut wrong = ws;
+    wrong.draft["steps"]["await_build"]["op"]["accepted_outcomes"] = json!(["built", "unchanged"]);
+    assert!(!check(&wrong).is_empty());
 }
