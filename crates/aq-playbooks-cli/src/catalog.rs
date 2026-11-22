@@ -81,3 +81,16 @@ pub const MANIFEST_2_4_JSON: &str = include_str!("../../../contracts/aq-host-2.4
 pub fn catalog_v2_4() -> Registry {
     serde_json::from_str(REGISTRY_2_4_JSON).expect("published AQ host registry 2.4.0")
 }
+
+/// Host catalog 2.5.0 (sandbox environments): the delivery lineage of 2.3.0 plus
+/// the 2.4.0 changes (decision notes, `work.activate`), the environment
+/// commands `environment.build` and `environment.admit`, their completion event
+/// `aq.environment.completed`, `aq.environment.base_changed`, an optional
+/// `environment` on `work.route`, and environment facts on `work.read`. Both the
+/// routing and the delivery playbook can pin it.
+pub const VERSION_2_5: &str = "2.5.0";
+pub const REGISTRY_2_5_JSON: &str = include_str!("../../../contracts/aq-host-2.5.0/registry.json");
+pub const MANIFEST_2_5_JSON: &str = include_str!("../../../contracts/aq-host-2.5.0/manifest.json");
+pub fn catalog_v2_5() -> Registry {
+    serde_json::from_str(REGISTRY_2_5_JSON).expect("published AQ host registry 2.5.0")
+}

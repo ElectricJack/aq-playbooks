@@ -61,11 +61,18 @@ pub const CATALOG_2_4_REGISTRY: &str =
     include_str!("../../../contracts/aq-host-2.4.0/registry.json");
 pub const CATALOG_2_4_NOTES: &str = include_str!("../../../contracts/aq-host-2.4.0/notes.json");
 
+/// Catalog 2.5.0, the delivery lineage with the 2.4.0 changes and the sandbox
+/// environment commands.
+pub const CATALOG_2_5_REGISTRY: &str =
+    include_str!("../../../contracts/aq-host-2.5.0/registry.json");
+pub const CATALOG_2_5_NOTES: &str = include_str!("../../../contracts/aq-host-2.5.0/notes.json");
+
 /// Authoring notes for a registration that matches a published host contract.
 pub fn published_notes(kind: &str, name: &str, contract: &Value) -> Option<Value> {
     for (registry, notes) in [
         (CATALOG_REGISTRY, CATALOG_NOTES),
         (CATALOG_2_4_REGISTRY, CATALOG_2_4_NOTES),
+        (CATALOG_2_5_REGISTRY, CATALOG_2_5_NOTES),
     ] {
         let registry: Registry =
             serde_json::from_str(registry).expect("the published catalog parses");
