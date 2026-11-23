@@ -31,14 +31,14 @@ impl ChecksAt<'_> {
     fn command(&mut self, name: &str, command: &CommandContract) {
         let valid_identity = registered_name(name, &command.name);
         self.require(
-            valid_identity && (1..=64).contains(&command.version.len()),
             "registry_identity",
+            valid_identity && (1..=64).contains(&command.version.len()),
             "invalid command name/version",
         );
         self.schema(&command.input);
         self.require(
-            (1..=64).contains(&command.outcomes.len()),
             "outcomes",
+            (1..=64).contains(&command.outcomes.len()),
             "one to 64 command outcomes required",
         );
         for schema in command.outcomes.values() {
@@ -51,13 +51,13 @@ impl ChecksAt<'_> {
         let bounded = (1..=16_777_216).contains(&c.max_payload_bytes)
             && (1..=31_536_000_000).contains(&c.deadline_ms);
         self.require(
-            bounded && !c.scopes.is_empty(),
             "contract_limits",
+            bounded && !c.scopes.is_empty(),
             "command requires bounded scope, payload, deadline",
         );
         self.require(
-            c.effect != Effect::Mutation || c.recovery != Recovery::Observation,
             "recovery",
+            c.effect != Effect::Mutation || c.recovery != Recovery::Observation,
             "mutation cannot use observation recovery",
         );
     }
@@ -68,7 +68,9 @@ impl ChecksAt<'_> {
         registry: &Registry,
     ) {
         self.schema(&contract.completion);
-        self.require(completion_valid(&contract.completion,command) && admission_valid(command), "async_contract","async contract requires accepted {handle:string} and completion {outcome:declared business enum,output}");
+        self.require(
+"async_contract",
+completion_valid(&contract.completion,command) && admission_valid(command),"async contract requires accepted {handle:string} and completion {outcome:declared business enum,output}");
         let registrations_present = registry
             .commands
             .contains_key(&contract.reconciliation_command)
@@ -85,11 +87,11 @@ impl ChecksAt<'_> {
             return;
         };
         self.require(
+            "async_contract",
             event
                 .correlation_fields
                 .contains(&contract.correlation_field)
                 && contract.completion.assignable_to(&event.payload),
-            "async_contract",
             "async completion schema/correlation incompatible with event",
         );
     }
@@ -101,27 +103,29 @@ impl ChecksAt<'_> {
         };
         for field in &c.public_result_fields {
             self.require(
-                in_output(field),
                 "public_projection",
+                in_output(field),
                 "public fields must exist in at least one declared outcome object",
             );
         }
         for field in &c.sensitive_output_fields {
             let protected = !c.public_result_fields.contains(field) && in_output(field);
-            self.require(protected, "sensitive_field", "protected output fields must exist in a declared outcome and cannot be public projection fields");
+            self.require(
+"sensitive_field",
+protected, "protected output fields must exist in a declared outcome and cannot be public projection fields");
         }
         for field in &c.sensitive_input_fields {
             self.require(
-                schema_has_field(&c.input, field),
                 "sensitive_field",
+                schema_has_field(&c.input, field),
                 "sensitive input field must exist in input object",
             );
         }
     }
     fn event(&mut self, name: &str, e: &EventContract) {
         self.require(
-            registered_event(name, e),
             "event_contract",
+            registered_event(name, e),
             "invalid event identity, producer, scope or resource bound",
         );
         self.schema(&e.payload);
@@ -130,8 +134,8 @@ impl ChecksAt<'_> {
             .iter()
             .all(|field| schema_has_field(&e.payload, field));
         self.require(
-            known_fields,
             "sensitive_field",
+            known_fields,
             "sensitive event payload fields must exist in the declared payload schema",
         );
     }

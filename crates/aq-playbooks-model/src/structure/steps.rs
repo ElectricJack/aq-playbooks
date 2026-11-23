@@ -100,15 +100,7 @@ impl StepCheck<'_> {
     }
     fn check_expressions(&mut self, bindings: &mut StepBindings) {
         for (at, e) in step_exprs(&self.step.op) {
-            check_expr_structure(
-                e,
-                &at,
-                &bindings.roots,
-                &mut vec![],
-                &self.path,
-                self.issues,
-            );
-            if check_eval_bounds(e, &at, &self.path, self.issues) {
+            if ExpressionCheck::new(&bindings.roots, &self.path, self.issues).validate(e, &at) {
                 bindings.too_deep.insert((self.path.clone(), at));
             }
         }

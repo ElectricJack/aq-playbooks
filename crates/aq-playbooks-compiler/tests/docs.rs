@@ -12,14 +12,6 @@ use serde_json::{Value, json};
 
 const DOCUMENTS: [(&str, &str); 2] = [("GUIDE.md", GUIDE), ("LANGUAGE.md", LANGUAGE)];
 const EXAMPLES: [&str; 2] = ["escalate-on-judgment", "notify-when-ready"];
-/// Where the codes come from: every `issue(…, "<code>", …)` and
-/// `Diagnostic::error("<code>", …)` call.
-const SOURCES: [&str; 4] = [
-    include_str!("../../aq-playbooks-model/src/lib.rs"),
-    include_str!("../../aq-playbooks-model/src/draft.rs"),
-    include_str!("../src/draft.rs"),
-    include_str!("../src/lib.rs"),
-];
 /// Codes built with `format!`, which the scan cannot read.
 const FORMATTED_CODES: [&str; 7] = [
     "unknown_command",
@@ -396,12 +388,28 @@ fn codes_after(
     }
 }
 
+/// Scan the sources of both validators so that splitting a module cannot drop its codes.
+fn collect_diagnostic_codes(dir: &std::path::Path, codes: &mut std::collections::BTreeSet<String>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            collect_diagnostic_codes(&path, codes);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            let source = std::fs::read_to_string(path).unwrap();
+            codes_after(&source, "issue(", true, codes);
+            for marker in ["Diagnostic::error(", ".require(", ".report("] {
+                codes_after(&source, marker, false, codes);
+            }
+        }
+    }
+}
+
 #[test]
 fn every_validation_code_has_an_entry() {
     let mut codes = std::collections::BTreeSet::new();
-    for source in SOURCES {
-        codes_after(source, "issue(", true, &mut codes);
-        codes_after(source, "Diagnostic::error(", false, &mut codes);
+    let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for src in ["src", "../aq-playbooks-model/src"] {
+        collect_diagnostic_codes(&crate_dir.join(src), &mut codes);
     }
     codes.extend(FORMATTED_CODES.map(String::from));
     // The scan finds the codes it must: a code from each source.

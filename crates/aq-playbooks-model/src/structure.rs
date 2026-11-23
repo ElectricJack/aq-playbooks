@@ -1,6 +1,8 @@
 //! Structural validation of captured playbooks and their registered contracts.
 use super::*;
 mod contracts;
+mod expressions;
+use expressions::ExpressionCheck;
 mod steps;
 
 struct ChecksAt<'a> {
@@ -15,7 +17,7 @@ impl ChecksAt<'_> {
     fn schema(&mut self, schema: &Schema) {
         schema_issue(schema, &self.path, self.issues);
     }
-    fn require(&mut self, allowed: bool, code: &str, message: &str) {
+    fn require(&mut self, code: &str, allowed: bool, message: &str) {
         if !allowed {
             self.report(code, message);
         }
@@ -180,20 +182,22 @@ impl ArtifactContent {
         let mut bindings = BTreeSet::new();
         for (name, d) in &self.dependencies {
             let mut check = ChecksAt::member("dependencies", name, issues);
-            check.require(dependency_matches(name,d,p),"dependency","dependency requires a reference artifact, same scope, declared interfaces and covered capabilities");
             check.require(
-                valid_selection(&d.selection),
+"dependency",
+dependency_matches(name,d,p),"dependency requires a reference artifact, same scope, declared interfaces and covered capabilities");
+            check.require(
                 "dependency_selection",
+                valid_selection(&d.selection),
                 "catalog artifact allowlist must contain bounded SHA-256 addresses",
             );
             check.require(
-                !d.dependencies.contains(&d.artifact),
                 "recursive_call",
+                !d.dependencies.contains(&d.artifact),
                 "recursive dependency closure",
             );
             check.require(
-                bindings.insert(d.binding.clone()),
                 "dependency",
+                bindings.insert(d.binding.clone()),
                 "duplicate callable binding",
             );
             check.interfaces(d);
@@ -215,8 +219,8 @@ impl ArtifactContent {
         let mut trigger_ids = BTreeSet::new();
         for t in &p.triggers {
             let path = format!("triggers.{}", t.id);
-            check_expr_structure(&t.input, "input", step_roots, &mut vec![], &path, issues);
-            let trigger_too_deep = check_eval_bounds(&t.input, "input", &path, issues);
+            let trigger_too_deep =
+                ExpressionCheck::new(step_roots, &path, issues).validate(&t.input, "input");
             if !valid_name(&t.id) || !trigger_ids.insert(t.id.clone()) {
                 issue(
                     issues,
@@ -373,8 +377,8 @@ impl ChecksAt<'_> {
     fn interfaces(&mut self, d: &CallableDependency) {
         for interface in d.interfaces.values() {
             self.require(
-                (1..=64).contains(&interface.outcomes.len()),
                 "outcomes",
+                (1..=64).contains(&interface.outcomes.len()),
                 "dependency interface requires one to 64 outcomes",
             );
             self.schema(&interface.input);
