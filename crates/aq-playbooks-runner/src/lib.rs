@@ -988,21 +988,15 @@ impl<S: Storage> Engine<S> {
                 .remove(binding)
                 .and_then(|d| d.configuration)
             {
-                let activation = &s.bindings[binding];
-                schedules::check_event(
-                    &s.artifacts[artifact],
-                    &activation.authority.scope,
-                    &configuration.event,
-                )?;
-                let registered = BindingSchedules::register(
-                    configuration,
-                    &self.namespace,
-                    binding,
-                    activation,
-                    now_ms,
+                configuration.install(
+                    s,
+                    schedules::BindingSite {
+                        namespace: &self.namespace,
+                        binding,
+                        now_ms,
+                    },
                     None,
                 )?;
-                s.binding_schedules.insert(binding.into(), registered);
             }
             Ok(())
         })

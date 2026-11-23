@@ -30,43 +30,57 @@ struct Registration {
     cursor: ScheduleCursor,
 }
 
-impl BindingSchedules {
-    pub(super) fn register(
-        configuration: ScheduleConfiguration,
-        namespace: &str,
-        binding: &str,
-        activation: &Activation,
-        now_ms: i64,
-        previous: Option<Self>,
-    ) -> Result<Self> {
+pub(super) struct BindingSite<'a> {
+    pub(super) namespace: &'a str,
+    pub(super) binding: &'a str,
+    pub(super) now_ms: i64,
+}
+
+impl ScheduleConfiguration {
+    pub(super) fn install(
+        self,
+        state: &mut State,
+        site: BindingSite<'_>,
+        previous: Option<BindingSchedules>,
+    ) -> Result<()> {
+        let activation = &state.bindings[site.binding];
+        check_event(
+            &state.artifacts[&activation.artifact],
+            &activation.authority.scope,
+            &self.event,
+        )?;
         let mut registrations = BTreeMap::new();
-        for (key, declaration) in &configuration.declarations {
+        for (key, declaration) in &self.declarations {
             let existing = previous
                 .as_ref()
                 .filter(|old| {
-                    old.configuration.event == configuration.event
+                    old.configuration.event == self.event
                         && old.configuration.declarations.get(key) == Some(declaration)
                 })
                 .and_then(|old| old.registrations.get(key));
             let registration = if let Some(existing) = existing {
                 existing.clone()
             } else {
-                let id = digest(&("aq.binding.interval", namespace, binding, key))?;
+                let id = digest(&("aq.binding.interval", site.namespace, site.binding, key))?;
                 let definition = declaration.register(
                     id,
                     activation.authority.scope.clone(),
                     activation.revision.to_string(),
-                    now_ms,
+                    site.now_ms,
                 )?;
                 let cursor = definition.cursor()?;
                 Registration { definition, cursor }
             };
             registrations.insert(key.clone(), registration);
         }
-        Ok(Self {
-            configuration,
-            registrations,
-        })
+        state.binding_schedules.insert(
+            site.binding.into(),
+            BindingSchedules {
+                configuration: self,
+                registrations,
+            },
+        );
+        Ok(())
     }
 }
 
@@ -102,66 +116,18 @@ impl<S: Storage> Engine<S> {
         event: Option<ContractRef>,
         now_ms: i64,
     ) -> Result<bool> {
-        BindingSchedule::validate_all(declarations)?;
-        let configuration = if declarations.is_empty() {
-            None
-        } else {
-            let event = event.ok_or_else(|| Error::Refused("interval event unavailable".into()))?;
-            Some(ScheduleConfiguration {
-                event,
-                declarations: declarations
-                    .iter()
-                    .map(|d| (d.key.clone(), d.clone()))
-                    .collect(),
-            })
+        let configuration = ScheduleConfiguration::from_declarations(declarations, event)?;
+        let target = ConfiguredBinding {
+            site: BindingSite {
+                namespace: &self.namespace,
+                binding,
+                now_ms,
+            },
+            artifact,
+            authority,
+            may_activate,
         };
-        self.transaction_choice_at(Some(now_ms), |s| {
-            if let Some(disabled) = s.deactivated_bindings.get_mut(binding) {
-                let changed = disabled.configuration != configuration;
-                disabled.configuration = configuration;
-                return Ok((false, changed));
-            }
-            let active = s.bindings.get(binding);
-            if active.is_some_and(|a| a.artifact != artifact || a.authority != authority) {
-                return Err(Error::Conflict("configured activation differs".into()));
-            }
-            let old_configuration = s
-                .binding_schedules
-                .get(binding)
-                .map(|old| &old.configuration);
-            if active.is_some() && old_configuration == configuration.as_ref() {
-                return Ok((true, false));
-            }
-            if !may_activate && (active.is_none() || !declarations.is_empty()) {
-                return Err(Error::Refused("binding requires a live grant".into()));
-            }
-            if let Some(a) = s.bindings.get_mut(binding) {
-                s.catalog_revision += 1;
-                a.revision = s.catalog_revision;
-                record_binding_change(s, binding, now_ms)?;
-            } else {
-                activate_binding(s, binding, artifact, authority.clone(), now_ms)?;
-            }
-            let previous = s.binding_schedules.remove(binding);
-            if let Some(configuration) = configuration {
-                let activation = &s.bindings[binding];
-                check_event(
-                    &s.artifacts[artifact],
-                    &authority.scope,
-                    &configuration.event,
-                )?;
-                let registered = BindingSchedules::register(
-                    configuration,
-                    &self.namespace,
-                    binding,
-                    activation,
-                    now_ms,
-                    previous,
-                )?;
-                s.binding_schedules.insert(binding.into(), registered);
-            }
-            Ok((true, true))
-        })
+        self.transaction_choice_at(Some(now_ms), |state| target.reconcile(state, configuration))
     }
 
     /// Stop new calls and event starts. A retry at the same revision is safe.
@@ -207,25 +173,7 @@ impl<S: Storage> Engine<S> {
             return Err(Error::Refused("invalid interval collection limit".into()));
         }
         self.transaction_choice_at(Some(now_ms), |s| {
-            let mut due = vec![];
-            for (binding, schedules) in &s.binding_schedules {
-                if !s
-                    .bindings
-                    .get(binding)
-                    .is_some_and(|a| a.controls.event_starts_enabled)
-                {
-                    continue;
-                }
-                for (key, r) in &schedules.registrations {
-                    if let Ok(at) = r.definition.scheduled_at_ms(r.cursor.next_index)
-                        && at <= now_ms
-                        && r.cursor.last_observed_ms.is_none_or(|last| last <= now_ms)
-                    {
-                        due.push((at, binding.clone(), key.clone()));
-                    }
-                }
-            }
-            due.sort_unstable();
+            let due = due_intervals(s, now_ms);
             let mut count = 0;
             for (_, binding, key) in due.into_iter().take(limit) {
                 let schedules = &s.binding_schedules[&binding];
@@ -261,5 +209,127 @@ impl<S: Storage> Engine<S> {
             }
             Ok((count, count > 0))
         })
+    }
+}
+impl ScheduleConfiguration {
+    fn from_declarations(
+        declarations: &[BindingSchedule],
+        event: Option<ContractRef>,
+    ) -> Result<Option<Self>> {
+        BindingSchedule::validate_all(declarations)?;
+        Ok(if declarations.is_empty() {
+            None
+        } else {
+            let event = event.ok_or_else(|| Error::Refused("interval event unavailable".into()))?;
+            Some(ScheduleConfiguration {
+                event,
+                declarations: declarations
+                    .iter()
+                    .map(|d| (d.key.clone(), d.clone()))
+                    .collect(),
+            })
+        })
+    }
+}
+struct ConfiguredBinding<'a> {
+    site: BindingSite<'a>,
+    artifact: &'a str,
+    authority: Authority,
+    may_activate: bool,
+}
+impl ConfiguredBinding<'_> {
+    fn reconcile(
+        self,
+        s: &mut State,
+        configuration: Option<ScheduleConfiguration>,
+    ) -> Result<(bool, bool)> {
+        let binding = self.site.binding;
+        if let Some(disabled) = s.deactivated_bindings.get_mut(binding) {
+            let changed = disabled.configuration != configuration;
+            disabled.configuration = configuration;
+            return Ok((false, changed));
+        }
+        if !self.requires_update(s, configuration.as_ref())? {
+            return Ok((true, false));
+        }
+        let Self {
+            site,
+            artifact,
+            authority,
+            ..
+        } = self;
+        site.activate(s, artifact, authority)?;
+        let previous = s.binding_schedules.remove(binding);
+        if let Some(configuration) = configuration {
+            configuration.install(s, site, previous)?;
+        }
+        Ok((true, true))
+    }
+    fn requires_update(
+        &self,
+        s: &State,
+        configuration: Option<&ScheduleConfiguration>,
+    ) -> Result<bool> {
+        let binding = self.site.binding;
+        let active = s.bindings.get(binding);
+        if active.is_some_and(|a| a.artifact != self.artifact || a.authority != self.authority) {
+            return Err(Error::Conflict("configured activation differs".into()));
+        }
+        let old_configuration = s
+            .binding_schedules
+            .get(binding)
+            .map(|old| &old.configuration);
+        if active.is_some() && old_configuration == configuration {
+            return Ok(false);
+        }
+        let needs_grant = active.is_none() || configuration.is_some();
+        if !self.may_activate && needs_grant {
+            return Err(Error::Refused("binding requires a live grant".into()));
+        }
+        Ok(true)
+    }
+}
+fn due_intervals(s: &State, now_ms: i64) -> Vec<(i64, String, String)> {
+    let mut due = vec![];
+    for (binding, schedules) in &s.binding_schedules {
+        if s.bindings
+            .get(binding)
+            .is_some_and(|a| a.controls.event_starts_enabled)
+        {
+            due.extend(schedules.registrations.iter().filter_map(|(key, r)| {
+                r.due_at(now_ms)
+                    .map(|at| (at, binding.clone(), key.clone()))
+            }));
+        }
+    }
+    due.sort_unstable();
+    due
+}
+impl Registration {
+    fn due_at(&self, now_ms: i64) -> Option<i64> {
+        let at = self
+            .definition
+            .scheduled_at_ms(self.cursor.next_index)
+            .ok()?;
+        let ordered = self
+            .cursor
+            .last_observed_ms
+            .is_none_or(|last| last <= now_ms);
+        (at <= now_ms && ordered).then_some(at)
+    }
+}
+impl BindingSite<'_> {
+    fn activate(&self, s: &mut State, artifact: &str, authority: Authority) -> Result<()> {
+        let Self {
+            binding, now_ms, ..
+        } = *self;
+        if let Some(a) = s.bindings.get_mut(binding) {
+            s.catalog_revision += 1;
+            a.revision = s.catalog_revision;
+            record_binding_change(s, binding, now_ms)?;
+        } else {
+            activate_binding(s, binding, artifact, authority, now_ms)?;
+        }
+        Ok(())
     }
 }

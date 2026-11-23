@@ -71,6 +71,14 @@ pub enum MisfirePolicy {
     CoalesceOnce,
     BoundedCatchUp { max_occurrences: u32 },
 }
+impl MisfirePolicy {
+    fn bounded(&self) -> bool {
+        match self {
+            Self::BoundedCatchUp { max_occurrences } => (1..=1024).contains(max_occurrences),
+            _ => true,
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FixedIntervalSchedule {
@@ -117,17 +125,13 @@ pub struct SchedulePlan {
 }
 impl FixedIntervalSchedule {
     pub fn validate(&self) -> Result<(), ModelError> {
-        if self.id.is_empty()
-            || self.id.len() > 128
-            || self.scope.is_empty()
-            || self.scope.len() > 128
-            || self.revision.is_empty()
-            || self.revision.len() > 128
-            || self.interval_ms == 0
-            || self.interval_ms > MAX_INTERVAL_MS
-            || self.grace_ms >= self.interval_ms
-            || matches!(self.misfire, MisfirePolicy::BoundedCatchUp { max_occurrences } if max_occurrences == 0 || max_occurrences > 1024)
-        {
+        let named = [&self.id, &self.scope, &self.revision]
+            .iter()
+            .all(|name| (1..=128).contains(&name.len()));
+        let interval = (1..=MAX_INTERVAL_MS).contains(&self.interval_ms)
+            && self.grace_ms < self.interval_ms
+            && self.misfire.bounded();
+        if !named || !interval {
             return Err(ModelError::Invalid(
                 "invalid bounded fixed-interval schedule".into(),
             ));
@@ -162,19 +166,8 @@ impl FixedIntervalSchedule {
                 "schedule cursor revision/fingerprint".into(),
             ));
         }
-        let backwards = cursor.last_observed_ms.is_some_and(|old| now_ms < old);
-        let mut next = cursor.clone();
-        if !backwards {
-            next.last_observed_ms = Some(now_ms);
-        }
-        let mut plan = SchedulePlan {
-            cursor: next,
-            occurrences: vec![],
-            skipped_count: 0,
-            clock_moved_backwards: backwards,
-            due_remaining: 0,
-        };
-        if backwards || now_ms < self.start_at_ms {
+        let mut plan = SchedulePlan::at(cursor, now_ms);
+        if plan.clock_moved_backwards || now_ms < self.start_at_ms {
             return Ok(plan);
         }
         let elapsed = i128::from(now_ms) - i128::from(self.start_at_ms);
@@ -190,49 +183,15 @@ impl FixedIntervalSchedule {
         let after_last = last
             .checked_add(1)
             .ok_or_else(|| ModelError::Invalid("schedule index exhausted".into()))?;
-        match self.misfire {
-            MisfirePolicy::Skip => {
-                let at = self.scheduled_at_ms(last)?;
-                if now_ms.saturating_sub(at) as u64 <= self.grace_ms {
-                    plan.occurrences.push(self.occurrence(
-                        last,
-                        last,
-                        1,
-                        now_ms,
-                        &cursor.schedule_fingerprint,
-                    )?);
-                }
-                plan.skipped_count = due - plan.occurrences.len() as u64;
-                plan.cursor.next_index = after_last;
-            }
-            MisfirePolicy::CoalesceOnce => {
-                plan.occurrences.push(self.occurrence(
-                    last,
-                    cursor.next_index,
-                    due,
-                    now_ms,
-                    &cursor.schedule_fingerprint,
-                )?);
-                plan.cursor.next_index = after_last;
-            }
-            MisfirePolicy::BoundedCatchUp { max_occurrences } => {
-                let kept = due.min(u64::from(max_occurrences));
-                plan.skipped_count = due - kept;
-                let first = cursor.next_index + plan.skipped_count;
-                let emitted = kept.min(batch_limit as u64);
-                for index in first..first + emitted {
-                    plan.occurrences.push(self.occurrence(
-                        index,
-                        index,
-                        1,
-                        now_ms,
-                        &cursor.schedule_fingerprint,
-                    )?);
-                }
-                plan.cursor.next_index = first + emitted;
-                plan.due_remaining = kept - emitted;
-            }
-        }
+        let batch = Due {
+            schedule: self,
+            cursor,
+            now_ms,
+            last,
+            due,
+            after_last,
+        };
+        batch.fill(&mut plan, batch_limit)?;
         Ok(plan)
     }
     pub fn scheduled_at_ms(&self, index: u64) -> Result<i64, ModelError> {
@@ -241,25 +200,87 @@ impl FixedIntervalSchedule {
         )
         .map_err(|_| ModelError::Invalid("schedule timestamp overflow".into()))
     }
+}
+
+impl SchedulePlan {
+    fn at(cursor: &ScheduleCursor, now_ms: i64) -> Self {
+        let backwards = cursor.last_observed_ms.is_some_and(|old| now_ms < old);
+        let mut next = cursor.clone();
+        if !backwards {
+            next.last_observed_ms = Some(now_ms);
+        }
+        Self {
+            cursor: next,
+            occurrences: vec![],
+            skipped_count: 0,
+            clock_moved_backwards: backwards,
+            due_remaining: 0,
+        }
+    }
+}
+struct Due<'a> {
+    last: u64,
+    due: u64,
+    after_last: u64,
+    schedule: &'a FixedIntervalSchedule,
+    cursor: &'a ScheduleCursor,
+    now_ms: i64,
+}
+impl Due<'_> {
+    fn fill(&self, plan: &mut SchedulePlan, batch_limit: usize) -> Result<(), ModelError> {
+        let Self {
+            last,
+            due,
+            after_last,
+            ..
+        } = *self;
+        let cursor = self.cursor;
+        let now_ms = self.now_ms;
+        match self.schedule.misfire {
+            MisfirePolicy::Skip => {
+                let at = self.schedule.scheduled_at_ms(last)?;
+                if now_ms.saturating_sub(at) as u64 <= self.schedule.grace_ms {
+                    plan.occurrences.push(self.occurrence(last, last, 1)?);
+                }
+                plan.skipped_count = due - plan.occurrences.len() as u64;
+                plan.cursor.next_index = after_last;
+            }
+            MisfirePolicy::CoalesceOnce => {
+                plan.occurrences
+                    .push(self.occurrence(last, cursor.next_index, due)?);
+                plan.cursor.next_index = after_last;
+            }
+            MisfirePolicy::BoundedCatchUp { max_occurrences } => {
+                let kept = due.min(u64::from(max_occurrences));
+                plan.skipped_count = due - kept;
+                let first = cursor.next_index + plan.skipped_count;
+                let emitted = kept.min(batch_limit as u64);
+                for index in first..first + emitted {
+                    plan.occurrences.push(self.occurrence(index, index, 1)?);
+                }
+                plan.cursor.next_index = first + emitted;
+                plan.due_remaining = kept - emitted;
+            }
+        }
+        Ok(())
+    }
     fn occurrence(
         &self,
         index: u64,
         first_index: u64,
         count: u64,
-        now: i64,
-        fingerprint: &str,
     ) -> Result<ScheduleOccurrence, ModelError> {
-        let at = self.scheduled_at_ms(index)?;
+        let at = self.schedule.scheduled_at_ms(index)?;
         Ok(ScheduleOccurrence {
-            id: digest(&(fingerprint, index))?,
-            schedule_id: self.id.clone(),
-            schedule_revision: self.revision.clone(),
-            scope: self.scope.clone(),
+            id: digest(&(&self.cursor.schedule_fingerprint, index))?,
+            schedule_id: self.schedule.id.clone(),
+            schedule_revision: self.schedule.revision.clone(),
+            scope: self.schedule.scope.clone(),
             index,
             scheduled_at_ms: at,
             first_index,
             represented_count: count,
-            misfired: count > 1 || now.saturating_sub(at) as u64 > self.grace_ms,
+            misfired: count > 1 || self.now_ms.saturating_sub(at) as u64 > self.schedule.grace_ms,
         })
     }
 }

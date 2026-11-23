@@ -1222,9 +1222,7 @@ fn bounded_driver_uses_persisted_fair_scope_queue_and_noop_does_not_commit() {
     assert_eq!(store.load("fair").unwrap().revision, revision);
 }
 
-#[test]
-fn activation_controls_separate_calls_events_and_current_execution() {
-    let e = engine();
+fn triggered_wait_artifact() -> Artifact {
     let mut a = wait_artifact().content;
     let c = event_contract();
     a.playbook.triggers.push(Trigger {
@@ -1236,7 +1234,13 @@ fn activation_controls_separate_calls_events_and_current_execution() {
         entry: "main".into(),
         input: Expr::literal(Value::Null),
     });
-    install(&e, Artifact::seal(a).unwrap(), "waiter");
+    Artifact::seal(a).unwrap()
+}
+
+#[test]
+fn activation_controls_separate_calls_events_and_current_execution() {
+    let e = engine();
+    install(&e, triggered_wait_artifact(), "waiter");
     e.set_activation_controls(
         "waiter",
         ActivationControls {
@@ -1844,4 +1848,58 @@ fn accepted_recovery_does_not_uncancel_a_run_or_bypass_revoked_authority() {
     e.drive(&mut host, 3, 10).unwrap();
     assert_eq!(settled(&e, &run).status, RunStatus::Cancelled);
     assert_eq!(host.dispatched.len(), 1);
+}
+
+#[test]
+fn interval_cursor_survives_reconfiguration_and_reactivation_starts_a_fresh_interval() {
+    use aq_playbooks_model::schedules::{BindingSchedule, ScheduleOccurrence};
+    let engine = engine();
+    let artifact = triggered_wait_artifact();
+    let binding = &artifact.content.playbook.id;
+    let reference = artifact.content.playbook.triggers[0].event.clone();
+    let schedule = BindingSchedule {
+        key: "daily".into(),
+        every_ms: 30_000,
+    };
+    engine.install(artifact.clone()).unwrap();
+    let configure = |now| {
+        engine
+            .configure_binding(
+                binding,
+                &artifact.digest,
+                authority(),
+                true,
+                std::slice::from_ref(&schedule),
+                Some(reference.clone()),
+                now,
+            )
+            .unwrap()
+    };
+    let collect = |now| {
+        engine
+            .collect_interval_events(now, 1, |_, _, occurrence: ScheduleOccurrence| {
+                let mut event = event(&occurrence.id, 1);
+                event.occurred_at_ms = Some(occurrence.scheduled_at_ms);
+                event
+            })
+            .unwrap()
+    };
+    assert!(configure(0));
+    assert!(configure(20_000));
+    assert_eq!(
+        (collect(29_999), collect(30_000), collect(30_000)),
+        (0, 1, 0)
+    );
+    let revision = engine.snapshot().unwrap().bindings[binding].revision;
+    assert!(
+        engine
+            .deactivate_binding(binding, revision, 31_000)
+            .unwrap()
+    );
+    assert!(!configure(40_000));
+    assert_eq!(collect(65_000), 0);
+    engine
+        .activate_at(binding, &artifact.digest, authority(), 70_000)
+        .unwrap();
+    assert_eq!((collect(99_999), collect(100_000)), (0, 1));
 }
