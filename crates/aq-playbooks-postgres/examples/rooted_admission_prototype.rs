@@ -136,7 +136,13 @@ fn run_sample(
     let revision: i64 = row.get(1);
     let root: Link = serde_json::from_slice(&row.get::<_, Vec<u8>>(2))?;
     let mut tree = Tree::new(&mut tx);
-    let planned = admission::plan(&mut tree, &root, "pb02", event.clone(), 0, 10_000)?;
+    let planned = admission::Admission {
+        producer: "pb02",
+        event: event.clone(),
+        epoch: 0,
+        now: 10_000,
+    }
+    .plan(&mut tree, &root)?;
     let next = admission::patch(&mut tree, &root, &planned.before, &planned.after)?;
     admission::quota(&mut tree, &next, &EngineConfig::default())?;
     tree.flush()?;

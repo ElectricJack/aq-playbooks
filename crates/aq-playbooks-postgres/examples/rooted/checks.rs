@@ -64,7 +64,13 @@ fn check_fallback_sources(client: &mut Client, state: &aq_playbooks_runner::Stat
         let mut tx = client.transaction()?;
         let mut tree = Tree::new(&mut tx);
         let root = tree.build(&serde_json::to_value(&source)?)?;
-        let result = admission::plan(&mut tree, &root, "pb02", event, 0, 10_000);
+        let result = admission::Admission {
+            producer: "pb02",
+            event,
+            epoch: 0,
+            now: 10_000,
+        }
+        .plan(&mut tree, &root);
         assert!(
             result
                 .err()
@@ -96,7 +102,13 @@ fn establish_reference(client: &mut Client, state: &aq_playbooks_runner::State) 
     let mut tx = client.transaction()?;
     let mut tree = Tree::new(&mut tx);
     let event = fixture::envelope("unrelated-history");
-    let planned = admission::plan(&mut tree, &root, "pb02", event.clone(), 0, 10_000)?;
+    let planned = admission::Admission {
+        producer: "pb02",
+        event: event.clone(),
+        epoch: 0,
+        now: 10_000,
+    }
+    .plan(&mut tree, &root)?;
     let next = admission::patch(&mut tree, &root, &planned.before, &planned.after)?;
     let reference = full_engine(state)?;
     reference.admit_event("pb02", event, 10_000)?;
@@ -149,7 +161,13 @@ fn check_replay(
     ] {
         let mut tx = client.transaction()?;
         let mut tree = Tree::new(&mut tx);
-        let result = admission::plan(&mut tree, root, "pb02", event.clone(), epoch, now);
+        let result = admission::Admission {
+            producer: "pb02",
+            event: event.clone(),
+            epoch,
+            now,
+        }
+        .plan(&mut tree, root);
         let expected = full_engine(state)?.admit_event_in_epoch("pb02", event, epoch, now);
         match (result, expected) {
             (Ok(plan), Ok(value)) => {
@@ -177,14 +195,13 @@ fn check_quota_rollback(client: &mut Client, root: &Link) -> Result<()> {
         .get(0);
     let mut tx = client.transaction()?;
     let mut tree = Tree::new(&mut tx);
-    let plan = admission::plan(
-        &mut tree,
-        root,
-        "pb02",
-        fixture::envelope("quota"),
-        0,
-        10_000,
-    )?;
+    let plan = admission::Admission {
+        producer: "pb02",
+        event: fixture::envelope("quota"),
+        epoch: 0,
+        now: 10_000,
+    }
+    .plan(&mut tree, root)?;
     let next = admission::patch(&mut tree, root, &plan.before, &plan.after)?;
     let config = EngineConfig {
         max_state_bytes: root.bytes as usize,
@@ -227,14 +244,13 @@ fn check_root_corruption(client: &mut Client, root: &Link) -> Result<()> {
     )?;
     let mut tree = Tree::new(&mut tx);
     assert!(
-        admission::plan(
-            &mut tree,
-            root,
-            "pb02",
-            fixture::envelope("corrupt"),
-            0,
-            10_000
-        )
+        admission::Admission {
+            producer: "pb02",
+            event: fixture::envelope("corrupt"),
+            epoch: 0,
+            now: 10_000
+        }
+        .plan(&mut tree, root)
         .is_err()
     );
     drop(tree);
@@ -263,14 +279,13 @@ fn check_unrelated_corruption(client: &mut Client, root: &Link) -> Result<(Link,
         &[&corrupt, &receipts.hash],
     )?;
     let mut tree = Tree::new(&mut tx);
-    let plan = admission::plan(
-        &mut tree,
-        root,
-        "pb02",
-        fixture::envelope("untouched"),
-        0,
-        10_000,
-    )?;
+    let plan = admission::Admission {
+        producer: "pb02",
+        event: fixture::envelope("untouched"),
+        epoch: 0,
+        now: 10_000,
+    }
+    .plan(&mut tree, root)?;
     let next = admission::patch(&mut tree, root, &plan.before, &plan.after)?;
     admission::quota(&mut tree, &next, &EngineConfig::default())?;
     assert!(tree.prefetch_subtree(&next).is_err());
@@ -290,14 +305,13 @@ fn check_malformed_neighbors(client: &mut Client, root: &Link, receipts: &Link) 
             &[&payload, &receipts.hash],
         )?;
         let mut tree = Tree::new(&mut tx);
-        let plan = admission::plan(
-            &mut tree,
-            root,
-            "pb02",
-            fixture::envelope("malformed-neighbor"),
-            0,
-            10_000,
-        )?;
+        let plan = admission::Admission {
+            producer: "pb02",
+            event: fixture::envelope("malformed-neighbor"),
+            epoch: 0,
+            now: 10_000,
+        }
+        .plan(&mut tree, root)?;
         let next = admission::patch(&mut tree, root, &plan.before, &plan.after)?;
         admission::quota(&mut tree, &next, &EngineConfig::default())?;
         assert!(tree.prefetch_subtree(&next).is_err());
@@ -364,14 +378,13 @@ fn check_dirty_record_fallback(
         let mut tree = Tree::new(&mut tx);
         let root = tree.build(&value)?;
         assert!(
-            admission::plan(
-                &mut tree,
-                &root,
-                "pb02",
-                fixture::envelope("dirty"),
-                0,
-                10_000
-            )
+            admission::Admission {
+                producer: "pb02",
+                event: fixture::envelope("dirty"),
+                epoch: 0,
+                now: 10_000
+            }
+            .plan(&mut tree, &root)
             .err()
             .unwrap()
             .to_string()
@@ -393,7 +406,13 @@ fn check_producer_epoch(client: &mut Client, state: &aq_playbooks_runner::State)
     let mut tx = client.transaction()?;
     let mut tree = Tree::new(&mut tx);
     let root = tree.build(&serde_json::to_value(&changed)?)?;
-    let plan = admission::plan(&mut tree, &root, "pb02", ev.clone(), 3, 10_000)?;
+    let plan = admission::Admission {
+        producer: "pb02",
+        event: ev.clone(),
+        epoch: 3,
+        now: 10_000,
+    }
+    .plan(&mut tree, &root)?;
     assert_eq!(plan.disposition.key, digest(&("pb02", 3u64, &ev.event_id))?);
     assert_eq!(
         canonical_bytes(&plan.disposition)?,
