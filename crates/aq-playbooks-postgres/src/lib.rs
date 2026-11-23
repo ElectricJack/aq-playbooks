@@ -25,6 +25,7 @@ use profiling::ObservedTransaction;
 pub use profiling::{OperationProfile, StageProfile, StorageProfile};
 pub use records::TransitionStats;
 mod retention;
+mod schema;
 mod snapshot;
 use aq_playbooks_model::{Artifact, canonical_bytes};
 use aq_playbooks_runner::{
@@ -41,22 +42,6 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-const MIGRATIONS: &[(i32, &str)] = &[
-    // Ordering is part of the qualified schema.
-    (1, include_str!("../migrations/0001_initial.sql")),
-    (
-        2,
-        include_str!("../migrations/0002_indexes_and_protection.sql"),
-    ),
-    (
-        3,
-        include_str!("../migrations/0003_keyed_admission_writer.sql"),
-    ),
-    (4, include_str!("../migrations/0004_catalog_inspection.sql")),
-    (5, include_str!("../migrations/0005_transition_records.sql")),
-    (6, include_str!("../migrations/0006_run_history.sql")),
-    (7, include_str!("../migrations/0007_run_history_trim.sql")),
-];
 #[cfg(all(test, feature = "postgres-tests"))]
 const WRITE_MARKER_SQL: &str = "SELECT set_config('aq_playbooks.writer_namespace',$1,true),set_config('aq_playbooks.writer_format','2',true)";
 use records::MARKER_SQL as WRITE_MARKER_FORMAT_SQL;
@@ -65,8 +50,6 @@ use records::MARKER_SQL as WRITE_MARKER_FORMAT_SQL;
 /// scans (Merge Append) instead of sorting every matching history row: the
 /// cost of a page does not grow with the number of finished runs.
 pub(crate) const INSPECT_SQL: &str = "SELECT item_key,public_value FROM ((SELECT item_key,public_value FROM aq_playbooks.inspection_rows WHERE namespace=$1 AND kind=$2 AND ($3::text IS NULL OR run_id=$3) AND ($4::text IS NULL OR item_key>$4) ORDER BY item_key LIMIT $5) UNION ALL (SELECT item_key,public_value FROM aq_playbooks.run_history WHERE namespace=$1 AND kind=$2 AND ($3::text IS NULL OR run_id=$3) AND ($4::text IS NULL OR item_key>$4) ORDER BY item_key LIMIT $5)) u ORDER BY item_key LIMIT $5";
-const MIGRATION_LOCK: i64 = 0x4151504c41594d47;
-
 struct Lease {
     owner: String,
     incarnation: i64,
@@ -100,13 +83,6 @@ pub struct PostgresStorage {
     #[cfg(test)]
     fail_catalog_before_snapshot: std::sync::atomic::AtomicBool,
 }
-struct SnapshotEnvelope {
-    plaintext: Option<Value>,
-    key_id: Option<String>,
-    nonce: Option<Vec<u8>>,
-    ciphertext: Option<Vec<u8>>,
-}
-
 fn backend(error: impl std::fmt::Display) -> StorageError {
     StorageError::Backend(error.to_string())
 }
@@ -123,56 +99,10 @@ fn check_name(name: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// The engine's tables without planner statistics: never analyzed
-/// (`reltuples` negative), or holding rows but no column statistics, as a
-/// fresh `pg_restore` leaves them (PostgreSQL 17 restores no statistics;
-/// its index builds set `reltuples`). An analyzed empty table (`reltuples`
-/// 0, no statistics to keep) is not one of them.
-const UNANALYZED_TABLES_SQL: &str = "SELECT c.relname FROM pg_class c WHERE c.relnamespace='aq_playbooks'::regnamespace AND c.relkind IN ('r','p') AND (c.reltuples<0 OR (c.reltuples>0 AND NOT EXISTS(SELECT 1 FROM pg_stats s WHERE s.schemaname='aq_playbooks' AND s.tablename=c.relname))) ORDER BY c.relname";
-/// Analyze the engine's tables that have no planner statistics
-/// ([`UNANALYZED_TABLES_SQL`]). Without them the planner may answer an
-/// indexed lookup by a prefix scan (the drain's receipt-row delete then
-/// reads every receipt row of the namespace per named row). Each gets one
-/// `ANALYZE` of its own, outside any commit, before the first commit. A
-/// table that has statistics is not touched, so this costs one catalog
-/// query after the first connection. `ANALYZE` takes SHARE UPDATE EXCLUSIVE, which blocks no
-/// reader or writer, and reads a bounded sample. It is best effort: a role
-/// that may not analyze a table it does not own gets a server warning and
-/// the table is skipped; any error (a statement or lock timeout, say) is
-/// reported on stderr, value-free, and ignored. Autovacuum analyzes such a
-/// table later anyway.
-fn analyze_unanalyzed(client: &mut Client) {
-    let tables: Vec<String> = match client.query(UNANALYZED_TABLES_SQL, &[]) {
-        Ok(rows) => rows.iter().map(|row| row.get(0)).collect(),
-        Err(error) => {
-            eprintln!("aq-playbooks: could not list tables without statistics: {error}");
-            return;
-        }
-    };
-    for table in tables {
-        // `relname` comes from the catalog of our own schema; quoted anyway.
-        let statement = format!("ANALYZE aq_playbooks.\"{}\"", table.replace('"', "\"\""));
-        if let Err(error) = client.batch_execute(&statement) {
-            eprintln!("aq-playbooks: ANALYZE aq_playbooks.{table} skipped: {error}");
-            continue;
-        }
-        // A role without the right gets only a server warning: say so.
-        let skipped = client
-            .query(UNANALYZED_TABLES_SQL, &[])
-            .map(|rows| rows.iter().any(|row| row.get::<_, String>(0) == table))
-            .unwrap_or(false);
-        if skipped {
-            eprintln!(
-                "aq-playbooks: ANALYZE aq_playbooks.{table} skipped (this role may not analyze it); run ANALYZE as its owner"
-            );
-        }
-    }
-}
-
 impl PostgresStorage {
     /// Connects and transactionally applies the crate-owned schema migrations,
     /// then analyzes the engine's tables that have no planner statistics yet
-    /// (see [`analyze_unanalyzed`]).
+    /// at connection time.
     /// Credentials are never included in adapter error messages. This convenience
     /// constructor uses NoTls; use `from_client` with a host-configured TLS client
     /// for remote production databases requiring transport encryption.
@@ -209,39 +139,7 @@ impl PostgresStorage {
         mut client: Client,
         keyring: Option<ProtectionKeyring>,
     ) -> Result<Self, StorageError> {
-        let mut tx = client.transaction().map_err(backend)?;
-        tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK])
-            .map_err(backend)?;
-        tx.batch_execute("CREATE SCHEMA IF NOT EXISTS aq_playbooks; CREATE TABLE IF NOT EXISTS aq_playbooks.schema_migrations (version integer PRIMARY KEY, checksum bytea NOT NULL, applied_at timestamptz NOT NULL DEFAULT clock_timestamp());").map_err(backend)?;
-        let versions = tx
-            .query(
-                "SELECT version,checksum FROM aq_playbooks.schema_migrations ORDER BY version",
-                &[],
-            )
-            .map_err(backend)?;
-        for (offset, row) in versions.iter().enumerate() {
-            let Some((version, sql)) = MIGRATIONS.get(offset) else {
-                return Err(backend("unsupported aq-playbooks schema migration"));
-            };
-            if row.get::<_, i32>(0) != *version
-                || row.get::<_, Vec<u8>>(1) != Sha256::digest(sql.as_bytes()).to_vec()
-            {
-                return Err(backend(
-                    "unsupported or altered aq-playbooks schema migration",
-                ));
-            }
-        }
-        for (version, sql) in MIGRATIONS.iter().skip(versions.len()) {
-            tx.batch_execute(sql).map_err(backend)?;
-            let checksum = Sha256::digest(sql.as_bytes()).to_vec();
-            tx.execute(
-                "INSERT INTO aq_playbooks.schema_migrations(version,checksum) VALUES($1,$2)",
-                &[version, &checksum],
-            )
-            .map_err(backend)?;
-        }
-        tx.commit().map_err(backend)?;
-        analyze_unanalyzed(&mut client);
+        schema::prepare(&mut client)?;
         Ok(Self {
             connection: Mutex::new(Connection {
                 client,
@@ -259,104 +157,7 @@ impl PostgresStorage {
             fail_catalog_before_snapshot: std::sync::atomic::AtomicBool::new(false),
         })
     }
-    fn encode(
-        &self,
-        namespace: &str,
-        revision: u64,
-        state: &State,
-    ) -> Result<SnapshotEnvelope, StorageError> {
-        let mut value = serde_json::to_value(state).map_err(backend)?;
-        value["artifacts"] = serde_json::json!({});
-        if let Some(keyring) = &self.keyring {
-            let plaintext = Zeroizing::new(serde_json::to_vec(&value).map_err(backend)?);
-            let sealed = keyring.seal(namespace, revision, &plaintext)?;
-            Ok(SnapshotEnvelope {
-                plaintext: None,
-                key_id: Some(sealed.key_id),
-                nonce: Some(sealed.nonce),
-                ciphertext: Some(sealed.ciphertext),
-            })
-        } else {
-            Ok(SnapshotEnvelope {
-                plaintext: Some(value),
-                key_id: None,
-                nonce: None,
-                ciphertext: None,
-            })
-        }
-    }
-    fn decode(
-        &self,
-        namespace: &str,
-        revision: u64,
-        row: &postgres::Row,
-    ) -> Result<State, StorageError> {
-        let plaintext: Option<Value> = row.get("snapshot");
-        if let Some(key_id) = row.get::<_, Option<String>>("protection_key_id") {
-            if plaintext.is_some() {
-                return Err(backend("invalid protected snapshot envelope"));
-            }
-            let keyring = self
-                .keyring
-                .as_ref()
-                .ok_or_else(|| backend("protected namespace requires configured keys"))?;
-            let nonce: Vec<u8> = row.get("protection_nonce");
-            let ciphertext: Vec<u8> = row.get("encrypted_snapshot");
-            let bytes = keyring.open(
-                namespace,
-                revision,
-                &protection::SealedValue {
-                    key_id,
-                    nonce,
-                    ciphertext,
-                },
-            )?;
-            serde_json::from_slice(&bytes)
-                .map_err(|_| backend("invalid authenticated snapshot format"))
-        } else {
-            serde_json::from_value(plaintext.ok_or_else(|| backend("missing snapshot payload"))?)
-                .map_err(backend)
-        }
-    }
-    fn read_artifacts(
-        &self,
-        tx: &mut ObservedTransaction<'_>,
-        namespace: &str,
-        protected: bool,
-    ) -> Result<BTreeMap<String, Artifact>, StorageError> {
-        let mut artifacts = BTreeMap::new();
-        let rows = tx.query("SELECT n.digest,a.canonical_bytes,e.key_id,e.nonce,e.ciphertext FROM aq_playbooks.namespace_artifacts n LEFT JOIN aq_playbooks.artifacts a ON a.digest=n.digest LEFT JOIN aq_playbooks.encrypted_artifacts e ON e.namespace=n.namespace AND e.digest=n.digest WHERE n.namespace=$1 ORDER BY n.digest",&[&namespace]).map_err(backend)?;
-        for artifact_row in rows {
-            let digest: String = artifact_row.get(0);
-            let bytes = if protected {
-                let sealed = protection::SealedValue {
-                    key_id: artifact_row
-                        .get::<_, Option<String>>(2)
-                        .ok_or_else(|| backend("missing protected artifact envelope"))?,
-                    nonce: artifact_row.get(3),
-                    ciphertext: artifact_row.get(4),
-                };
-                self.keyring
-                    .as_ref()
-                    .ok_or_else(|| backend("protected namespace requires configured keys"))?
-                    .open_artifact(namespace, &digest, &sealed)?
-            } else {
-                Zeroizing::new(
-                    artifact_row
-                        .get::<_, Option<Vec<u8>>>(1)
-                        .ok_or_else(|| backend("missing plaintext artifact payload"))?,
-                )
-            };
-            let started = tx.clock();
-            let artifact = Artifact::from_canonical_bytes(&bytes).map_err(backend)?;
-            tx.verified(started);
-            if artifact.digest != digest {
-                return Err(backend("artifact address integrity mismatch"));
-            }
-            artifacts.insert(digest, artifact);
-        }
-        Ok(artifacts)
-    }
+
     /// Disabled by default. Value-free fixed-stage aggregate diagnostics only.
     pub fn set_profiling(&self, enabled: bool) {
         if let Ok(mut p) = self.profiling.lock() {

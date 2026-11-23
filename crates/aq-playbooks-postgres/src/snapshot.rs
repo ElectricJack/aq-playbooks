@@ -1,6 +1,7 @@
 //! Full-state compare-and-swap, with the same publication fence for snapshots and records.
 use super::*;
 mod artifacts;
+mod payload;
 
 pub(super) struct Commit<'a> {
     pub(super) storage: &'a PostgresStorage,
