@@ -39,14 +39,14 @@ pub fn catalog_registry() -> Registry {
 
 /// The notes on one contract: `kind` is `"commands"` or `"events"`.
 pub fn notes(kind: &str, name: &str) -> Option<Value> {
-    notes_in(CATALOG_NOTES, kind, name)
+    notes_in(CATALOG_NOTES, [kind, name])
 }
-fn notes_in(all: &str, kind: &str, name: &str) -> Option<Value> {
+fn notes_in(all: &str, path: [&str; 2]) -> Option<Value> {
     let all: Value = serde_json::from_str(all).ok()?;
-    contract_notes(&all, kind, name).cloned()
+    contract_notes(&all, path).cloned()
 }
 
-fn contract_notes<'a>(all: &'a Value, kind: &str, name: &str) -> Option<&'a Value> {
+fn contract_notes<'a>(all: &'a Value, [kind, name]: [&str; 2]) -> Option<&'a Value> {
     all.get(kind)?.get(name)
 }
 
@@ -82,7 +82,7 @@ pub fn published_notes(kind: &str, name: &str, contract: &Value) -> Option<Value
             _ => None,
         };
         if published.and_then(Result::ok).as_ref() == Some(contract) {
-            return notes_in(notes, kind, name);
+            return notes_in(notes, [kind, name]);
         }
     }
     None
@@ -129,46 +129,49 @@ pub fn catalog_with_extensions(
          the catalog does not say: do not rely on it, and ask the owner when the document \
          depends on it.\n",
     );
-    let commands = kept
-        .commands
-        .iter()
-        .filter(|(name, _)| base.commands.contains_key(*name));
-    if commands.clone().next().is_some() {
-        out.push_str("\n## Commands\n");
-    }
-    for (_, contract) in commands {
-        out.push_str(&command(contract, &base_notes)?);
-    }
-    let events = kept
-        .events
-        .iter()
-        .filter(|(name, _)| base.events.contains_key(*name));
-    if events.clone().next().is_some() {
-        out.push_str("\n## Events\n");
-    }
-    for (_, contract) in events {
-        out.push_str(&event(contract, &base_notes)?);
-    }
+    let (commands, events) = render_contracts(&kept, base, &base_notes)?;
+    append_section(&mut out, "Commands", commands);
+    append_section(&mut out, "Events", events);
     let mut extensions: Vec<_> = extensions.iter().collect();
     extensions.sort_by_key(|extension| extension.name());
     for extension in extensions {
-        let mut section = String::new();
-        for name in extension.registry().commands.keys() {
-            if let Some(contract) = kept.commands.get(name) {
-                section.push_str(&command(contract, extension.notes())?);
-            }
-        }
-        for name in extension.registry().events.keys() {
-            if let Some(contract) = kept.events.get(name) {
-                section.push_str(&event(contract, extension.notes())?);
-            }
-        }
-        if !section.is_empty() {
-            out.push_str(&format!("\n## Extension `{}`\n", extension.name()));
-            out.push_str(&section);
-        }
+        let (mut section, events) =
+            render_contracts(&kept, extension.registry(), extension.notes())?;
+        section.push_str(&events);
+        append_section(
+            &mut out,
+            &format!("Extension `{}`", extension.name()),
+            section,
+        );
     }
     Ok(out)
+}
+
+fn render_contracts(
+    kept: &Registry,
+    source: &Registry,
+    notes: &Value,
+) -> Result<(String, String), String> {
+    let commands = source
+        .commands
+        .keys()
+        .filter_map(|name| kept.commands.get(name))
+        .map(|contract| command(contract, notes))
+        .collect::<Result<String, _>>()?;
+    let events = source
+        .events
+        .keys()
+        .filter_map(|name| kept.events.get(name))
+        .map(|contract| event(contract, notes))
+        .collect::<Result<String, _>>()?;
+    Ok((commands, events))
+}
+
+fn append_section(target: &mut String, title: &str, contents: String) {
+    if !contents.is_empty() {
+        target.push_str(&format!("\n## {title}\n"));
+        target.push_str(&contents);
+    }
 }
 
 fn stated(text: &str) -> &str {
@@ -262,7 +265,7 @@ fn paragraphs(notes: &Value) -> String {
         .collect()
 }
 fn command(c: &CommandContract, all_notes: &Value) -> Result<String, String> {
-    let notes = contract_notes(all_notes, "commands", &c.name)
+    let notes = contract_notes(all_notes, ["commands", &c.name])
         .ok_or(format!("no notes on command {}", c.name))?;
     let what = format!("command {}", c.name);
     covered(&what, &notes, "input", &properties(&c.input))?;
@@ -314,7 +317,7 @@ fn command(c: &CommandContract, all_notes: &Value) -> Result<String, String> {
     Ok(out)
 }
 fn event(e: &EventContract, all_notes: &Value) -> Result<String, String> {
-    let notes = contract_notes(all_notes, "events", &e.name)
+    let notes = contract_notes(all_notes, ["events", &e.name])
         .ok_or(format!("no notes on event {}", e.name))?;
     covered(
         &format!("event {}", e.name),
@@ -352,80 +355,83 @@ fn event(e: &EventContract, all_notes: &Value) -> Result<String, String> {
     Ok(out)
 }
 
+macro_rules! example_files {
+    ($($path:literal),* $(,)?) => {
+        &[$(($path, include_str!(concat!("../authoring-examples/", $path)))),*]
+    };
+}
+
+const EXAMPLE_FILES: &[(&str, &str)] = example_files![
+    "escalate-on-judgment/CATALOG.md",
+    "escalate-on-judgment/cases/assumed-route-refused.json",
+    "escalate-on-judgment/cases/assumed-route-stale.json",
+    "escalate-on-judgment/cases/failed-three-times.json",
+    "escalate-on-judgment/cases/failed-twice.json",
+    "escalate-on-judgment/cases/high-risk.json",
+    "escalate-on-judgment/cases/judgment-fails.json",
+    "escalate-on-judgment/cases/judgment-never-answers.json",
+    "escalate-on-judgment/cases/judgment-refused-at-once.json",
+    "escalate-on-judgment/cases/low-risk.json",
+    "escalate-on-judgment/cases/medium-risk-small-and-tested.json",
+    "escalate-on-judgment/cases/medium-risk.json",
+    "escalate-on-judgment/cases/nothing-offers-the-level.json",
+    "escalate-on-judgment/cases/owner-chose.json",
+    "escalate-on-judgment/cases/risk-unknown.json",
+    "escalate-on-judgment/cases/task-changed.json",
+    "escalate-on-judgment/cases/task-gone.json",
+    "escalate-on-judgment/cases/unroutable-refused.json",
+    "escalate-on-judgment/cases/unroutable-stale.json",
+    "escalate-on-judgment/catalog.json",
+    "escalate-on-judgment/draft.json",
+    "escalate-on-judgment/facts.json",
+    "escalate-on-judgment/previous.artifact.json",
+    "escalate-on-judgment/record.json",
+    "escalate-on-judgment/source.md",
+    "escalate-on-judgment/stuck/deep-level.json",
+    "escalate-on-judgment/stuck/deep-level.md",
+    "notify-when-ready/CATALOG.md",
+    "notify-when-ready/cases/changed-and-still-bare.json",
+    "notify-when-ready/cases/described-meanwhile.json",
+    "notify-when-ready/cases/finished-during-the-wait.json",
+    "notify-when-ready/cases/message-refused.json",
+    "notify-when-ready/cases/still-no-description.json",
+    "notify-when-ready/cases/task-cancelled.json",
+    "notify-when-ready/cases/task-finished.json",
+    "notify-when-ready/cases/task-gone.json",
+    "notify-when-ready/cases/task-not-readable.json",
+    "notify-when-ready/catalog.json",
+    "notify-when-ready/draft.json",
+    "notify-when-ready/facts.json",
+    "notify-when-ready/previous.artifact.json",
+    "notify-when-ready/record.json",
+    "notify-when-ready/source.md",
+    "notify-when-ready/stuck/how-long.json",
+    "notify-when-ready/stuck/how-long.md",
+    "notify-when-ready/stuck/phone-call.json",
+    "notify-when-ready/stuck/phone-call.md",
+    "notify-when-ready/stuck/urgent.json",
+    "notify-when-ready/stuck/urgent.md",
+    "route-to-environment/CATALOG.md",
+    "route-to-environment/cases/continuation_keeps_environment.json",
+    "route-to-environment/cases/default_fits.json",
+    "route-to-environment/cases/fewest_extras.json",
+    "route-to-environment/cases/no_default.json",
+    "route-to-environment/cases/nothing_fits_holds.json",
+    "route-to-environment/cases/pinned_profile_wins.json",
+    "route-to-environment/cases/route_is_stale.json",
+    "route-to-environment/cases/task_gone.json",
+    "route-to-environment/catalog.json",
+    "route-to-environment/draft.json",
+    "route-to-environment/facts.json",
+    "route-to-environment/record.json",
+    "route-to-environment/source.md",
+    "route-to-environment/stuck/fastest.json",
+    "route-to-environment/stuck/fastest.md",
+];
+
 /// Every file of the worked examples, as `(path, content)`. A path is
 /// relative to `authoring-examples`, such as `"notify-when-ready/draft.json"`;
 /// its first component names the example.
 pub fn example_files() -> Vec<(&'static str, &'static str)> {
-    macro_rules! files {
-        ($($path:literal),* $(,)?) => {
-            vec![$(($path, include_str!(concat!("../authoring-examples/", $path)))),*]
-        };
-    }
-    files![
-        "escalate-on-judgment/CATALOG.md",
-        "escalate-on-judgment/cases/assumed-route-refused.json",
-        "escalate-on-judgment/cases/assumed-route-stale.json",
-        "escalate-on-judgment/cases/failed-three-times.json",
-        "escalate-on-judgment/cases/failed-twice.json",
-        "escalate-on-judgment/cases/high-risk.json",
-        "escalate-on-judgment/cases/judgment-fails.json",
-        "escalate-on-judgment/cases/judgment-never-answers.json",
-        "escalate-on-judgment/cases/judgment-refused-at-once.json",
-        "escalate-on-judgment/cases/low-risk.json",
-        "escalate-on-judgment/cases/medium-risk-small-and-tested.json",
-        "escalate-on-judgment/cases/medium-risk.json",
-        "escalate-on-judgment/cases/nothing-offers-the-level.json",
-        "escalate-on-judgment/cases/owner-chose.json",
-        "escalate-on-judgment/cases/risk-unknown.json",
-        "escalate-on-judgment/cases/task-changed.json",
-        "escalate-on-judgment/cases/task-gone.json",
-        "escalate-on-judgment/cases/unroutable-refused.json",
-        "escalate-on-judgment/cases/unroutable-stale.json",
-        "escalate-on-judgment/catalog.json",
-        "escalate-on-judgment/draft.json",
-        "escalate-on-judgment/facts.json",
-        "escalate-on-judgment/previous.artifact.json",
-        "escalate-on-judgment/record.json",
-        "escalate-on-judgment/source.md",
-        "escalate-on-judgment/stuck/deep-level.json",
-        "escalate-on-judgment/stuck/deep-level.md",
-        "notify-when-ready/CATALOG.md",
-        "notify-when-ready/cases/changed-and-still-bare.json",
-        "notify-when-ready/cases/described-meanwhile.json",
-        "notify-when-ready/cases/finished-during-the-wait.json",
-        "notify-when-ready/cases/message-refused.json",
-        "notify-when-ready/cases/still-no-description.json",
-        "notify-when-ready/cases/task-cancelled.json",
-        "notify-when-ready/cases/task-finished.json",
-        "notify-when-ready/cases/task-gone.json",
-        "notify-when-ready/cases/task-not-readable.json",
-        "notify-when-ready/catalog.json",
-        "notify-when-ready/draft.json",
-        "notify-when-ready/facts.json",
-        "notify-when-ready/previous.artifact.json",
-        "notify-when-ready/record.json",
-        "notify-when-ready/source.md",
-        "notify-when-ready/stuck/how-long.json",
-        "notify-when-ready/stuck/how-long.md",
-        "notify-when-ready/stuck/phone-call.json",
-        "notify-when-ready/stuck/phone-call.md",
-        "notify-when-ready/stuck/urgent.json",
-        "notify-when-ready/stuck/urgent.md",
-        "route-to-environment/CATALOG.md",
-        "route-to-environment/cases/continuation_keeps_environment.json",
-        "route-to-environment/cases/default_fits.json",
-        "route-to-environment/cases/fewest_extras.json",
-        "route-to-environment/cases/no_default.json",
-        "route-to-environment/cases/nothing_fits_holds.json",
-        "route-to-environment/cases/pinned_profile_wins.json",
-        "route-to-environment/cases/route_is_stale.json",
-        "route-to-environment/cases/task_gone.json",
-        "route-to-environment/catalog.json",
-        "route-to-environment/draft.json",
-        "route-to-environment/facts.json",
-        "route-to-environment/record.json",
-        "route-to-environment/source.md",
-        "route-to-environment/stuck/fastest.json",
-        "route-to-environment/stuck/fastest.md",
-    ]
+    EXAMPLE_FILES.to_vec()
 }
