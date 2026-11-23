@@ -65,6 +65,60 @@ fn uses_index(plan: &Value, index: &str) -> bool {
             .any(|child| uses_index(child, index))
 }
 
+fn explain(
+    client: &mut postgres::Client,
+    sql: &str,
+    params: &[&(dyn postgres::types::ToSql + Sync)],
+) -> Value {
+    let statement = format!("EXPLAIN (FORMAT JSON) {sql}");
+    let result: Value = client.query_one(statement.as_str(), params).unwrap().get(0);
+    result[0]["Plan"].clone()
+}
+
+struct InspectionPlans<'a> {
+    namespace: &'a str,
+    kind: &'a str,
+    run: Option<&'a str>,
+}
+
+impl InspectionPlans<'_> {
+    fn problems(&self, client: &mut postgres::Client) -> Vec<String> {
+        let mut problems = vec![];
+        for after in [None, Some(format!("{:020}", 15_000))] {
+            for limit in [3_i64, 1001] {
+                for (name, sql) in [("inspect", INSPECT_SQL), ("page", history::PAGE_SQL)] {
+                    let plan = explain(
+                        client,
+                        sql,
+                        &[&self.namespace, &self.kind, &self.run, &after, &limit],
+                    );
+                    let found = self.check(&plan);
+                    problems.extend(found.into_iter().map(|p| {
+                        format!(
+                            "{name} {} run={:?} after={after:?} limit={limit}: {p}",
+                            self.kind, self.run
+                        )
+                    }));
+                }
+            }
+        }
+        problems
+    }
+
+    fn check(&self, plan: &Value) -> Vec<String> {
+        let mut found = vec![];
+        // A run's history is small enough that sorting after its index scan is bounded.
+        if self.run.is_some() {
+            if !uses_index(plan, "run_history_by_run") {
+                found.push("run_history_by_run not used".into());
+            }
+        } else {
+            check_plan(plan, false, &mut found);
+        }
+        found
+    }
+}
+
 /// An inspection page costs the same however much history the namespace
 /// holds: PostgreSQL reads `run_history` through an ordered index scan for
 /// every kind and cursor, never a sort or a sequential scan. A run-filtered
@@ -101,35 +155,13 @@ fn inspection_pages_read_history_through_ordered_index_scans() {
         InspectionKind::Effects,
         InspectionKind::Receipts,
     ] {
-        for run in [None, Some("r7".to_string())] {
-            for after in [None, Some(format!("{:020}", 15_000))] {
-                for limit in [3_i64, 1001] {
-                    for (name, sql) in [("inspect", INSPECT_SQL), ("page", history::PAGE_SQL)] {
-                        let explain = format!("EXPLAIN (FORMAT JSON) {sql}");
-                        let plan: Value = c
-                            .query_one(explain.as_str(), &[&ns, &kind.key(), &run, &after, &limit])
-                            .unwrap()
-                            .get(0);
-                        let mut found = vec![];
-                        if run.is_some() {
-                            // A run's history is small: any plan that reads
-                            // it through the run index is bounded, sorted
-                            // or not.
-                            if !uses_index(&plan[0]["Plan"], "run_history_by_run") {
-                                found.push("run_history_by_run not used".into());
-                            }
-                        } else {
-                            check_plan(&plan[0]["Plan"], false, &mut found);
-                        }
-                        problems.extend(found.into_iter().map(|p| {
-                            format!(
-                                "{name} {} run={run:?} after={after:?} limit={limit}: {p}",
-                                kind.key()
-                            )
-                        }));
-                    }
-                }
-            }
+        for run in [None, Some("r7")] {
+            let page = InspectionPlans {
+                namespace: &ns,
+                kind: kind.key(),
+                run,
+            };
+            problems.extend(page.problems(&mut c));
         }
     }
     assert!(problems.is_empty(), "{problems:#?}");
@@ -205,12 +237,12 @@ fn history_trim_reads_and_deletes_through_indexes() {
     tx.execute("INSERT INTO aq_playbooks.run_history(namespace,kind,item_key,run_id,root_id,sequence,finished_at_ms,public_value) SELECT $1,'receipts',lpad(i::text,20,'0'),CASE WHEN i<=50000 THEN 'event:e'||(i/2) ELSE 'admin' END,'x',i,i,'{}'::jsonb FROM generate_series(30001,60000) i",&[&ns]).unwrap();
     tx.commit().unwrap();
     c.batch_execute("ANALYZE aq_playbooks.run_history").unwrap();
-    let mut plan = |sql: &str, params: &[&(dyn postgres::types::ToSql + Sync)]| -> Value {
-        let explain = format!("EXPLAIN (FORMAT JSON) {sql}");
-        let plan: Value = c.query_one(explain.as_str(), params).unwrap().get(0);
-        plan[0]["Plan"].clone()
-    };
     let mut problems = vec![];
+    check_oldest_queries(&mut c, &ns, &mut problems);
+    check_delete_queries(&mut c, &ns, &mut problems);
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+fn check_oldest_queries(client: &mut postgres::Client, ns: &str, problems: &mut Vec<String>) {
     for limit in [1_i64, 64, 1_000] {
         for (name, sql, index) in [
             (
@@ -229,48 +261,52 @@ fn history_trim_reads_and_deletes_through_indexes() {
                 "run_history_admin_receipts_by_sequence",
             ),
         ] {
-            let oldest = plan(sql, &[&ns, &limit]);
+            let oldest = explain(client, sql, &[&ns, &limit]);
             if !uses_index(&oldest, index) {
                 problems.push(format!(
                     "oldest {name}, limit {limit}: {index} not used: {oldest}"
                 ));
             }
-            check_plan(&oldest, false, &mut problems);
+            check_plan(&oldest, false, problems);
         }
     }
+}
+
+fn check_delete_queries(client: &mut postgres::Client, ns: &str, problems: &mut Vec<String>) {
     let owners: Vec<String> = (15_001..15_065).map(|i| format!("event:e{i}")).collect();
-    let events = plan(history::TRIM_EVENT_RECEIPTS_SQL, &[&ns, &owners]);
-    if !uses_index(&events, "run_history_by_run") {
-        problems.push(format!("trim event receipts: run index not used: {events}"));
-    }
     let admin: Vec<String> = (50_001..50_065).map(|i| format!("{i:020}")).collect();
-    let admin = plan(history::TRIM_ADMIN_RECEIPTS_SQL, &[&ns, &admin]);
-    if !uses_index(&admin, "run_history_pkey") {
-        problems.push(format!(
-            "trim admin receipts: primary key not used: {admin}"
-        ));
-    }
     let victims: Vec<String> = (1..=64).map(|i| format!("r{i:06}")).collect();
-    let items = plan(history::TRIM_ITEMS_SQL, &[&ns, &victims]);
-    if !uses_index(&items, "run_history_by_run") {
-        problems.push(format!("trim items: run index not used: {items}"));
-    }
-    let runs = plan(history::TRIM_RUNS_SQL, &[&ns, &victims]);
-    if !uses_index(&runs, "run_history_pkey") {
-        problems.push(format!("trim runs: primary key not used: {runs}"));
-    }
-    for (name, p) in [
-        ("items", &items),
-        ("runs", &runs),
-        ("event receipts", &events),
-        ("admin receipts", &admin),
+    for (name, sql, index, keys) in [
+        (
+            "event receipts",
+            history::TRIM_EVENT_RECEIPTS_SQL,
+            "run_history_by_run",
+            &owners,
+        ),
+        (
+            "admin receipts",
+            history::TRIM_ADMIN_RECEIPTS_SQL,
+            "run_history_pkey",
+            &admin,
+        ),
+        (
+            "items",
+            history::TRIM_ITEMS_SQL,
+            "run_history_by_run",
+            &victims,
+        ),
+        ("runs", history::TRIM_RUNS_SQL, "run_history_pkey", &victims),
     ] {
+        let plan = explain(client, sql, &[&ns, keys]);
+        if !uses_index(&plan, index) {
+            problems.push(format!("trim {name}: {index} not used: {plan}"));
+        }
         let mut found = vec![];
-        no_sequential_scan(p, &mut found);
+        no_sequential_scan(&plan, &mut found);
         problems.extend(found.into_iter().map(|f| format!("trim {name}: {f}")));
     }
-    assert!(problems.is_empty(), "{problems:#?}");
 }
+
 /// No node of `plan` is a sequential scan of `run_history`.
 fn no_sequential_scan(plan: &Value, problems: &mut Vec<String>) {
     if plan["Relation Name"] == "run_history" && plan["Node Type"] == "Seq Scan" {
