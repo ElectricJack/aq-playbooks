@@ -76,23 +76,6 @@ fn contracts_dir() -> PathBuf {
 
 // ---- The generator: 2.1.0 plus the additive contracts. ----
 
-fn pretty(value: &impl serde::Serialize) -> String {
-    // A Value orders keys, as every published bundle does.
-    let value = serde_json::to_value(value).unwrap();
-    serde_json::to_string_pretty(&value).unwrap() + "\n"
-}
-fn fingerprints<'a, T: 'a>(
-    items: impl Iterator<Item = (&'a String, &'a T)>,
-    keep: impl Fn(&str) -> bool,
-    fingerprint: impl Fn(&T) -> Hash,
-) -> Value {
-    items
-        .filter(|(n, _)| keep(n))
-        .map(|(n, c)| (n.clone(), json!(fingerprint(c))))
-        .collect::<serde_json::Map<_, _>>()
-        .into()
-}
-
 #[test]
 #[ignore = "writes contracts/aq-host-2.2.0; run by hand after changing the generator"]
 fn write_catalog_v2_2() {
@@ -272,12 +255,7 @@ fn satisfies(request: &Value, answer: &Value) -> bool {
 fn valid_and_invalid_fixture_cases_validate_as_declared() {
     let registry = catalog::catalog_v2_2();
     let fixtures = fixtures();
-    let covered: BTreeSet<_> = fixtures["cases"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|f| validate_fixture(&registry, f))
-        .collect();
+    let covered = validate_fixtures(&registry, &fixtures);
     // A valid case for every new input, outcome and event.
     let mut expected = BTreeSet::new();
     for name in ADDED_COMMANDS {
@@ -878,25 +856,6 @@ fn reported_facts(task: &Task) -> Value {
         "ended_attempts": task.failures, "route": "none"})
 }
 
-fn validate_fixture(registry: &Registry, fixture: &Value) -> Option<String> {
-    let name = fixture["name"].as_str().unwrap();
-    let contract = fixture["contract"].as_str().unwrap();
-    let kind = fixture["kind"].as_str().unwrap();
-    let schema = match kind {
-        "input" => &registry.commands[contract].input,
-        "output" => &registry.commands[contract].outcomes[fixture["outcome"].as_str().unwrap()],
-        "event" => &registry.events[contract].payload,
-        other => panic!("unknown fixture kind {other}"),
-    };
-    let valid = fixture["valid"].as_bool().unwrap();
-    assert_eq!(schema.validate(&fixture["value"]).is_ok(), valid, "{name}");
-    valid.then(|| match kind {
-        "output" => format!("{contract}.{}", fixture["outcome"].as_str().unwrap()),
-        "input" => format!("{contract}.input"),
-        _ => contract.to_string(),
-    })
-}
-
 use aq_playbooks_simulation::{Case, CaseReturn, CaseStart, Expectation, ExpectedCall, run_case};
 fn expected_route_calls(task: &Task, subject: &Value) -> Expectation {
     Expectation {
@@ -964,3 +923,7 @@ fn routing_case(name: &str, task: &Task, subject: &Value) -> Case {
         expect: expected_route_calls(task, subject),
     }
 }
+
+#[path = "support/catalog_fixtures.rs"]
+mod catalog_fixtures;
+use catalog_fixtures::{fingerprints, pretty, validate_fixtures};
