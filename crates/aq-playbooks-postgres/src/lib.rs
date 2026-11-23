@@ -784,7 +784,11 @@ impl PostgresStorage {
         }
         tx.phase("retention");
         let drain_limit = self.tombstone_drain_limit(namespace, state);
-        let rows = retention::verify_and_record(&mut tx, namespace, &previous, state, drain_limit)?;
+        let rows = retention::Changes {
+            previous: &previous,
+            next: state,
+        }
+        .verify_and_record(&mut tx, namespace, drain_limit)?;
         let items = aq_playbooks_runner::history_items(&state.settled);
         aq_playbooks_runner::history::check_not_live(state, &items)?;
         history::check_unrecorded(
