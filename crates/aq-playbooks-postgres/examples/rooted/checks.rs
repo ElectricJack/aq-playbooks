@@ -18,6 +18,21 @@ pub fn run(client: &mut Client) -> Result<()> {
             && !state.receipts.is_empty()
             && !state.intents.is_empty()
     );
+    check_fallback_sources(client, &state)?;
+    let root = establish_reference(client, &state)?;
+    check_replay(client, &state, &root)?;
+    check_quota_rollback(client, &root)?;
+    check_root_corruption(client, &root)?;
+    let (receipts, corrupt) = check_unrelated_corruption(client, &root)?;
+    check_malformed_neighbors(client, &root, &receipts)?;
+    check_corrupt_existing_bytes(client, &state, &root, &corrupt)?;
+    check_tree_canonicalization(client)?;
+    check_dirty_record_fallback(client, &state)?;
+    check_producer_epoch(client, &state)?;
+    Ok(())
+}
+
+fn check_fallback_sources(client: &mut Client, state: &aq_playbooks_runner::State) -> Result<()> {
     // A full genesis source audit is mandatory. SQL mirrors never certify waiters.
     for (kind, (mut source, event)) in [
         ("waiter", fixture::waiter_state()),
@@ -63,9 +78,13 @@ pub fn run(client: &mut Client) -> Result<()> {
             "source_{kind}_with_unrelated_history_is_explicit_fallback"
         ));
     }
+    Ok(())
+}
+
+fn establish_reference(client: &mut Client, state: &aq_playbooks_runner::State) -> Result<Link> {
     let mut tx = client.transaction()?;
     let mut tree = Tree::new(&mut tx);
-    let root = tree.build(&serde_json::to_value(&state)?)?;
+    let root = tree.build(&serde_json::to_value(state)?)?;
     tree.flush()?;
     drop(tree);
     tx.execute("DELETE FROM pb04_root", &[])?;
@@ -79,7 +98,7 @@ pub fn run(client: &mut Client) -> Result<()> {
     let event = fixture::envelope("unrelated-history");
     let planned = admission::plan(&mut tree, &root, "pb02", event.clone(), 0, 10_000)?;
     let next = admission::patch(&mut tree, &root, &planned.before, &planned.after)?;
-    let reference = full_engine(&state)?;
+    let reference = full_engine(state)?;
     reference.admit_event("pb02", event, 10_000)?;
     tree.prefetch_subtree(&next)?;
     assert_eq!(
@@ -93,6 +112,14 @@ pub fn run(client: &mut Client) -> Result<()> {
     drop(tree);
     tx.rollback()?;
     passed("full_reference_with_unrelated_runs_events_receipts_intents");
+    Ok(root)
+}
+
+fn check_replay(
+    client: &mut Client,
+    state: &aq_playbooks_runner::State,
+    root: &Link,
+) -> Result<()> {
     // Existing event error/duplicate behavior remains the canonical engine's.
     let old = state.events.values().next().unwrap().envelope.clone();
     for (name, event, epoch, now) in [
@@ -122,16 +149,16 @@ pub fn run(client: &mut Client) -> Result<()> {
     ] {
         let mut tx = client.transaction()?;
         let mut tree = Tree::new(&mut tx);
-        let result = admission::plan(&mut tree, &root, "pb02", event.clone(), epoch, now);
-        let expected = full_engine(&state)?.admit_event_in_epoch("pb02", event, epoch, now);
+        let result = admission::plan(&mut tree, root, "pb02", event.clone(), epoch, now);
+        let expected = full_engine(state)?.admit_event_in_epoch("pb02", event, epoch, now);
         match (result, expected) {
             (Ok(plan), Ok(value)) => {
                 assert_eq!(
                     canonical_bytes(&plan.disposition)?,
                     canonical_bytes(&value)?
                 );
-                let next = admission::patch(&mut tree, &root, &plan.before, &plan.after)?;
-                assert_eq!(root, next);
+                let next = admission::patch(&mut tree, root, &plan.before, &plan.after)?;
+                assert_eq!(root, &next);
             }
             (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
             _ => return Err("canonical result mismatch".into()),
@@ -140,6 +167,10 @@ pub fn run(client: &mut Client) -> Result<()> {
         tx.rollback()?;
         passed(name);
     }
+    Ok(())
+}
+
+fn check_quota_rollback(client: &mut Client, root: &Link) -> Result<()> {
     // Failed exact global quota does not publish a root or node writes.
     let count_before: i64 = client
         .query_one("SELECT count(*) FROM pb04_nodes", &[])?
@@ -148,13 +179,13 @@ pub fn run(client: &mut Client) -> Result<()> {
     let mut tree = Tree::new(&mut tx);
     let plan = admission::plan(
         &mut tree,
-        &root,
+        root,
         "pb02",
         fixture::envelope("quota"),
         0,
         10_000,
     )?;
-    let next = admission::patch(&mut tree, &root, &plan.before, &plan.after)?;
+    let next = admission::patch(&mut tree, root, &plan.before, &plan.after)?;
     let config = EngineConfig {
         max_state_bytes: root.bytes as usize,
         ..EngineConfig::default()
@@ -173,9 +204,13 @@ pub fn run(client: &mut Client) -> Result<()> {
         client
             .query_one("SELECT root FROM pb04_root", &[])?
             .get::<_, Vec<u8>>(0),
-        canonical_bytes(&root)?
+        canonical_bytes(root)?
     );
     passed("quota_and_staged_nodes_rollback_atomically");
+    Ok(())
+}
+
+fn check_root_corruption(client: &mut Client, root: &Link) -> Result<()> {
     // Root-path corruption must fail before planning. Never trust address alone.
     let original: Vec<u8> = client
         .query_one(
@@ -194,7 +229,7 @@ pub fn run(client: &mut Client) -> Result<()> {
     assert!(
         admission::plan(
             &mut tree,
-            &root,
+            root,
             "pb02",
             fixture::envelope("corrupt"),
             0,
@@ -205,11 +240,15 @@ pub fn run(client: &mut Client) -> Result<()> {
     drop(tree);
     tx.rollback()?;
     passed("touched_raw_bytes_corruption_fails");
+    Ok(())
+}
+
+fn check_unrelated_corruption(client: &mut Client, root: &Link) -> Result<(Link, Vec<u8>)> {
     // Untouched history is NOT scanned on admission. A later explicit full audit
     // must fail: this is the intentional touched-integrity/full-audit boundary.
     let mut tx = client.transaction()?;
     let mut tree = Tree::new(&mut tx);
-    let receipts = tree.path(&root, &["receipts"])?.unwrap();
+    let receipts = tree.path(root, &["receipts"])?.unwrap();
     drop(tree);
     let payload: Vec<u8> = tx
         .query_one(
@@ -226,18 +265,22 @@ pub fn run(client: &mut Client) -> Result<()> {
     let mut tree = Tree::new(&mut tx);
     let plan = admission::plan(
         &mut tree,
-        &root,
+        root,
         "pb02",
         fixture::envelope("untouched"),
         0,
         10_000,
     )?;
-    let next = admission::patch(&mut tree, &root, &plan.before, &plan.after)?;
+    let next = admission::patch(&mut tree, root, &plan.before, &plan.after)?;
     admission::quota(&mut tree, &next, &EngineConfig::default())?;
     assert!(tree.prefetch_subtree(&next).is_err());
     drop(tree);
     tx.rollback()?;
     passed("untouched_history_corruption_detected_by_explicit_full_audit");
+    Ok((receipts, corrupt))
+}
+
+fn check_malformed_neighbors(client: &mut Client, root: &Link, receipts: &Link) -> Result<()> {
     // Speculative SQL lookahead must not make malformed unrelated bytes into
     // authority or widen this planner's certified logical dependency set.
     for payload in [vec![0xff, 0xfe], b"{invalid json".to_vec()] {
@@ -249,19 +292,28 @@ pub fn run(client: &mut Client) -> Result<()> {
         let mut tree = Tree::new(&mut tx);
         let plan = admission::plan(
             &mut tree,
-            &root,
+            root,
             "pb02",
             fixture::envelope("malformed-neighbor"),
             0,
             10_000,
         )?;
-        let next = admission::patch(&mut tree, &root, &plan.before, &plan.after)?;
+        let next = admission::patch(&mut tree, root, &plan.before, &plan.after)?;
         admission::quota(&mut tree, &next, &EngineConfig::default())?;
         assert!(tree.prefetch_subtree(&next).is_err());
         drop(tree);
         tx.rollback()?;
     }
     passed("malformed_speculative_neighbors_remain_untrusted_and_full_audit_fails");
+    Ok(())
+}
+
+fn check_corrupt_existing_bytes(
+    client: &mut Client,
+    state: &aq_playbooks_runner::State,
+    root: &Link,
+    corrupt: &[u8],
+) -> Result<()> {
     // Existing hash-address rows must be rechecked even if staged payload matches.
     let mut tx = client.transaction()?;
     tx.execute(
@@ -269,11 +321,15 @@ pub fn run(client: &mut Client) -> Result<()> {
         &[&corrupt, &root.hash],
     )?;
     let mut tree = Tree::new(&mut tx);
-    tree.build(&serde_json::to_value(&state)?)?;
+    tree.build(&serde_json::to_value(state)?)?;
     assert!(tree.flush().is_err());
     drop(tree);
     tx.rollback()?;
     passed("deduplicated_existing_bytes_cannot_hide_corruption");
+    Ok(())
+}
+
+fn check_tree_canonicalization(client: &mut Client) -> Result<()> {
     // Canonical punctuation, escaped keys/unicode, empty arrays and AVL rotations.
     let mut tx = client.transaction()?;
     let mut tree = Tree::new(&mut tx);
@@ -293,9 +349,16 @@ pub fn run(client: &mut Client) -> Result<()> {
     drop(tree);
     tx.rollback()?;
     passed("exact_canonical_delimiters_escapes_empty_containers_and_rotations");
+    Ok(())
+}
+
+fn check_dirty_record_fallback(
+    client: &mut Client,
+    state: &aq_playbooks_runner::State,
+) -> Result<()> {
     // Read-set certification refuses synchronization that could touch omitted data.
     for field in ["dirty_runs", "dirty_intents"] {
-        let mut value = serde_json::to_value(&state)?;
+        let mut value = serde_json::to_value(state)?;
         value["indexes"][field] = json!(["omitted"]);
         let mut tx = client.transaction()?;
         let mut tree = Tree::new(&mut tx);
@@ -318,6 +381,10 @@ pub fn run(client: &mut Client) -> Result<()> {
         tx.rollback()?;
     }
     passed("omitted_dirty_record_sources_require_full_reference_fallback");
+    Ok(())
+}
+
+fn check_producer_epoch(client: &mut Client, state: &aq_playbooks_runner::State) -> Result<()> {
     // Exact epoch identity used by canonical event keys is not approximated.
     let mut changed = state.clone();
     changed.retention.producer_epochs.insert("pb02".into(), 3);

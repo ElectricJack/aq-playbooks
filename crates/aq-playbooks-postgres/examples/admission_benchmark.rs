@@ -8,14 +8,8 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = std::env::var("AQ_PLAYBOOKS_TEST_DATABASE_URL")?;
-    let namespace = format!(
-        "benchmark-{}-{}",
-        std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-    );
-    let artifact = Artifact::seal(ArtifactContent {
+fn benchmark_artifact() -> Result<Artifact, ModelError> {
+    Artifact::seal(ArtifactContent {
         format_version: FORMAT_VERSION,
         compiler: "benchmark-v1".into(),
         source: SourceBinding {
@@ -59,7 +53,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dependencies: BTreeMap::new(),
         definitions: BTreeMap::new(),
         source_map: BTreeMap::new(),
-    })?;
+    })
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = std::env::var("AQ_PLAYBOOKS_TEST_DATABASE_URL")?;
+    let namespace = format!(
+        "benchmark-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    );
+    let artifact = benchmark_artifact()?;
     let artifact_bytes = canonical_bytes(&artifact)?.len();
     let authority = Authority {
         actor: "synthetic-benchmark".into(),
