@@ -17,6 +17,10 @@ use completions::process_completions;
 mod clock_rebase;
 use clock_rebase::rebase_plan;
 pub use clock_rebase::{ClockRebaseReport, DeadlineAdjustment, REBASE_ADJUSTMENTS_LISTED};
+mod dependencies;
+use dependencies::{ensure_admission_protection, resolve, resolve_at};
+mod starts;
+use starts::{Invocation, Lineage};
 mod driver;
 mod effects;
 mod events;
@@ -791,20 +795,14 @@ impl<S: Storage> Engine<S> {
             }
             let dependencies = resolve(s, &activation.artifact, &authority)?;
             let id = next_id(s, "run");
-            admit_run(
-                s,
-                id.clone(),
-                id.clone(),
-                None,
-                None,
-                &activation.artifact,
+            Invocation {
+                artifact: &activation.artifact,
                 entry,
                 input,
                 authority,
                 dependencies,
-                0,
-                now_ms,
-            )?;
+            }
+            .admit_root(s, &id, now_ms)?;
             Ok(id)
         });
         self.metrics.admission(&result, false);
@@ -940,179 +938,6 @@ fn receipt(s: &mut State, run: &str, step: &str, now: i64, kind: &str, detail: V
         kind: kind.into(),
         detail,
     });
-}
-fn resolve(s: &State, artifact: &str, authority: &Authority) -> Result<BTreeMap<String, String>> {
-    resolve_at(s, artifact, authority, s.catalog_revision)
-}
-fn resolve_at(
-    s: &State,
-    artifact: &str,
-    authority: &Authority,
-    revision: u64,
-) -> Result<BTreeMap<String, String>> {
-    fn visit(
-        s: &State,
-        id: &str,
-        a: &Authority,
-        stack: &mut BTreeSet<String>,
-        out: &mut BTreeMap<String, String>,
-        revision: u64,
-    ) -> Result<()> {
-        if !stack.insert(id.into()) {
-            return Err(Error::Refused("recursive dependency".into()));
-        }
-        let artifact = s
-            .artifacts
-            .get(id)
-            .ok_or_else(|| Error::NotFound(id.into()))?;
-        artifact.verify()?;
-        check_authority(artifact, a)?;
-        for (name, dep) in &artifact.content.dependencies {
-            let selected = match &dep.selection {
-                DependencySelection::Exact => dep.artifact.clone(),
-                DependencySelection::Catalog { allowed_artifacts } => {
-                    let bindings = s.catalog_history.get(&revision).unwrap_or(&s.bindings);
-                    let binding = bindings
-                        .get(&dep.binding)
-                        .ok_or_else(|| Error::NotFound(dep.binding.clone()))?;
-                    if !binding.controls.calls_enabled {
-                        return Err(Error::Refused("dependency new calls disabled".into()));
-                    }
-                    if !allowed_artifacts.is_empty()
-                        && !allowed_artifacts.contains(&binding.artifact)
-                    {
-                        return Err(Error::Refused(
-                            "catalog target outside allowed artifacts".into(),
-                        ));
-                    }
-                    binding.artifact.clone()
-                }
-            };
-            let child = s
-                .artifacts
-                .get(&selected)
-                .ok_or_else(|| Error::NotFound(selected.clone()))?;
-            if !execution_allowed(
-                s,
-                &selected,
-                a,
-                &child.content.playbook.required_capabilities,
-            )? {
-                return Err(Error::Refused(
-                    "dependency execution authority revoked".into(),
-                ));
-            }
-            if dep.scope != a.scope || !dep.capabilities.is_subset(&a.capabilities) {
-                return Err(Error::Refused("dependency authority".into()));
-            }
-            for (entry, interface) in &dep.interfaces {
-                let actual = child
-                    .content
-                    .playbook
-                    .entries
-                    .get(entry)
-                    .ok_or_else(|| Error::Refused("missing child interface".into()))?;
-                if !interface_compatible(actual, interface) {
-                    return Err(Error::Refused("incompatible child interface".into()));
-                }
-            }
-            out.insert(format!("{id}/{name}"), selected.clone());
-            visit(s, &selected, a, stack, out, revision)?;
-        }
-        stack.remove(id);
-        Ok(())
-    }
-    let mut out = BTreeMap::new();
-    visit(
-        s,
-        artifact,
-        authority,
-        &mut BTreeSet::new(),
-        &mut out,
-        revision,
-    )?;
-    Ok(out)
-}
-#[allow(clippy::too_many_arguments)]
-fn admit_run(
-    s: &mut State,
-    id: String,
-    root: String,
-    parent: Option<String>,
-    origin: Option<String>,
-    artifact: &str,
-    entry: &str,
-    input: Value,
-    authority: Authority,
-    dependencies: BTreeMap<String, String>,
-    depth: u32,
-    now: i64,
-) -> Result<()> {
-    if s.runs.contains_key(&id) {
-        return Ok(());
-    }
-    ensure_admission_protection(
-        s,
-        artifact,
-        &dependencies,
-        s.runs
-            .get(&root)
-            .map(|run| run.catalog_revision)
-            .unwrap_or(s.catalog_revision),
-    )?;
-    let a = s
-        .artifacts
-        .get(artifact)
-        .ok_or_else(|| Error::NotFound(artifact.into()))?;
-    check_authority(a, &authority)?;
-    let e = a
-        .content
-        .playbook
-        .entries
-        .get(entry)
-        .ok_or_else(|| Error::NotFound(entry.into()))?;
-    e.input.validate(&input)?;
-    check_bytes(&input, a.content.playbook.limits.max_payload_bytes)?;
-    let step = e.start.clone();
-    s.runs.insert(
-        id.clone(),
-        Run {
-            catalog_revision: s
-                .runs
-                .get(&root)
-                .map(|run| run.catalog_revision)
-                .unwrap_or(s.catalog_revision),
-            id: id.clone(),
-            root: root.clone(),
-            parent,
-            origin,
-            artifact: artifact.into(),
-            entry: entry.into(),
-            dependencies,
-            authority,
-            step: step.clone(),
-            status: RunStatus::Admitted,
-            input,
-            variables: BTreeMap::new(),
-            outcome: None,
-            output: None,
-            reason: None,
-            admitted_at_ms: now,
-            visits: 0,
-            depth,
-            children: vec![],
-            pending: None,
-            loops: vec![],
-            attempts: BTreeMap::new(),
-            pending_return: None,
-            pending_failure: false,
-            terminal_sequence: None,
-        },
-    );
-    s.budgets.entry(root).or_default();
-    indexes::mark_run(s, &id);
-    receipt(s, &id, &step, now, "admitted", json!({"artifact":artifact}));
-    Ok(())
 }
 fn context(s: &State, r: &Run) -> EvalContext {
     let mut c = EvalContext::new();
@@ -1982,55 +1807,4 @@ fn execution_allowed(
         && s.authority_revocations
             .get(&digest(&(&authority.actor, &authority.scope))?)
             .is_none_or(|revoked| revoked.is_disjoint(capabilities)))
-}
-
-/// Determine protection from the exact pinned execution closure before any input
-/// is persisted. Catalog provenance that is not selected does not grant or deny
-/// execution; known exact/transitive selections are followed even for blocked
-/// event destinations whose immutable bytes are only partially installed.
-fn ensure_admission_protection(
-    s: &State,
-    artifact: &str,
-    manifest: &BTreeMap<String, String>,
-    revision: u64,
-) -> Result<()> {
-    if s.protection_available {
-        return Ok(());
-    }
-    let mut pending = vec![artifact.to_string()];
-    pending.extend(manifest.values().cloned());
-    let mut visited = BTreeSet::new();
-    while let Some(hash) = pending.pop() {
-        if !visited.insert(hash.clone()) {
-            continue;
-        }
-        let Some(artifact) = s.artifacts.get(&hash) else {
-            continue;
-        };
-        if artifact.content.registry.commands.values().any(|command| {
-            !command.sensitive_input_fields.is_empty()
-                || !command.sensitive_output_fields.is_empty()
-        }) {
-            return Err(Error::Refused(
-                "protected-value storage unavailable for admitted workflow inputs/results".into(),
-            ));
-        }
-        for (name, dependency) in &artifact.content.dependencies {
-            let selected = manifest
-                .get(&format!("{hash}/{name}"))
-                .cloned()
-                .unwrap_or_else(|| match &dependency.selection {
-                    DependencySelection::Exact => dependency.artifact.clone(),
-                    DependencySelection::Catalog { .. } => s
-                        .catalog_history
-                        .get(&revision)
-                        .unwrap_or(&s.bindings)
-                        .get(&dependency.binding)
-                        .map(|binding| binding.artifact.clone())
-                        .unwrap_or_else(|| dependency.artifact.clone()),
-                });
-            pending.push(selected);
-        }
-    }
-    Ok(())
 }

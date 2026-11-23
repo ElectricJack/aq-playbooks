@@ -42,29 +42,15 @@ impl StepExecution<'_> {
                 .collect::<Vec<_>>(),
         ))?;
         self.state.budgets.get_mut(&self.run.root).unwrap().children += 1;
-        let independent = mode == CallMode::Independent;
-        let parent = if independent {
-            None
-        } else {
-            Some(self.run.id.clone())
-        };
-        // Independent starts retain the original shared allocation ledger. They
-        // cannot replenish budgets by detaching, even after the origin finishes.
-        admit_run(
-            self.state,
-            id.clone(),
-            self.run.root.clone(),
-            parent,
-            Some(self.run.id.clone()),
-            &child_artifact,
-            &entry,
+        Invocation {
+            artifact: &child_artifact,
+            entry: &entry,
             input,
-            self.run.authority.clone(),
-            self.run.dependencies.clone(),
-            self.run.depth + 1,
-            self.now,
-        )?;
-        if !independent {
+            authority: self.run.authority.clone(),
+            dependencies: self.run.dependencies.clone(),
+        }
+        .admit(self.state, Lineage::child(self.run, &id, &mode), self.now)?;
+        if mode != CallMode::Independent {
             self.run.children.push(id.clone());
         }
         receipt(

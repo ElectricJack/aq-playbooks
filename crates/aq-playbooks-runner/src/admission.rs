@@ -159,20 +159,14 @@ impl Admission<'_> {
         let activation = self.request.activation(s)?;
         let dependencies = self.request.dependencies(s, &activation)?;
         let run_id = next_id(s, "run");
-        admit_run(
-            s,
-            run_id.clone(),
-            run_id.clone(),
-            None,
-            None,
-            &activation.artifact,
-            &self.request.entry,
-            self.request.input.clone(),
-            self.request.authority.clone(),
+        Invocation {
+            artifact: &activation.artifact,
+            entry: &self.request.entry,
+            input: self.request.input.clone(),
+            authority: self.request.authority.clone(),
             dependencies,
-            0,
-            self.now_ms,
-        )?;
+        }
+        .admit_root(s, &run_id, self.now_ms)?;
         let receipt = KeyedAdmissionReceipt {
             key: self.request.key.clone(),
             request_digest: self.request_digest.clone(),

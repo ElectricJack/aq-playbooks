@@ -173,20 +173,14 @@ pub(crate) fn fanout_event(
             d.dependencies = dependencies;
         }
         let id = format!("event-{}", d.key);
-        admit_run(
-            s,
-            id.clone(),
-            id.clone(),
-            None,
-            None,
-            &d.artifact,
-            &d.entry,
-            d.input.clone(),
-            d.authority.clone(),
-            d.dependencies.clone(),
-            0,
-            now_ms,
-        )?;
+        Invocation {
+            artifact: &d.artifact,
+            entry: &d.entry,
+            input: d.input.clone(),
+            authority: d.authority.clone(),
+            dependencies: d.dependencies.clone(),
+        }
+        .admit_root(s, &id, now_ms)?;
         s.runs.get_mut(&id).unwrap().catalog_revision = event.catalog_revision;
         d.run = Some(id);
         count += 1;
