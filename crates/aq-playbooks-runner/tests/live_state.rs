@@ -6,66 +6,32 @@ mod async_operation;
 use async_operation::*;
 #[path = "fixtures/engine.rs"]
 mod engine_fixtures;
+#[path = "fixtures/removal_state.rs"]
+mod removal_state;
+use removal_state::{
+    completed_run, refused_with, removal_fences_hold, synthetic_cohort, tombstone,
+};
+
+/// The planner fixture also carries a settled operation and an event without a recorded expiry.
+fn fence_state() -> State {
+    let mut s = removal_state::base_fence_state();
+    s.intents.insert(
+        "op-a".into(),
+        intent("op-a", "run-a", IntentStatus::Completed),
+    );
+    s.events
+        .insert("ev-fallback".into(), accepted_event("ev-fallback", 0));
+    s
+}
+
 use aq_playbooks_model::*;
 use aq_playbooks_runner::*;
 use engine_fixtures::*;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-/// One Completed run `id`, its own root, with receipts at `receipts`.
-fn synthetic_cohort(id: &str, finished_at_ms: i64, receipts: &[u64]) -> SettledCohort {
-    let run = Run {
-        catalog_revision: 1,
-        id: id.into(),
-        root: id.into(),
-        parent: None,
-        origin: None,
-        artifact: "artifact".into(),
-        entry: "main".into(),
-        dependencies: BTreeMap::new(),
-        authority: authority(),
-        step: "ok".into(),
-        status: RunStatus::Completed,
-        input: Value::Null,
-        variables: BTreeMap::new(),
-        outcome: Some("ok".into()),
-        output: Some(Value::Null),
-        reason: None,
-        admitted_at_ms: 1,
-        visits: 1,
-        depth: 0,
-        children: vec![],
-        pending: None,
-        loops: vec![],
-        attempts: BTreeMap::new(),
-        pending_return: None,
-        pending_failure: false,
-        terminal_sequence: receipts.last().copied(),
-    };
-    SettledCohort {
-        root: id.into(),
-        finished_at_ms,
-        runs: vec![run],
-        intents: vec![],
-        receipts: receipts
-            .iter()
-            .map(|&sequence| Receipt {
-                sequence,
-                run: id.into(),
-                step: "ok".into(),
-                at_ms: finished_at_ms,
-                kind: "terminal".into(),
-                detail: json!({"status": "completed", "outcome": "ok"}),
-            })
-            .collect(),
-    }
-}
 
 // --- Task 4: retention clock, window fields and removal fences ------------
 
-/// A terminal root run `id` with no children.
-fn completed_run(id: &str) -> Run {
-    synthetic_cohort(id, 1, &[]).runs.remove(0)
-}
 fn intent(id: &str, run: &str, status: IntentStatus) -> Intent {
     Intent {
         id: id.into(),
@@ -99,9 +65,6 @@ fn accepted_event(key: &str, accepted_at_ms: i64) -> AcceptedEvent {
         catalog_revision: 1,
         destinations: vec![],
     }
-}
-fn refused_with<T>(result: std::result::Result<T, StorageError>, text: &str) -> bool {
-    matches!(result, Err(StorageError::Backend(m)) if m == text)
 }
 
 #[test]
@@ -206,54 +169,13 @@ fn legacy_fixture_from_5046282_decodes_on_format_2_and_format_3() {
         store.compare_and_swap("legacy", "w", r, &next).unwrap();
     }
 }
-fn removal_fences_hold<S: Storage>(store: S) {
-    store.acquire("ns", "w").unwrap();
-    let mut s = State::default();
-    // Round 1 (I2): a recorded expiry is at least acceptance plus the policy
-    // window, so the brief's 1_000 needs a 1_000 window.
-    s.retention.policy.admission_replay_ms = 1_000;
-    s.retention.clock_ms = Some(500);
-    s.keyed_admissions.insert("k".into(), receipt("k", 0));
-    s.retention
-        .admission_expires_at_ms
-        .insert("k".into(), 1_000);
-    s.runs.insert("run-a".into(), completed_run("run-a"));
-    let r = store.compare_and_swap("ns", "w", 0, &s).unwrap();
-    let mut next = s.clone();
-    next.keyed_admissions.remove("k");
-    next.retention.clock_ms = Some(999);
-    assert!(
-        matches!(store.compare_and_swap("ns", "w", r, &next), Err(StorageError::Backend(m)) if m == retention::REFUSE_EARLY_REMOVAL)
-    );
-    next.retention.clock_ms = Some(1_000);
-    let r = store.compare_and_swap("ns", "w", r, &next).unwrap();
-    let mut gone = next.clone();
-    gone.runs.remove("run-a");
-    assert!(
-        matches!(store.compare_and_swap("ns", "w", r, &gone), Err(StorageError::Backend(m)) if m == retention::REFUSE_RUN_REMOVAL)
-    );
-    gone.settled.push(SettledCohort {
-        root: "run-a".into(),
-        finished_at_ms: 1,
-        runs: vec![completed_run("run-a")],
-        intents: vec![],
-        receipts: vec![],
-    });
-    let r = store.compare_and_swap("ns", "w", r, &gone).unwrap();
-    let mut back = gone.clone();
-    back.settled.clear();
-    back.retention.clock_ms = Some(10);
-    assert!(
-        matches!(store.compare_and_swap("ns", "w", r, &back), Err(StorageError::Backend(m)) if m == retention::REFUSE_CLOCK)
-    );
-}
 #[test]
 fn memory_storage_removal_fences() {
-    removal_fences_hold(MemoryStorage::default())
+    removal_fences_hold(&MemoryStorage::default(), "ns")
 }
 #[test]
 fn record_storage_removal_fences() {
-    removal_fences_hold(RecordStorage::new())
+    removal_fences_hold(&RecordStorage::new(), "ns")
 }
 #[test]
 fn commits_advance_the_clock_only_with_host_time() {
@@ -301,54 +223,6 @@ fn cohort(run: Run, intents: Vec<Intent>, receipts: Vec<Receipt>) -> SettledCoho
         receipts,
     }
 }
-/// The window and history state shared by the refusal tests. Policy
-/// windows: receipts 2_000, events 3_000; recorded expiries "k" 3_000 and
-/// "ev" 4_000; "fallback" and "ev-fallback" have none.
-fn fence_state() -> State {
-    let mut s = State::default();
-    s.retention.clock_ms = Some(500);
-    s.retention.policy.admission_replay_ms = 2_000;
-    s.retention.policy.event_replay_ms = 3_000;
-    s.runs.insert("run-a".into(), completed_run("run-a"));
-    s.runs.insert("run-b".into(), {
-        let mut run = completed_run("run-b");
-        run.status = RunStatus::Running;
-        run
-    });
-    s.intents.insert(
-        "op-a".into(),
-        intent("op-a", "run-a", IntentStatus::Completed),
-    );
-    s.receipts.push(audit(1, "run-a"));
-    s.receipts.push(audit(2, "run-b"));
-    s.sequence = 2;
-    s.keyed_admissions.insert("k".into(), receipt("k", 0));
-    s.keyed_admissions
-        .insert("fallback".into(), receipt("fallback", 0));
-    s.retention
-        .admission_expires_at_ms
-        .insert("k".into(), 3_000);
-    s.events.insert("ev".into(), accepted_event("ev", 0));
-    s.retention.event_expires_at_ms.insert("ev".into(), 4_000);
-    s.events
-        .insert("ev-fallback".into(), accepted_event("ev-fallback", 0));
-    // Round 2 (C1): an installed contract whose window (5_000) is longer
-    // than the policy's, and an event of it expiring at 9_000.
-    let long = long_artifact();
-    s.artifacts.insert(long.digest.clone(), long);
-    s.events.insert("ev-long".into(), {
-        let mut e = accepted_event("ev-long", 0);
-        e.envelope.contract = ContractRef {
-            name: long_contract().name,
-            fingerprint: long_contract().fingerprint().unwrap(),
-        };
-        e
-    });
-    s.retention
-        .event_expires_at_ms
-        .insert("ev-long".into(), 9_000);
-    s
-}
 fn long_contract() -> EventContract {
     EventContract {
         name: "test.long".into(),
@@ -370,14 +244,6 @@ fn long_artifact() -> Artifact {
             ..Default::default()
         },
     )
-}
-fn tombstone(digest: &str) -> retention::EventTombstone {
-    retention::EventTombstone {
-        producer: "host".into(),
-        epoch: 0,
-        digest: digest.into(),
-        disposed_at_ms: 5,
-    }
 }
 /// Legacy event tombstones and correlation fences (no engine writes them
 /// any more) may always be removed; an expired event leaves by its window.
@@ -3383,10 +3249,12 @@ fn eviction_state() -> State {
     s.sequence = 20;
     s
 }
-/// Each a (label, refusal, previous State, change): every way an eviction
-/// can break the licence.
 #[path = "fixtures/eviction_cases.rs"]
 mod eviction_cases;
+/// Each a (label, refusal, previous State, change): every way an eviction
+/// can break the licence.
+#[path = "fixtures/eviction_commits.rs"]
+mod eviction_commits;
 use eviction_cases::{EvictionCase, common_refusals};
 fn eviction_refusal_cases() -> Vec<EvictionCase> {
     let base = eviction_state();
@@ -3531,41 +3399,7 @@ fn eviction_fences_hold_on_cas(store: &dyn Storage) {
         let base = seed_eviction_state(store, &ns, state);
         (ns, base)
     };
-    let mut failures = vec![];
-    for (label, text, previous, f) in eviction_refusal_cases() {
-        let (ns, base) = fresh(&previous);
-        let mut next = previous.clone();
-        f(&mut next);
-        let result = store.compare_and_swap(&ns, "w", base, &next);
-        if !refused_with(result.clone(), text) {
-            failures.push(format!("{label}: {result:?}"));
-        } else {
-            assert_eq!(store.load(&ns).unwrap().revision, base, "{label}");
-        }
-    }
-    for (label, previous, f) in [
-        (
-            "the correct eviction",
-            eviction_state(),
-            Box::new(evicted_correctly) as Box<dyn Fn(&mut State)>,
-        ),
-        (
-            "64 at once",
-            bulk_eviction_state(),
-            Box::new(|n: &mut State| {
-                for i in 0..64 {
-                    ReplayMember::Keyed(&format!("b{i:03}")).evict(n);
-                }
-            }),
-        ),
-    ] {
-        let (ns, base) = fresh(&previous);
-        let mut next = previous.clone();
-        f(&mut next);
-        if let Err(err) = store.compare_and_swap(&ns, "w", base, &next) {
-            failures.push(format!("{label} refused: {err}"));
-        }
-    }
+    let failures = eviction_commits::cas(store, &fresh);
     assert!(failures.is_empty(), "{failures:#?}");
 }
 #[test]
@@ -3590,60 +3424,16 @@ fn record_storage_transitions_hold_the_eviction_licence() {
         let base = seed_eviction_state(&store, &ns, &state);
         (ns, base)
     };
-    let transition_in = |ns: &str, f: &dyn Fn(&mut State)| {
-        let mut plan = |s: &mut State| {
-            f(s);
-            Ok(true)
-        };
-        store
-            .transition_v1(
-                ns,
-                "w",
-                &mut TransitionRequest {
-                    operation: "evict",
-                    plan: &mut plan,
-                },
-            )
-            .map_err(|e| match e {
-                Error::Storage(e) => e,
-                other => StorageError::Backend(other.to_string()),
-            })
-    };
-    let mut failures = vec![];
-    for (label, text, previous, f) in eviction_refusal_cases() {
-        let (ns, base) = fresh(&previous);
-        let result = transition_in(&ns, &*f);
-        if !refused_with(result.clone(), text) {
-            failures.push(format!("{label}: {result:?}"));
-        } else {
-            assert_eq!(store.load(&ns).unwrap().revision, base, "{label}");
-        }
-    }
+    let mut failures = eviction_commits::refusals(&store, &fresh, |ns, _, _, mutate| {
+        (eviction_commits::transition(&store, ns, mutate), false)
+    });
     let full = store
         .stats
         .full_commits
         .load(std::sync::atomic::Ordering::Relaxed);
-    for (label, previous, f) in [
-        (
-            "the correct eviction",
-            eviction_state(),
-            Box::new(evicted_correctly) as Box<dyn Fn(&mut State)>,
-        ),
-        (
-            "64 at once",
-            bulk_eviction_state(),
-            Box::new(|n: &mut State| {
-                for i in 0..64 {
-                    ReplayMember::Keyed(&format!("b{i:03}")).evict(n);
-                }
-            }),
-        ),
-    ] {
-        let (ns, _) = fresh(&previous);
-        if let Err(err) = transition_in(&ns, &*f) {
-            failures.push(format!("{label} refused: {err}"));
-        }
-    }
+    failures.extend(eviction_commits::allowances(&fresh, |ns, _, _, mutate| {
+        eviction_commits::transition(&store, ns, mutate)
+    }));
     assert!(failures.is_empty(), "{failures:#?}");
     // Four seeding full commits; the evictions themselves are bounded.
     assert_eq!(
