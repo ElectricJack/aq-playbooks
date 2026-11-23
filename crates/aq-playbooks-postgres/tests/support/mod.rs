@@ -91,21 +91,56 @@ pub fn artifact(label: &str) -> Artifact {
     })
     .unwrap()
 }
-pub fn boundary(label: &str) -> State {
-    // Distinct records ensure a database boundary preserves the relationship
-    // among progress, parent/child admission, receipts, waits and outgoing work.
-    let a = artifact(label);
-    let authority = Authority {
-        actor: "synthetic-test".into(),
-        scope: "project".into(),
+fn boundary_command() -> CommandContract {
+    CommandContract {
+        name: "fixture.ensure".into(),
+        version: "1".into(),
+        input: Schema::Null,
+        outcomes: BTreeMap::from([("ok".into(), Schema::Null)]),
         capabilities: BTreeSet::new(),
-    };
+        scopes: BTreeSet::from(["project".into()]),
+        effect: Effect::Mutation,
+        recovery: Recovery::KeyedIdempotent,
+        asynchronous: None,
+        cancellation: false,
+        public_result_fields: BTreeSet::new(),
+        sensitive_input_fields: BTreeSet::new(),
+        sensitive_output_fields: BTreeSet::new(),
+        max_payload_bytes: 1024,
+        deadline_ms: 1000,
+    }
+}
+
+fn boundary_intent(authority: Authority) -> Intent {
+    Intent {
+        id: "intent".into(),
+        run: "child".into(),
+        step: "ensure".into(),
+        invocation: 1,
+        deadline_at_ms: 60_000,
+        command: boundary_command(),
+        input: Value::Null,
+        input_digest: digest(&Value::Null).unwrap(),
+        authority,
+        status: IntentStatus::Dispatched,
+        cancel_requested: false,
+        cancel_dispatched: false,
+        late_results: vec![],
+        completion_event: None,
+        dispatch_sequence: None,
+        handle: Some("host-operation".into()),
+        result: None,
+        reason: None,
+    }
+}
+
+fn boundary_runs(artifact: &Artifact, authority: &Authority) -> (Run, Run) {
     let parent = Run {
         id: "parent".into(),
         root: "parent".into(),
         parent: None,
         origin: None,
-        artifact: a.digest.clone(),
+        artifact: artifact.digest.clone(),
         entry: "main".into(),
         catalog_revision: 0,
         dependencies: BTreeMap::new(),
@@ -139,23 +174,19 @@ pub fn boundary(label: &str) -> State {
     child.pending = Some(Pending::Effect {
         intent: "intent".into(),
     });
-    let command = CommandContract {
-        name: "fixture.ensure".into(),
-        version: "1".into(),
-        input: Schema::Null,
-        outcomes: BTreeMap::from([("ok".into(), Schema::Null)]),
+    (parent, child)
+}
+
+pub fn boundary(label: &str) -> State {
+    // Distinct records ensure a database boundary preserves the relationship
+    // among progress, parent/child admission, receipts, waits and outgoing work.
+    let a = artifact(label);
+    let authority = Authority {
+        actor: "synthetic-test".into(),
+        scope: "project".into(),
         capabilities: BTreeSet::new(),
-        scopes: BTreeSet::from(["project".into()]),
-        effect: Effect::Mutation,
-        recovery: Recovery::KeyedIdempotent,
-        asynchronous: None,
-        cancellation: false,
-        public_result_fields: BTreeSet::new(),
-        sensitive_input_fields: BTreeSet::new(),
-        sensitive_output_fields: BTreeSet::new(),
-        max_payload_bytes: 1024,
-        deadline_ms: 1000,
     };
+    let (parent, child) = boundary_runs(&a, &authority);
     let mut state = State::default();
     state.artifacts.insert(a.digest.clone(), a);
     state.runs.insert("parent".into(), parent);
@@ -168,29 +199,9 @@ pub fn boundary(label: &str) -> State {
         kind: "child_admitted".into(),
         detail: json!({"child":"child"}),
     });
-    state.intents.insert(
-        "intent".into(),
-        Intent {
-            id: "intent".into(),
-            run: "child".into(),
-            step: "ensure".into(),
-            invocation: 1,
-            deadline_at_ms: 60_000,
-            command,
-            input: Value::Null,
-            input_digest: digest(&Value::Null).unwrap(),
-            authority,
-            status: IntentStatus::Dispatched,
-            cancel_requested: false,
-            cancel_dispatched: false,
-            late_results: vec![],
-            completion_event: None,
-            dispatch_sequence: None,
-            handle: Some("host-operation".into()),
-            result: None,
-            reason: None,
-        },
-    );
+    state
+        .intents
+        .insert("intent".into(), boundary_intent(authority));
     state.waits.insert(
         "wait".into(),
         WaitRecord {

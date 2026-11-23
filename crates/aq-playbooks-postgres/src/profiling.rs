@@ -81,25 +81,26 @@ impl<'a> ObservedTransaction<'a> {
                 .saturating_add(started.elapsed().as_micros() as u64);
         }
     }
-    pub(crate) fn verified(&mut self, started: Option<Instant>) {
+    fn record_duration(count: &mut u64, elapsed_us: &mut u64, started: Option<Instant>) {
         if let Some(started) = started {
-            self.sample.artifact_verifications =
-                self.sample.artifact_verifications.saturating_add(1);
-            self.sample.artifact_verification_us = self
-                .sample
-                .artifact_verification_us
-                .saturating_add(started.elapsed().as_micros() as u64);
+            *count = count.saturating_add(1);
+            *elapsed_us = elapsed_us.saturating_add(started.elapsed().as_micros() as u64);
         }
     }
+
+    pub(crate) fn verified(&mut self, started: Option<Instant>) {
+        Self::record_duration(
+            &mut self.sample.artifact_verifications,
+            &mut self.sample.artifact_verification_us,
+            started,
+        );
+    }
     pub(crate) fn canonicalized(&mut self, started: Option<Instant>) {
-        if let Some(started) = started {
-            self.sample.artifact_canonicalizations =
-                self.sample.artifact_canonicalizations.saturating_add(1);
-            self.sample.artifact_canonicalization_us = self
-                .sample
-                .artifact_canonicalization_us
-                .saturating_add(started.elapsed().as_micros() as u64);
-        }
+        Self::record_duration(
+            &mut self.sample.artifact_canonicalizations,
+            &mut self.sample.artifact_canonicalization_us,
+            started,
+        );
     }
     pub(crate) fn skipped(&mut self) {
         if self.enabled {
@@ -107,45 +108,39 @@ impl<'a> ObservedTransaction<'a> {
                 self.sample.unchanged_artifacts_skipped.saturating_add(1);
         }
     }
+    fn measure_sql<R>(&mut self, operation: impl FnOnce(&mut Transaction<'a>) -> R) -> R {
+        let started = self.clock();
+        let result = operation(self.inner.as_mut().unwrap());
+        self.sql(started);
+        result
+    }
     pub(crate) fn query<T: ToStatement + ?Sized>(
         &mut self,
         q: &T,
         p: &[&(dyn ToSql + Sync)],
     ) -> Result<Vec<Row>, postgres::Error> {
-        let t = self.clock();
-        let r = self.inner.as_mut().unwrap().query(q, p);
-        self.sql(t);
-        r
+        self.measure_sql(|tx| tx.query(q, p))
     }
     pub(crate) fn query_one<T: ToStatement + ?Sized>(
         &mut self,
         q: &T,
         p: &[&(dyn ToSql + Sync)],
     ) -> Result<Row, postgres::Error> {
-        let t = self.clock();
-        let r = self.inner.as_mut().unwrap().query_one(q, p);
-        self.sql(t);
-        r
+        self.measure_sql(|tx| tx.query_one(q, p))
     }
     pub(crate) fn query_opt<T: ToStatement + ?Sized>(
         &mut self,
         q: &T,
         p: &[&(dyn ToSql + Sync)],
     ) -> Result<Option<Row>, postgres::Error> {
-        let t = self.clock();
-        let r = self.inner.as_mut().unwrap().query_opt(q, p);
-        self.sql(t);
-        r
+        self.measure_sql(|tx| tx.query_opt(q, p))
     }
     pub(crate) fn execute<T: ToStatement + ?Sized>(
         &mut self,
         q: &T,
         p: &[&(dyn ToSql + Sync)],
     ) -> Result<u64, postgres::Error> {
-        let t = self.clock();
-        let r = self.inner.as_mut().unwrap().execute(q, p);
-        self.sql(t);
-        r
+        self.measure_sql(|tx| tx.execute(q, p))
     }
     pub(crate) fn commit(mut self) -> Result<(), postgres::Error> {
         self.phase("commit");
