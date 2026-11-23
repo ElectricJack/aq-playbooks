@@ -302,7 +302,15 @@ impl PostgresStorage {
                 .ok_or_else(|| backend("protected namespace requires configured keys"))?;
             let nonce: Vec<u8> = row.get("protection_nonce");
             let ciphertext: Vec<u8> = row.get("encrypted_snapshot");
-            let bytes = keyring.open(namespace, revision, &key_id, &nonce, &ciphertext)?;
+            let bytes = keyring.open(
+                namespace,
+                revision,
+                &protection::SealedValue {
+                    key_id,
+                    nonce,
+                    ciphertext,
+                },
+            )?;
             serde_json::from_slice(&bytes)
                 .map_err(|_| backend("invalid authenticated snapshot format"))
         } else {
@@ -317,10 +325,35 @@ impl PostgresStorage {
         protected: bool,
     ) -> Result<BTreeMap<String, Artifact>, StorageError> {
         let mut artifacts = BTreeMap::new();
-        for artifact_row in tx.query("SELECT n.digest,a.canonical_bytes,e.key_id,e.nonce,e.ciphertext FROM aq_playbooks.namespace_artifacts n LEFT JOIN aq_playbooks.artifacts a ON a.digest=n.digest LEFT JOIN aq_playbooks.encrypted_artifacts e ON e.namespace=n.namespace AND e.digest=n.digest WHERE n.namespace=$1 ORDER BY n.digest",&[&namespace]).map_err(backend)?{
-            let digest:String=artifact_row.get(0);
-            let bytes=if protected{let key_id:Option<String>=artifact_row.get(2);let key_id=key_id.ok_or_else(||backend("missing protected artifact envelope"))?;let nonce:Vec<u8>=artifact_row.get(3);let ciphertext:Vec<u8>=artifact_row.get(4);self.keyring.as_ref().ok_or_else(||backend("protected namespace requires configured keys"))?.open_artifact(namespace,&digest,&key_id,&nonce,&ciphertext)?}else{Zeroizing::new(artifact_row.get::<_,Option<Vec<u8>>>(1).ok_or_else(||backend("missing plaintext artifact payload"))?)};
-            let started=tx.clock();let artifact=Artifact::from_canonical_bytes(&bytes).map_err(backend)?;tx.verified(started);if artifact.digest!=digest{return Err(backend("artifact address integrity mismatch"));}artifacts.insert(digest,artifact);
+        let rows = tx.query("SELECT n.digest,a.canonical_bytes,e.key_id,e.nonce,e.ciphertext FROM aq_playbooks.namespace_artifacts n LEFT JOIN aq_playbooks.artifacts a ON a.digest=n.digest LEFT JOIN aq_playbooks.encrypted_artifacts e ON e.namespace=n.namespace AND e.digest=n.digest WHERE n.namespace=$1 ORDER BY n.digest",&[&namespace]).map_err(backend)?;
+        for artifact_row in rows {
+            let digest: String = artifact_row.get(0);
+            let bytes = if protected {
+                let sealed = protection::SealedValue {
+                    key_id: artifact_row
+                        .get::<_, Option<String>>(2)
+                        .ok_or_else(|| backend("missing protected artifact envelope"))?,
+                    nonce: artifact_row.get(3),
+                    ciphertext: artifact_row.get(4),
+                };
+                self.keyring
+                    .as_ref()
+                    .ok_or_else(|| backend("protected namespace requires configured keys"))?
+                    .open_artifact(namespace, &digest, &sealed)?
+            } else {
+                Zeroizing::new(
+                    artifact_row
+                        .get::<_, Option<Vec<u8>>>(1)
+                        .ok_or_else(|| backend("missing plaintext artifact payload"))?,
+                )
+            };
+            let started = tx.clock();
+            let artifact = Artifact::from_canonical_bytes(&bytes).map_err(backend)?;
+            tx.verified(started);
+            if artifact.digest != digest {
+                return Err(backend("artifact address integrity mismatch"));
+            }
+            artifacts.insert(digest, artifact);
         }
         Ok(artifacts)
     }

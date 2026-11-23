@@ -84,7 +84,7 @@ impl Commit<'_> {
                 let key_id: String = existing.get(0);
                 let nonce: Vec<u8> = existing.get(1);
                 let ciphertext: Vec<u8> = existing.get(2);
-                let stored = keyring.open_artifact(namespace,digest,&key_id,&nonce,&ciphertext)?;
+                let stored = keyring.open_artifact(namespace, digest, &protection::SealedValue { key_id, nonce, ciphertext })?;
                 if stored.as_slice() != bytes { return Err(backend("immutable protected artifact address conflict")); }
             }
             let sealed = keyring.seal_artifact(namespace, digest, bytes)?;

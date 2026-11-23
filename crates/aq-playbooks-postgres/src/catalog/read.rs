@@ -96,9 +96,11 @@ impl Decoder<'_> {
                         key: &key,
                         revision: at as u64,
                     },
-                    &key_id,
-                    &nonce,
-                    &bytes,
+                    &protection::SealedValue {
+                        key_id,
+                        nonce,
+                        ciphertext: bytes,
+                    },
                 )?,
             _ => {
                 return Err(CatalogError::Backend(
