@@ -210,3 +210,144 @@ fn memory_storage_refuses_removals_without_history_or_expiry() {
 fn record_storage_refuses_removals_without_history_or_expiry() {
     removals_without_history_or_expiry_are_refused(&RecordStorage::new());
 }
+
+#[test]
+fn memory_storage_removal_fences() {
+    removal_fences_hold(&MemoryStorage::default(), "ns")
+}
+
+#[test]
+fn record_storage_removal_fences() {
+    removal_fences_hold(&RecordStorage::new(), "ns")
+}
+
+#[test]
+fn commits_advance_the_clock_only_with_host_time() {
+    let e = engine();
+    install(
+        &e,
+        artifact(
+            "a",
+            "done",
+            BTreeMap::from([("done".into(), ret("ok"))]),
+            FixtureContracts::default(),
+        ),
+        "a",
+    );
+    e.admit("a", "main", Value::Null, authority(), 5_000)
+        .unwrap();
+    e.admit("a", "main", Value::Null, authority(), 10).unwrap();
+    assert_eq!(e.snapshot().unwrap().retention.clock_ms, Some(5_000));
+}
+
+/// Commits without a host time leave the clock where it is.
+#[test]
+fn commits_without_host_time_do_not_move_the_clock() {
+    let e = engine();
+    let a = artifact(
+        "a",
+        "done",
+        BTreeMap::from([("done".into(), ret("ok"))]),
+        FixtureContracts::default(),
+    );
+    let digest = a.digest.clone();
+    e.install(a).unwrap();
+    e.activate("a", &digest, authority()).unwrap();
+    e.set_retention_policy(RetentionPolicy::default()).unwrap();
+    assert_eq!(e.snapshot().unwrap().retention.clock_ms, None);
+    e.admit("a", "main", Value::Null, authority(), 7).unwrap();
+    e.activate("b", &digest, authority()).unwrap();
+    assert_eq!(e.snapshot().unwrap().retention.clock_ms, Some(7));
+}
+
+/// Legacy event tombstones and correlation fences (no engine writes them
+/// any more) may always be removed; an expired event leaves by its window.
+/// A legacy disposal record licenses nothing: a run removed without its
+/// history is refused, disposal record or not.
+fn legacy_records_license_no_removal(store: &dyn Storage) {
+    store.acquire("legacy", "w").unwrap();
+    let mut s = State::default();
+    s.retention.policy.event_replay_ms = 1_000_000;
+    s.runs.insert("run-a".into(), completed_run("run-a"));
+    s.receipts.push(audit(1, "run-a"));
+    s.events.insert("ev".into(), accepted_event("ev", 0));
+    s.retention
+        .event_expires_at_ms
+        .insert("ev".into(), 1_000_000);
+    s.retention
+        .expired_correlations
+        .insert("c".into(), ("host".into(), 0));
+    s.retention
+        .event_tombstones
+        .insert("old".into(), tombstone("d"));
+    let r = store.compare_and_swap("legacy", "w", 0, &s).unwrap();
+    let mut next = s.clone();
+    next.retention.clock_ms = Some(1_000_000);
+    next.runs.remove("run-a");
+    next.receipts.clear();
+    next.retention.disposals.push(retention::Disposal {
+        kind: "run".into(),
+        key: "run-a".into(),
+        at_ms: 5,
+    });
+    assert!(refused_with(
+        store.compare_and_swap("legacy", "w", r, &next),
+        retention::REFUSE_RUN_REMOVAL
+    ));
+    let mut next = s.clone();
+    next.retention.clock_ms = Some(1_000_000);
+    next.events.remove("ev");
+    next.retention.event_expires_at_ms.remove("ev");
+    next.retention.event_tombstones.remove("old");
+    next.retention.expired_correlations.remove("c");
+    store.compare_and_swap("legacy", "w", r, &next).unwrap();
+}
+
+#[test]
+fn memory_storage_legacy_records_license_no_removal() {
+    legacy_records_license_no_removal(&MemoryStorage::default());
+}
+
+#[test]
+fn record_storage_legacy_records_license_no_removal() {
+    legacy_records_license_no_removal(&RecordStorage::new());
+}
+
+/// `check_not_live` on a State whose runtime indexes are initialised (the
+/// branch every engine commit takes): a receipt is live when the receipt
+/// index points at a receipt with that sequence.
+#[test]
+fn check_not_live_reads_receipts_through_the_initialised_index() {
+    let mut state = State::default();
+    state.indexes.initialized = true;
+    state.receipts.push(live_receipt(7));
+    state.receipts.push(live_receipt(9));
+    state.indexes.all_receipts.insert(7, 0);
+    state.indexes.all_receipts.insert(9, 1);
+    let items = |sequence: u64| synthetic_cohort("r", 10, &[sequence]).history_items();
+    let receipts_only = |sequence: u64| {
+        items(sequence)
+            .into_iter()
+            .filter(|i| i.kind == InspectionKind::Receipts)
+            .collect::<Vec<_>>()
+    };
+    assert!(refused_as_also_live(history::check_not_live(
+        &state,
+        &receipts_only(7)
+    )));
+    assert!(refused_as_also_live(history::check_not_live(
+        &state,
+        &receipts_only(9)
+    )));
+    assert!(history::check_not_live(&state, &receipts_only(8)).is_ok());
+    // An index entry that points at a receipt with another sequence is not
+    // taken as live (it is re-checked against the receipt).
+    state.indexes.all_receipts.insert(8, 1);
+    assert!(history::check_not_live(&state, &receipts_only(8)).is_ok());
+    // Runs and operations are map lookups on either branch.
+    state.runs.insert("r".into(), completed_run("r"));
+    assert!(refused_as_also_live(history::check_not_live(
+        &state,
+        &items(8)
+    )));
+}

@@ -460,3 +460,35 @@ fn settlement_reads(others: usize) -> (usize, BTreeSet<String>) {
         scanned,
     )
 }
+
+/// M4: a finished run's inspection items are byte-for-byte the same while it
+/// is still live (its cohort waits for an independent child) and after its
+/// cohort has left as history.
+#[test]
+fn a_finished_runs_inspection_is_identical_before_and_after_removal() {
+    let e = engine();
+    let child = wait_artifact();
+    e.install(child.clone()).unwrap();
+    install(&e, parent_artifact(&child, CallMode::Independent), "parent");
+    let root = e
+        .admit("parent", "main", Value::Null, authority(), 0)
+        .unwrap();
+    e.drive(&mut FakeHost::default(), 0, 20).unwrap();
+    assert!(e.snapshot().unwrap().runs[&root].status.terminal());
+    let pages = |e: &Engine<MemoryStorage>| -> Vec<Vec<u8>> {
+        [
+            InspectionKind::Runs,
+            InspectionKind::Effects,
+            InspectionKind::Receipts,
+        ]
+        .into_iter()
+        .map(|kind| serde_json::to_vec(&inspect_all(e, kind, Some(&root))).unwrap())
+        .collect()
+    };
+    let live = pages(&e);
+    assert!(live[2].len() > 2, "the root has receipts");
+    e.admit_event("host", event("e1", 2), 5).unwrap();
+    e.drive(&mut FakeHost::default(), 5, 20).unwrap();
+    assert!(e.snapshot().unwrap().runs.is_empty());
+    assert_eq!(pages(&e), live);
+}

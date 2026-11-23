@@ -199,3 +199,107 @@ fn memory_storage_vendored_namespace_drains_while_new_runs_are_served() {
 fn record_storage_vendored_namespace_drains_while_new_runs_are_served() {
     vendored_namespace_drains_while_new_runs_are_served(RecordStorage::new());
 }
+
+/// `RuntimeIndexes` fields of the engine that aq-server vendors
+/// (`vendor/aq-playbooks-0173673`, pre-D10): no `root_intents` and no
+/// backfill flag.
+const VENDORED_INDEX_FIELDS: &[&str] = &[
+    "ready",
+    "ready_tokens",
+    "scope_cursor",
+    "dispatch_turn",
+    "effect_cursor",
+    "effect_item_cursor",
+    "root_members",
+    "root_active",
+    "root_effects",
+    "root_last_activity",
+    "run_roots",
+    "intent_roots",
+    "effects",
+    "effect_memberships",
+    "timers",
+    "due",
+    "run_timer",
+    "events",
+    "event_memberships",
+    "waiters",
+    "run_subscriptions",
+    "dependents",
+    "run_dependencies",
+    "completion_ready",
+    "uncertain_completion_contracts",
+    "uncertain_contract_membership",
+    "dirty_runs",
+    "dirty_intents",
+    "runs",
+    "receipts",
+    "all_receipts",
+    "triggers",
+    "activation_triggers",
+    "initialized",
+];
+/// `state` as a pre-D10 engine stored it: the index fields D10 and this task
+/// added are absent, so they decode with their defaults.
+pub(super) fn vendored_shape(state: &State) -> State {
+    let mut value = serde_json::to_value(state).unwrap();
+    let indexes = value["indexes"].as_object_mut().unwrap();
+    indexes.retain(|field, _| VENDORED_INDEX_FIELDS.contains(&field.as_str()));
+    let fields: BTreeSet<&str> = indexes.keys().map(String::as_str).collect();
+    assert_eq!(fields, VENDORED_INDEX_FIELDS.iter().copied().collect());
+    serde_json::from_value(value).unwrap()
+}
+
+/// C1: a namespace written by the pre-D10 engine has no `root_intents`.
+/// Opening it backfills the index once, so a pre-upgrade run with an earlier
+/// completed operation finishes, leaves with that operation in its history,
+/// and a run admitted afterwards progresses.
+fn pre_d10_namespace_is_backfilled_on_open<S: Storage + Clone>(store: S) {
+    let e = Engine::new(store.clone(), "test", "incarnation-1").unwrap();
+    install_on(
+        &e,
+        invoke_artifact(command(Recovery::KeyedIdempotent), None),
+        "invoke",
+    );
+    let mut host = completed_host();
+    let (old, intent) = run_with_completed_operation(&e, &mut host);
+    let legacy = vendored_shape(&e.snapshot().unwrap());
+    assert!(legacy.indexes.initialized && legacy.indexes.root_intents.is_empty());
+    assert!(!legacy.indexes.root_intents_complete);
+    overwrite(&e.store, "incarnation-1", &legacy);
+    e.release().unwrap();
+    let e = Engine::new(store, "test", "incarnation-2").unwrap();
+    let s = e.snapshot().unwrap();
+    assert!(s.indexes.root_intents_complete);
+    assert!(s.indexes.root_intents[&old].contains(&intent));
+    let new = e
+        .admit("invoke", "main", Value::Null, authority(), 1)
+        .unwrap();
+    for _ in 0..10 {
+        e.drive(&mut host, 1, 20).unwrap();
+    }
+    let s = e.snapshot().unwrap();
+    assert!(
+        s.runs.is_empty() && s.intents.is_empty(),
+        "{:?}",
+        s.runs.keys().collect::<Vec<_>>()
+    );
+    let effects = inspect_all(&e, InspectionKind::Effects, Some(&old));
+    assert_eq!(effects.len(), 1);
+    assert_eq!(effects[0]["id"], intent.as_str());
+    assert_eq!(effects[0]["status"], "completed");
+    for id in [&old, &new] {
+        let runs = inspect_all(&e, InspectionKind::Runs, Some(id));
+        assert_eq!(runs[0]["outcome"], "ok", "{id}");
+    }
+}
+
+#[test]
+fn memory_storage_pre_d10_namespace_is_backfilled_on_open() {
+    pre_d10_namespace_is_backfilled_on_open(MemoryStorage::retaining_settled());
+}
+
+#[test]
+fn record_storage_pre_d10_namespace_is_backfilled_on_open() {
+    pre_d10_namespace_is_backfilled_on_open(RecordStorage::new());
+}
