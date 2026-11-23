@@ -256,26 +256,12 @@ struct Cell {
 /// Full-State comparison against the reference after every step: revision
 /// and the complete serialized State (every container, record backend fully
 /// assembled). `exact` also checks canonical bytes and record counts.
-fn compare<C: Candidate>(
-    ns: &str,
-    m: &Engine<MemoryStorage>,
-    r: &Engine<C>,
-    step: &str,
-    exact: bool,
-) {
+fn compare<C: Candidate>(m: &Engine<MemoryStorage>, r: &Engine<C>, step: &str, exact: bool) {
+    let ns = &m.namespace;
     let mv = m.store.load(ns).unwrap();
     let rv = r.store.load(ns).unwrap();
     assert_eq!(mv.revision, rv.revision, "revision after {step}");
-    if serde_json::to_vec(&mv.state).unwrap() != serde_json::to_vec(&rv.state).unwrap() {
-        let (a, b) = (
-            serde_json::to_value(&mv.state).unwrap(),
-            serde_json::to_value(&rv.state).unwrap(),
-        );
-        for (k, v) in a.as_object().unwrap() {
-            assert_eq!(Some(v), b.get(k), "state.{k} after {step}");
-        }
-        panic!("State differs after {step}");
-    }
+    compare_serialized_state(&mv.state, &rv.state, step);
     for kind in [
         InspectionKind::Runs,
         InspectionKind::Effects,
@@ -300,23 +286,37 @@ fn compare<C: Candidate>(
             "canonical State after {step}"
         );
         if let Some((counts, _)) = r.store.accounting(ns) {
-            let mut plain = mv.state.clone();
-            let expected: BTreeMap<&'static str, usize> = take_patch(&mut plain)
-                .unwrap()
-                .changes
-                .into_iter()
-                .filter_map(|(path, change)| match change {
-                    aq_playbooks_runner::lazy::ContainerChange::Replace(rows)
-                        if !rows.is_empty() =>
-                    {
-                        Some((path.field, rows.len()))
-                    }
-                    _ => None,
-                })
-                .collect();
+            let expected = expected_record_counts(&mv.state);
             assert_eq!(counts, expected, "maintained record counts after {step}");
         }
     }
+}
+
+fn compare_serialized_state(reference: &State, candidate: &State, step: &str) {
+    if serde_json::to_vec(reference).unwrap() != serde_json::to_vec(candidate).unwrap() {
+        let (a, b) = (
+            serde_json::to_value(reference).unwrap(),
+            serde_json::to_value(candidate).unwrap(),
+        );
+        for (k, v) in a.as_object().unwrap() {
+            assert_eq!(Some(v), b.get(k), "state.{k} after {step}");
+        }
+        panic!("State differs after {step}");
+    }
+}
+fn expected_record_counts(state: &State) -> BTreeMap<&'static str, usize> {
+    let mut plain = state.clone();
+    take_patch(&mut plain)
+        .unwrap()
+        .changes
+        .into_iter()
+        .filter_map(|(path, change)| match change {
+            aq_playbooks_runner::lazy::ContainerChange::Replace(rows) if !rows.is_empty() => {
+                Some((path.field, rows.len()))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn measure<C: Candidate>(
@@ -327,40 +327,17 @@ fn measure<C: Candidate>(
 ) -> BTreeMap<&'static str, Cell> {
     let m = seed(MemoryStorage::retaining_settled(), ns, state, cohorts);
     let r = seed(candidate, ns, state, cohorts);
-    compare(ns, &m, &r, "seed", true);
+    compare(&m, &r, "seed", true);
     let full_settling = r.store.settling_commit_is_full();
     let mut cells: BTreeMap<&'static str, Cell> = BTreeMap::new();
     for i in 0..samples {
         for kind in ["admit", "event", "dispatch"] {
-            let at = NOW + i as i64;
             let step = format!("{kind} {i} in {ns}");
             let settled = m.store.settled_cohorts(ns).len();
-            let reference = format!(
-                "{:?}",
-                match kind {
-                    "admit" => m
-                        .admit("a", "main", Value::Null, authority("a"), at)
-                        .map(|_| 0),
-                    "event" => m
-                        .admit_event("pb02", event(&format!("measure-{i}")), at)
-                        .map(|_| 0),
-                    _ => m.drive(&mut FakeHost::default(), at + 100, 1),
-                }
-            );
+            let reference = measure_operation(&m, kind, i);
             let before = r.store.work();
             let fallbacks = r.store.fallbacks().len();
-            let candidate = format!(
-                "{:?}",
-                match kind {
-                    "admit" => r
-                        .admit("a", "main", Value::Null, authority("a"), at)
-                        .map(|_| 0),
-                    "event" => r
-                        .admit_event("pb02", event(&format!("measure-{i}")), at)
-                        .map(|_| 0),
-                    _ => r.drive(&mut FakeHost::default(), at + 100, 1),
-                }
-            );
+            let candidate = measure_operation(&r, kind, i);
             let after = r.store.work();
             assert_eq!(reference, candidate, "result of {step}");
             assert!(reference.starts_with("Ok"), "{step}: {reference}");
@@ -399,10 +376,26 @@ fn measure<C: Candidate>(
             if let Some((_, header_len)) = r.store.accounting(ns) {
                 cell.header_len.push(header_len);
             }
-            compare(ns, &m, &r, &step, i + 1 == samples);
+            compare(&m, &r, &step, i + 1 == samples);
         }
     }
     cells
+}
+
+fn measure_operation<S: Storage>(engine: &Engine<S>, kind: &str, i: usize) -> String {
+    let at = NOW + i as i64;
+    format!(
+        "{:?}",
+        match kind {
+            "admit" => engine
+                .admit("a", "main", Value::Null, authority("a"), at)
+                .map(|_| 0),
+            "event" => engine
+                .admit_event("pb02", event(&format!("measure-{i}")), at)
+                .map(|_| 0),
+            _ => engine.drive(&mut FakeHost::default(), at + 100, 1),
+        }
+    )
 }
 
 /// History snapshots of the five-artifact fixture: `h` finished runs (now
