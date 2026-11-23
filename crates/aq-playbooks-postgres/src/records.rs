@@ -325,8 +325,14 @@ impl PostgresStorage {
             drop(tx);
             drop(conn);
             drop(state);
-            let revision =
-                self.commit_state(namespace, owner, head.expected as u64, &next, false)?;
+            let revision = crate::snapshot::Commit {
+                storage: self,
+                namespace,
+                owner,
+                state: &next,
+                force_artifact_refresh: false,
+            }
+            .write(head.expected as u64)?;
             self.count(|s| s.heavy += 1);
             return Ok(TransitionOutcome::Committed { revision });
         }
@@ -424,7 +430,7 @@ pub(crate) fn owns_lock(
     Ok(tx.query_one("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid() AND classid::bigint=$1 AND objid::bigint=$2 AND objsubid=1 AND granted)", &[&high,&low]).map_err(backend)?.get(0))
 }
 
-/// Header-only invariants of `retention::verify_and_record` and
+/// Header-only invariants of `retention::Changes::verify_and_record` and
 /// `retention::verify_removals` for a transition that removes no retained
 /// history (other than expired window entries, see `stage`) and leaves
 /// artifacts unchanged.
