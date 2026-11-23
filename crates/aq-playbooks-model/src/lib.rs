@@ -847,33 +847,35 @@ fn children(step: &Step) -> Vec<&str> {
     }
     result
 }
-/// Every expression of an operation, with its location inside the step.
-fn step_exprs(op: &Operation) -> Vec<(String, &Expr)> {
-    match op {
-        Operation::Invoke { input, .. } | Operation::Call { input, .. } => {
-            vec![("input".into(), input)]
+impl Operation {
+    /// Every expression of an operation, with its location inside the step.
+    pub fn expressions(&self) -> Vec<(String, &Expr)> {
+        match self {
+            Operation::Invoke { input, .. } | Operation::Call { input, .. } => {
+                vec![("input".into(), input)]
+            }
+            Operation::Decide { predicate } => vec![("predicate".into(), predicate)],
+            Operation::Wait {
+                correlation,
+                minimum_revision,
+                ..
+            } => correlation
+                .iter()
+                .map(|(k, e)| (format!("correlation.{k}"), e))
+                .chain(
+                    minimum_revision
+                        .iter()
+                        .map(|e| ("minimum_revision".into(), e)),
+                )
+                .collect(),
+            Operation::ForEach { collection, .. } => vec![("collection".into(), collection)],
+            Operation::Join { members, .. } => members
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (format!("members[{i}]"), e))
+                .collect(),
+            Operation::Return { output, .. } => vec![("output".into(), output)],
         }
-        Operation::Decide { predicate } => vec![("predicate".into(), predicate)],
-        Operation::Wait {
-            correlation,
-            minimum_revision,
-            ..
-        } => correlation
-            .iter()
-            .map(|(k, e)| (format!("correlation.{k}"), e))
-            .chain(
-                minimum_revision
-                    .iter()
-                    .map(|e| ("minimum_revision".into(), e)),
-            )
-            .collect(),
-        Operation::ForEach { collection, .. } => vec![("collection".into(), collection)],
-        Operation::Join { members, .. } => members
-            .iter()
-            .enumerate()
-            .map(|(i, e)| (format!("members[{i}]"), e))
-            .collect(),
-        Operation::Return { output, .. } => vec![("output".into(), output)],
     }
 }
 fn op_name(expr: &Expr) -> &'static str {

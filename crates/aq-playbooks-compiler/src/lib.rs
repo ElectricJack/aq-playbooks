@@ -125,62 +125,42 @@ pub fn validate(input: &CompileInput) -> Vec<Diagnostic> {
         ));
     }
     if let Some(header) = header {
-        let c = content(input, header);
-        // First, and alone when it fails: typing and the read check grow with
-        // an expression's size once every name is replaced by its value.
-        let mut found = c.draft_expansion_issues();
-        if found.is_empty() {
-            found = c.validate_structure();
-            draft_depth_issues(&c.playbook, &mut found);
-            // Join member forms and reads every way to a step can satisfy: a
-            // new draft only, as for depth, so stored artifacts keep loading.
-            // Not while a binding name is reused: every way then carries every
-            // earlier variant forward, which costs far more and says nothing new.
-            if !found.iter().any(|i| i.code == "binding") {
-                let strict = c.draft_issues(&found);
-                found.extend(strict);
-            }
-        }
-        for issue in found {
-            let mut d = Diagnostic::error(&issue.code, &issue.path, issue.message);
-            if let Some(loc) = c.source_map.get(&issue.path) {
-                d.line = Some(loc.line);
-                d.column = Some(loc.column);
-            }
-            issues.push(d);
-        }
+        let content = content(input, header);
+        issues.extend(
+            proposal_issues(&content)
+                .into_iter()
+                .map(|issue| diagnostic(&content, issue)),
+        );
     }
     issues
 }
-/// Every expression of an operation, with its location inside the step.
-fn step_exprs(op: &Operation) -> Vec<(String, &Expr)> {
-    match op {
-        Operation::Invoke { input, .. } | Operation::Call { input, .. } => {
-            vec![("input".into(), input)]
-        }
-        Operation::Decide { predicate } => vec![("predicate".into(), predicate)],
-        Operation::Wait {
-            correlation,
-            minimum_revision,
-            ..
-        } => correlation
-            .iter()
-            .map(|(k, e)| (format!("correlation.{k}"), e))
-            .chain(
-                minimum_revision
-                    .iter()
-                    .map(|e| ("minimum_revision".into(), e)),
-            )
-            .collect(),
-        Operation::ForEach { collection, .. } => vec![("collection".into(), collection)],
-        Operation::Join { members, .. } => members
-            .iter()
-            .enumerate()
-            .map(|(i, e)| (format!("members[{i}]"), e))
-            .collect(),
-        Operation::Return { output, .. } => vec![("output".into(), output)],
+
+fn proposal_issues(content: &ArtifactContent) -> Vec<ValidationIssue> {
+    // Expansion is checked on its own before typing and checking reads.
+    let limits = content.draft_expansion_issues();
+    if !limits.is_empty() {
+        return limits;
     }
+    let mut found = content.validate_structure();
+    draft_depth_issues(&content.playbook, &mut found);
+    // Draft-only joins and reads assume unique bindings. Checking reused names
+    // propagates every variant from previous steps and yields no new information.
+    if !found.iter().any(|i| i.code == "binding") {
+        let strict = content.draft_issues(&found);
+        found.extend(strict);
+    }
+    found
 }
+
+fn diagnostic(content: &ArtifactContent, issue: ValidationIssue) -> Diagnostic {
+    let mut diagnostic = Diagnostic::error(&issue.code, &issue.path, issue.message);
+    if let Some(location) = content.source_map.get(&issue.path) {
+        diagnostic.line = Some(location.line);
+        diagnostic.column = Some(location.column);
+    }
+    diagnostic
+}
+
 /// Nesting depth as evaluation counts it (the root is 0), and whether the
 /// expression uses lookup or let (the model already bounds those).
 fn depth(expr: &Expr) -> (usize, bool) {
@@ -236,7 +216,8 @@ pub use aq_playbooks_model::{MAX_DRAFT_EXPANSION, MAX_DRAFT_EXPANSION_TOTAL, MAX
 fn draft_depth_issues(playbook: &Playbook, issues: &mut Vec<ValidationIssue>) {
     let limit = EvalLimits::default().max_depth;
     let steps = playbook.steps.iter().flat_map(|(name, step)| {
-        step_exprs(&step.op)
+        step.op
+            .expressions()
             .into_iter()
             .map(move |(at, e)| (format!("steps.{name}"), at, e))
     });
@@ -244,8 +225,11 @@ fn draft_depth_issues(playbook: &Playbook, issues: &mut Vec<ValidationIssue>) {
         .triggers
         .iter()
         .map(|t| (format!("triggers.{}", t.id), "input".to_string(), &t.input));
-    for (path, at, expr) in steps.chain(triggers).collect::<Vec<_>>() {
+    for (path, at, expr) in steps.chain(triggers) {
         let (levels, bounded_by_model) = depth(expr);
+        if levels <= limit || bounded_by_model {
+            continue;
+        }
         let place = format!("{path}.{at}");
         // Typing already refuses most deep expressions; say it once.
         let reported = issues.iter().any(|i| {
@@ -253,7 +237,7 @@ fn draft_depth_issues(playbook: &Playbook, issues: &mut Vec<ValidationIssue>) {
                 && i.message.starts_with(&place)
                 && i.message.contains("expression nesting exceeds 32")
         });
-        if levels > limit && !bounded_by_model && !reported {
+        if !reported {
             issues.push(ValidationIssue {
                 code: "expression_limit".into(),
                 path,
@@ -772,6 +756,74 @@ mod tests {
         }
         assert!(!codes(&f).contains("join_qualifier"));
     }
+    fn append_join_child(f: &mut CompileInput, name: &str, output: Schema) {
+        f.dependencies.insert(
+            name.into(),
+            CallableDependency {
+                binding: format!("{name}-workflow"),
+                selection: DependencySelection::Exact,
+                artifact: hash_bytes(name.as_bytes()),
+                interfaces: BTreeMap::from([(
+                    "main".into(),
+                    EntryPoint {
+                        input: Schema::Null,
+                        outcomes: BTreeMap::from([
+                            ("ok".into(), output),
+                            ("unavailable".into(), Schema::Null),
+                        ]),
+                        start: "child-start".into(),
+                    },
+                )]),
+                capabilities: BTreeSet::new(),
+                scope: "project".into(),
+                dependencies: BTreeSet::new(),
+            },
+        );
+        f.proposal.playbook.steps.insert(
+            name.into(),
+            Step {
+                op: Operation::Call {
+                    dependency: name.into(),
+                    entry: "main".into(),
+                    input: Expr::literal(Value::Null),
+                    mode: CallMode::OwnedAsync,
+                    bind: format!("{name}_handle"),
+                },
+                edges: BTreeMap::from([(
+                    "started".into(),
+                    if name == "review" {
+                        "check".into()
+                    } else {
+                        "join".into()
+                    },
+                )]),
+                on_error: Some("failed".into()),
+            },
+        );
+    }
+
+    fn join_step() -> Step {
+        Step {
+            op: Operation::Join {
+                members: vec![
+                    Expr::reference("review_handle"),
+                    Expr::reference("check_handle"),
+                ],
+                member_keys: vec!["review".into(), "check".into()],
+                mode: JoinMode::All,
+                accepted_outcomes: BTreeSet::from(["ok".into()]),
+                deadline_ms: 100,
+                remaining: RemainingPolicy::Track,
+                bind: "joined".into(),
+            },
+            edges: BTreeMap::from([
+                ("completed".into(), "finish".into()),
+                ("timeout".into(), "failed".into()),
+                ("no_match".into(), "failed".into()),
+            ]),
+            on_error: Some("failed".into()),
+        }
+    }
     fn named_join_fixture() -> CompileInput {
         let mut f = fixture();
         let review_output = Schema::object(BTreeMap::from([("subject".into(), Schema::string(8))]));
@@ -784,73 +836,9 @@ mod tests {
         entry.outcomes.insert("done".into(), final_output);
         entry.outcomes.insert("failed".into(), Schema::Null);
         for (name, output) in [("review", review_output), ("check", Schema::Boolean)] {
-            f.dependencies.insert(
-                name.into(),
-                CallableDependency {
-                    binding: format!("{name}-workflow"),
-                    selection: DependencySelection::Exact,
-                    artifact: hash_bytes(name.as_bytes()),
-                    interfaces: BTreeMap::from([(
-                        "main".into(),
-                        EntryPoint {
-                            input: Schema::Null,
-                            outcomes: BTreeMap::from([
-                                ("ok".into(), output),
-                                ("unavailable".into(), Schema::Null),
-                            ]),
-                            start: "child-start".into(),
-                        },
-                    )]),
-                    capabilities: BTreeSet::new(),
-                    scope: "project".into(),
-                    dependencies: BTreeSet::new(),
-                },
-            );
-            f.proposal.playbook.steps.insert(
-                name.into(),
-                Step {
-                    op: Operation::Call {
-                        dependency: name.into(),
-                        entry: "main".into(),
-                        input: Expr::literal(Value::Null),
-                        mode: CallMode::OwnedAsync,
-                        bind: format!("{name}_handle"),
-                    },
-                    edges: BTreeMap::from([(
-                        "started".into(),
-                        if name == "review" {
-                            "check".into()
-                        } else {
-                            "join".into()
-                        },
-                    )]),
-                    on_error: Some("failed".into()),
-                },
-            );
+            append_join_child(&mut f, name, output);
         }
-        f.proposal.playbook.steps.insert(
-            "join".into(),
-            Step {
-                op: Operation::Join {
-                    members: vec![
-                        Expr::reference("review_handle"),
-                        Expr::reference("check_handle"),
-                    ],
-                    member_keys: vec!["review".into(), "check".into()],
-                    mode: JoinMode::All,
-                    accepted_outcomes: BTreeSet::from(["ok".into()]),
-                    deadline_ms: 100,
-                    remaining: RemainingPolicy::Track,
-                    bind: "joined".into(),
-                },
-                edges: BTreeMap::from([
-                    ("completed".into(), "finish".into()),
-                    ("timeout".into(), "failed".into()),
-                    ("no_match".into(), "failed".into()),
-                ]),
-                on_error: Some("failed".into()),
-            },
-        );
+        f.proposal.playbook.steps.insert("join".into(), join_step());
         f.proposal.playbook.steps.insert(
             "failed".into(),
             Step {

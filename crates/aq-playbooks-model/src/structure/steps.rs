@@ -99,7 +99,7 @@ impl StepCheck<'_> {
         required_edges(self.step, names, &self.path, self.issues);
     }
     fn check_expressions(&mut self, bindings: &mut StepBindings) {
-        for (at, e) in step_exprs(&self.step.op) {
+        for (at, e) in self.step.op.expressions() {
             if ExpressionCheck::new(&bindings.roots, &self.path, self.issues).validate(e, &at) {
                 bindings.too_deep.insert((self.path.clone(), at));
             }

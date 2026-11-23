@@ -170,35 +170,7 @@ fn content(route_input: Expr, output: Expr, done: Schema) -> ArtifactContent {
                     start: "route".into(),
                 },
             )]),
-            steps: BTreeMap::from([
-                (
-                    "route".into(),
-                    Step {
-                        op: Operation::Invoke {
-                            command: ContractRef {
-                                name: c.name.clone(),
-                                fingerprint: c.fingerprint().unwrap(),
-                            },
-                            input: route_input,
-                            bind: "routed".into(),
-                            retry: None,
-                        },
-                        edges: BTreeMap::from([("ok".into(), "finish".into())]),
-                        on_error: Some("finish".into()),
-                    },
-                ),
-                (
-                    "finish".into(),
-                    Step {
-                        op: Operation::Return {
-                            outcome: "done".into(),
-                            output,
-                        },
-                        edges: BTreeMap::new(),
-                        on_error: None,
-                    },
-                ),
-            ]),
+            steps: route_steps(&c, route_input, output),
             triggers: vec![],
             limits: Limits::default(),
             required_capabilities: BTreeSet::new(),
@@ -211,6 +183,37 @@ fn content(route_input: Expr, output: Expr, done: Schema) -> ArtifactContent {
         definitions: BTreeMap::new(),
         source_map: BTreeMap::new(),
     }
+}
+fn route_steps(c: &CommandContract, route_input: Expr, output: Expr) -> BTreeMap<String, Step> {
+    BTreeMap::from([
+        (
+            "route".into(),
+            Step {
+                op: Operation::Invoke {
+                    command: ContractRef {
+                        name: c.name.clone(),
+                        fingerprint: c.fingerprint().unwrap(),
+                    },
+                    input: route_input,
+                    bind: "routed".into(),
+                    retry: None,
+                },
+                edges: BTreeMap::from([("ok".into(), "finish".into())]),
+                on_error: Some("finish".into()),
+            },
+        ),
+        (
+            "finish".into(),
+            Step {
+                op: Operation::Return {
+                    outcome: "done".into(),
+                    output,
+                },
+                edges: BTreeMap::new(),
+                on_error: None,
+            },
+        ),
+    ])
 }
 fn valid_route_input() -> Expr {
     Expr::Object {
@@ -332,7 +335,7 @@ fn lookup_result_type_is_the_union_of_its_results() {
 }
 
 #[test]
-fn lookup_refuses_duplicate_incompatible_or_too_many_cases() {
+fn lookup_refuses_duplicate_scalar_and_object_keys() {
     let target = Schema::string(16);
     let key = || r("input", &["kind"]);
     let s = |v: &str| lit(json!(v));
@@ -371,6 +374,13 @@ fn lookup_refuses_duplicate_incompatible_or_too_many_cases() {
         "steps.finish",
         "cases[1].when: {\"a\":1,\"b\":2} equals cases[0].when"
     ));
+}
+
+#[test]
+fn lookup_refuses_an_incompatible_key_type() {
+    let key = || r("input", &["kind"]);
+    let target = Schema::string(16);
+    let s = |v: &str| lit(json!(v));
     // A `when` the key's type cannot take: integer against a string key.
     let incompatible = lookup(key(), vec![case(json!(1), s("a"))], s("b"));
     let issues = returning(incompatible, target.clone());
@@ -383,6 +393,12 @@ fn lookup_refuses_duplicate_incompatible_or_too_many_cases() {
         ),
         "{issues:?}"
     );
+}
+
+#[test]
+fn lookup_bounds_case_count_and_canonical_key_length() {
+    let target = Schema::string(16);
+    let s = |v: &str| lit(json!(v));
     // At most 256 cases.
     let ranks = |n: i64| {
         lookup(
@@ -678,7 +694,7 @@ fn let_chain(n: usize) -> Expr {
 }
 
 #[test]
-fn validation_refuses_what_evaluation_would_refuse_for_depth_and_budget() {
+fn validation_and_evaluation_agree_on_expression_depth() {
     let ctx = input_context(json!({"narrow": false}));
     let limits = EvalLimits::default();
     for chain in [lookup_chain, let_chain] {
@@ -702,6 +718,11 @@ fn validation_refuses_what_evaluation_would_refuse_for_depth_and_budget() {
             );
         }
     }
+}
+
+#[test]
+fn lookup_table_maps_respect_the_evaluation_element_budget() {
+    let limits = EvalLimits::default();
     // Every case is charged on every map item: 100 items of a 256-case table
     // cannot fit the 10 000-element budget; 30 items can.
     let mapped = |max_items: usize| Expr::Map {
@@ -828,7 +849,7 @@ fn empty_array_branches_meet_any_array_target() {
 }
 
 #[test]
-fn diagnostics_name_the_place_the_key_type_and_the_branch_once() {
+fn diagnostics_locate_the_incompatible_lookup_key() {
     let s = |v: &str| lit(json!(v));
     let strings = Schema::object(BTreeMap::from([
         ("first".into(), Schema::string(16)),
@@ -866,6 +887,11 @@ fn diagnostics_name_the_place_the_key_type_and_the_branch_once() {
         s("b"),
     );
     assert!(returning(wide, Schema::string(16)).is_empty());
+}
+
+#[test]
+fn diagnostics_identify_the_invalid_lookup_branch_and_let_binding() {
+    let s = |v: &str| lit(json!(v));
     // A refused assignment names the branch and its type.
     let deep = lookup(
         r("input", &["kind"]),
