@@ -5,211 +5,9 @@
 use aq_playbooks_runner::{Intent, Receipt, Run, State, inspection};
 use serde_json::{Value, json};
 use std::{borrow::Cow, collections::BTreeMap};
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct NativeKey<'a>(Cow<'a, str>, Cow<'a, str>, Cow<'a, str>);
-#[derive(Debug, PartialEq, Eq)]
-struct NativeFields<'a> {
-    scope: Cow<'a, str>,
-    sequence: u64,
-    at: Option<i64>,
-}
-struct BorrowedNativeRow<'a> {
-    key: NativeKey<'a>,
-    fields: NativeFields<'a>,
-}
-#[derive(Default)]
-struct NativeRows<'a>(BTreeMap<NativeKey<'a>, NativeFields<'a>>);
-impl<'a> NativeRows<'a> {
-    fn push(&mut self, row: BorrowedNativeRow<'a>) {
-        self.0.insert(row.key, row.fields);
-    }
-}
-fn native_json(k: &NativeKey<'_>, f: &NativeFields<'_>) -> Value {
-    json!({"kind":k.0,"lookup_key":k.1,"item_key":k.2,"scope":f.scope,"sequence":f.sequence,"at_ms":f.at})
-}
-pub(crate) fn native_delta(previous: &State, next: &State) -> (Vec<Value>, Vec<Value>) {
-    let previous = native_rows(previous);
-    let next = native_rows(next);
-    let changed = next
-        .0
-        .iter()
-        .filter(|(key, row)| previous.0.get(*key) != Some(*row))
-        .map(|(key, row)| native_json(key, row))
-        .collect();
-    let deleted = previous
-        .0
-        .keys()
-        .filter(|key| !next.0.contains_key(*key))
-        .map(|key| json!({"kind":key.0,"lookup_key":key.1,"item_key":key.2}))
-        .collect();
-    (changed, deleted)
-}
-fn borrowed_record<'a>(
-    kind: impl Into<std::borrow::Cow<'a, str>>,
-    lookup: impl Into<std::borrow::Cow<'a, str>>,
-    key: impl Into<std::borrow::Cow<'a, str>>,
-    scope: impl Into<std::borrow::Cow<'a, str>>,
-    sequence: u64,
-    at: Option<i64>,
-) -> BorrowedNativeRow<'a> {
-    BorrowedNativeRow {
-        key: NativeKey(kind.into(), lookup.into(), key.into()),
-        fields: NativeFields {
-            scope: scope.into(),
-            sequence,
-            at,
-        },
-    }
-}
-fn native_rows(state: &State) -> NativeRows<'_> {
-    let mut rows = NativeRows::default();
-    let idx = &state.indexes;
-    if let Some(cursor) = &idx.scope_cursor {
-        rows.push(borrowed_record("cursor", "ready", cursor, "", 0, None));
-    }
-    for (kind, cursor) in &idx.effect_cursor {
-        rows.push(borrowed_record("cursor", kind, cursor, "", 0, None));
-    }
-    for (kind_scope, cursor) in &idx.effect_item_cursor {
-        rows.push(borrowed_record(
-            "item_cursor",
-            kind_scope,
-            cursor,
-            "",
-            0,
-            None,
-        ));
-    }
-    for (scope, queue) in &idx.ready {
-        if let Some((sequence, id)) = queue.first_key_value() {
-            rows.push(borrowed_record("ready", "", id, scope, *sequence, None));
-        }
-    }
-    for (kind, scopes) in &idx.effects {
-        for (scope, ids) in scopes {
-            let cursor = idx.effect_item_cursor.get(&format!("{kind}:{scope}"));
-            let selected = cursor
-                .and_then(|cursor| {
-                    ids.range((
-                        std::ops::Bound::Excluded(cursor.clone()),
-                        std::ops::Bound::Unbounded,
-                    ))
-                    .next()
-                })
-                .or_else(|| ids.first());
-            if let Some(id) = selected {
-                rows.push(borrowed_record(
-                    format!("effect:{kind}"),
-                    "",
-                    id,
-                    scope,
-                    0,
-                    None,
-                ));
-            }
-        }
-    }
-    for id in &idx.completion_ready {
-        rows.push(borrowed_record(
-            "effect:completion",
-            "",
-            id,
-            state
-                .intents
-                .get(id)
-                .map(|i| i.authority.scope.as_str())
-                .unwrap_or(""),
-            0,
-            None,
-        ));
-    }
-    for (key, timer) in &idx.timers {
-        rows.push(borrowed_record(
-            "timer",
-            "",
-            key,
-            state
-                .runs
-                .get(&timer.run)
-                .map(|r| r.authority.scope.as_str())
-                .unwrap_or(""),
-            0,
-            Some(timer.at_ms),
-        ));
-    }
-    for (key, events) in &idx.events {
-        for (seq, id) in events {
-            rows.push(borrowed_record(
-                "event",
-                key,
-                id,
-                state
-                    .events
-                    .get(id)
-                    .map(|e| e.envelope.scope.as_str())
-                    .unwrap_or(""),
-                *seq,
-                state.events.get(id).map(|e| e.accepted_at_ms),
-            ));
-        }
-    }
-    for (key, ids) in &idx.waiters {
-        for id in ids {
-            rows.push(borrowed_record(
-                "waiter",
-                key,
-                id,
-                state
-                    .runs
-                    .get(id)
-                    .map(|r| r.authority.scope.as_str())
-                    .unwrap_or(""),
-                0,
-                None,
-            ));
-        }
-    }
-    for id in &idx.runs {
-        rows.push(borrowed_record(
-            "run",
-            "",
-            id,
-            state
-                .runs
-                .get(id)
-                .map(|r| r.authority.scope.as_str())
-                .unwrap_or(""),
-            0,
-            None,
-        ));
-    }
-    // Receipt rows are keyed by the receipt's sequence, its stable identity:
-    // a commit that compacts `receipts` (a cohort leaving) moves receipts to
-    // new positions but changes none of their rows.
-    for (run, receipts) in &idx.receipts {
-        for (seq, offset) in receipts {
-            rows.push(borrowed_record(
-                "receipt",
-                run,
-                receipt_item_key(*seq),
-                "",
-                *seq,
-                state.receipts.get(*offset).map(|r| r.at_ms),
-            ));
-        }
-    }
-    for (seq, offset) in &idx.all_receipts {
-        rows.push(borrowed_record(
-            "all_receipt",
-            "",
-            receipt_item_key(*seq),
-            "",
-            *seq,
-            state.receipts.get(*offset).map(|r| r.at_ms),
-        ));
-    }
-    rows
-}
+mod native;
+pub(crate) use native::native_delta;
+
 /// The `item_key` of a receipt's runtime-index rows: its sequence, 20
 /// zero-padded digits. An engine before this keyed them by the receipt's
 /// position in the record (an unpadded number, never 20 digits), so the two
@@ -259,7 +57,7 @@ fn public_rows(state: &State) -> BTreeMap<PublicKey<'_>, PublicRow<'_>> {
     }
     for r in &state.receipts {
         rows.insert(
-            PublicKey("receipts", Cow::Owned(format!("{:020}", r.sequence))),
+            PublicKey("receipts", Cow::Owned(receipt_item_key(r.sequence))),
             PublicRow {
                 run: &r.run,
                 sequence: r.sequence,
@@ -269,57 +67,69 @@ fn public_rows(state: &State) -> BTreeMap<PublicKey<'_>, PublicRow<'_>> {
     }
     rows
 }
-fn same_source(a: &Source<'_>, b: &Source<'_>) -> bool {
+impl PublicRow<'_> {
+    fn unchanged(&self, old: &PublicRow<'_>) -> bool {
+        self.run == old.run && self.sequence == old.sequence && self.source.same(&old.source)
+    }
+}
+
+impl Source<'_> {
+    fn same(&self, other: &Source<'_>) -> bool {
+        match (self, other) {
+            (Self::Run(a), Source::Run(b)) => {
+                run_fields(a) == run_fields(b) && same_pending(&a.pending, &b.pending)
+            }
+            (Self::Intent(a), Source::Intent(b)) => intent_fields(a) == intent_fields(b),
+            (Self::Receipt(a), Source::Receipt(b)) => receipt_fields(a) == receipt_fields(b),
+            _ => false,
+        }
+    }
+}
+
+// Compare only the input fields used by the public sanitizers, without cloning
+// event payloads, results or other private state into temporary JSON.
+fn run_fields(r: &Run) -> impl PartialEq + '_ {
+    (
+        (&r.id, &r.artifact, &r.entry, &r.step),
+        (
+            &r.status,
+            &r.outcome,
+            r.reason.is_some(),
+            r.visits,
+            r.admitted_at_ms,
+        ),
+        (&r.root, &r.parent, &r.origin, &r.children, &r.dependencies),
+    )
+}
+fn intent_fields(i: &Intent) -> impl PartialEq + '_ {
+    (
+        (&i.id, &i.run, &i.step, &i.command),
+        (
+            &i.status,
+            &i.handle,
+            i.reason.is_some(),
+            i.deadline_at_ms,
+            i.cancel_requested,
+            i.cancel_dispatched,
+        ),
+    )
+}
+fn receipt_fields(r: &Receipt) -> impl PartialEq + '_ {
+    (r.sequence, &r.run, &r.step, r.at_ms, &r.kind, &r.detail)
+}
+fn same_pending(
+    a: &Option<aq_playbooks_runner::Pending>,
+    b: &Option<aq_playbooks_runner::Pending>,
+) -> bool {
     match (a, b) {
-        (Source::Run(a), Source::Run(b)) => {
-            a.id == b.id
-                && a.artifact == b.artifact
-                && a.entry == b.entry
-                && a.step == b.step
-                && a.status == b.status
-                && a.outcome == b.outcome
-                && a.reason.is_some() == b.reason.is_some()
-                && a.root == b.root
-                && a.parent == b.parent
-                && a.origin == b.origin
-                && a.children == b.children
-                && a.dependencies == b.dependencies
-                && a.visits == b.visits
-                && a.admitted_at_ms == b.admitted_at_ms
-                && match (&a.pending, &b.pending) {
-                    (None, None) => true,
-                    (Some(a), Some(b)) => {
-                        match (serde_json::to_value(a), serde_json::to_value(b)) {
-                            (Ok(a), Ok(b)) => a == b,
-                            _ => false,
-                        }
-                    }
-                    _ => false,
-                }
-        }
-        (Source::Intent(a), Source::Intent(b)) => {
-            a.id == b.id
-                && a.run == b.run
-                && a.step == b.step
-                && a.command == b.command
-                && a.status == b.status
-                && a.handle == b.handle
-                && a.reason.is_some() == b.reason.is_some()
-                && a.deadline_at_ms == b.deadline_at_ms
-                && a.cancel_requested == b.cancel_requested
-                && a.cancel_dispatched == b.cancel_dispatched
-        }
-        (Source::Receipt(a), Source::Receipt(b)) => {
-            a.sequence == b.sequence
-                && a.run == b.run
-                && a.step == b.step
-                && a.at_ms == b.at_ms
-                && a.kind == b.kind
-                && a.detail == b.detail
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            matches!((serde_json::to_value(a),serde_json::to_value(b)),(Ok(a),Ok(b)) if a == b)
         }
         _ => false,
     }
 }
+
 fn public_json(k: &PublicKey<'_>, r: &PublicRow<'_>) -> Value {
     let value = match r.source {
         Source::Run(run) => inspection::public_run(run),
@@ -334,10 +144,7 @@ pub(crate) fn public_delta(previous: &State, next: &State) -> (Vec<Value>, Vec<V
     let mut changed = vec![];
     for (key, row) in &next {
         if let Some(old) = previous.get(key) {
-            if old.run == row.run
-                && old.sequence == row.sequence
-                && same_source(&old.source, &row.source)
-            {
+            if row.unchanged(old) {
                 continue;
             }
             let new = public_json(key, row);
