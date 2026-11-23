@@ -14,6 +14,9 @@ use crate::storage::{Storage, StorageError, VersionedState};
 use crate::{Error, Result, State};
 use std::collections::BTreeMap;
 use std::panic::Location;
+
+mod patch_checks;
+use patch_checks::{verify_events, verify_keyed_admissions, verify_patch_removals};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -143,43 +146,54 @@ pub fn assemble_state(
         serde_json::from_slice(header).map_err(|e| backend(format!("state header: {e}")))?;
     for (field, shape) in schema() {
         let rows = records(field)?;
-        let container = match shape {
-            Shape::Map(_) | Shape::Nested(..) => {
-                let mut map = serde_json::Map::new();
-                for (key, bytes) in rows {
-                    let text = match key {
-                        TreeKey::U64(v) => v.to_string(),
-                        TreeKey::I64(v) => v.to_string(),
-                        TreeKey::Str(s) => s,
-                    };
-                    map.insert(text, serde_json::from_slice(&bytes).map_err(backend)?);
-                }
-                serde_json::Value::Object(map)
-            }
-            Shape::Set(_) | Shape::Seq => serde_json::Value::Array(
-                rows.into_iter()
-                    .map(|(_, bytes)| serde_json::from_slice(&bytes).map_err(backend))
-                    .collect::<Result<_>>()?,
-            ),
-        };
-        let mut slot = &mut value;
-        let mut parts = field.split('.').peekable();
-        while let Some(part) = parts.next() {
-            let object = slot
-                .as_object_mut()
-                .ok_or_else(|| backend(format!("state header: {field} parent is not an object")))?;
-            if parts.peek().is_none() {
-                object.insert(part.to_string(), container);
-                break;
-            }
-            slot = object
-                .entry(part.to_string())
-                .or_insert_with(|| serde_json::Value::Object(Default::default()));
-        }
+        let container = assemble_container(shape, rows)?;
+        set_field(&mut value, field, container)?;
     }
     serde_json::from_value(value).map_err(|e| backend(format!("state assemble: {e}")))
 }
 
+fn assemble_container(shape: Shape, rows: Vec<(TreeKey, Vec<u8>)>) -> Result<serde_json::Value> {
+    Ok(match shape {
+        Shape::Map(_) | Shape::Nested(..) => {
+            let mut map = serde_json::Map::new();
+            for (key, bytes) in rows {
+                let text = match key {
+                    TreeKey::U64(v) => v.to_string(),
+                    TreeKey::I64(v) => v.to_string(),
+                    TreeKey::Str(s) => s,
+                };
+                map.insert(text, serde_json::from_slice(&bytes).map_err(backend)?);
+            }
+            serde_json::Value::Object(map)
+        }
+        Shape::Set(_) | Shape::Seq => serde_json::Value::Array(
+            rows.into_iter()
+                .map(|(_, bytes)| serde_json::from_slice(&bytes).map_err(backend))
+                .collect::<Result<_>>()?,
+        ),
+    })
+}
+fn set_field(
+    value: &mut serde_json::Value,
+    field: &str,
+    container: serde_json::Value,
+) -> Result<()> {
+    let mut slot = value;
+    let mut parts = field.split('.').peekable();
+    while let Some(part) = parts.next() {
+        let object = slot
+            .as_object_mut()
+            .ok_or_else(|| backend(format!("state header: {field} parent is not an object")))?;
+        if parts.peek().is_none() {
+            object.insert(part.to_string(), container);
+            break;
+        }
+        slot = object
+            .entry(part.to_string())
+            .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    }
+    Ok(())
+}
 /// The number of records of each container of one namespace revision
 /// (what a bound container's `len` reads), and the header's length.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -384,350 +398,25 @@ fn apply(data: &mut RecordData, patch: StatePatch) -> Result<()> {
     for (path, change) in patch.changes {
         let field = field_name(&path)?;
         let container = data.containers.entry(field).or_default();
-        match change {
-            ContainerChange::Entries(rows) => {
-                for (key, new) in rows {
-                    match new {
-                        Some(bytes) => container.insert(key, bytes),
-                        None => container.remove(&key),
-                    };
-                }
-            }
-            ContainerChange::Replace(rows) => *container = rows.into_iter().collect(),
-        }
+        apply_rows(container, change);
         if container.is_empty() {
             data.containers.remove(field);
         }
     }
     Ok(())
 }
-/// An accepted event's identity never changes
-/// ([`crate::retention::check_event_change`]): each stored event the patch
-/// rewrites is compared with what it writes. O(rewritten events).
-fn verify_events(data: &RecordData, patch: &StatePatch) -> Result<()> {
-    let Some(old) = data.container("events") else {
-        return Ok(());
-    };
-    let decode = |bytes: &[u8]| -> Result<crate::AcceptedEvent> {
-        serde_json::from_slice(bytes).map_err(|e| backend(format!("events record: {e}")))
-    };
-    for (path, change) in &patch.changes {
-        if path.field != "events" {
-            continue;
-        }
-        let written: Vec<(&TreeKey, &Vec<u8>)> = match change {
-            ContainerChange::Entries(rows) => rows
-                .iter()
-                .filter_map(|(k, v)| v.as_ref().map(|v| (k, v)))
-                .collect(),
-            ContainerChange::Replace(rows) => rows.iter().map(|(k, v)| (k, v)).collect(),
-        };
-        for (key, new) in written {
-            if let Some(before) = old.get(key)
-                && before != new
-            {
-                crate::retention::check_event_change(&decode(before)?, &decode(new)?)?;
-            }
-        }
-    }
-    Ok(())
-}
-/// Keyed admission receipts are never rebound. Their removal is checked by
-/// [`verify_patch_removals`].
-fn verify_keyed_admissions(data: &RecordData, patch: &StatePatch) -> Result<()> {
-    let refuse = || {
-        Error::Storage(StorageError::Backend(
-            "immutable keyed admission receipt removed or changed".into(),
-        ))
-    };
-    let Some(old) = data.container("keyed_admissions") else {
-        return Ok(());
-    };
-    for (path, change) in &patch.changes {
-        if path.field != "keyed_admissions" {
-            continue;
-        }
-        match change {
-            ContainerChange::Entries(rows) => {
-                for (key, new) in rows {
-                    if let (Some(before), Some(new)) = (old.get(key), new)
-                        && new != before
-                    {
-                        return Err(refuse());
-                    }
-                }
-            }
-            ContainerChange::Replace(rows) => {
-                if rows
-                    .iter()
-                    .any(|(k, v)| old.get(k).is_some_and(|before| before != v))
-                {
-                    return Err(refuse());
-                }
-            }
-        }
-    }
-    Ok(())
-}
-/// A touched record key with its stored value and the value a patch writes.
-type Touch<'a> = (&'a TreeKey, Option<&'a Vec<u8>>, Option<&'a Vec<u8>>);
-/// Incremental equivalent of [`crate::retention::verify_removals`]: the same
-/// rules over the records `patch` deletes from `data` (and the expiry records
-/// it writes), checked against the bound `next`. Reads only the touched
-/// records, the operations and children of deleted runs, and (for a legacy
-/// run disposal) the disposal records.
-fn verify_patch_removals(data: &RecordData, patch: &StatePatch, next: &State) -> Result<()> {
-    use crate::retention::Window;
-    use std::collections::BTreeSet;
-    const FENCED: &[&str] = &["runs", "intents", "events", "keyed_admissions"];
-    let decode = |field: &str, bytes: &[u8]| -> Result<serde_json::Value> {
-        serde_json::from_slice(bytes).map_err(|e| backend(format!("{field} record: {e}")))
-    };
-    let at = |field: &str, bytes: &[u8]| -> Result<i64> {
-        serde_json::from_slice(bytes).map_err(|e| backend(format!("{field} record: {e}")))
-    };
-    // A licensed admin commit changes no header field its licence does not
-    // name, and adds no run, operation, event or keyed receipt. Its caps are
-    // computed from the stored header and the stored events.
-    let licensed = crate::retention::licence(next)?.is_some();
-    let mut caps = State::default();
-    if licensed {
-        caps = header_state(&data.header)?;
-        crate::retention::check_licensed_header(&caps, next)?;
-        for (path, change) in &patch.changes {
-            let field = field_name(path)?;
-            if !FENCED.contains(&field) {
-                continue;
-            }
-            let old = data.container(field);
-            let added = match change {
-                ContainerChange::Entries(rows) => rows
-                    .iter()
-                    .any(|(key, new)| new.is_some() && old.and_then(|c| c.get(key)).is_none()),
-                ContainerChange::Replace(rows) => rows
-                    .iter()
-                    .any(|(key, _)| old.and_then(|c| c.get(key)).is_none()),
-            };
-            if added {
-                return Err(backend(crate::retention::REFUSE_LICENCE));
-            }
-        }
-        if let Some(stored) = data.container("events") {
-            for (path, change) in &patch.changes {
-                if field_name(path)? != "retention.event_expires_at_ms" {
-                    continue;
-                }
-                let keys: Vec<&TreeKey> = match change {
-                    ContainerChange::Entries(rows) => rows.iter().map(|(k, _)| k).collect(),
-                    ContainerChange::Replace(rows) => rows.iter().map(|(k, _)| k).collect(),
+fn apply_rows(container: &mut Container, change: ContainerChange) {
+    match change {
+        ContainerChange::Entries(rows) => {
+            for (key, new) in rows {
+                match new {
+                    Some(bytes) => container.insert(key, bytes),
+                    None => container.remove(&key),
                 };
-                for key in keys {
-                    if let (TreeKey::Str(id), Some(bytes)) = (key, stored.get(key)) {
-                        let event: crate::AcceptedEvent = serde_json::from_slice(bytes)
-                            .map_err(|e| backend(format!("events record: {e}")))?;
-                        caps.events.insert(id.clone(), event);
-                    }
-                }
             }
         }
+        ContainerChange::Replace(rows) => *container = rows.into_iter().collect(),
     }
-    let mut removed: BTreeMap<&str, serde_json::Map<String, serde_json::Value>> = BTreeMap::new();
-    let mut removed_receipts: Vec<serde_json::Value> = vec![];
-    for (path, change) in &patch.changes {
-        let field = field_name(path)?;
-        let old = data.container(field);
-        // Each touched key: its stored value and the value the patch writes.
-        let touched: Vec<Touch<'_>> = match change {
-            ContainerChange::Entries(rows) => rows
-                .iter()
-                .map(|(key, new)| (key, old.and_then(|c| c.get(key)), new.as_ref()))
-                .collect(),
-            ContainerChange::Replace(rows) => {
-                let new: BTreeMap<&TreeKey, &Vec<u8>> = rows.iter().map(|(k, v)| (k, v)).collect();
-                let keys: BTreeSet<&TreeKey> = old
-                    .into_iter()
-                    .flatten()
-                    .map(|(k, _)| k)
-                    .chain(new.keys().copied())
-                    .collect();
-                keys.into_iter()
-                    .map(|key| (key, old.and_then(|c| c.get(key)), new.get(key).copied()))
-                    .collect()
-            }
-        };
-        let window = match field {
-            "retention.event_expires_at_ms" => Some(Window::Event),
-            "retention.admission_expires_at_ms" => Some(Window::Admission),
-            _ => None,
-        };
-        if let Some(window) = window {
-            for (key, before, after) in touched {
-                let TreeKey::Str(id) = key else {
-                    return Err(backend(format!("{field}: unexpected record key")));
-                };
-                let before = before.map(|b| at(field, b)).transpose()?;
-                let after = after.map(|b| at(field, b)).transpose()?;
-                if before != after {
-                    crate::retention::ExpiryChange {
-                        window,
-                        key: id,
-                        old: before,
-                        new: after,
-                    }
-                    .check(&caps, next)?;
-                }
-            }
-        } else if field == "receipts" {
-            // Positional: a receipt is removed when its sequence was at a
-            // touched position and the patch writes it nowhere.
-            let mut written = BTreeSet::new();
-            let mut stored = vec![];
-            for (_, before, after) in touched {
-                if let Some(after) = after {
-                    written.insert(decode(field, after)?["sequence"].as_u64());
-                }
-                if let Some(before) = before {
-                    stored.push(decode(field, before)?);
-                }
-            }
-            removed_receipts.extend(
-                stored
-                    .into_iter()
-                    .filter(|r| !written.contains(&r["sequence"].as_u64())),
-            );
-        } else if FENCED.contains(&field) {
-            for (key, before, after) in touched {
-                let (Some(before), None) = (before, after) else {
-                    continue;
-                };
-                let TreeKey::Str(id) = key else {
-                    return Err(backend(format!("{field}: unexpected record key")));
-                };
-                removed
-                    .entry(field)
-                    .or_default()
-                    .insert(id.clone(), decode(field, before)?);
-            }
-        }
-    }
-    // The State header (policy, clock, artifacts) plus the deleted records.
-    let mut previous = header_state(&data.header)?;
-    if !removed.is_empty() || !removed_receipts.is_empty() {
-        let expires = |field: &str, key: &str| -> Result<Option<serde_json::Value>> {
-            data.container(field)
-                .and_then(|c| c.get(&TreeKey::Str(key.to_string())))
-                .map(|bytes| decode(field, bytes))
-                .transpose()
-        };
-        let mut value = serde_json::to_value(&previous).map_err(backend)?;
-        for (field, records) in &removed {
-            let expiry_field = match *field {
-                "events" => Some(("event_expires_at_ms", "retention.event_expires_at_ms")),
-                "keyed_admissions" => Some((
-                    "admission_expires_at_ms",
-                    "retention.admission_expires_at_ms",
-                )),
-                _ => None,
-            };
-            if let Some((name, path)) = expiry_field {
-                for key in records.keys() {
-                    if let Some(at) = expires(path, key)? {
-                        value["retention"][name][key] = at;
-                    }
-                }
-            }
-            value[*field] = serde_json::Value::Object(records.clone());
-        }
-        value["receipts"] = serde_json::Value::Array(removed_receipts);
-        if let Some(runs) = removed.get("runs") {
-            // Children of removed runs, and every operation of a removed run.
-            let mut all_runs = runs.clone();
-            let stored = data.container("runs");
-            for run in runs.values() {
-                for child in run["children"].as_array().into_iter().flatten() {
-                    let Some(child) = child.as_str() else {
-                        continue;
-                    };
-                    if let Some(bytes) = stored.and_then(|c| c.get(&TreeKey::Str(child.into()))) {
-                        all_runs.insert(child.into(), decode("runs", bytes)?);
-                    }
-                }
-            }
-            value["runs"] = serde_json::Value::Object(all_runs);
-            let mut intents = removed.get("intents").cloned().unwrap_or_default();
-            for (key, bytes) in data.container("intents").into_iter().flatten() {
-                let intent = decode("intents", bytes)?;
-                if intent["run"]
-                    .as_str()
-                    .is_some_and(|run| runs.contains_key(run))
-                    && let TreeKey::Str(id) = key
-                {
-                    intents.insert(id.clone(), intent);
-                }
-            }
-            value["intents"] = serde_json::Value::Object(intents);
-        }
-        previous =
-            serde_json::from_value(value).map_err(|e| backend(format!("removed records: {e}")))?;
-    }
-    // Evictions: the order keys the patch adds, and the stored correlation
-    // keys of the events it removes.
-    let stored_order = data.container("retention.replay_order");
-    let mut added = vec![];
-    for (path, change) in &patch.changes {
-        if path.field != "retention.replay_order" {
-            continue;
-        }
-        let written: Vec<&TreeKey> = match change {
-            ContainerChange::Entries(rows) => rows
-                .iter()
-                .filter(|(_, new)| new.is_some())
-                .map(|(key, _)| key)
-                .collect(),
-            ContainerChange::Replace(rows) => rows.iter().map(|(key, _)| key).collect(),
-        };
-        for key in written {
-            if stored_order.is_none_or(|c| !c.contains_key(key))
-                && let TreeKey::Str(key) = key
-            {
-                added.push(key.clone());
-            }
-        }
-    }
-    let memberships = |key: &str| -> std::result::Result<Option<Vec<String>>, StorageError> {
-        data.container("indexes.event_memberships")
-            .and_then(|c| c.get(&TreeKey::Str(key.to_string())))
-            .map(|bytes| {
-                serde_json::from_slice(bytes)
-                    .map_err(|e| StorageError::Backend(format!("event memberships record: {e}")))
-            })
-            .transpose()
-    };
-    let evicted = crate::retention::check_evictions(
-        &previous,
-        next,
-        &mut added.into_iter(),
-        &crate::retention::Stored {
-            ordered: &|key| {
-                Ok(stored_order.is_some_and(|c| c.contains_key(&TreeKey::Str(key.to_string()))))
-            },
-            memberships: &memberships,
-            waiters: &|key| {
-                data.container("indexes.waiters")
-                    .and_then(|c| c.get(&TreeKey::Str(key.to_string())))
-                    .map(|bytes| {
-                        serde_json::from_slice(bytes)
-                            .map_err(|e| StorageError::Backend(format!("waiters record: {e}")))
-                    })
-                    .transpose()
-            },
-        },
-    )?;
-    // `previous` holds only removed receipts.
-    crate::retention::check_removals(&previous, next, &|_| false, &|window, key| {
-        evicted.contains(&(window, key.to_string()))
-    })?;
-    Ok(())
 }
 fn assemble(data: &RecordData) -> Result<State> {
     if data.header.is_empty() {
