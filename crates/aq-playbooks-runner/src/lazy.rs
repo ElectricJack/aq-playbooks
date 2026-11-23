@@ -10,6 +10,13 @@
 //! records a fallback with its caller location, then materializes the whole
 //! container from the source, so results always equal the reference State. A
 //! source failure poisons the transition and must abort it (fail closed).
+mod maps;
+mod sequences;
+mod sets;
+pub use maps::{Entry, LazyMap};
+pub use sequences::LazySeq;
+pub use sets::LazySet;
+
 use aq_playbooks_model::canonical_bytes;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
 use std::borrow::Borrow;
@@ -357,68 +364,62 @@ impl<K: LazyKey, V: Clone> Bound<K, V> {
     /// [`Self::next_after`], reading the source `page` records at a time.
     fn next_after_paged(&self, after: Option<&K>, page: usize) -> Option<K> {
         let mut cache = lock(&self.cache);
-        let overlay = match after {
-            Some(a) => cache
-                .range::<K, _>((std::ops::Bound::Excluded(a), std::ops::Bound::Unbounded))
-                .find(|(_, s)| s.current.is_some())
-                .map(|(k, _)| k.clone()),
-            None => cache
-                .iter()
-                .find(|(_, s)| s.current.is_some())
-                .map(|(k, _)| k.clone()),
-        };
+        let lower = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        let overlay = cache
+            .range::<K, _>((lower, std::ops::Bound::Unbounded))
+            .find(|(_, slot)| slot.current.is_some())
+            .map(|(key, _)| key.clone());
         let mut cursor = after.map(LazyKey::to_tree);
         loop {
-            let page = match self.source.after(&self.path, cursor.as_ref(), page) {
-                Ok(page) => page,
-                Err(e) => {
-                    self.source.fail(e);
-                    return None;
-                }
-            };
+            let page = self
+                .source
+                .after(&self.path, cursor.as_ref(), page)
+                .map_err(|error| self.source.fail(error))
+                .ok()?;
             if page.is_empty() {
                 return overlay;
             }
-            for (tree_key, bytes) in &page {
-                let Some(key) = K::from_tree(tree_key) else {
-                    self.source
-                        .fail(format!("{:?}: comparator mismatch", self.path));
-                    return None;
-                };
-                if overlay.as_ref().is_some_and(|o| &key >= o) {
-                    return overlay;
-                }
-                if cache.contains_key(&key) {
-                    continue;
-                }
-                let slot = self.decoded(&key, Some(bytes.clone()));
-                cache.insert(key.clone(), Box::new(slot));
-                return Some(key);
+            if let std::ops::ControlFlow::Break(key) =
+                self.first_uncached(&mut cache, &page, overlay.as_ref())
+            {
+                return key;
             }
             cursor = page.last().map(|(k, _)| k.clone());
         }
     }
+    fn first_uncached(
+        &self,
+        cache: &mut BTreeMap<K, Box<Slot<V>>>,
+        page: &[(TreeKey, Vec<u8>)],
+        overlay: Option<&K>,
+    ) -> std::ops::ControlFlow<Option<K>> {
+        for (tree_key, bytes) in page {
+            let Some(key) = self.typed_key(tree_key) else {
+                return std::ops::ControlFlow::Break(None);
+            };
+            if overlay.is_some_and(|o| &key >= o) {
+                return std::ops::ControlFlow::Break(overlay.cloned());
+            }
+            if cache.contains_key(&key) {
+                continue;
+            }
+            let slot = self.decoded(&key, Some(bytes.clone()));
+            cache.insert(key.clone(), Box::new(slot));
+            return std::ops::ControlFlow::Break(Some(key));
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
     #[track_caller]
     fn full(&self, at: &'static Location<'static>) -> BTreeMap<K, V> {
         self.source.fallback(&self.path, at);
         let mut map = BTreeMap::new();
         match self.source.scan(&self.path) {
-            Ok(rows) => {
-                for (tree_key, bytes) in rows {
-                    let Some(key) = K::from_tree(&tree_key) else {
-                        self.source
-                            .fail(format!("{:?}: comparator mismatch", self.path));
-                        continue;
-                    };
-                    match (self.decode)(&key, &bytes) {
-                        Ok(v) => {
-                            map.insert(key, v);
-                        }
-                        Err(e) => self.source.fail(e),
-                    }
-                }
-            }
-            Err(e) => self.source.fail(e),
+            Ok(rows) => map.extend(
+                rows.into_iter()
+                    .filter_map(|(key, bytes)| self.decode_row(&key, &bytes)),
+            ),
+            Err(error) => self.source.fail(error),
         }
         for (key, slot) in lock(&self.cache).iter() {
             match &slot.current {
@@ -431,6 +432,25 @@ impl<K: LazyKey, V: Clone> Bound<K, V> {
             }
         }
         map
+    }
+    fn typed_key(&self, key: &TreeKey) -> Option<K> {
+        let typed = K::from_tree(key);
+        if typed.is_none() {
+            self.source
+                .fail(format!("{:?}: comparator mismatch", self.path));
+        }
+        typed
+    }
+
+    fn decode_row(&self, key: &TreeKey, bytes: &[u8]) -> Option<(K, V)> {
+        let key = self.typed_key(key)?;
+        match (self.decode)(&key, bytes) {
+            Ok(value) => Some((key, value)),
+            Err(error) => {
+                self.source.fail(error);
+                None
+            }
+        }
     }
     fn view(&self, at: &'static Location<'static>) -> &BTreeMap<K, V> {
         self.view.get_or_init(|| self.full(at))
@@ -462,678 +482,6 @@ impl<K: LazyKey, V: Clone> Bound<K, V> {
     }
 }
 
-/// Object container (`BTreeMap` compatible).
-pub struct LazyMap<K, V>(MapRepr<K, V>);
-enum MapRepr<K, V> {
-    Plain(BTreeMap<K, V>),
-    Bound(Box<Bound<K, V>>),
-    /// Materialized after a full-container mutation; patched as a replacement.
-    Promoted(BTreeMap<K, V>),
-}
-pub trait Record: Clone + Serialize + DeserializeOwned + Send + Sync + 'static {}
-impl<T: Clone + Serialize + DeserializeOwned + Send + Sync + 'static> Record for T {}
-
-fn map_encode<K, V: Serialize>(_: &K, v: &V) -> Result<Vec<u8>, String> {
-    encode_value(v)
-}
-fn map_decode<K, V: DeserializeOwned>(_: &K, b: &[u8]) -> Result<V, String> {
-    decode_value(b)
-}
-impl<K: LazyKey, V: Record> LazyMap<K, V> {
-    pub fn new() -> Self {
-        Self(MapRepr::Plain(BTreeMap::new()))
-    }
-    pub fn bound(source: Arc<dyn RecordSource>, path: ContainerPath) -> Self {
-        Self(MapRepr::Bound(Box::new(Bound::new(
-            source,
-            path,
-            map_encode::<K, V>,
-            map_decode::<K, V>,
-        ))))
-    }
-    pub fn is_bound(&self) -> bool {
-        matches!(self.0, MapRepr::Bound(_))
-    }
-    pub fn get<Q>(&self, key: &Q) -> Option<&V>
-    where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized + ToOwned<Owned = K>,
-    {
-        match &self.0 {
-            MapRepr::Plain(m) | MapRepr::Promoted(m) => m.get(key),
-            MapRepr::Bound(b) => b.slot(&key.to_owned()).current.as_ref(),
-        }
-    }
-    pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
-    where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized + ToOwned<Owned = K>,
-    {
-        match &mut self.0 {
-            MapRepr::Plain(m) | MapRepr::Promoted(m) => m.get_mut(key),
-            MapRepr::Bound(b) => b.slot_mut(&key.to_owned()).current.as_mut(),
-        }
-    }
-    pub fn contains_key<Q>(&self, key: &Q) -> bool
-    where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized + ToOwned<Owned = K>,
-    {
-        self.get(key).is_some()
-    }
-    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        match &mut self.0 {
-            MapRepr::Plain(m) | MapRepr::Promoted(m) => m.insert(key, value),
-            MapRepr::Bound(b) => b.slot_mut(&key).current.replace(value),
-        }
-    }
-    /// Insert a record the caller has just proven absent (for example a fresh
-    /// sequence-derived identifier); bound containers skip the source read.
-    pub fn insert_new(&mut self, key: K, value: V) {
-        match &mut self.0 {
-            MapRepr::Plain(m) | MapRepr::Promoted(m) => {
-                m.insert(key, value);
-            }
-            MapRepr::Bound(b) => {
-                if lock(&b.cache).contains_key(&key) {
-                    b.slot_mut(&key).current = Some(value);
-                } else {
-                    b.insert_absent(key, value)
-                }
-            }
-        }
-    }
-    pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
-    where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized + ToOwned<Owned = K>,
-    {
-        match &mut self.0 {
-            MapRepr::Plain(m) | MapRepr::Promoted(m) => m.remove(key),
-            MapRepr::Bound(b) => b.slot_mut(&key.to_owned()).current.take(),
-        }
-    }
-    pub fn len(&self) -> usize {
-        match &self.0 {
-            MapRepr::Plain(m) | MapRepr::Promoted(m) => m.len(),
-            MapRepr::Bound(b) => b.len(),
-        }
-    }
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-    pub fn entry(&mut self, key: K) -> Entry<'_, K, V> {
-        Entry { map: self, key }
-    }
-    /// First key strictly after `after` (or the first key) in typed order,
-    /// without materializing the container.
-    pub fn next_key<Q>(&self, after: Option<&Q>) -> Option<K>
-    where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized + ToOwned<Owned = K>,
-    {
-        match &self.0 {
-            MapRepr::Plain(m) | MapRepr::Promoted(m) => match after {
-                Some(a) => m
-                    .range::<Q, _>((std::ops::Bound::Excluded(a), std::ops::Bound::Unbounded))
-                    .next()
-                    .map(|(k, _)| k.clone()),
-                None => m.keys().next().cloned(),
-            },
-            MapRepr::Bound(b) => b.next_after(after.map(|a| a.to_owned()).as_ref()),
-        }
-    }
-    /// [`Self::next_key`] reading one record at a time from a bound source,
-    /// for a caller that needs only the next key (the head of an order), so
-    /// its cost does not depend on how many records follow it.
-    pub fn next_key_by_one<Q>(&self, after: Option<&Q>) -> Option<K>
-    where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized + ToOwned<Owned = K>,
-    {
-        match &self.0 {
-            MapRepr::Bound(b) => b.next_after_paged(after.map(|a| a.to_owned()).as_ref(), 1),
-            _ => self.next_key(after),
-        }
-    }
-    /// Up to `limit` keys strictly after `after`, in typed order.
-    pub fn keys_after<Q>(&self, after: Option<&Q>, limit: usize) -> Vec<K>
-    where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized + ToOwned<Owned = K>,
-    {
-        let mut out: Vec<K> = Vec::new();
-        while out.len() < limit {
-            let next = match out.last() {
-                Some(last) => self.next_key::<K>(Some(last)),
-                None => self.next_key(after),
-            };
-            match next {
-                Some(k) => out.push(k),
-                None => break,
-            }
-        }
-        out
-    }
-    /// Touched records `(key, original canonical bytes, current value)`; `None`
-    /// unless bound (callers then use the complete map).
-    pub fn touched(&self) -> Option<Vec<Touched<K, V>>> {
-        match &self.0 {
-            MapRepr::Bound(b) => Some(b.touched()),
-            _ => None,
-        }
-    }
-    pub fn into_plain(self) -> BTreeMap<K, V> {
-        match self.0 {
-            MapRepr::Plain(m) | MapRepr::Promoted(m) => m,
-            MapRepr::Bound(b) => b.full(Location::caller()),
-        }
-    }
-    fn changes(&mut self) -> Result<ContainerChange, String> {
-        match &mut self.0 {
-            MapRepr::Bound(b) => Ok(ContainerChange::Entries(b.changes()?)),
-            MapRepr::Plain(m) | MapRepr::Promoted(m) => Ok(ContainerChange::Replace(
-                m.iter()
-                    .map(|(k, v)| Ok((k.to_tree(), encode_value(v)?)))
-                    .collect::<Result<_, String>>()?,
-            )),
-        }
-    }
-}
-impl<K: LazyKey, V: Record> Default for LazyMap<K, V> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-impl<K: LazyKey, V: Record> Clone for LazyMap<K, V> {
-    fn clone(&self) -> Self {
-        Self(match &self.0 {
-            MapRepr::Plain(m) => MapRepr::Plain(m.clone()),
-            MapRepr::Promoted(m) => MapRepr::Promoted(m.clone()),
-            MapRepr::Bound(b) => MapRepr::Bound(b.clone()),
-        })
-    }
-}
-impl<K: LazyKey, V: Record + fmt::Debug> fmt::Debug for LazyMap<K, V> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0 {
-            MapRepr::Plain(m) | MapRepr::Promoted(m) => m.fmt(f),
-            MapRepr::Bound(b) => write!(f, "LazyMap({:?})", b.path),
-        }
-    }
-}
-impl<K: LazyKey, V: Record + PartialEq> PartialEq for LazyMap<K, V> {
-    fn eq(&self, other: &Self) -> bool {
-        **self == **other
-    }
-}
-impl<K: LazyKey, V: Record> Deref for LazyMap<K, V> {
-    type Target = BTreeMap<K, V>;
-    #[track_caller]
-    fn deref(&self) -> &BTreeMap<K, V> {
-        match &self.0 {
-            MapRepr::Plain(m) | MapRepr::Promoted(m) => m,
-            MapRepr::Bound(b) => b.view(Location::caller()),
-        }
-    }
-}
-impl<K: LazyKey, V: Record> DerefMut for LazyMap<K, V> {
-    #[track_caller]
-    fn deref_mut(&mut self) -> &mut BTreeMap<K, V> {
-        if let MapRepr::Bound(b) = &self.0 {
-            let full = b.full(Location::caller());
-            self.0 = MapRepr::Promoted(full);
-        }
-        match &mut self.0 {
-            MapRepr::Plain(m) | MapRepr::Promoted(m) => m,
-            MapRepr::Bound(_) => unreachable!(),
-        }
-    }
-}
-impl<K: LazyKey + Borrow<Q>, V: Record, Q: Ord + ?Sized + ToOwned<Owned = K>> Index<&Q>
-    for LazyMap<K, V>
-{
-    type Output = V;
-    fn index(&self, key: &Q) -> &V {
-        self.get(key).expect("no entry found for key")
-    }
-}
-impl<'a, K: LazyKey, V: Record> IntoIterator for &'a LazyMap<K, V> {
-    type Item = (&'a K, &'a V);
-    type IntoIter = std::collections::btree_map::Iter<'a, K, V>;
-    #[track_caller]
-    fn into_iter(self) -> Self::IntoIter {
-        self.deref().iter()
-    }
-}
-impl<'a, K: LazyKey, V: Record> IntoIterator for &'a mut LazyMap<K, V> {
-    type Item = (&'a K, &'a mut V);
-    type IntoIter = std::collections::btree_map::IterMut<'a, K, V>;
-    #[track_caller]
-    fn into_iter(self) -> Self::IntoIter {
-        self.deref_mut().iter_mut()
-    }
-}
-impl<K: LazyKey, V: Record> From<BTreeMap<K, V>> for LazyMap<K, V> {
-    fn from(m: BTreeMap<K, V>) -> Self {
-        Self(MapRepr::Plain(m))
-    }
-}
-impl<K: LazyKey, V: Record> FromIterator<(K, V)> for LazyMap<K, V> {
-    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
-        Self(MapRepr::Plain(iter.into_iter().collect()))
-    }
-}
-impl<K: LazyKey, V: Record> Serialize for LazyMap<K, V> {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        if header_mode() {
-            return BTreeMap::<K, V>::new().serialize(s);
-        }
-        self.deref().serialize(s)
-    }
-}
-impl<'de, K: LazyKey, V: Record> Deserialize<'de> for LazyMap<K, V> {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(Self(MapRepr::Plain(BTreeMap::deserialize(d)?)))
-    }
-}
-pub struct Entry<'a, K: LazyKey, V: Record> {
-    map: &'a mut LazyMap<K, V>,
-    key: K,
-}
-impl<'a, K: LazyKey, V: Record> Entry<'a, K, V> {
-    pub fn and_modify(self, f: impl FnOnce(&mut V)) -> Self {
-        if let Some(v) = self.map.get_mut::<K>(&self.key) {
-            f(v);
-        }
-        self
-    }
-    pub fn or_insert_with(self, f: impl FnOnce() -> V) -> &'a mut V {
-        if !self.map.contains_key::<K>(&self.key) {
-            self.map.insert(self.key.clone(), f());
-        }
-        self.map.get_mut::<K>(&self.key).expect("present")
-    }
-    pub fn or_insert(self, value: V) -> &'a mut V {
-        self.or_insert_with(|| value)
-    }
-    pub fn or_default(self) -> &'a mut V
-    where
-        V: Default,
-    {
-        self.or_insert_with(V::default)
-    }
-}
-
-/// Ordered unique-member array (`BTreeSet` compatible).
-pub struct LazySet<K>(SetRepr<K>);
-enum SetRepr<K> {
-    Plain(BTreeSet<K>),
-    Bound(Box<Bound<K, ()>>, OnceLock<BTreeSet<K>>),
-    Promoted(BTreeSet<K>),
-}
-fn set_encode<K: Serialize>(k: &K, _: &()) -> Result<Vec<u8>, String> {
-    encode_value(k)
-}
-fn set_decode<K>(_: &K, _: &[u8]) -> Result<(), String> {
-    Ok(())
-}
-impl<K: LazyKey> LazySet<K> {
-    pub fn new() -> Self {
-        Self(SetRepr::Plain(BTreeSet::new()))
-    }
-    pub fn bound(source: Arc<dyn RecordSource>, path: ContainerPath) -> Self {
-        Self(SetRepr::Bound(
-            Box::new(Bound::new(source, path, set_encode::<K>, set_decode::<K>)),
-            OnceLock::new(),
-        ))
-    }
-    pub fn contains<Q>(&self, key: &Q) -> bool
-    where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized + ToOwned<Owned = K>,
-    {
-        match &self.0 {
-            SetRepr::Plain(m) | SetRepr::Promoted(m) => m.contains(key),
-            SetRepr::Bound(b, _) => b.slot(&key.to_owned()).current.is_some(),
-        }
-    }
-    pub fn insert(&mut self, key: K) -> bool {
-        match &mut self.0 {
-            SetRepr::Plain(m) | SetRepr::Promoted(m) => m.insert(key),
-            SetRepr::Bound(b, v) => {
-                v.take();
-                b.slot_mut(&key).current.replace(()).is_none()
-            }
-        }
-    }
-    pub fn remove<Q>(&mut self, key: &Q) -> bool
-    where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized + ToOwned<Owned = K>,
-    {
-        match &mut self.0 {
-            SetRepr::Plain(m) | SetRepr::Promoted(m) => m.remove(key),
-            SetRepr::Bound(b, v) => {
-                v.take();
-                b.slot_mut(&key.to_owned()).current.take().is_some()
-            }
-        }
-    }
-    pub fn len(&self) -> usize {
-        match &self.0 {
-            SetRepr::Plain(m) | SetRepr::Promoted(m) => m.len(),
-            SetRepr::Bound(b, _) => b.len(),
-        }
-    }
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-    pub fn next_key<Q>(&self, after: Option<&Q>) -> Option<K>
-    where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized + ToOwned<Owned = K>,
-    {
-        match &self.0 {
-            SetRepr::Plain(m) | SetRepr::Promoted(m) => match after {
-                Some(a) => m
-                    .range::<Q, _>((std::ops::Bound::Excluded(a), std::ops::Bound::Unbounded))
-                    .next()
-                    .cloned(),
-                None => m.iter().next().cloned(),
-            },
-            SetRepr::Bound(b, _) => b.next_after(after.map(|a| a.to_owned()).as_ref()),
-        }
-    }
-    pub fn keys_after<Q>(&self, after: Option<&Q>, limit: usize) -> Vec<K>
-    where
-        K: Borrow<Q>,
-        Q: Ord + ?Sized + ToOwned<Owned = K>,
-    {
-        let mut out: Vec<K> = Vec::new();
-        while out.len() < limit {
-            let next = match out.last() {
-                Some(last) => self.next_key::<K>(Some(last)),
-                None => self.next_key(after),
-            };
-            match next {
-                Some(k) => out.push(k),
-                None => break,
-            }
-        }
-        out
-    }
-    fn changes(&mut self) -> Result<ContainerChange, String> {
-        match &mut self.0 {
-            SetRepr::Bound(b, _) => Ok(ContainerChange::Entries(b.changes()?)),
-            SetRepr::Plain(m) | SetRepr::Promoted(m) => Ok(ContainerChange::Replace(
-                m.iter()
-                    .map(|k| Ok((k.to_tree(), encode_value(k)?)))
-                    .collect::<Result<_, String>>()?,
-            )),
-        }
-    }
-}
-impl<K: LazyKey> Default for LazySet<K> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-impl<K: LazyKey> Clone for LazySet<K> {
-    fn clone(&self) -> Self {
-        Self(match &self.0 {
-            SetRepr::Plain(m) => SetRepr::Plain(m.clone()),
-            SetRepr::Promoted(m) => SetRepr::Promoted(m.clone()),
-            SetRepr::Bound(b, _) => SetRepr::Bound(b.clone(), OnceLock::new()),
-        })
-    }
-}
-impl<K: LazyKey> fmt::Debug for LazySet<K> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0 {
-            SetRepr::Plain(m) | SetRepr::Promoted(m) => m.fmt(f),
-            SetRepr::Bound(b, _) => write!(f, "LazySet({:?})", b.path),
-        }
-    }
-}
-impl<K: LazyKey> PartialEq for LazySet<K> {
-    fn eq(&self, other: &Self) -> bool {
-        **self == **other
-    }
-}
-impl<K: LazyKey> Deref for LazySet<K> {
-    type Target = BTreeSet<K>;
-    #[track_caller]
-    fn deref(&self) -> &BTreeSet<K> {
-        match &self.0 {
-            SetRepr::Plain(m) | SetRepr::Promoted(m) => m,
-            SetRepr::Bound(b, view) => {
-                let at = Location::caller();
-                view.get_or_init(|| b.full(at).into_keys().collect())
-            }
-        }
-    }
-}
-impl<K: LazyKey> DerefMut for LazySet<K> {
-    #[track_caller]
-    fn deref_mut(&mut self) -> &mut BTreeSet<K> {
-        if let SetRepr::Bound(b, _) = &self.0 {
-            let full = b.full(Location::caller()).into_keys().collect();
-            self.0 = SetRepr::Promoted(full);
-        }
-        match &mut self.0 {
-            SetRepr::Plain(m) | SetRepr::Promoted(m) => m,
-            SetRepr::Bound(..) => unreachable!(),
-        }
-    }
-}
-impl<'a, K: LazyKey> IntoIterator for &'a LazySet<K> {
-    type Item = &'a K;
-    type IntoIter = std::collections::btree_set::Iter<'a, K>;
-    #[track_caller]
-    fn into_iter(self) -> Self::IntoIter {
-        self.deref().iter()
-    }
-}
-impl<K: LazyKey> IntoIterator for LazySet<K> {
-    type Item = K;
-    type IntoIter = std::collections::btree_set::IntoIter<K>;
-    #[track_caller]
-    fn into_iter(mut self) -> Self::IntoIter {
-        std::mem::take(self.deref_mut()).into_iter()
-    }
-}
-impl<K: LazyKey> From<BTreeSet<K>> for LazySet<K> {
-    fn from(m: BTreeSet<K>) -> Self {
-        Self(SetRepr::Plain(m))
-    }
-}
-impl<K: LazyKey> FromIterator<K> for LazySet<K> {
-    fn from_iter<I: IntoIterator<Item = K>>(iter: I) -> Self {
-        Self(SetRepr::Plain(iter.into_iter().collect()))
-    }
-}
-impl<K: LazyKey> Serialize for LazySet<K> {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        if header_mode() {
-            return BTreeSet::<K>::new().serialize(s);
-        }
-        self.deref().serialize(s)
-    }
-}
-impl<'de, K: LazyKey> Deserialize<'de> for LazySet<K> {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(Self(SetRepr::Plain(BTreeSet::deserialize(d)?)))
-    }
-}
-
-/// Position-ordered array (`Vec` compatible); physical key is the position.
-/// Bound sequences support append and positional access; any other mutation
-/// (retain, truncate, removal) promotes to a full replacement.
-pub struct LazySeq<T>(SeqRepr<T>);
-enum SeqRepr<T> {
-    Plain(Vec<T>),
-    Bound(Box<Bound<u64, T>>, OnceLock<Vec<T>>),
-    Promoted(Vec<T>),
-}
-impl<T: Record> LazySeq<T> {
-    pub fn new() -> Self {
-        Self(SeqRepr::Plain(Vec::new()))
-    }
-    pub fn bound(source: Arc<dyn RecordSource>, path: ContainerPath) -> Self {
-        Self(SeqRepr::Bound(
-            Box::new(Bound::new(
-                source,
-                path,
-                map_encode::<u64, T>,
-                map_decode::<u64, T>,
-            )),
-            OnceLock::new(),
-        ))
-    }
-    pub fn len(&self) -> usize {
-        match &self.0 {
-            SeqRepr::Plain(v) | SeqRepr::Promoted(v) => v.len(),
-            SeqRepr::Bound(b, _) => b.len(),
-        }
-    }
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-    pub fn push(&mut self, value: T) {
-        match &mut self.0 {
-            SeqRepr::Plain(v) | SeqRepr::Promoted(v) => v.push(value),
-            SeqRepr::Bound(b, view) => {
-                view.take();
-                let at = b.len() as u64;
-                b.insert_absent(at, value);
-            }
-        }
-    }
-    pub fn get(&self, index: usize) -> Option<&T> {
-        match &self.0 {
-            SeqRepr::Plain(v) | SeqRepr::Promoted(v) => v.get(index),
-            SeqRepr::Bound(b, _) => {
-                if index >= b.len() {
-                    return None;
-                }
-                b.slot(&(index as u64)).current.as_ref()
-            }
-        }
-    }
-    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
-        match &mut self.0 {
-            SeqRepr::Plain(v) | SeqRepr::Promoted(v) => v.get_mut(index),
-            SeqRepr::Bound(b, view) => {
-                if index >= b.len() {
-                    return None;
-                }
-                view.take();
-                b.slot_mut(&(index as u64)).current.as_mut()
-            }
-        }
-    }
-    pub fn last(&self) -> Option<&T> {
-        self.len().checked_sub(1).and_then(|i| self.get(i))
-    }
-    fn changes(&mut self) -> Result<ContainerChange, String> {
-        match &mut self.0 {
-            SeqRepr::Bound(b, _) => Ok(ContainerChange::Entries(b.changes()?)),
-            SeqRepr::Plain(v) | SeqRepr::Promoted(v) => Ok(ContainerChange::Replace(
-                v.iter()
-                    .enumerate()
-                    .map(|(i, x)| Ok((TreeKey::U64(i as u64), encode_value(x)?)))
-                    .collect::<Result<_, String>>()?,
-            )),
-        }
-    }
-}
-impl<T: Record> Default for LazySeq<T> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-impl<T: Record> Clone for LazySeq<T> {
-    fn clone(&self) -> Self {
-        Self(match &self.0 {
-            SeqRepr::Plain(v) => SeqRepr::Plain(v.clone()),
-            SeqRepr::Promoted(v) => SeqRepr::Promoted(v.clone()),
-            SeqRepr::Bound(b, _) => SeqRepr::Bound(b.clone(), OnceLock::new()),
-        })
-    }
-}
-impl<T: Record + fmt::Debug> fmt::Debug for LazySeq<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0 {
-            SeqRepr::Plain(v) | SeqRepr::Promoted(v) => v.fmt(f),
-            SeqRepr::Bound(b, _) => write!(f, "LazySeq({:?})", b.path),
-        }
-    }
-}
-impl<T: Record + PartialEq> PartialEq for LazySeq<T> {
-    fn eq(&self, other: &Self) -> bool {
-        **self == **other
-    }
-}
-impl<T: Record> Deref for LazySeq<T> {
-    type Target = Vec<T>;
-    #[track_caller]
-    fn deref(&self) -> &Vec<T> {
-        match &self.0 {
-            SeqRepr::Plain(v) | SeqRepr::Promoted(v) => v,
-            SeqRepr::Bound(b, view) => {
-                let at = Location::caller();
-                view.get_or_init(|| b.full(at).into_values().collect())
-            }
-        }
-    }
-}
-impl<T: Record> DerefMut for LazySeq<T> {
-    #[track_caller]
-    fn deref_mut(&mut self) -> &mut Vec<T> {
-        if let SeqRepr::Bound(b, _) = &self.0 {
-            let full = b.full(Location::caller()).into_values().collect();
-            self.0 = SeqRepr::Promoted(full);
-        }
-        match &mut self.0 {
-            SeqRepr::Plain(v) | SeqRepr::Promoted(v) => v,
-            SeqRepr::Bound(..) => unreachable!(),
-        }
-    }
-}
-impl<T: Record> Index<usize> for LazySeq<T> {
-    type Output = T;
-    fn index(&self, index: usize) -> &T {
-        self.get(index).expect("sequence index out of range")
-    }
-}
-impl<'a, T: Record> IntoIterator for &'a LazySeq<T> {
-    type Item = &'a T;
-    type IntoIter = std::slice::Iter<'a, T>;
-    #[track_caller]
-    fn into_iter(self) -> Self::IntoIter {
-        self.deref().iter()
-    }
-}
-impl<T: Record> From<Vec<T>> for LazySeq<T> {
-    fn from(v: Vec<T>) -> Self {
-        Self(SeqRepr::Plain(v))
-    }
-}
-impl<T: Record> Serialize for LazySeq<T> {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        if header_mode() {
-            return Vec::<T>::new().serialize(s);
-        }
-        self.deref().serialize(s)
-    }
-}
-impl<'de, T: Record> Deserialize<'de> for LazySeq<T> {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(Self(SeqRepr::Plain(Vec::deserialize(d)?)))
-    }
-}
-
 /// One schema-certified lazy container field of the State.
 pub trait LazyField {
     fn shape(&self) -> Shape;
@@ -1145,77 +493,28 @@ pub trait LazyField {
     /// True when a bound field was materialized by a full-container mutation.
     fn promoted(&self) -> bool;
 }
-impl<K: LazyKey, V: Record> LazyField for LazyMap<K, V> {
-    fn shape(&self) -> Shape {
-        Shape::Map(K::KIND)
-    }
-    fn bind_field(&mut self, source: Arc<dyn RecordSource>, field: &'static str) {
-        *self = Self::bound(source, ContainerPath::field(field));
-    }
-    fn field_changes(&mut self, field: &'static str, out: &mut Changes) -> Result<(), String> {
-        out.push((ContainerPath::field(field), self.changes()?));
-        Ok(())
-    }
-    fn promoted(&self) -> bool {
-        matches!(self.0, MapRepr::Promoted(_))
-    }
-}
-impl<K: LazyKey> LazyField for LazySet<K> {
-    fn shape(&self) -> Shape {
-        Shape::Set(K::KIND)
-    }
-    fn bind_field(&mut self, source: Arc<dyn RecordSource>, field: &'static str) {
-        *self = Self::bound(source, ContainerPath::field(field));
-    }
-    fn field_changes(&mut self, field: &'static str, out: &mut Changes) -> Result<(), String> {
-        out.push((ContainerPath::field(field), self.changes()?));
-        Ok(())
-    }
-    fn promoted(&self) -> bool {
-        matches!(self.0, SetRepr::Promoted(_))
-    }
-}
-impl<T: Record> LazyField for LazySeq<T> {
-    fn shape(&self) -> Shape {
-        Shape::Seq
-    }
-    fn bind_field(&mut self, source: Arc<dyn RecordSource>, field: &'static str) {
-        *self = Self::bound(source, ContainerPath::field(field));
-    }
-    fn field_changes(&mut self, field: &'static str, out: &mut Changes) -> Result<(), String> {
-        out.push((ContainerPath::field(field), self.changes()?));
-        Ok(())
-    }
-    fn promoted(&self) -> bool {
-        matches!(self.0, SeqRepr::Promoted(_))
-    }
-}
+pub trait Record: Clone + Serialize + DeserializeOwned + Send + Sync + 'static {}
+impl<T: Clone + Serialize + DeserializeOwned + Send + Sync + 'static> Record for T {}
 
-impl<K: LazyKey, V: Record> IntoIterator for LazyMap<K, V> {
-    type Item = (K, V);
-    type IntoIter = std::collections::btree_map::IntoIter<K, V>;
-    #[track_caller]
-    fn into_iter(mut self) -> Self::IntoIter {
-        std::mem::take(self.deref_mut()).into_iter()
-    }
+fn map_encode<K, V: Serialize>(_: &K, v: &V) -> Result<Vec<u8>, String> {
+    encode_value(v)
 }
-impl<K: LazyKey + Borrow<Q>, V: Record, Q: Ord + ?Sized + ToOwned<Owned = K>> std::ops::IndexMut<&Q>
-    for LazyMap<K, V>
+fn map_decode<K, V: DeserializeOwned>(_: &K, b: &[u8]) -> Result<V, String> {
+    decode_value(b)
+}
+fn keys_after<K: LazyKey, Q: ?Sized>(
+    after: Option<&Q>,
+    limit: usize,
+    mut next: impl FnMut(Option<&Q>) -> Option<K>,
+) -> Vec<K>
+where
+    K: Borrow<Q>,
 {
-    fn index_mut(&mut self, key: &Q) -> &mut V {
-        self.get_mut(key).expect("no entry found for key")
+    let mut out = Vec::new();
+    while out.len() < limit {
+        let cursor = out.last().map(Borrow::borrow).or(after);
+        let Some(key) = next(cursor) else { break };
+        out.push(key);
     }
-}
-impl<T: Record> IntoIterator for LazySeq<T> {
-    type Item = T;
-    type IntoIter = std::vec::IntoIter<T>;
-    #[track_caller]
-    fn into_iter(mut self) -> Self::IntoIter {
-        std::mem::take(self.deref_mut()).into_iter()
-    }
-}
-impl<T: Record> std::ops::IndexMut<usize> for LazySeq<T> {
-    fn index_mut(&mut self, index: usize) -> &mut T {
-        self.get_mut(index).expect("sequence index out of range")
-    }
+    out
 }
