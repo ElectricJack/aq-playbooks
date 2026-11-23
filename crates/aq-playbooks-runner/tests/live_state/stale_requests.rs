@@ -393,12 +393,3 @@ fn at_expiry() -> (
         .unwrap();
     (e, first, accepted)
 }
-
-fn short_windows(e: &Engine<impl Storage>) {
-    e.set_retention_policy(RetentionPolicy {
-        admission_replay_ms: 1_000,
-        event_replay_ms: 1,
-        ..RetentionPolicy::default()
-    })
-    .unwrap();
-}

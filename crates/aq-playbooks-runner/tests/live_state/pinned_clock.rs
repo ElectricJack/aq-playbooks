@@ -16,12 +16,7 @@ fn json(s: &State) -> Value {
 /// 1_000, events max(1, contract 1_000). Real time starts at `NORMAL`.
 fn pinned_clock_is_rebased_and_normal_operation_resumes<S: Storage>(e: &Engine<S>) {
     install_on(e, wait_artifact(), "waiter");
-    e.set_retention_policy(RetentionPolicy {
-        admission_replay_ms: 1_000,
-        event_replay_ms: 1,
-        ..RetentionPolicy::default()
-    })
-    .unwrap();
+    short_windows(e);
     let fixtures = pin(e);
     requests_with_real_time_are_stale(e);
     let (before, pinned_event) = admit_during_pin(e);
