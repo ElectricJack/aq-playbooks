@@ -61,6 +61,11 @@ use std::{
     time::Instant,
 };
 
+#[path = "growth/workload.rs"]
+mod workload;
+use workload::authority;
+pub(crate) use workload::{Bench, RunSample, playbook, serve_run};
+
 pub(crate) const NS: &str = "growth";
 const RUN_SPACING_MS: i64 = 100_000;
 const CHECKPOINTS: [usize; 9] = [1, 50, 100, 200, 500, 1000, 2000, 5000, 10000];
@@ -68,228 +73,6 @@ const STOP_US: u64 = 5_000_000;
 /// Spec 0003 acceptance: 10 s per run, 10-minute windows.
 pub(crate) const STEADY_SPACING_MS: i64 = 10_000;
 pub(crate) const ACCEPTANCE_WINDOW_MS: u64 = 600_000;
-
-fn set(xs: &[&str]) -> BTreeSet<String> {
-    xs.iter().map(|s| s.to_string()).collect()
-}
-pub(crate) fn authority() -> Authority {
-    Authority {
-        actor: "bench".into(),
-        scope: "project".into(),
-        capabilities: set(&["execute"]),
-    }
-}
-fn r(root: &str, path: &[&str]) -> Expr {
-    Expr::Ref {
-        root: root.into(),
-        path: path.iter().map(|s| s.to_string()).collect(),
-    }
-}
-fn ticket_object() -> Expr {
-    Expr::Object {
-        fields: BTreeMap::from([("ticket".into(), r("input", &["ticket"]))]),
-    }
-}
-fn command(name: &str) -> CommandContract {
-    CommandContract {
-        name: name.into(),
-        version: "1".into(),
-        input: Schema::object(BTreeMap::from([("ticket".into(), Schema::string(64))])),
-        outcomes: BTreeMap::from([(
-            "ok".into(),
-            Schema::object(BTreeMap::from([("summary".into(), Schema::string(2048))])),
-        )]),
-        capabilities: set(&["execute"]),
-        scopes: set(&["project"]),
-        effect: Effect::Mutation,
-        recovery: Recovery::KeyedIdempotent,
-        asynchronous: None,
-        cancellation: false,
-        public_result_fields: BTreeSet::new(),
-        sensitive_input_fields: BTreeSet::new(),
-        sensitive_output_fields: BTreeSet::new(),
-        max_payload_bytes: 4096,
-        deadline_ms: 60_000,
-    }
-}
-pub(crate) fn signal_contract() -> EventContract {
-    EventContract {
-        sensitive_payload_fields: BTreeSet::new(),
-        name: "bench.signal".into(),
-        version: "1".into(),
-        payload: Schema::object(BTreeMap::from([("detail".into(), Schema::string(1024))])),
-        trusted_producers: set(&["host"]),
-        scopes: set(&["project"]),
-        correlation_fields: set(&["ticket"]),
-        subject_field: None,
-        revision_field: None,
-        max_payload_bytes: 2048,
-        retention_ms: 60_000,
-    }
-}
-fn cref(c: &CommandContract) -> ContractRef {
-    ContractRef {
-        name: c.name.clone(),
-        fingerprint: c.fingerprint().unwrap(),
-    }
-}
-fn edges(xs: &[(&str, &str)]) -> BTreeMap<String, String> {
-    xs.iter()
-        .map(|(a, b)| (a.to_string(), b.to_string()))
-        .collect()
-}
-pub(crate) fn playbook() -> Artifact {
-    let prepare = command("bench.prepare");
-    let finish = command("bench.finish");
-    let signal = signal_contract();
-    let steps = BTreeMap::from([
-        (
-            "prepare".into(),
-            Step {
-                op: Operation::Invoke {
-                    command: cref(&prepare),
-                    input: ticket_object(),
-                    bind: "prepared".into(),
-                    retry: None,
-                },
-                edges: edges(&[("ok", "await")]),
-                on_error: Some("failed".into()),
-            },
-        ),
-        (
-            "await".into(),
-            Step {
-                op: Operation::Wait {
-                    event: Some(ContractRef {
-                        name: signal.name.clone(),
-                        fingerprint: signal.fingerprint().unwrap(),
-                    }),
-                    correlation: BTreeMap::from([("ticket".into(), r("input", &["ticket"]))]),
-                    minimum_revision: None,
-                    deadline_ms: 60_000,
-                    bind: "signal".into(),
-                },
-                edges: edges(&[("received", "check"), ("timeout", "failed")]),
-                on_error: Some("failed".into()),
-            },
-        ),
-        (
-            "check".into(),
-            Step {
-                op: Operation::Decide {
-                    predicate: Expr::Exists {
-                        value: Box::new(r("prepared", &[])),
-                    },
-                },
-                edges: edges(&[
-                    ("true", "finish"),
-                    ("false", "failed"),
-                    ("unknown", "failed"),
-                ]),
-                on_error: Some("failed".into()),
-            },
-        ),
-        (
-            "finish".into(),
-            Step {
-                op: Operation::Invoke {
-                    command: cref(&finish),
-                    input: ticket_object(),
-                    bind: "finished".into(),
-                    retry: None,
-                },
-                edges: edges(&[("ok", "done")]),
-                on_error: Some("failed".into()),
-            },
-        ),
-        (
-            "done".into(),
-            Step {
-                op: Operation::Return {
-                    outcome: "ok".into(),
-                    output: ticket_object(),
-                },
-                edges: BTreeMap::new(),
-                on_error: None,
-            },
-        ),
-        (
-            "failed".into(),
-            Step {
-                op: Operation::Return {
-                    outcome: "error".into(),
-                    output: Expr::literal(Value::Null),
-                },
-                edges: BTreeMap::new(),
-                on_error: None,
-            },
-        ),
-    ]);
-    Artifact::seal(ArtifactContent {
-        format_version: 1,
-        compiler: "engine-growth-bench".into(),
-        source: SourceBinding {
-            digest: hash_bytes(b"engine-growth-bench"),
-            header: SourceHeader {
-                format_version: 1,
-                id: "growth".into(),
-                scope: "project".into(),
-                interfaces: set(&["main"]),
-                definitions: BTreeSet::new(),
-            },
-        },
-        playbook: Playbook {
-            id: "growth".into(),
-            purpose: "engine growth measurement".into(),
-            scope: "project".into(),
-            entries: BTreeMap::from([(
-                "main".into(),
-                EntryPoint {
-                    input: Schema::object(BTreeMap::from([("ticket".into(), Schema::string(64))])),
-                    outcomes: BTreeMap::from([
-                        (
-                            "ok".into(),
-                            Schema::object(BTreeMap::from([("ticket".into(), Schema::string(64))])),
-                        ),
-                        ("error".into(), Schema::Null),
-                    ]),
-                    start: "prepare".into(),
-                },
-            )]),
-            steps,
-            triggers: vec![],
-            limits: Limits::default(),
-            required_capabilities: set(&["execute"]),
-        },
-        registry: Registry {
-            commands: BTreeMap::from([
-                (prepare.name.clone(), prepare),
-                (finish.name.clone(), finish),
-            ]),
-            events: BTreeMap::from([(signal.name.clone(), signal)]),
-        },
-        dependencies: BTreeMap::new(),
-        definitions: BTreeMap::new(),
-        source_map: BTreeMap::new(),
-    })
-    .unwrap()
-}
-
-pub(crate) struct BenchHost;
-impl Host for BenchHost {
-    fn authorize(&self, a: &Authority, c: &CommandContract) -> bool {
-        c.capabilities.is_subset(&a.capabilities) && c.scopes.contains(&a.scope)
-    }
-    fn dispatch(&mut self, i: &Intent) -> DispatchResult {
-        DispatchResult::Completed {
-            outcome: "ok".into(),
-            output: json!({"summary": format!("{} handled {}", i.command.name, "s".repeat(400))}),
-        }
-    }
-    fn reconcile(&mut self, i: &Intent) -> DispatchResult {
-        self.dispatch(i)
-    }
-}
 
 #[derive(Clone, Debug)]
 pub(crate) struct Sample {
@@ -701,8 +484,10 @@ fn breakdown(state: &State) -> Value {
     let mut out = serde_json::Map::new();
     for (k, f) in v.as_object().unwrap() {
         out.insert(k.clone(), json!([len(f), count(f)]));
-        if (k == "retention" || k == "indexes") && f.is_object() {
-            for (sk, sf) in f.as_object().unwrap() {
+        if matches!(k.as_str(), "retention" | "indexes")
+            && let Some(fields) = f.as_object()
+        {
+            for (sk, sf) in fields {
                 out.insert(format!("{k}.{sk}"), json!([len(sf), count(sf)]));
             }
         }
@@ -730,90 +515,6 @@ fn median(v: &mut [u64]) -> f64 {
     }
 }
 
-/// What serving a run needs of the namespace.
-pub(crate) struct Bench<'a> {
-    pub(crate) e: &'a Engine<Measured>,
-    pub(crate) activation_revision: u64,
-    /// Prefix of admission keys, tickets and event ids.
-    pub(crate) prefix: String,
-    /// Pass the producer's request time (`admit_once_at`, `admit_event_at`).
-    pub(crate) timed: bool,
-}
-
-/// Serves run `k` from its admission at `now` to completion, each
-/// transition `step` ms after the last. Returns the run id and the time of
-/// its last transition.
-pub(crate) fn serve_run(
-    b: &Bench,
-    host: &mut BenchHost,
-    k: usize,
-    mut now: i64,
-    step: i64,
-) -> (String, i64) {
-    let (e, prefix) = (b.e, &b.prefix);
-    let ticket = format!("{prefix}ticket-{k:06}");
-    // Keyed admission, as aq-server's host uses (`admit_once`).
-    let id = e
-        .admit_once_at(
-            KeyedAdmissionRequest {
-                key: format!("{prefix}admission-{k:06}"),
-                binding: "growth".into(),
-                expected_activation_revision: b.activation_revision,
-                entry: "main".into(),
-                input: json!({"ticket": ticket}),
-                authority: authority(),
-            },
-            b.timed.then_some(now),
-            now,
-        )
-        .unwrap()
-        .receipt
-        .run_id;
-    let mut guard = 0;
-    loop {
-        now += step;
-        guard += 1;
-        if e.drive(host, now, 1).unwrap() == 0 || guard > 40 {
-            break;
-        }
-    }
-    now += step;
-    let c = signal_contract();
-    let d = e
-        .admit_event_at(
-            "host",
-            EventEnvelope {
-                producer: "host".into(),
-                event_id: format!("{prefix}signal-{k:06}"),
-                contract: ContractRef {
-                    name: c.name.clone(),
-                    fingerprint: c.fingerprint().unwrap(),
-                },
-                scope: "project".into(),
-                correlation: BTreeMap::from([("ticket".into(), ticket.clone())]),
-                subject: None,
-                revision: None,
-                causation: None,
-                occurred_at_ms: Some(now),
-                observed_at_ms: None,
-                payload: json!({"detail": "d".repeat(256)}),
-            },
-            0,
-            b.timed.then_some(now),
-            now,
-        )
-        .unwrap();
-    assert!(!d.duplicate);
-    loop {
-        now += step;
-        guard += 1;
-        if e.drive(host, now, 1).unwrap() == 0 || guard > 80 {
-            break;
-        }
-    }
-    (id, now)
-}
-
 /// Every item of a `Runs` inspection, paged 1,000 at a time.
 pub(crate) fn all_runs<S: Storage>(e: &Engine<S>) -> Vec<Value> {
     let mut items = vec![];
@@ -833,6 +534,27 @@ pub(crate) fn all_runs<S: Storage>(e: &Engine<S>) -> Vec<Value> {
             None => return items,
         }
     }
+}
+
+fn run_status(e: &Engine<Measured>, state: &State, id: &str) -> Option<String> {
+    // A finished run has left the State (spec 0003): read its
+    // public projection from run history.
+    state
+        .runs
+        .get(id)
+        .map(|r| format!("{:?}/{:?}", r.status, r.outcome))
+        .or_else(|| {
+            e.inspect(&InspectionQuery {
+                kind: InspectionKind::Runs,
+                run: Some(id.to_string()),
+                after: None,
+                limit: 1,
+            })
+            .unwrap()
+            .items
+            .first()
+            .map(|r| format!("history:{}/{}", r["status"], r["outcome"]))
+        })
 }
 
 /// What a checkpoint measured, for the verdicts.
@@ -863,19 +585,12 @@ struct Measurement {
 impl Measurement {
     /// Serves run `k` at `now`, prints its `run` line and, at a checkpoint
     /// (or when `checkpoint`), its `checkpoint` line.
-    fn run(
-        &mut self,
-        b: &Bench,
-        host: &mut BenchHost,
-        k: usize,
-        now: i64,
-        step: i64,
-        checkpoint: bool,
-    ) {
+    fn run(&mut self, b: &Bench, sample: RunSample, checkpoint: bool) {
+        let k = sample.number;
         let e = b.e;
         let run_started = Instant::now();
         let wal0 = e.store.lsn();
-        let (id, mut now) = serve_run(b, host, k, now, step);
+        let (id, mut now) = serve_run(b, sample);
         e.store.close_unchanged();
         let run_wall_us = run_started.elapsed().as_micros() as u64;
         let wal_run = e.store.lsn() - wal0;
@@ -947,24 +662,7 @@ impl Measurement {
         let wal_med = median(&mut wal);
         let wal_max = wal.iter().copied().max().unwrap_or(0);
         let state = e.snapshot().unwrap();
-        // A finished run has left the State (spec 0003): read its
-        // public projection from run history.
-        let status = state
-            .runs
-            .get(id)
-            .map(|r| format!("{:?}/{:?}", r.status, r.outcome))
-            .or_else(|| {
-                e.inspect(&InspectionQuery {
-                    kind: InspectionKind::Runs,
-                    run: Some(id.to_string()),
-                    after: None,
-                    limit: 1,
-                })
-                .unwrap()
-                .items
-                .first()
-                .map(|r| format!("history:{}/{}", r["status"], r["outcome"]))
-            });
+        let status = run_status(e, &state, id);
         let completed = state
             .runs
             .values()
@@ -1034,190 +732,273 @@ fn history_verdict(e: &Engine<Measured>, ids: &[String], history_keep: u64) -> V
            "captured_runs":captured.len(),"live_runs":live,"history_keep":history_keep})
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let mode = args[1].as_str();
-    let runs: usize = args[2].parse().unwrap();
-    let url = &args[3];
-    let acceptance = matches!(mode, "steady" | "burst");
-    let config = if acceptance { "a" } else { mode };
-    let spacing: i64 = match mode {
-        "steady" => STEADY_SPACING_MS,
-        "burst" => 0,
-        _ => args.get(4).map_or(RUN_SPACING_MS, |v| v.parse().unwrap()),
-    };
-    let window_ms: Option<u64> = if acceptance {
-        Some(ACCEPTANCE_WINDOW_MS)
-    } else {
-        args.get(5).map(|v| v.parse().unwrap())
-    };
-    // A frozen clock does not step within a run either.
-    let step: i64 = if spacing == 0 { 0 } else { 10 };
-    let protected = matches!(config, "a" | "e");
-    let records = matches!(config, "c" | "d");
-    let gc = matches!(config, "d" | "e");
-    let inner = if protected {
-        let keyring = ProtectionKeyring::new(
-            "bench-key",
-            BTreeMap::from([("bench-key".to_string(), [7u8; 32])]),
-        )
-        .unwrap();
-        PostgresStorage::connect_protected(url, keyring).unwrap()
-    } else if records {
-        PostgresStorage::connect_records(url).unwrap()
-    } else {
-        PostgresStorage::connect(url).unwrap()
-    };
-    let env = |name: &str| std::env::var(name).ok();
-    let prefix = env("ENGINE_GROWTH_KEY_PREFIX").unwrap_or_default();
-    let start_ms: i64 = env("ENGINE_GROWTH_START_MS").map_or(0, |v| v.parse().unwrap());
-    let history_keep: Option<u64> = env("ENGINE_GROWTH_HISTORY_KEEP").map(|v| v.parse().unwrap());
-    let store = Measured::new(
-        inner,
-        url,
-        env("ENGINE_GROWTH_COMMIT_LOG").map_or(0, |v| v.parse().unwrap()),
-    );
-    let e = Engine::new(store, NS, "bench-owner").unwrap();
-    let a = playbook();
-    let digest = a.digest.clone();
-    e.install(a).unwrap();
-    e.activate_at("growth", &digest, authority(), 0).unwrap();
-    if gc {
-        e.set_retention_policy(RetentionPolicy {
-            event_replay_ms: 1,
-            terminal_run_ms: 1,
-            audit_ms: 1,
-            max_tombstones: 100_000,
-            ..RetentionPolicy::default()
-        })
-        .unwrap();
-    }
-    if window_ms.is_some() || history_keep.is_some() {
-        let mut policy = e.snapshot().unwrap().retention.policy;
-        if let Some(window_ms) = window_ms {
-            policy.event_replay_ms = window_ms;
-            policy.admission_replay_ms = window_ms;
-        }
-        if let Some(keep) = history_keep {
-            policy.history_keep = keep;
-        }
-        e.set_retention_policy(policy).unwrap();
-    }
-    let policy = e.snapshot().unwrap().retention.policy;
-    let format: i32 = e
-        .store
-        .monitor
-        .lock()
-        .unwrap()
-        .query_one(
-            "SELECT writer_format FROM aq_playbooks.namespaces WHERE namespace=$1",
-            &[&NS],
-        )
-        .unwrap()
-        .get(0);
-    println!(
-        "{}",
-        json!({"kind":"setup","mode":mode,"config":config,"protected":protected,"records":records,"gc":gc,
-               "run_spacing_ms":spacing,"window_ms":window_ms,"timed_requests":acceptance,
-               "policy":policy,
-               "writer_format":format,"transition_v1_support":e.store.transition_v1_support(NS).unwrap(),
-               "artifact_bytes": canonical_bytes(&e.snapshot().unwrap().artifacts[&digest]).unwrap().len(),
-               "setup": sizes(&e.store.monitor)})
-    );
-    let bench = Bench {
-        e: &e,
-        activation_revision: e.snapshot().unwrap().bindings["growth"].revision,
-        prefix,
-        timed: acceptance,
-    };
-    e.store.drain();
-    let mut host = BenchHost;
-    let mut b = Measurement {
-        config: config.to_string(),
-        phase: mode.to_string(),
-        gc,
-        window: vec![],
-        gc_calls: vec![],
-        marks: BTreeMap::new(),
-        ids: vec![],
-        started: Instant::now(),
-        stopped: None,
-    };
-    for k in 1..=runs {
-        let now = start_ms + k as i64 * spacing;
-        b.run(&bench, &mut host, k, now, step, k == runs);
-        if b.stopped.is_some() {
-            break;
+struct Experiment {
+    mode: String,
+    config: String,
+    url: String,
+    runs: usize,
+    acceptance: bool,
+    spacing: i64,
+    step: i64,
+    protected: bool,
+    records: bool,
+    gc: bool,
+    window_ms: Option<u64>,
+    history_keep: Option<u64>,
+    prefix: String,
+    start_ms: i64,
+    commit_log: u64,
+}
+impl Experiment {
+    fn from_args(args: &[String]) -> Self {
+        let mode = args[1].as_str();
+        let runs: usize = args[2].parse().unwrap();
+        let url = &args[3];
+        let acceptance = matches!(mode, "steady" | "burst");
+        let config = if acceptance { "a" } else { mode };
+        let spacing: i64 = match mode {
+            "steady" => STEADY_SPACING_MS,
+            "burst" => 0,
+            _ => args.get(4).map_or(RUN_SPACING_MS, |v| v.parse().unwrap()),
+        };
+        let window_ms: Option<u64> = if acceptance {
+            Some(ACCEPTANCE_WINDOW_MS)
+        } else {
+            args.get(5).map(|v| v.parse().unwrap())
+        };
+        // A frozen clock does not step within a run either.
+        let step: i64 = if spacing == 0 { 0 } else { 10 };
+        let protected = matches!(config, "a" | "e");
+        let records = matches!(config, "c" | "d");
+        let gc = matches!(config, "d" | "e");
+        let env = |name: &str| std::env::var(name).ok();
+        let prefix = env("ENGINE_GROWTH_KEY_PREFIX").unwrap_or_default();
+        let start_ms: i64 = env("ENGINE_GROWTH_START_MS").map_or(0, |v| v.parse().unwrap());
+        let history_keep: Option<u64> =
+            env("ENGINE_GROWTH_HISTORY_KEEP").map(|v| v.parse().unwrap());
+        Self {
+            mode: mode.into(),
+            config: config.into(),
+            url: url.to_string(),
+            runs,
+            acceptance,
+            spacing,
+            step,
+            protected,
+            records,
+            gc,
+            window_ms,
+            history_keep,
+            prefix,
+            start_ms,
+            commit_log: env("ENGINE_GROWTH_COMMIT_LOG").map_or(0, |v| v.parse().unwrap()),
         }
     }
-    let completed = b.stopped.is_none();
-    if mode == "steady" && completed {
-        let (at200, at2000, last) = (b.marks.get(&200), b.marks.get(&2000), b.marks[&runs]);
-        let bytes_ratio = at200.map(|m| last.total_bytes as f64 / m.total_bytes as f64);
-        let median_ratio = at200.map(|m| last.median_us / m.median_us);
-        let disk_ratio = at2000.map(|m| last.namespaces_disk as f64 / m.namespaces_disk as f64);
-        let pass = bytes_ratio.is_some_and(|r| r <= 1.2)
-            && median_ratio.is_some_and(|r| r <= 1.2)
-            && disk_ratio.is_none_or(|r| r <= 3.0);
+    fn connect(&self) -> PostgresStorage {
+        if self.protected {
+            let keyring = ProtectionKeyring::new(
+                "bench-key",
+                BTreeMap::from([("bench-key".to_string(), [7u8; 32])]),
+            )
+            .unwrap();
+            PostgresStorage::connect_protected(&self.url, keyring).unwrap()
+        } else if self.records {
+            PostgresStorage::connect_records(&self.url).unwrap()
+        } else {
+            PostgresStorage::connect(&self.url).unwrap()
+        }
+    }
+    fn policy(&self, e: &Engine<Measured>) -> RetentionPolicy {
+        if self.gc {
+            e.set_retention_policy(RetentionPolicy {
+                event_replay_ms: 1,
+                terminal_run_ms: 1,
+                audit_ms: 1,
+                max_tombstones: 100_000,
+                ..RetentionPolicy::default()
+            })
+            .unwrap();
+        }
+        if self.window_ms.is_some() || self.history_keep.is_some() {
+            let mut policy = e.snapshot().unwrap().retention.policy;
+            if let Some(window_ms) = self.window_ms {
+                policy.event_replay_ms = window_ms;
+                policy.admission_replay_ms = window_ms;
+            }
+            if let Some(keep) = self.history_keep {
+                policy.history_keep = keep;
+            }
+            e.set_retention_policy(policy).unwrap();
+        }
+        e.snapshot().unwrap().retention.policy
+    }
+    fn print_setup(&self, e: &Engine<Measured>, digest: &str, policy: &RetentionPolicy) {
+        let format: i32 = e
+            .store
+            .monitor
+            .lock()
+            .unwrap()
+            .query_one(
+                "SELECT writer_format FROM aq_playbooks.namespaces WHERE namespace=$1",
+                &[&NS],
+            )
+            .unwrap()
+            .get(0);
         println!(
             "{}",
-            json!({"kind":"verdict","acceptance":1,"pass":pass,"runs":runs,
+            json!({"kind":"setup","mode":self.mode,"config":self.config,"protected":self.protected,"records":self.records,"gc":self.gc,
+               "run_spacing_ms":self.spacing,"window_ms":self.window_ms,"timed_requests":self.acceptance,
+               "policy":policy,
+               "writer_format":format,"transition_v1_support":e.store.transition_v1_support(NS).unwrap(),
+               "artifact_bytes": canonical_bytes(&e.snapshot().unwrap().artifacts[digest]).unwrap().len(),
+               "setup": sizes(&e.store.monitor)})
+        );
+    }
+    fn measurement(&self) -> Measurement {
+        Measurement {
+            config: self.config.clone(),
+            phase: self.mode.clone(),
+            gc: self.gc,
+            window: vec![],
+            gc_calls: vec![],
+            marks: BTreeMap::new(),
+            ids: vec![],
+            started: Instant::now(),
+            stopped: None,
+        }
+    }
+    fn measure_runs(&self, bench: &Bench, b: &mut Measurement) {
+        for k in 1..=self.runs {
+            let now = self.start_ms + k as i64 * self.spacing;
+            b.run(
+                bench,
+                RunSample {
+                    number: k,
+                    at_ms: now,
+                    step_ms: self.step,
+                },
+                k == self.runs,
+            );
+            if b.stopped.is_some() {
+                break;
+            }
+        }
+    }
+    fn execute(&self) {
+        let store = Measured::new(self.connect(), &self.url, self.commit_log);
+        let e = Engine::new(store, NS, "bench-owner").unwrap();
+        let a = playbook();
+        let digest = a.digest.clone();
+        e.install(a).unwrap();
+        e.activate_at("growth", &digest, authority(), 0).unwrap();
+        let policy = self.policy(&e);
+        self.print_setup(&e, &digest, &policy);
+        let bench = Bench {
+            e: &e,
+            activation_revision: e.snapshot().unwrap().bindings["growth"].revision,
+            prefix: self.prefix.clone(),
+            timed: self.acceptance,
+        };
+        e.store.drain();
+        let mut b = self.measurement();
+        self.measure_runs(&bench, &mut b);
+        if b.stopped.is_none() {
+            match self.mode.as_str() {
+                "steady" => steady_verdict(&b, self.runs),
+                "burst" => burst_verdict(&mut b, &bench, self, policy.replay_keep),
+                _ => (),
+            }
+            if self.acceptance {
+                println!("{}", history_verdict(&e, &b.ids, policy.history_keep));
+            }
+        }
+        println!(
+            "{}",
+            json!({"kind":"done","mode":self.mode,"config":self.config,"stopped_early_at_run":b.stopped,
+               "elapsed_s": b.started.elapsed().as_secs_f64()})
+        );
+    }
+}
+fn steady_verdict(b: &Measurement, runs: usize) {
+    let (at200, at2000, last) = (b.marks.get(&200), b.marks.get(&2000), b.marks[&runs]);
+    let bytes_ratio = at200.map(|m| last.total_bytes as f64 / m.total_bytes as f64);
+    let median_ratio = at200.map(|m| last.median_us / m.median_us);
+    let disk_ratio = at2000.map(|m| last.namespaces_disk as f64 / m.namespaces_disk as f64);
+    let pass = bytes_ratio.is_some_and(|r| r <= 1.2)
+        && median_ratio.is_some_and(|r| r <= 1.2)
+        && disk_ratio.is_none_or(|r| r <= 3.0);
+    println!(
+        "{}",
+        json!({"kind":"verdict","acceptance":1,"pass":pass,"runs":runs,
                    "record_bytes_at_200":at200.map(|m| m.total_bytes),"record_bytes_last":last.total_bytes,
                    "record_ratio":bytes_ratio,
                    "median_us_at_200":at200.map(|m| m.median_us),"median_us_last":last.median_us,
                    "median_ratio":median_ratio,
                    "namespaces_disk_at_2000":at2000.map(|m| m.namespaces_disk),
                    "namespaces_disk_last":last.namespaces_disk,"namespaces_disk_ratio":disk_ratio})
-        );
-    }
-    if mode == "burst" && completed {
-        let s = e.snapshot().unwrap();
-        let left = json!({"runs":s.runs.len(),"intents":s.intents.len(),"waits":s.waits.len(),
+    );
+}
+fn burst_verdict(b: &mut Measurement, bench: &Bench, experiment: &Experiment, replay_keep: usize) {
+    let e = bench.e;
+    let runs = experiment.runs;
+    let start_ms = experiment.start_ms;
+    let s = e.snapshot().unwrap();
+    let left = json!({"runs":s.runs.len(),"intents":s.intents.len(),"waits":s.waits.len(),
                           "budgets":s.budgets.len(),"events":s.events.len(),
                           "keyed_admissions":s.keyed_admissions.len(),
                           "replay_order":s.retention.replay_order.len(),
                           "replay_held":s.retention.replay_held.len(),
                           "expiry":s.retention.expiry.len()});
-        let nothing_live =
-            s.runs.is_empty() && s.intents.is_empty() && s.waits.is_empty() && s.budgets.is_empty();
-        let order_bounded = s.retention.replay_order.len() <= policy.replay_keep;
-        drop(s);
-        let (first, last) = (b.marks[&1], b.marks[&runs]);
-        let per_run = (last.total_bytes - first.total_bytes) as f64 / (runs.max(2) - 1) as f64;
-        // NR-2 (plan "Spec check"): move the clock past the window and
-        // complete 20 runs at that frozen clock; they drain the burst. That
-        // record is the literal "after 20" figure.
-        let past = ACCEPTANCE_WINDOW_MS as i64 + STEADY_SPACING_MS;
-        let t1 = start_ms + past;
-        b.phase = "drain_frozen".into();
-        for j in 1..=20 {
-            b.run(&bench, &mut host, runs + j, t1, 0, j == 20);
-        }
-        let literal = b.marks[&(runs + 20)];
-        // Then once more past the window, one more run: compared with run 1.
-        b.phase = "after_drain".into();
-        b.run(&bench, &mut host, runs + 21, t1 + past, 0, true);
-        let nr2 = b.marks[&(runs + 21)];
-        let nr2_ratio = nr2.total_bytes as f64 / first.total_bytes as f64;
-        let pass = per_run <= 2048.0 && nothing_live && order_bounded && nr2_ratio <= 1.2;
-        println!(
-            "{}",
-            json!({"kind":"verdict","acceptance":2,"pass":pass,"runs":runs,
+    let nothing_live =
+        s.runs.is_empty() && s.intents.is_empty() && s.waits.is_empty() && s.budgets.is_empty();
+    let order_bounded = s.retention.replay_order.len() <= replay_keep;
+    drop(s);
+    let (first, last) = (b.marks[&1], b.marks[&runs]);
+    let per_run = (last.total_bytes - first.total_bytes) as f64 / (runs.max(2) - 1) as f64;
+    // NR-2 (plan "Spec check"): move the clock past the window and
+    // complete 20 runs at that frozen clock; they drain the burst. That
+    // record is the literal "after 20" figure.
+    let past = ACCEPTANCE_WINDOW_MS as i64 + STEADY_SPACING_MS;
+    let t1 = start_ms + past;
+    b.phase = "drain_frozen".into();
+    for j in 1..=20 {
+        b.run(
+            bench,
+            RunSample {
+                number: runs + j,
+                at_ms: t1,
+                step_ms: 0,
+            },
+            j == 20,
+        );
+    }
+    let literal = b.marks[&(runs + 20)];
+    // Then once more past the window, one more run: compared with run 1.
+    b.phase = "after_drain".into();
+    b.run(
+        bench,
+        RunSample {
+            number: runs + 21,
+            at_ms: t1 + past,
+            step_ms: 0,
+        },
+        true,
+    );
+    let nr2 = b.marks[&(runs + 21)];
+    let nr2_ratio = nr2.total_bytes as f64 / first.total_bytes as f64;
+    let pass = per_run <= 2048.0 && nothing_live && order_bounded && nr2_ratio <= 1.2;
+    println!(
+        "{}",
+        json!({"kind":"verdict","acceptance":2,"pass":pass,"runs":runs,
                    "record_bytes_at_1":first.total_bytes,"record_bytes_at_burst_end":last.total_bytes,
                    "growth_per_run_bytes":per_run,"left_after_burst":left,"nothing_live_left":nothing_live,
-                   "replay_order_within_replay_keep":order_bounded,"replay_keep":policy.replay_keep,
+                   "replay_order_within_replay_keep":order_bounded,"replay_keep":replay_keep,
                    "nr2_record_bytes":nr2.total_bytes,"nr2_ratio":nr2_ratio,
                    "literal_after_20_record_bytes":literal.total_bytes,
                    "literal_after_20_ratio":literal.total_bytes as f64 / first.total_bytes as f64,
                    "median_us_at_1":first.median_us,"median_us_at_burst_end":last.median_us})
-        );
-    }
-    if acceptance && completed {
-        println!("{}", history_verdict(&e, &b.ids, policy.history_keep));
-    }
-    println!(
-        "{}",
-        json!({"kind":"done","mode":mode,"config":config,"stopped_early_at_run":b.stopped,
-               "elapsed_s": b.started.elapsed().as_secs_f64()})
     );
+}
+fn main() {
+    Experiment::from_args(&std::env::args().collect::<Vec<_>>()).execute();
 }
