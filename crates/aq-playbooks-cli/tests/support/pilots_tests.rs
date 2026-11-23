@@ -14,8 +14,7 @@ fn catalog_v2_async_judgment_and_check_compile_and_join() {
         (
             "judgment".into(),
             invoke(
-                &r,
-                "judgment.request",
+                &r.commands["judgment.request"],
                 lit(replay_input("judgment.request")),
                 "judgment",
                 &[("accepted", "check")],
@@ -24,8 +23,7 @@ fn catalog_v2_async_judgment_and_check_compile_and_join() {
         (
             "check".into(),
             invoke(
-                &r,
-                "check.request",
+                &r.commands["check.request"],
                 lit(replay_input("check.request")),
                 "check",
                 &[("accepted", "wait")],
@@ -55,11 +53,13 @@ fn catalog_v2_async_judgment_and_check_compile_and_join() {
         ("done".into(), ret("success", lit(Value::Null))),
     ]);
     let artifact = build(
-        "v2-adapters",
+        PilotSpec {
+            id: "v2-adapters",
+            input: Schema::Null,
+            output: Schema::Null,
+            start: "judgment",
+        },
         r,
-        Schema::Null,
-        Schema::Null,
-        "judgment",
         steps,
         &[],
     )
@@ -92,8 +92,7 @@ fn prepared_source_check(r: Registry) -> anyhow::Result<Artifact> {
         (
             "prepare".into(),
             invoke(
-                &r,
-                "candidate.prepare",
+                &r.commands["candidate.prepare"],
                 lit(json!({"base": subject_value(), "sources": [subject_value()]})),
                 "candidate",
                 &[("prepared", "check")],
@@ -102,8 +101,7 @@ fn prepared_source_check(r: Registry) -> anyhow::Result<Artifact> {
         (
             "check".into(),
             invoke(
-                &r,
-                "check.request",
+                &r.commands["check.request"],
                 fields(&[
                     ("subject", reference("candidate", &["subject"])),
                     ("check", lit(check)),
@@ -116,11 +114,13 @@ fn prepared_source_check(r: Registry) -> anyhow::Result<Artifact> {
         ("done".into(), ret("success", lit(Value::Null))),
     ]);
     build(
-        "prepared-source-check",
+        PilotSpec {
+            id: "prepared-source-check",
+            input: Schema::Null,
+            output: Schema::Null,
+            start: "prepare",
+        },
         r,
-        Schema::Null,
-        Schema::Null,
-        "prepare",
         steps,
         &[],
     )

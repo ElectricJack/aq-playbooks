@@ -49,18 +49,11 @@ pub fn ret(outcome: &str, output: Expr) -> Step {
         on_error: None,
     }
 }
-pub fn invoke(
-    registry: &Registry,
-    name: &str,
-    input: Expr,
-    bind: &str,
-    success: &[(&str, &str)],
-) -> Step {
-    let c = &registry.commands[name];
+pub fn invoke(c: &CommandContract, input: Expr, bind: &str, success: &[(&str, &str)]) -> Step {
     let mut s = edge(
         Operation::Invoke {
             command: ContractRef {
-                name: name.into(),
+                name: c.name.clone(),
                 fingerprint: c.fingerprint().unwrap(),
             },
             input,
@@ -77,132 +70,18 @@ pub fn invoke(
     }
     s
 }
-fn call(name: &str, input: Expr, mode: CallMode, bind: &str, edges: &[(&str, &str)]) -> Step {
-    edge(
-        Operation::Call {
-            dependency: name.into(),
-            entry: "main".into(),
-            input,
-            mode,
-            bind: bind.into(),
-        },
-        edges,
-    )
-}
-pub fn build(
-    id: &str,
-    registry: Registry,
-    input: Schema,
-    output: Schema,
-    start: &str,
-    mut steps: BTreeMap<String, Step>,
-    children: &[(&str, &Artifact)],
-) -> anyhow::Result<Artifact> {
-    let mut registry = registry;
-    let mut commands = BTreeSet::new();
-    let mut events = BTreeSet::new();
-    for step in steps.values() {
-        match &step.op {
-            Operation::Invoke { command, .. } => {
-                commands.insert(command.name.clone());
-            }
-            Operation::Wait {
-                event: Some(event), ..
-            } => {
-                events.insert(event.name.clone());
-            }
-            _ => {}
-        }
+fn child_call(name: &str, input: Expr, mode: CallMode, bind: &str) -> Operation {
+    Operation::Call {
+        dependency: name.into(),
+        entry: "main".into(),
+        input,
+        mode,
+        bind: bind.into(),
     }
-    for name in commands.clone() {
-        if let Some(asynchronous) = &registry.commands[&name].asynchronous {
-            commands.insert(asynchronous.reconciliation_command.clone());
-            events.insert(asynchronous.completion_event.clone());
-        }
-    }
-    registry.commands.retain(|name, _| commands.contains(name));
-    registry.events.retain(|name, _| events.contains(name));
-    steps
-        .entry("failure".into())
-        .or_insert_with(|| ret("escalated", lit(Value::Null)));
-    let caps = registry
-        .commands
-        .values()
-        .flat_map(|c| c.capabilities.clone())
-        .chain(
-            children
-                .iter()
-                .flat_map(|(_, c)| c.content.playbook.required_capabilities.clone()),
-        )
-        .collect();
-    let playbook = Playbook {
-        id: id.into(),
-        purpose: format!("Synthetic {id} pilot"),
-        scope: "project".into(),
-        entries: BTreeMap::from([(
-            "main".into(),
-            EntryPoint {
-                input,
-                outcomes: BTreeMap::from([
-                    ("success".into(), output),
-                    ("escalated".into(), Schema::Null),
-                ]),
-                start: start.into(),
-            },
-        )]),
-        steps,
-        triggers: vec![],
-        limits: Limits::default(),
-        required_capabilities: caps,
-    };
-    let header = SourceHeader {
-        format_version: 1,
-        id: id.into(),
-        scope: "project".into(),
-        interfaces: strings(&["main"]),
-        definitions: BTreeSet::new(),
-    };
-    let dependencies = children
-        .iter()
-        .map(|(name, a)| {
-            (
-                (*name).into(),
-                CallableDependency {
-                    selection: DependencySelection::Exact,
-                    binding: (*name).into(),
-                    artifact: a.digest.clone(),
-                    interfaces: a.content.playbook.entries.clone(),
-                    capabilities: a.content.playbook.required_capabilities.clone(),
-                    scope: "project".into(),
-                    dependencies: a
-                        .content
-                        .dependencies
-                        .values()
-                        .flat_map(|d| {
-                            std::iter::once(d.artifact.clone()).chain(d.dependencies.clone())
-                        })
-                        .collect(),
-                },
-            )
-        })
-        .collect();
-    let input = CompileInput {
-        source: format!(
-            "---aq-playbook\n{}\n---\n\n# {id}\n\nA synthetic bounded pilot. Domain services retain authority.\n",
-            serde_json::to_string(&header)?
-        ),
-        proposal: Proposal {
-            playbook,
-            source_map: BTreeMap::new(),
-        },
-        registry,
-        dependencies,
-        definitions: BTreeMap::new(),
-        compiler: COMPILER_VERSION.into(),
-    };
-    compile(&input)
-        .map_err(|d| anyhow::anyhow!("{id}: {}", serde_json::to_string_pretty(&d).unwrap()))
 }
+#[path = "pilot_compiler.rs"]
+mod pilot_compiler;
+pub use pilot_compiler::{PilotSpec, build};
 pub fn subject_value() -> Value {
     json!({"id":"candidate-1","revision":1})
 }
@@ -252,7 +131,6 @@ fn base(
     artifacts: Vec<Artifact>,
     name: &str,
     mocks: BTreeMap<String, Vec<DispatchResult>>,
-    input: Value,
     actions: Vec<Action>,
 ) -> Scenario {
     let a = artifacts.last().unwrap();
@@ -268,7 +146,7 @@ fn base(
         starts: vec![Start {
             binding: name.into(),
             entry: "main".into(),
-            input,
+            input: Value::Null,
             authority,
         }],
         mocks,
@@ -276,59 +154,70 @@ fn base(
         max_transitions: 1000,
     }
 }
-fn projected_result(root: &str, prefix: &[&str]) -> Expr {
-    let mut reference_path = prefix.to_vec();
-    reference_path.push("reference");
-    let mut subject_path = prefix.to_vec();
-    subject_path.push("subject");
-    fields(&[
-        ("reference", reference(root, &reference_path)),
-        ("subject", reference(root, &subject_path)),
-    ])
+#[derive(Clone, Copy)]
+enum WorkResult {
+    Immediate,
+    Completion,
 }
-fn accepted_work(root: &str, prefix: &[&str]) -> Expr {
-    let mut path = prefix.to_vec();
-    path.push("disposition");
-    Expr::Eq {
-        left: Box::new(reference(root, &path)),
-        right: Box::new(lit(json!("accepted"))),
+impl WorkResult {
+    fn field(self, name: &str) -> Expr {
+        match self {
+            Self::Immediate => reference("work", &[name]),
+            Self::Completion => reference("completion", &["output", name]),
+        }
+    }
+    fn projection(self) -> Expr {
+        fields(&[
+            ("reference", self.field("reference")),
+            ("subject", self.field("subject")),
+        ])
+    }
+    fn accepted(self) -> Expr {
+        Expr::Eq {
+            left: Box::new(self.field("disposition")),
+            right: Box::new(lit(json!("accepted"))),
+        }
     }
 }
-fn work_child(id: &str, kind: &str) -> anyhow::Result<Artifact> {
+#[derive(Clone, Copy)]
+enum WorkPilot {
+    Implementation,
+    Review,
+    Repair,
+    ReportAuthor,
+}
+impl WorkPilot {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::Implementation => "implementation",
+            Self::Review => "review",
+            Self::Repair => "repair",
+            Self::ReportAuthor => "supervisor_authoring",
+        }
+    }
+    fn id(self) -> &'static str {
+        match self {
+            Self::ReportAuthor => "report-author",
+            _ => self.kind(),
+        }
+    }
+}
+fn work_child(pilot: WorkPilot) -> anyhow::Result<Artifact> {
     let r = catalog();
-    let event = ContractRef {
-        name: "aq.operation.updated".into(),
-        fingerprint: r.events["aq.operation.updated"].fingerprint()?,
-    };
-    let input_schema = if kind == "repair" {
-        Schema::string(128)
-    } else {
-        Schema::Null
-    };
-    let request = if kind == "repair" {
-        fields(&[
-            ("kind", lit(json!(kind))),
-            ("subject", lit(subject_value())),
-            ("logical_key", reference("input", &[])),
-            ("lifetime", lit(json!("owned"))),
-            ("context", lit(json!("snapshot-1"))),
-            ("visibility", lit(json!("project"))),
-        ])
-    } else {
-        work(kind)
-    };
+    let (input_schema, request) = work_request(pilot);
     build(
-        id,
+        PilotSpec {
+            id: pilot.id(),
+            input: input_schema,
+            output: result(),
+            start: "request",
+        },
         r.clone(),
-        input_schema,
-        result(),
-        "request",
         BTreeMap::from([
             (
                 "request".into(),
                 invoke(
-                    &r,
-                    "work.ensure",
+                    &r.commands["work.ensure"],
                     request,
                     "work",
                     &[("completed", "assess"), ("accepted", "await_result")],
@@ -336,64 +225,80 @@ fn work_child(id: &str, kind: &str) -> anyhow::Result<Artifact> {
             ),
             (
                 "assess".into(),
-                edge(
-                    Operation::Decide {
-                        predicate: accepted_work("work", &[]),
-                    },
-                    &[
-                        ("true", "done"),
-                        ("false", "failure"),
-                        ("unknown", "failure"),
-                    ],
-                ),
+                assessment(WorkResult::Immediate.accepted(), "done"),
             ),
-            ("done".into(), ret("success", projected_result("work", &[]))),
             (
-                "await_result".into(),
-                edge(
-                    Operation::Wait {
-                        event: Some(event),
-                        correlation: BTreeMap::from([(
-                            "operation".into(),
-                            reference("work", &["handle"]),
-                        )]),
-                        minimum_revision: Some(lit(json!(1))),
-                        deadline_ms: 10000,
-                        bind: "completion".into(),
-                    },
-                    &[("received", "assess_event"), ("timeout", "failure")],
-                ),
+                "done".into(),
+                ret("success", WorkResult::Immediate.projection()),
             ),
+            ("await_result".into(), await_completion(&r)?),
             (
                 "assess_event".into(),
-                edge(
-                    Operation::Decide {
-                        predicate: Expr::And {
-                            values: vec![
-                                Expr::Eq {
-                                    left: Box::new(reference("completion", &["outcome"])),
-                                    right: Box::new(lit(json!("completed"))),
-                                },
-                                accepted_work("completion", &["output"]),
-                            ],
-                        },
+                assessment(
+                    Expr::And {
+                        values: vec![
+                            Expr::Eq {
+                                left: Box::new(reference("completion", &["outcome"])),
+                                right: Box::new(lit(json!("completed"))),
+                            },
+                            WorkResult::Completion.accepted(),
+                        ],
                     },
-                    &[
-                        ("true", "done_event"),
-                        ("false", "failure"),
-                        ("unknown", "failure"),
-                    ],
+                    "done_event",
                 ),
             ),
             (
                 "done_event".into(),
-                ret("success", projected_result("completion", &["output"])),
+                ret("success", WorkResult::Completion.projection()),
             ),
         ]),
         &[],
     )
 }
 
+fn await_completion(r: &Registry) -> anyhow::Result<Step> {
+    let event = ContractRef {
+        name: "aq.operation.updated".into(),
+        fingerprint: r.events["aq.operation.updated"].fingerprint()?,
+    };
+    Ok(edge(
+        Operation::Wait {
+            event: Some(event),
+            correlation: BTreeMap::from([("operation".into(), reference("work", &["handle"]))]),
+            minimum_revision: Some(lit(json!(1))),
+            deadline_ms: 10000,
+            bind: "completion".into(),
+        },
+        &[("received", "assess_event"), ("timeout", "failure")],
+    ))
+}
+
+fn work_request(pilot: WorkPilot) -> (Schema, Expr) {
+    let input_schema = if matches!(pilot, WorkPilot::Repair) {
+        Schema::string(128)
+    } else {
+        Schema::Null
+    };
+    let request = if matches!(pilot, WorkPilot::Repair) {
+        fields(&[
+            ("kind", lit(json!(pilot.kind()))),
+            ("subject", lit(subject_value())),
+            ("logical_key", reference("input", &[])),
+            ("lifetime", lit(json!("owned"))),
+            ("context", lit(json!("snapshot-1"))),
+            ("visibility", lit(json!("project"))),
+        ])
+    } else {
+        work(pilot.kind())
+    };
+    (input_schema, request)
+}
+fn assessment(predicate: Expr, pass: &str) -> Step {
+    edge(
+        Operation::Decide { predicate },
+        &[("true", pass), ("false", "failure"), ("unknown", "failure")],
+    )
+}
 pub fn scenario(name: &str) -> anyhow::Result<Scenario> {
     match name {
         "coding" => coding(),
@@ -402,225 +307,16 @@ pub fn scenario(name: &str) -> anyhow::Result<Scenario> {
         _ => anyhow::bail!("unknown pilot {name}; choose {}", NAMES.join(", ")),
     }
 }
-fn coding() -> anyhow::Result<Scenario> {
-    let r = catalog();
-    let implementation = work_child("implementation", "implementation")?;
-    let review = work_child("review", "review")?;
-    let repair = work_child("repair", "repair")?;
-    let validation = build(
-        "validation",
-        r.clone(),
-        subject(),
-        result(),
-        "check",
-        BTreeMap::from([
-            (
-                "check".into(),
-                invoke(
-                    &r,
-                    "check.request",
-                    fields(&[
-                        ("subject", reference("input", &[])),
-                        ("suite", lit(json!("integration"))),
-                        ("execution_context", lit(json!("fake-ci"))),
-                    ]),
-                    "check",
-                    &[("passed", "done")],
-                ),
-            ),
-            ("done".into(), ret("success", reference("check", &[]))),
-        ]),
-        &[],
-    )?;
-    let followup = build(
-        "post-delivery-report",
-        r.clone(),
-        Schema::Null,
-        Schema::Null,
-        "send",
-        BTreeMap::from([
-            (
-                "send".into(),
-                invoke(
-                    &r,
-                    "message.send",
-                    lit(
-                        json!({"identity":"coding-delivered","recipient":"supervisor","visibility":"project","body":"Candidate delivered"}),
-                    ),
-                    "message",
-                    &[("queued", "done")],
-                ),
-            ),
-            ("done".into(), ret("success", lit(Value::Null))),
-        ]),
-        &[],
-    )?;
-    let mut steps = BTreeMap::new();
-    steps.insert(
-        "implementation".into(),
-        call(
-            "implementation",
-            lit(Value::Null),
-            CallMode::Wait,
-            "implementation_result",
-            &[("success", "review"), ("escalated", "failure")],
-        ),
-    );
-    steps.insert(
-        "review".into(),
-        call(
-            "review",
-            lit(Value::Null),
-            CallMode::Wait,
-            "review_result",
-            &[("success", "attempts"), ("escalated", "failure")],
-        ),
-    );
-    steps.insert(
-        "attempts".into(),
-        edge(
-            Operation::ForEach {
-                collection: lit(json!(["repair-1", "repair-2", "exhausted"])),
-                item: "attempt".into(),
-                body: "observe_base".into(),
-                next: "failure".into(),
-                max_items: 3,
-                concurrency: 1,
-                on_failure: IterationFailure::Stop,
-            },
-            &[],
-        ),
-    );
-    steps.insert(
-        "can_repair".into(),
-        edge(
-            Operation::Decide {
-                predicate: Expr::Eq {
-                    left: Box::new(reference("attempt", &[])),
-                    right: Box::new(lit(json!("exhausted"))),
-                },
-            },
-            &[
-                ("true", "failure"),
-                ("false", "repair"),
-                ("unknown", "failure"),
-            ],
-        ),
-    );
-    steps.insert("observe_base".into(),invoke(&r,"context.read",lit(json!({"view":"project","subject":{"id":"main","revision":1},"snapshot":"","page":0})),"base",&[("observed","prepare")]));
-    steps.insert(
-        "prepare".into(),
-        invoke(
-            &r,
-            "candidate.prepare",
-            fields(&[
-                ("sources", lit(json!([subject_value()]))),
-                ("base", reference("base", &["subject"])),
-            ]),
-            "candidate",
-            &[("prepared", "validate"), ("conflict", "can_repair")],
-        ),
-    );
-    steps.insert(
-        "validate".into(),
-        call(
-            "validation",
-            reference("candidate", &["subject"]),
-            CallMode::Wait,
-            "checks",
-            &[("success", "publish"), ("escalated", "can_repair")],
-        ),
-    );
-    steps.insert(
-        "publish".into(),
-        invoke(
-            &r,
-            "candidate.publish",
-            fields(&[
-                ("candidate", reference("candidate", &["subject"])),
-                ("destination", reference("base", &["subject"])),
-                (
-                    "evidence",
-                    Expr::Array {
-                        items: vec![reference("checks", &["subject"])],
-                    },
-                ),
-            ]),
-            "published",
-            &[("published", "followup"), ("conflict", "can_repair")],
-        ),
-    );
-    steps.insert(
-        "repair".into(),
-        call(
-            "repair",
-            reference("attempt", &[]),
-            CallMode::Wait,
-            "repair_result",
-            &[("success", "attempts"), ("escalated", "failure")],
-        ),
-    );
-    steps.insert(
-        "followup".into(),
-        call(
-            "report",
-            lit(Value::Null),
-            CallMode::Independent,
-            "report_handle",
-            &[("started", "done")],
-        ),
-    );
-    steps.insert("done".into(), ret("success", lit(Value::Null)));
-    let root = build(
-        "coding",
-        r,
-        Schema::Null,
-        Schema::Null,
-        "implementation",
-        steps,
-        &[
-            ("implementation", &implementation),
-            ("review", &review),
-            ("repair", &repair),
-            ("validation", &validation),
-            ("report", &followup),
-        ],
-    )?;
-    Ok(base(
-        vec![implementation, review, repair, validation, followup, root],
-        "coding",
-        BTreeMap::from([
-            (
-                "context.read".into(),
-                vec![base_observation(1), base_observation(2)],
-            ),
-            (
-                "work.ensure".into(),
-                vec![done("completed"), done("completed"), done("completed")],
-            ),
-            (
-                "candidate.prepare".into(),
-                vec![done("prepared"), done("prepared")],
-            ),
-            ("check.request".into(), vec![done("passed"), done("passed")]),
-            (
-                "candidate.publish".into(),
-                vec![done("conflict"), done("published")],
-            ),
-            ("message.send".into(), vec![done("queued")]),
-        ]),
-        Value::Null,
-        vec![],
-    ))
-}
+#[path = "coding_pilot.rs"]
+mod coding_pilot;
+use coding_pilot::coding;
 fn watcher() -> anyhow::Result<Scenario> {
     let r = catalog();
     let steps = BTreeMap::from([
         (
             "observe".into(),
             invoke(
-                &r,
-                "context.read",
+                &r.commands["context.read"],
                 context("health_observations"),
                 "observation",
                 &[("observed", "reconcile"), ("incomplete", "reconcile")],
@@ -629,8 +325,7 @@ fn watcher() -> anyhow::Result<Scenario> {
         (
             "reconcile".into(),
             invoke(
-                &r,
-                "findings.reconcile",
+                &r.commands["findings.reconcile"],
                 fields(&[
                     ("partition", lit(json!("project-health"))),
                     ("observation", reference("observation", &["snapshot"])),
@@ -650,11 +345,13 @@ fn watcher() -> anyhow::Result<Scenario> {
         ("done".into(), ret("success", lit(Value::Null))),
     ]);
     let a = build(
-        "watcher",
+        PilotSpec {
+            id: "watcher",
+            input: Schema::Null,
+            output: Schema::Null,
+            start: "observe",
+        },
         r,
-        Schema::Null,
-        Schema::Null,
-        "observe",
         steps,
         &[],
     )?;
@@ -665,19 +362,55 @@ fn watcher() -> anyhow::Result<Scenario> {
             ("context.read".into(), vec![observed()]),
             ("findings.reconcile".into(), vec![done("reconciled")]),
         ]),
-        Value::Null,
         vec![],
     ))
 }
 fn report() -> anyhow::Result<Scenario> {
     let r = catalog();
-    let author = work_child("report-author", "supervisor_authoring")?;
+    let author = work_child(WorkPilot::ReportAuthor)?;
+    let steps = report_steps(&r);
+    let root = build(
+        PilotSpec {
+            id: "report",
+            input: Schema::Null,
+            output: Schema::Null,
+            start: "context",
+        },
+        r.clone(),
+        steps,
+        &[("author", &author)],
+    )?;
+    let event = author_completion(&r)?;
+    Ok(base(
+        vec![author, root],
+        "report",
+        BTreeMap::from([
+            ("context.read".into(), vec![observed()]),
+            (
+                "work.ensure".into(),
+                vec![DispatchResult::Accepted {
+                    handle: "author-operation".into(),
+                }],
+            ),
+            ("message.send".into(), vec![done("queued")]),
+        ]),
+        vec![
+            Action::Tick { at_ms: 1001 },
+            Action::Event {
+                at_ms: 2000,
+                producer: "aq.host.bridge@1".into(),
+                event: Box::new(event),
+            },
+        ],
+    ))
+}
+
+fn report_steps(r: &Registry) -> BTreeMap<String, Step> {
     let mut steps = BTreeMap::from([
         (
             "context".into(),
             invoke(
-                &r,
-                "context.read",
+                &r.commands["context.read"],
                 context("project"),
                 "context",
                 &[("observed", "author")],
@@ -685,11 +418,13 @@ fn report() -> anyhow::Result<Scenario> {
         ),
         (
             "author".into(),
-            call(
-                "author",
-                lit(Value::Null),
-                CallMode::OwnedAsync,
-                "author_handle",
+            edge(
+                child_call(
+                    "author",
+                    lit(Value::Null),
+                    CallMode::OwnedAsync,
+                    "author_handle",
+                ),
                 &[("started", "wait")],
             ),
         ),
@@ -724,18 +459,12 @@ fn report() -> anyhow::Result<Scenario> {
             "Supervisor report deadline elapsed; frozen context snapshot-1 remains available",
         ),
     ] {
-        steps.insert(name.into(),invoke(&r,"message.send",lit(json!({"identity":"report-window-1","recipient":"supervisor","visibility":"project","body":body})),&format!("{name}_message"),&[("queued","done")]));
+        steps.insert(name.into(),invoke(&r.commands["message.send"],lit(json!({"identity":"report-window-1","recipient":"supervisor","visibility":"project","body":body})),&format!("{name}_message"),&[("queued","done")]));
     }
-    let root = build(
-        "report",
-        r.clone(),
-        Schema::Null,
-        Schema::Null,
-        "context",
-        steps,
-        &[("author", &author)],
-    )?;
-    let event = EventEnvelope {
+    steps
+}
+fn author_completion(r: &Registry) -> anyhow::Result<EventEnvelope> {
+    Ok(EventEnvelope {
         producer: "aq.host.bridge@1".into(),
         event_id: "author-complete".into(),
         contract: ContractRef {
@@ -750,28 +479,5 @@ fn report() -> anyhow::Result<Scenario> {
         occurred_at_ms: Some(2000),
         observed_at_ms: Some(2000),
         payload: json!({"outcome":"completed","output":{"reference":"evidence-1","subject":subject_value(),"disposition":"accepted"}}),
-    };
-    Ok(base(
-        vec![author, root],
-        "report",
-        BTreeMap::from([
-            ("context.read".into(), vec![observed()]),
-            (
-                "work.ensure".into(),
-                vec![DispatchResult::Accepted {
-                    handle: "author-operation".into(),
-                }],
-            ),
-            ("message.send".into(), vec![done("queued")]),
-        ]),
-        Value::Null,
-        vec![
-            Action::Tick { at_ms: 1001 },
-            Action::Event {
-                at_ms: 2000,
-                producer: "aq.host.bridge@1".into(),
-                event: Box::new(event),
-            },
-        ],
-    ))
+    })
 }
