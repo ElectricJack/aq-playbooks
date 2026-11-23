@@ -83,15 +83,7 @@ pub struct SimulationReport {
     pub invocations: Vec<String>,
 }
 
-pub fn simulate(scenario: &Scenario) -> anyhow::Result<SimulationReport> {
-    anyhow::ensure!(
-        scenario.max_transitions > 0 && scenario.max_transitions <= 100_000,
-        "scenario transition limit must be 1..100000"
-    );
-    anyhow::ensure!(
-        scenario.actions.len() <= 10_000 && scenario.starts.len() <= 100,
-        "scenario action/start bound exceeded"
-    );
+fn setup_scenario(scenario: &Scenario) -> anyhow::Result<(Engine<MemoryStorage>, Vec<String>)> {
     let engine = Engine::new(
         MemoryStorage::default(),
         "simulation",
@@ -116,29 +108,26 @@ pub fn simulate(scenario: &Scenario) -> anyhow::Result<SimulationReport> {
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut host = ScriptedHost {
-        responses: scenario
-            .mocks
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone().into()))
-            .collect(),
-        invocations: vec![],
-    };
-    let mut used = engine.drive(&mut host, 0, scenario.max_transitions)?;
-    let mut clock = 0;
-    for action in &scenario.actions {
-        if used >= scenario.max_transitions {
-            break;
-        }
-        let at = match action {
+    Ok((engine, roots))
+}
+
+impl Action {
+    fn at_ms(&self) -> i64 {
+        match self {
             Action::Tick { at_ms }
             | Action::Event { at_ms, .. }
             | Action::Cancel { at_ms, .. }
             | Action::Recover { at_ms } => *at_ms,
-        };
-        anyhow::ensure!(at >= clock, "simulation clock cannot move backwards");
-        clock = at;
-        match action {
+        }
+    }
+    fn apply(
+        &self,
+        engine: &Engine<MemoryStorage>,
+        roots: &[String],
+        host: &mut ScriptedHost,
+    ) -> anyhow::Result<()> {
+        let clock = self.at_ms();
+        match self {
             Action::Tick { .. } => {}
             Action::Event {
                 producer, event, ..
@@ -167,9 +156,41 @@ pub fn simulate(scenario: &Scenario) -> anyhow::Result<SimulationReport> {
                 }
             }
             Action::Recover { .. } => {
-                engine.recover(&mut host, clock)?;
+                engine.recover(host, clock)?;
             }
         }
+        Ok(())
+    }
+}
+
+pub fn simulate(scenario: &Scenario) -> anyhow::Result<SimulationReport> {
+    anyhow::ensure!(
+        scenario.max_transitions > 0 && scenario.max_transitions <= 100_000,
+        "scenario transition limit must be 1..100000"
+    );
+    anyhow::ensure!(
+        scenario.actions.len() <= 10_000 && scenario.starts.len() <= 100,
+        "scenario action/start bound exceeded"
+    );
+    let (engine, roots) = setup_scenario(scenario)?;
+    let mut host = ScriptedHost {
+        responses: scenario
+            .mocks
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone().into()))
+            .collect(),
+        invocations: vec![],
+    };
+    let mut used = engine.drive(&mut host, 0, scenario.max_transitions)?;
+    let mut clock = 0;
+    for action in &scenario.actions {
+        if used >= scenario.max_transitions {
+            break;
+        }
+        let at = action.at_ms();
+        anyhow::ensure!(at >= clock, "simulation clock cannot move backwards");
+        clock = at;
+        action.apply(&engine, &roots, &mut host)?;
         used += engine.drive(&mut host, clock, scenario.max_transitions - used)?;
     }
     let state = engine.snapshot()?;

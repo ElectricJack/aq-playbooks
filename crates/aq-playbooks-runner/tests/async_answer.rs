@@ -62,58 +62,59 @@ fn registry() -> Registry {
 }
 /// `ask` → (`hold`, a 50 ms timer, when `hold`) → `read`, a join on the handle
 /// under the key `c` → `decide` on `answer.c.output.choice`.
-fn playbook(member: Expr, hold: bool) -> Artifact {
-    let registry = registry();
+fn ask_step(judgment: &CommandContract, after_ask: &str) -> Step {
+    Step {
+        op: Operation::Invoke {
+            command: ContractRef {
+                name: judgment.name.clone(),
+                fingerprint: judgment.fingerprint().unwrap(),
+            },
+            input: Expr::literal(json!({
+                "budget": {"deadline_ms": 60000, "max_cost_microunits": 50000, "max_input_tokens": 8192, "max_output_tokens": 512},
+                "context": {"artifacts": [], "text": "Work item summary."},
+                "output": {"choices": ["approve", "decline"], "rationale_max_bytes": 2048},
+                "question": "Should this change be approved?",
+                "subject": {"id": "work-1", "revision": 1},
+            })),
+            bind: "j".into(),
+            retry: None,
+        },
+        edges: edges(&[
+            ("accepted", after_ask),
+            ("assessed", "error"),
+            ("failed", "error"),
+            ("refused", "error"),
+        ]),
+        on_error: Some("error".into()),
+    }
+}
+
+fn read_answer_step(member: Expr) -> Step {
+    Step {
+        op: Operation::Join {
+            members: vec![member],
+            member_keys: vec!["c".into()],
+            mode: JoinMode::All,
+            accepted_outcomes: set(&["assessed"]),
+            deadline_ms: JOIN_DEADLINE_MS,
+            remaining: RemainingPolicy::Track,
+            bind: "answer".into(),
+        },
+        edges: edges(&[
+            ("completed", "decide"),
+            ("no_match", "unanswered"),
+            ("timeout", "late"),
+        ]),
+        on_error: Some("error".into()),
+    }
+}
+
+fn judgment_steps(registry: &Registry, member: Expr, hold: bool) -> BTreeMap<String, Step> {
     let judgment = &registry.commands["judgment.request"];
     let after_ask = if hold { "hold" } else { "read" };
     let mut steps = BTreeMap::from([
-        (
-            "ask".into(),
-            Step {
-                op: Operation::Invoke {
-                    command: ContractRef {
-                        name: judgment.name.clone(),
-                        fingerprint: judgment.fingerprint().unwrap(),
-                    },
-                    input: Expr::literal(json!({
-                        "budget": {"deadline_ms": 60000, "max_cost_microunits": 50000, "max_input_tokens": 8192, "max_output_tokens": 512},
-                        "context": {"artifacts": [], "text": "Work item summary."},
-                        "output": {"choices": ["approve", "decline"], "rationale_max_bytes": 2048},
-                        "question": "Should this change be approved?",
-                        "subject": {"id": "work-1", "revision": 1},
-                    })),
-                    bind: "j".into(),
-                    retry: None,
-                },
-                edges: edges(&[
-                    ("accepted", after_ask),
-                    ("assessed", "error"),
-                    ("failed", "error"),
-                    ("refused", "error"),
-                ]),
-                on_error: Some("error".into()),
-            },
-        ),
-        (
-            "read".into(),
-            Step {
-                op: Operation::Join {
-                    members: vec![member],
-                    member_keys: vec!["c".into()],
-                    mode: JoinMode::All,
-                    accepted_outcomes: set(&["assessed"]),
-                    deadline_ms: JOIN_DEADLINE_MS,
-                    remaining: RemainingPolicy::Track,
-                    bind: "answer".into(),
-                },
-                edges: edges(&[
-                    ("completed", "decide"),
-                    ("no_match", "unanswered"),
-                    ("timeout", "late"),
-                ]),
-                on_error: Some("error".into()),
-            },
-        ),
+        ("ask".into(), ask_step(judgment, after_ask)),
+        ("read".into(), read_answer_step(member)),
         (
             "decide".into(),
             Step {
@@ -153,6 +154,12 @@ fn playbook(member: Expr, hold: bool) -> Artifact {
             },
         );
     }
+    steps
+}
+
+fn playbook(member: Expr, hold: bool) -> Artifact {
+    let registry = registry();
+    let steps = judgment_steps(&registry, member, hold);
     Artifact::seal(ArtifactContent {
         format_version: FORMAT_VERSION,
         compiler: "test".into(),
