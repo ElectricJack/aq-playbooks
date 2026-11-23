@@ -12,6 +12,8 @@ pub mod metrics;
 pub mod storage;
 pub mod transition;
 pub use inspection::{InspectionKind, InspectionPage, InspectionQuery};
+mod completions;
+use completions::process_completions;
 mod clock_rebase;
 use clock_rebase::rebase_plan;
 pub use clock_rebase::{ClockRebaseReport, DeadlineAdjustment, REBASE_ADJUSTMENTS_LISTED};
@@ -23,6 +25,8 @@ use execution::advance_inner;
 mod pending;
 pub mod retention;
 use pending::poll_pending;
+mod results;
+use results::record_result;
 mod schedules;
 use aq_playbooks_model::*;
 pub use indexes::{EffectQueueKind, IndexItem, IndexPage, IndexQuery, RuntimeIndexes};
@@ -1211,7 +1215,7 @@ impl<S: Storage> Engine<S> {
             )?;
             if !due.items.is_empty() || !completions.items.is_empty() {
                 self.transaction_at(Some(now_ms), |s| {
-                    process_completions(s, now_ms)?;
+                    process_completions(s)?;
                     process_operation_deadlines(s, now_ms);
                     let timers = s
                         .indexes
@@ -1607,7 +1611,7 @@ fn record_binding_change(s: &mut State, binding: &str, now_ms: i64) -> Result<()
 }
 
 fn advance(s: &mut State, id: &str, now: i64) -> Result<bool> {
-    process_completions(s, now)?;
+    process_completions(s)?;
     process_operation_deadlines(s, now);
     indexes::unqueue(s, id);
     let mut r = s
@@ -1774,189 +1778,6 @@ fn settled(s: &State, r: &Run) -> Result<bool> {
             )
         }),
     })
-}
-fn record_result(s: &mut State, intent_id: &str, result: DispatchResult, now: i64) -> Result<()> {
-    indexes::mark_intent(s, intent_id);
-    let mut i = s
-        .intents
-        .get(intent_id)
-        .ok_or_else(|| Error::NotFound(intent_id.into()))?
-        .clone();
-    if i.status == IntentStatus::Cancelled {
-        if let DispatchResult::Completed { outcome, output } = result
-            && !i.late_results.contains(&(outcome.clone(), output.clone()))
-        {
-            i.command
-                .outcomes
-                .get(&outcome)
-                .ok_or_else(|| Error::Refused("undeclared late command outcome".into()))?
-                .validate(&output)?;
-            check_bytes(&output, i.command.max_payload_bytes)?;
-            i.late_results.push((outcome, output));
-            receipt(
-                s,
-                &i.run,
-                &i.step,
-                now,
-                "late_result",
-                json!({"operation":i.id}),
-            );
-            s.intents.insert(intent_id.into(), i);
-        }
-        return Ok(());
-    }
-    if matches!(i.status, IntentStatus::Completed) {
-        if let DispatchResult::Completed { outcome, output } = result
-            && i.result != Some((outcome, output))
-        {
-            return Err(Error::Conflict("operation result changed".into()));
-        }
-        return Ok(());
-    }
-    match result {
-        DispatchResult::Completed { outcome, output } => {
-            let validation = i
-                .command
-                .outcomes
-                .get(&outcome)
-                .ok_or_else(|| Error::Refused("undeclared command outcome".into()))
-                .and_then(|schema| schema.validate(&output).map_err(Error::from))
-                .and_then(|_| {
-                    let run = &s.runs[&i.run];
-                    let root = &s.runs[&run.root];
-                    check_bytes(
-                        &output,
-                        i.command
-                            .max_payload_bytes
-                            .min(
-                                s.artifacts[&run.artifact]
-                                    .content
-                                    .playbook
-                                    .limits
-                                    .max_payload_bytes,
-                            )
-                            .min(
-                                s.artifacts[&root.artifact]
-                                    .content
-                                    .playbook
-                                    .limits
-                                    .max_payload_bytes,
-                            ),
-                    )
-                });
-            if validation.is_err() {
-                i.status = IntentStatus::Unknown;
-                i.reason=Some("command returned invalid outcome/output; external effect requires reconciliation".into());
-                let run = s
-                    .runs
-                    .get_mut(&i.run)
-                    .ok_or_else(|| Error::NotFound(i.run.clone()))?;
-                if !matches!(run.status, RunStatus::Cancelling | RunStatus::Finishing) {
-                    run.status = RunStatus::Blocked;
-                }
-                run.reason = i.reason.clone();
-                receipt(
-                    s,
-                    &i.run,
-                    &i.step,
-                    now,
-                    "invalid_output",
-                    json!({"operation":i.id}),
-                );
-                s.intents.insert(intent_id.into(), i);
-                return Ok(());
-            }
-            let public = output
-                .as_object()
-                .map(|o| {
-                    Value::Object(
-                        o.iter()
-                            .filter(|(k, _)| i.command.public_result_fields.contains(*k))
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                    )
-                })
-                .unwrap_or(Value::Null);
-            i.status = IntentStatus::Completed;
-            i.result = Some((outcome.clone(), output));
-            receipt(
-                s,
-                &i.run,
-                &i.step,
-                now,
-                "command_result",
-                json!({"operation":i.id,"outcome":outcome,"public":public}),
-            );
-        }
-        DispatchResult::Accepted { handle } => {
-            if let Some(previous) = &i.handle {
-                if previous != &handle {
-                    return Err(Error::Conflict("operation admission handle changed".into()));
-                }
-                if i.status == IntentStatus::Accepted {
-                    return Ok(());
-                }
-            }
-            if i.command.asynchronous.is_none() {
-                return Err(Error::Refused(
-                    "synchronous contract returned async admission".into(),
-                ));
-            }
-            i.status = IntentStatus::Accepted;
-            i.handle = Some(handle);
-            i.reason = None;
-            receipt(
-                s,
-                &i.run,
-                &i.step,
-                now,
-                "operation_accepted",
-                json!({"operation":i.id}),
-            );
-        }
-        DispatchResult::Unknown { reason } => {
-            i.status = IntentStatus::Unknown;
-            i.reason = Some(reason);
-            receipt(
-                s,
-                &i.run,
-                &i.step,
-                now,
-                "operation_unknown",
-                json!({"operation":i.id}),
-            );
-        }
-        DispatchResult::Rejected { reason } => {
-            i.status = IntentStatus::Rejected;
-            i.reason = Some(reason);
-            receipt(
-                s,
-                &i.run,
-                &i.step,
-                now,
-                "operation_rejected",
-                json!({"operation":i.id}),
-            );
-        }
-    }
-    let run = s
-        .runs
-        .get_mut(&i.run)
-        .ok_or_else(|| Error::NotFound(i.run.clone()))?;
-    // A lost admission reply blocks this pending invoke. Confirming the same
-    // admitted handle must allow its accepted branch (e.g. notify then join)
-    // before final completion exists. Do not revive cancellation/terminal runs
-    // or unblock a different pending operation.
-    let recovered_admission = i.status == IntentStatus::Accepted
-        && matches!(&run.pending, Some(Pending::Effect { intent }) if intent == intent_id);
-    if run.status == RunStatus::Blocked
-        && (i.status == IntentStatus::Completed || recovered_admission)
-    {
-        run.status = RunStatus::Waiting;
-        run.reason = None;
-    }
-    s.intents.insert(intent_id.into(), i);
-    Ok(())
 }
 fn request_cancel(s: &mut State, id: &str, now: i64) -> Result<()> {
     let mut r = s
@@ -2163,123 +1984,6 @@ fn participant(s: &State, id: &str) -> Option<Participant> {
         });
     }
     None
-}
-fn process_completions(s: &mut State, _now: i64) -> Result<()> {
-    let ids = s
-        .indexes
-        .completion_ready
-        .iter()
-        .take(64)
-        .cloned()
-        .collect::<Vec<_>>();
-    let pending = ids
-        .iter()
-        .filter_map(|id| s.intents.get(id))
-        .filter(|intent| intent.completion_event.is_none() && intent.handle.is_some())
-        .cloned()
-        .collect::<Vec<_>>();
-    for id in ids {
-        s.indexes.completion_ready.remove(&id);
-    }
-    for i in pending {
-        let Some(asynchronous) = &i.command.asynchronous else {
-            continue;
-        };
-        let artifact = &s.artifacts[&s.runs[&i.run].artifact];
-        let expected = artifact
-            .content
-            .registry
-            .events
-            .get(&asynchronous.completion_event)
-            .ok_or_else(|| Error::Refused("missing pinned completion contract".into()))?;
-        let fingerprint = expected.fingerprint()?;
-        let correlation = indexes::field_key(
-            &ContractRef {
-                name: expected.name.clone(),
-                fingerprint: fingerprint.clone(),
-            },
-            &i.authority.scope,
-            &asynchronous.correlation_field,
-            i.handle.as_deref().unwrap_or_default(),
-        )?;
-        let keys = s
-            .indexes
-            .events
-            .get(&correlation)
-            .cloned()
-            .unwrap_or_default();
-        let event = keys
-            .values()
-            .filter_map(|id| s.events.get(id))
-            .filter(|e| {
-                e.envelope.contract.name == expected.name
-                    && e.envelope.contract.fingerprint == fingerprint
-                    && e.envelope.scope == i.authority.scope
-                    && expected.trusted_producers.contains(&e.envelope.producer)
-                    && e.envelope.correlation.get(&asynchronous.correlation_field)
-                        == i.handle.as_ref()
-            })
-            .min_by_key(|e| e.sequence)
-            .cloned();
-        if let Some(event) = event {
-            if asynchronous
-                .completion
-                .validate(&event.envelope.payload)
-                .is_err()
-            {
-                let current = s.intents.get_mut(&i.id).unwrap();
-                if current.status != IntentStatus::Cancelled {
-                    current.status = IntentStatus::Unknown;
-                }
-                current.reason =
-                    Some("invalid asynchronous completion requires reconciliation".into());
-                current.completion_event = Some(event.key);
-                indexes::mark_intent(s, &i.id);
-                let run = s.runs.get_mut(&i.run).unwrap();
-                if !run.status.terminal()
-                    && !matches!(run.status, RunStatus::Finishing | RunStatus::Cancelling)
-                {
-                    run.status = RunStatus::Blocked;
-                }
-                if !run.status.terminal() {
-                    run.reason =
-                        Some("invalid asynchronous completion requires reconciliation".into());
-                }
-                receipt(
-                    s,
-                    &i.run,
-                    &i.step,
-                    event.accepted_at_ms,
-                    "invalid_output",
-                    json!({"operation":i.id}),
-                );
-                continue;
-            }
-            let outcome = event
-                .envelope
-                .payload
-                .get("outcome")
-                .and_then(Value::as_str)
-                .ok_or_else(|| Error::Refused("async completion missing outcome".into()))?;
-            let output = event
-                .envelope
-                .payload
-                .get("output")
-                .cloned()
-                .ok_or_else(|| Error::Refused("async completion missing output".into()))?;
-            record_result(
-                s,
-                &i.id,
-                DispatchResult::Completed {
-                    outcome: outcome.into(),
-                    output,
-                },
-                event.accepted_at_ms,
-            )?;
-            s.intents.get_mut(&i.id).unwrap().completion_event = Some(event.key);
-        }
-    }
-    Ok(())
 }
 fn fail_run(s: &mut State, r: &mut Run, reason: String, now: i64) -> Result<()> {
     r.pending = None;
