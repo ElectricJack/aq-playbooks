@@ -194,9 +194,14 @@ impl<S: Storage> Engine<S> {
                     .get(&producer)
                     .copied()
                     .unwrap_or(0);
-                let accepted =
-                    accept_event(s, &producer, event, epoch, None, now_ms, Some(&binding))?
-                        .ok_or_else(|| invariant("new interval event has expired".into()))?;
+                let accepted = EventIngress {
+                    producer: &producer,
+                    epoch,
+                    requested_at_ms: None,
+                    now_ms,
+                }
+                .accept(s, event, Some(&binding))?
+                .ok_or_else(|| invariant("new interval event has expired".into()))?;
                 fanout_event(s, &accepted.key, 128, now_ms)?;
                 s.binding_schedules
                     .get_mut(&binding)
