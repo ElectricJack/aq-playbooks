@@ -124,45 +124,7 @@ fn every_worked_example_checks_saves_and_its_cases_pass() {
             "{name}: catalog.json is not the pinned catalog as the record keeps it"
         );
 
-        // Every case passes, and is named after its file.
-        let mut cases: Vec<String> = fs::read_dir(root.join("cases"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
-        cases.sort();
-        assert!(cases.len() >= 5, "{name} has {} cases", cases.len());
-        for file in &cases {
-            let report = ok(&root, &["try", &format!("cases/{file}")]);
-            assert_eq!(report["passed"], true, "{name} {file}: {report:#}");
-            // A case lists every call the run makes, in order, each with
-            // its whole input, and gives no return the run does not use.
-            let case = json_file(&root.join("cases").join(file));
-            let made: Vec<Value> = report["calls"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|c| serde_json::json!({"command": c["command"], "input": c["input"]}))
-                .collect();
-            assert_eq!(
-                Value::Array(made.clone()),
-                case["expect"]["calls"],
-                "{name} {file}"
-            );
-            for (command, returns) in case["returns"].as_object().unwrap() {
-                let used = made.iter().filter(|c| c["command"] == *command).count();
-                assert_eq!(
-                    used,
-                    returns.as_array().unwrap().len(),
-                    "{name} {file}: {command}"
-                );
-            }
-            assert_eq!(
-                format!("{}.json", report["name"].as_str().unwrap()),
-                *file,
-                "{name}: a case is named after its file"
-            );
-        }
-
+        let case_count = verify_cases(&root);
         // The sealed artifact verifies, and is the one save records.
         let sealed = ok(&root, &["seal", "--output", "sealed.artifact.json"]);
         let bytes = fs::read(root.join("sealed.artifact.json")).unwrap();
@@ -187,7 +149,7 @@ fn every_worked_example_checks_saves_and_its_cases_pass() {
         let outcome = json_file(&root.join("out/outcome.json"));
         assert_eq!(outcome["kind"], "saved", "{name}");
         assert_eq!(outcome["artifact"], artifact.digest.as_str(), "{name}");
-        assert_eq!(outcome["cases"].as_array().unwrap().len(), cases.len());
+        assert_eq!(outcome["cases"].as_array().unwrap().len(), case_count);
     }
 }
 
@@ -294,17 +256,6 @@ fn each_stuck_document_writes_the_outcome_it_shows() {
 /// identifiers, no code.
 #[test]
 fn example_files_are_the_examples_on_disk() {
-    fn walk(root: &Path, dir: &Path, found: &mut BTreeMap<String, String>) {
-        for entry in fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                walk(root, &path, found);
-            } else {
-                let relative = path.strip_prefix(root).unwrap().to_str().unwrap();
-                found.insert(relative.into(), fs::read_to_string(&path).unwrap());
-            }
-        }
-    }
     let mut on_disk = BTreeMap::new();
     walk(Path::new(ON_DISK), Path::new(ON_DISK), &mut on_disk);
     let listed: BTreeMap<String, String> = example_files()
@@ -317,12 +268,8 @@ fn example_files_are_the_examples_on_disk() {
     );
     assert_eq!(listed, on_disk);
     for (path, text) in &listed {
-        // The owner's documents (each example's source.md and its stuck
-        // variants), not the host's CATALOG.md.
         if path.ends_with(".md") && !path.ends_with("/CATALOG.md") {
-            for code in ["`", "work.", "judgment.", "message.", "aq.", "_"] {
-                assert!(!text.contains(code), "{path} contains {code:?}");
-            }
+            verify_owner_document(Path::new(path), text);
         }
     }
 }
@@ -400,27 +347,19 @@ fn fits(want: &Value, got: &Value) -> bool {
 /// The words of a command line; `"…"` quotes one word.
 fn words(line: &str) -> Vec<String> {
     let mut words = vec![];
-    let mut word = String::new();
+    let mut current = None;
     let mut quoted = false;
-    let mut any = false;
     for c in line.chars() {
         match c {
             '"' => {
                 quoted = !quoted;
-                any = true;
+                current.get_or_insert_with(String::new);
             }
-            ' ' if !quoted => {
-                if any || !word.is_empty() {
-                    words.push(std::mem::take(&mut word));
-                }
-                any = false;
-            }
-            c => word.push(c),
+            ' ' if !quoted => words.extend(current.take()),
+            c => current.get_or_insert_with(String::new).push(c),
         }
     }
-    if any || !word.is_empty() {
-        words.push(word);
-    }
+    words.extend(current);
     assert!(!quoted, "an unclosed quote in {line:?}");
     words
 }
@@ -435,129 +374,18 @@ const DOCUMENTS: [(&str, &str); 2] = [
 /// `aq-playbooks …` the prose names is one of the commands run.
 #[test]
 fn every_command_and_case_the_documents_show_runs_as_shown() {
-    use aq_playbooks_simulation::{CaseReturn, CaseStart};
-    let mut run_lines: Vec<Vec<String>> = vec![];
+    let mut run_lines = vec![];
     let mut shown = 0;
     for (name, doc) in DOCUMENTS {
         let found = blocks(doc);
-        for (i, block) in found.iter().enumerate() {
-            let at = format!("{name} line {}", block.line);
-            let next = found.get(i + 1);
-            let expected = |r: &str| {
-                next.filter(|b| role(b) == ("json", r)).map(|b| -> Value {
-                    serde_json::from_str(&b.body).unwrap_or_else(|e| panic!("{at}: {e}"))
-                })
-            };
-            match role(block) {
-                ("sh", example) => {
-                    let dir = written("docs");
-                    let root = dir.0.join(example);
-                    if let Some(document) = option(block, "doc") {
-                        fs::copy(root.join(document), root.join("source.md")).unwrap();
-                    }
-                    let cwd = option(block, "in").map_or(root.clone(), |sub| root.join(sub));
-                    let lines: Vec<&str> = block
-                        .body
-                        .lines()
-                        .filter(|l| !l.trim().is_empty())
-                        .collect();
-                    let want = expected("output");
-                    for (k, line) in lines.iter().enumerate() {
-                        let args = words(line);
-                        assert_eq!(args[0], "aq-playbooks", "{at}: {line}");
-                        let args: Vec<&str> = args[1..].iter().map(String::as_str).collect();
-                        let out = run(&cwd, &args);
-                        let printed: Value = serde_json::from_slice(&out.stdout)
-                            .unwrap_or_else(|e| panic!("{at}: {line} printed no JSON ({e})"));
-                        match (&want, k + 1 == lines.len()) {
-                            (Some(want), true) => assert!(
-                                fits(want, &printed),
-                                "{at}: {line} printed {printed:#}, not {want:#}"
-                            ),
-                            _ => assert!(out.status.success(), "{at}: {line} failed: {printed:#}"),
-                        }
-                        run_lines.push(words(line));
-                    }
-                    shown += 1;
-                }
-                ("json", "case") => {
-                    let example = block
-                        .info
-                        .get(2)
-                        .unwrap_or_else(|| panic!("{at}: name the example"));
-                    let case: Value =
-                        serde_json::from_str(&block.body).unwrap_or_else(|e| panic!("{at}: {e}"));
-                    let dir = written("docs-case");
-                    let root = dir.0.join(example);
-                    let file = format!("cases/{}.json", case["name"].as_str().unwrap());
-                    fs::write(root.join(&file), &block.body).unwrap();
-                    let out = run(&root, &["try", &file]);
-                    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-                    match expected("report") {
-                        Some(want) => assert!(fits(&want, &report), "{at}: try reports {report:#}"),
-                        None => assert_eq!(report["passed"], true, "{at}: {report:#}"),
-                    }
-                    shown += 1;
-                }
-                ("json", "start") => {
-                    serde_json::from_str::<CaseStart>(&block.body)
-                        .unwrap_or_else(|e| panic!("{at}: {e}"));
-                }
-                ("json", "returns") => {
-                    serde_json::from_str::<BTreeMap<String, Vec<CaseReturn>>>(&block.body)
-                        .unwrap_or_else(|e| panic!("{at}: {e}"));
-                }
-                // An output or a report shows what the block before it
-                // printed, so it must follow its command.
-                ("json", "output") => {
-                    let before = i.checked_sub(1).map(|j| role(&found[j]).0);
-                    assert_eq!(before, Some("sh"), "{at}: an output follows its command");
-                }
-                ("json", "report") => {
-                    let before = i.checked_sub(1).map(|j| role(&found[j]));
-                    assert_eq!(
-                        before,
-                        Some(("json", "case")),
-                        "{at}: a report follows its case"
-                    );
-                }
-                ("json", _) | ("", _) => {}
-                (other, _) => panic!("{at}: a {other} block is not run by any test"),
-            }
+        for i in 0..found.len() {
+            shown += usize::from(verify_document_block(&found, i, name, &mut run_lines));
         }
     }
     assert!(shown >= 12, "only {shown} commands and cases were run");
     // Every `aq-playbooks …` named in the text is a command run above, with
     // `<…>` standing for any one word, or the first words of one.
-    for (name, doc) in DOCUMENTS {
-        let mut fenced = false;
-        for line in doc.lines() {
-            if line.trim_start().starts_with("```") {
-                fenced = !fenced;
-                continue;
-            }
-            if fenced {
-                continue;
-            }
-            for span in line.split('`').skip(1).step_by(2) {
-                let Some(rest) = span.strip_prefix("aq-playbooks ") else {
-                    continue;
-                };
-                let named = words(rest);
-                let matches = run_lines.iter().any(|ran| {
-                    ran.len() > named.len()
-                        && named
-                            .iter()
-                            .zip(&ran[1..])
-                            .all(|(n, r)| (n.starts_with('<') && n.ends_with('>')) || n == r)
-                });
-                assert!(
-                    matches,
-                    "{name}: `{span}` is not a command the documents run"
-                );
-            }
-        }
-    }
+    verify_prose_commands(&run_lines);
 }
 
 /// `commands describe` and `events describe` carry the same notes as the
@@ -574,46 +402,7 @@ fn describe_carries_the_notes_catalog_md_renders() {
             for contract in names.as_array().unwrap() {
                 let contract = contract.as_str().unwrap();
                 let described = ok(&root, &[list, "describe", contract]);
-                // The notes of the catalog the example pins: a contract 2.5.0
-                // changed has the 2.5.0 notes.
-                let mut bare = described.clone();
-                bare.as_object_mut().unwrap().remove("notes");
-                let notes = aq_playbooks_compiler::docs::published_notes(kind, contract, &bare)
-                    .or_else(|| aq_playbooks_compiler::docs::notes(kind, contract))
-                    .unwrap();
-                assert_eq!(described["notes"], notes, "{name}: {contract}");
-                let section = catalog
-                    .split(&format!("\n### `{contract}` "))
-                    .nth(1)
-                    .unwrap_or_else(|| panic!("{name}: CATALOG.md has no {contract}"))
-                    .split("\n### ")
-                    .next()
-                    .unwrap();
-                let rows = |schema: &Value| -> Vec<String> {
-                    schema["properties"]
-                        .as_object()
-                        .map(|m| m.keys().cloned().collect())
-                        .unwrap_or_default()
-                };
-                let fields = if kind == "commands" {
-                    rows(&described["input"])
-                } else {
-                    rows(&described["payload"])
-                };
-                for field in fields {
-                    assert!(
-                        section.contains(&format!("| `{field}` |")),
-                        "{name}: {contract}.{field}"
-                    );
-                }
-                if let Some(outcomes) = described["outcomes"].as_object() {
-                    for outcome in outcomes.keys() {
-                        assert!(
-                            section.contains(&format!("| `{outcome}` |")),
-                            "{name}: {contract} {outcome}"
-                        );
-                    }
-                }
+                verify_contract_notes(&catalog, kind, contract, &described);
             }
         }
     }
@@ -690,4 +479,255 @@ fn an_answer_at_once_takes_the_invokes_own_edge() {
             .contains("work.read always answers at once; leave at_once out."),
         "{report:#}"
     );
+}
+
+fn verify_cases(root: &Path) -> usize {
+    let name = root.display();
+    // Every case passes, and is named after its file.
+    let mut cases: Vec<String> = fs::read_dir(root.join("cases"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    cases.sort();
+    assert!(cases.len() >= 5, "{name} has {} cases", cases.len());
+    for file in &cases {
+        verify_case(root, file);
+    }
+    cases.len()
+}
+
+fn verify_case(root: &Path, file: &str) {
+    let name = root.display();
+    let report = ok(root, &["try", &format!("cases/{file}")]);
+    assert_eq!(report["passed"], true, "{name} {file}: {report:#}");
+    // A case lists every call the run makes, in order, each with
+    // its whole input, and gives no return the run does not use.
+    let case = json_file(&root.join("cases").join(file));
+    let made: Vec<Value> = report["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| serde_json::json!({"command": c["command"], "input": c["input"]}))
+        .collect();
+    assert_eq!(
+        Value::Array(made.clone()),
+        case["expect"]["calls"],
+        "{name} {file}"
+    );
+    for (command, returns) in case["returns"].as_object().unwrap() {
+        let used = made.iter().filter(|c| c["command"] == *command).count();
+        assert_eq!(
+            used,
+            returns.as_array().unwrap().len(),
+            "{name} {file}: {command}"
+        );
+    }
+    assert_eq!(
+        format!("{}.json", report["name"].as_str().unwrap()),
+        file,
+        "{name}: a case is named after its file"
+    );
+}
+
+fn walk(root: &Path, dir: &Path, found: &mut BTreeMap<String, String>) {
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            walk(root, &path, found);
+        } else {
+            let relative = path.strip_prefix(root).unwrap().to_str().unwrap();
+            found.insert(relative.into(), fs::read_to_string(&path).unwrap());
+        }
+    }
+}
+
+fn verify_owner_document(path: &Path, text: &str) {
+    for code in ["`", "work.", "judgment.", "message.", "aq.", "_"] {
+        assert!(!text.contains(code), "{} contains {code:?}", path.display());
+    }
+}
+
+fn verify_document_block(
+    found: &[Block],
+    i: usize,
+    name: &str,
+    run_lines: &mut Vec<Vec<String>>,
+) -> bool {
+    use aq_playbooks_simulation::{CaseReturn, CaseStart};
+    let block = &found[i];
+    let at = format!("{name} line {}", block.line);
+    let next = found.get(i + 1);
+    let expected = |r: &str| {
+        next.filter(|b| role(b) == ("json", r)).map(|b| -> Value {
+            serde_json::from_str(&b.body).unwrap_or_else(|e| panic!("{at}: {e}"))
+        })
+    };
+    match role(block) {
+        ("sh", _) => {
+            run_document_commands(block, &at, expected("output"), run_lines);
+            return true;
+        }
+        ("json", "case") => {
+            verify_document_case(block, &at, expected("report"));
+            return true;
+        }
+        ("json", "start") => {
+            serde_json::from_str::<CaseStart>(&block.body).unwrap_or_else(|e| panic!("{at}: {e}"));
+        }
+        ("json", "returns") => {
+            serde_json::from_str::<BTreeMap<String, Vec<CaseReturn>>>(&block.body)
+                .unwrap_or_else(|e| panic!("{at}: {e}"));
+        }
+        // An output or a report shows what the block before it
+        // printed, so it must follow its command.
+        ("json", "output") => {
+            let before = i.checked_sub(1).map(|j| role(&found[j]).0);
+            assert_eq!(before, Some("sh"), "{at}: an output follows its command");
+        }
+        ("json", "report") => {
+            let before = i.checked_sub(1).map(|j| role(&found[j]));
+            assert_eq!(
+                before,
+                Some(("json", "case")),
+                "{at}: a report follows its case"
+            );
+        }
+        ("json", _) | ("", _) => {}
+        (other, _) => panic!("{at}: a {other} block is not run by any test"),
+    }
+    false
+}
+
+fn run_document_commands(
+    block: &Block,
+    at: &str,
+    want: Option<Value>,
+    run_lines: &mut Vec<Vec<String>>,
+) {
+    let (_, example) = role(block);
+    let dir = written("docs");
+    let root = dir.0.join(example);
+    if let Some(document) = option(block, "doc") {
+        fs::copy(root.join(document), root.join("source.md")).unwrap();
+    }
+    let cwd = option(block, "in").map_or(root.clone(), |sub| root.join(sub));
+    let lines: Vec<&str> = block
+        .body
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+
+    for (k, line) in lines.iter().enumerate() {
+        let args = words(line);
+        assert_eq!(args[0], "aq-playbooks", "{at}: {line}");
+        let command: Vec<&str> = args[1..].iter().map(String::as_str).collect();
+        let out = run(&cwd, &command);
+        let printed: Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("{at}: {line} printed no JSON ({e})"));
+        match (&want, k + 1 == lines.len()) {
+            (Some(want), true) => assert!(
+                fits(want, &printed),
+                "{at}: {line} printed {printed:#}, not {want:#}"
+            ),
+            _ => assert!(out.status.success(), "{at}: {line} failed: {printed:#}"),
+        }
+        run_lines.push(args);
+    }
+}
+
+fn verify_document_case(block: &Block, at: &str, want: Option<Value>) {
+    let example = block
+        .info
+        .get(2)
+        .unwrap_or_else(|| panic!("{at}: name the example"));
+    let case: Value = serde_json::from_str(&block.body).unwrap_or_else(|e| panic!("{at}: {e}"));
+    let dir = written("docs-case");
+    let root = dir.0.join(example);
+    let file = format!("cases/{}.json", case["name"].as_str().unwrap());
+    fs::write(root.join(&file), &block.body).unwrap();
+    let out = run(&root, &["try", &file]);
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    match want {
+        Some(want) => assert!(fits(&want, &report), "{at}: try reports {report:#}"),
+        None => assert_eq!(report["passed"], true, "{at}: {report:#}"),
+    }
+}
+
+fn verify_prose_commands(run_lines: &[Vec<String>]) {
+    for (name, doc) in DOCUMENTS {
+        let mut fenced = false;
+        for line in doc.lines() {
+            if line.trim_start().starts_with("```") {
+                fenced = !fenced;
+                continue;
+            }
+            if fenced {
+                continue;
+            }
+            for span in line.split('`').skip(1).step_by(2) {
+                let Some(rest) = span.strip_prefix("aq-playbooks ") else {
+                    continue;
+                };
+                let matches = command_was_run(rest, run_lines);
+                assert!(
+                    matches,
+                    "{name}: `{span}` is not a command the documents run"
+                );
+            }
+        }
+    }
+}
+
+fn command_was_run(rest: &str, run_lines: &[Vec<String>]) -> bool {
+    let named = words(rest);
+    run_lines.iter().any(|ran| {
+        ran.len() > named.len()
+            && named
+                .iter()
+                .zip(&ran[1..])
+                .all(|(n, r)| (n.starts_with('<') && n.ends_with('>')) || n == r)
+    })
+}
+
+fn verify_contract_notes(catalog: &str, kind: &str, contract: &str, described: &Value) {
+    // The notes of the catalog the example pins: a contract 2.5.0
+    // changed has the 2.5.0 notes.
+    let mut bare = described.clone();
+    bare.as_object_mut().unwrap().remove("notes");
+    let notes = aq_playbooks_compiler::docs::published_notes(kind, contract, &bare)
+        .or_else(|| aq_playbooks_compiler::docs::notes(kind, contract))
+        .unwrap();
+    assert_eq!(described["notes"], notes, "{contract}");
+    let section = catalog
+        .split(&format!("\n### `{contract}` "))
+        .nth(1)
+        .unwrap_or_else(|| panic!("CATALOG.md has no {contract}"))
+        .split("\n### ")
+        .next()
+        .unwrap();
+    let rows = |schema: &Value| -> Vec<String> {
+        schema["properties"]
+            .as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+    let fields = if kind == "commands" {
+        rows(&described["input"])
+    } else {
+        rows(&described["payload"])
+    };
+    for field in fields {
+        assert!(
+            section.contains(&format!("| `{field}` |")),
+            "{contract}.{field}"
+        );
+    }
+    if let Some(outcomes) = described["outcomes"].as_object() {
+        for outcome in outcomes.keys() {
+            assert!(
+                section.contains(&format!("| `{outcome}` |")),
+                "{contract} {outcome}"
+            );
+        }
+    }
 }
