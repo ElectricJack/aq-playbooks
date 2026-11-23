@@ -145,6 +145,34 @@ pub struct RuntimeIndexes {
     #[serde(default)]
     pub dispatch_sequences_complete: bool,
 }
+impl IndexQuery {
+    /// Maximum number of items a storage adapter may return for this query.
+    pub fn page_limit(&self) -> usize {
+        match self {
+            IndexQuery::Ready { limit, .. }
+            | IndexQuery::DueTimers { limit, .. }
+            | IndexQuery::Effects { limit, .. }
+            | IndexQuery::CorrelatedEvents { limit, .. }
+            | IndexQuery::Waiters { limit, .. }
+            | IndexQuery::Runs { limit, .. }
+            | IndexQuery::Receipts { limit, .. } => *limit,
+        }
+        .min(1000)
+    }
+
+    /// Attach the continuation cursor specified for this query.
+    pub fn page(&self, items: Vec<IndexItem>) -> IndexPage {
+        let next = items.last().map(|i| match self {
+            IndexQuery::Ready { .. } | IndexQuery::Effects { .. } => i.scope.clone(),
+            IndexQuery::Receipts { .. } | IndexQuery::CorrelatedEvents { .. } => {
+                i.sequence.to_string()
+            }
+            _ => i.key.clone(),
+        });
+        IndexPage { items, next }
+    }
+}
+
 pub fn correlation_key(
     contract: &ContractRef,
     scope: &str,
@@ -158,230 +186,8 @@ pub fn field_key(contract: &ContractRef, scope: &str, field: &str, value: &str) 
 pub fn trigger_key(contract: &ContractRef, scope: &str) -> Result<String> {
     Ok(digest(&(contract, scope))?)
 }
-fn fair_scopes<T>(scopes: &BTreeMap<String, T>, after: Option<&str>) -> Vec<String> {
-    let mut v: Vec<_> = scopes
-        .keys()
-        .filter(|s| after.is_none_or(|a| s.as_str() > a))
-        .cloned()
-        .collect();
-    v.extend(
-        scopes
-            .keys()
-            .filter(|s| after.is_some_and(|a| s.as_str() <= a))
-            .cloned(),
-    );
-    v
-}
-impl RuntimeIndexes {
-    pub fn query(&self, state: &State, query: &IndexQuery) -> IndexPage {
-        let mut items = vec![];
-        let limit = match query {
-            IndexQuery::Ready { limit, .. }
-            | IndexQuery::DueTimers { limit, .. }
-            | IndexQuery::Effects { limit, .. }
-            | IndexQuery::CorrelatedEvents { limit, .. }
-            | IndexQuery::Waiters { limit, .. }
-            | IndexQuery::Runs { limit, .. }
-            | IndexQuery::Receipts { limit, .. } => *limit,
-        }
-        .min(1000);
-        match query {
-            IndexQuery::Ready { scope_after, .. } => {
-                for scope in fair_scopes(
-                    &self.ready,
-                    scope_after.as_deref().or(self.scope_cursor.as_deref()),
-                ) {
-                    if let Some((seq, id)) = self.ready[&scope].first_key_value() {
-                        items.push(IndexItem {
-                            key: id.clone(),
-                            scope: scope.clone(),
-                            sequence: *seq,
-                            at_ms: None,
-                        });
-                        if items.len() >= limit {
-                            break;
-                        }
-                    }
-                }
-            }
-            IndexQuery::Effects {
-                kind, scope_after, ..
-            } => {
-                if *kind == EffectQueueKind::Completion {
-                    for id in self.completion_ready.iter().take(limit) {
-                        items.push(IndexItem {
-                            key: id.clone(),
-                            scope: state
-                                .intents
-                                .get(id)
-                                .map(|i| i.authority.scope.clone())
-                                .unwrap_or_default(),
-                            sequence: 0,
-                            at_ms: None,
-                        });
-                    }
-                } else if let Some(scopes) = self.effects.get(kind.key()) {
-                    for scope in fair_scopes(
-                        scopes,
-                        scope_after
-                            .as_deref()
-                            .or_else(|| self.effect_cursor.get(kind.key()).map(String::as_str)),
-                    ) {
-                        let cursor =
-                            self.effect_item_cursor
-                                .get(&format!("{}:{}", kind.key(), scope));
-                        let selected = scopes[&scope]
-                            .iter()
-                            .find(|id| cursor.is_none_or(|cursor| *id > cursor))
-                            .or_else(|| scopes[&scope].first());
-                        if let Some(id) = selected {
-                            items.push(IndexItem {
-                                key: id.clone(),
-                                scope: scope.clone(),
-                                sequence: 0,
-                                at_ms: None,
-                            });
-                        }
-                        if items.len() >= limit {
-                            break;
-                        }
-                    }
-                }
-            }
-            IndexQuery::DueTimers { now_ms, .. } => {
-                let mut after: Option<i64> = None;
-                while let Some(at) = self.due.next_key(after.as_ref()) {
-                    if at > *now_ms {
-                        break;
-                    }
-                    after = Some(at);
-                    let at = &at;
-                    let ids = &self.due[at];
-                    for id in ids {
-                        let t = &self.timers[id];
-                        items.push(IndexItem {
-                            key: id.clone(),
-                            scope: state
-                                .runs
-                                .get(&t.run)
-                                .map(|r| r.authority.scope.clone())
-                                .unwrap_or_default(),
-                            sequence: 0,
-                            at_ms: Some(*at),
-                        });
-                        if items.len() >= limit {
-                            break;
-                        }
-                    }
-                    if items.len() >= limit {
-                        break;
-                    }
-                }
-            }
-            IndexQuery::CorrelatedEvents {
-                key,
-                after_sequence,
-                ..
-            } => {
-                if let Some(events) = self.events.get(key) {
-                    for (seq, id) in events
-                        .range((
-                            std::ops::Bound::Excluded(*after_sequence),
-                            std::ops::Bound::Unbounded,
-                        ))
-                        .take(limit)
-                    {
-                        items.push(IndexItem {
-                            key: id.clone(),
-                            scope: state
-                                .events
-                                .get(id)
-                                .map(|e| e.envelope.scope.clone())
-                                .unwrap_or_default(),
-                            sequence: *seq,
-                            at_ms: state.events.get(id).map(|e| e.accepted_at_ms),
-                        });
-                    }
-                }
-            }
-            IndexQuery::Waiters { key, .. } => {
-                if let Some(waiters) = self.waiters.get(key) {
-                    for id in waiters.iter().take(limit) {
-                        items.push(IndexItem {
-                            key: id.clone(),
-                            scope: state
-                                .runs
-                                .get(id)
-                                .map(|r| r.authority.scope.clone())
-                                .unwrap_or_default(),
-                            sequence: 0,
-                            at_ms: None,
-                        });
-                    }
-                }
-            }
-            IndexQuery::Runs { after, .. } => {
-                for id in self
-                    .runs
-                    .iter()
-                    .filter(|id| after.as_ref().is_none_or(|a| *id > a))
-                    .take(limit)
-                {
-                    items.push(IndexItem {
-                        key: id.clone(),
-                        scope: state
-                            .runs
-                            .get(id)
-                            .map(|r| r.authority.scope.clone())
-                            .unwrap_or_default(),
-                        sequence: 0,
-                        at_ms: None,
-                    });
-                }
-            }
-            IndexQuery::Receipts {
-                run,
-                after_sequence,
-                ..
-            } => {
-                let receipts = if let Some(run) = run {
-                    self.receipts.get(run)
-                } else {
-                    Some(&*self.all_receipts)
-                };
-                if let Some(receipts) = receipts {
-                    for (seq, offset) in receipts
-                        .range((
-                            std::ops::Bound::Excluded(*after_sequence),
-                            std::ops::Bound::Unbounded,
-                        ))
-                        .take(limit)
-                    {
-                        items.push(IndexItem {
-                            // The receipt's sequence (its stable identity),
-                            // never its position in the record.
-                            key: format!("{seq:020}"),
-                            scope: String::new(),
-                            sequence: *seq,
-                            at_ms: state.receipts.get(*offset).map(|r| r.at_ms),
-                        });
-                    }
-                }
-            }
-        }
-        if limit == 0 {
-            items.clear()
-        }
-        let next = items.last().map(|i| match query {
-            IndexQuery::Ready { .. } | IndexQuery::Effects { .. } => i.scope.clone(),
-            IndexQuery::Receipts { .. } | IndexQuery::CorrelatedEvents { .. } => {
-                i.sequence.to_string()
-            }
-            _ => i.key.clone(),
-        });
-        IndexPage { items, next }
-    }
-}
+mod query;
+
 pub(crate) fn mark_run(s: &mut State, id: &str) {
     s.indexes.dirty_runs.insert(id.into());
 }
@@ -442,6 +248,14 @@ pub(crate) fn timer(s: &mut State, t: TimerIndex) {
         .or_default()
         .insert(t.key.clone());
     s.indexes.timers.insert(t.key.clone(), t);
+}
+fn unsubscribe(s: &mut State, id: &str) {
+    if let Some(keys) = s.indexes.run_subscriptions.remove(id) {
+        for key in keys {
+            remove_lazy_member(&mut s.indexes.waiters, &key, id);
+            s.replay_touched.wait_keys.insert(key);
+        }
+    }
 }
 fn subscribe(s: &mut State, run: &str, key: String) {
     s.replay_touched.wait_keys.insert(key.clone());
@@ -549,389 +363,12 @@ pub(crate) fn index_activation(s: &mut State, binding: &str) -> Result<()> {
     s.indexes.activation_triggers.insert(binding.into(), keys);
     Ok(())
 }
-fn refresh_run(s: &mut State, id: &str) -> Result<()> {
-    let was_queued = s.indexes.ready_tokens.contains_key(id);
-    unqueue(s, id);
-    if let Some(keys) = s.indexes.run_subscriptions.remove(id) {
-        for key in keys {
-            remove_lazy_member(&mut s.indexes.waiters, &key, id);
-            s.replay_touched.wait_keys.insert(key);
-        }
-    }
-    if let Some(ids) = s.indexes.run_dependencies.remove(id) {
-        for dep in ids {
-            remove_lazy_member(&mut s.indexes.dependents, &dep, id);
-        }
-    }
-    let timerkey = format!("run:{id}");
-    remove_timer(s, &timerkey);
-    let Some(r) = s.runs.get(id).cloned() else {
-        s.indexes.runs.remove(id);
-        if let Some(root) = s.indexes.run_roots.remove(id) {
-            if let Some(ids) = s.indexes.root_members.get_mut(&root) {
-                ids.remove(id);
-                if ids.is_empty() {
-                    s.indexes.root_members.remove(&root);
-                    s.indexes.root_active.remove(&root);
-                    s.indexes.root_effects.remove(&root);
-                    s.indexes.root_intents.remove(&root);
-                    s.indexes.root_last_activity.remove(&root);
-                }
-            }
-            if let Some(ids) = s.indexes.root_active.get_mut(&root) {
-                ids.remove(id);
-            }
-        }
-        return Ok(());
-    };
-    s.indexes.runs.insert(id.into());
-    s.indexes.run_roots.insert(id.into(), r.root.clone());
-    s.indexes
-        .root_members
-        .entry(r.root.clone())
-        .or_default()
-        .insert(id.into());
-    if r.status.terminal() {
-        if let Some(ids) = s.indexes.root_active.get_mut(&r.root) {
-            ids.remove(id);
-        }
-    } else {
-        s.indexes
-            .root_active
-            .entry(r.root.clone())
-            .or_default()
-            .insert(id.into());
-    }
-    if r.status.terminal() {
-        wake_dependents(s, id);
-        return Ok(());
-    }
-    let mut at = None;
-    match r.status {
-        RunStatus::Admitted | RunStatus::Running => wake(s, id),
-        RunStatus::Waiting => match &r.pending {
-            Some(Pending::Effect { intent }) => {
-                depend(s, id, intent.clone());
-                if let Some(i) = s.intents.get(intent)
-                    && (matches!(
-                        i.status,
-                        IntentStatus::Completed
-                            | IntentStatus::Rejected
-                            | IntentStatus::Cancelled
-                            | IntentStatus::Unknown
-                    ) || i.status == IntentStatus::Accepted
-                        && s.artifacts[&r.artifact].content.playbook.steps[&r.step]
-                            .edges
-                            .contains_key("accepted"))
-                {
-                    wake(s, id);
-                }
-            }
-            Some(Pending::Event { wait }) => {
-                let w = &s.waits[wait];
-                at = Some(w.deadline);
-                if let Some(contract) = &w.event {
-                    subscribe(s, id, correlation_key(contract, &w.scope, &w.correlation)?);
-                }
-            }
-            Some(Pending::Child { child, .. }) => {
-                depend(s, id, child.clone());
-                if s.runs.get(child).is_some_and(|r| r.status.terminal()) {
-                    wake(s, id);
-                }
-            }
-            Some(Pending::Join {
-                members, deadline, ..
-            }) => {
-                at = Some(*deadline);
-                for member in members {
-                    depend(s, id, member.clone());
-                }
-            }
-            Some(Pending::Retry { deadline }) => at = Some(*deadline),
-            None => {}
-        },
-        RunStatus::Finishing | RunStatus::Cancelling => {
-            if crate::settled(s, &r)? {
-                wake(s, id)
-            } else {
-                for child in &r.children {
-                    depend(s, id, child.clone());
-                }
-                let ids = s
-                    .intents
-                    .values()
-                    .filter(|i| i.run == id)
-                    .map(|i| i.id.clone())
-                    .collect::<Vec<_>>();
-                for intent in ids {
-                    depend(s, id, intent);
-                }
-            }
-        }
-        RunStatus::Blocked => {}
-        _ => {}
-    }
-    if !matches!(
-        r.status,
-        RunStatus::Finishing | RunStatus::Cancelling | RunStatus::Blocked
-    ) {
-        // A live run's root is live: a cohort leaves only as a whole.
-        let root = s
-            .runs
-            .get(&r.root)
-            .ok_or_else(|| crate::invariant(format!("root {} of run {id} is missing", r.root)))?;
-        let end = crate::deadline(
-            root.admitted_at_ms,
-            s.artifacts[&root.artifact]
-                .content
-                .playbook
-                .limits
-                .max_duration_ms,
-        )?;
-        let own = crate::deadline(
-            r.admitted_at_ms,
-            s.artifacts[&r.artifact]
-                .content
-                .playbook
-                .limits
-                .max_duration_ms,
-        )?;
-        let end = end.min(own);
-        at = Some(at.map_or(end, |a| a.min(end)));
-    }
-    if was_queued
-        && matches!(
-            r.status,
-            RunStatus::Waiting | RunStatus::Finishing | RunStatus::Cancelling
-        )
-    {
-        wake(s, id);
-    }
-    if let Some(at_ms) = at {
-        timer(
-            s,
-            TimerIndex {
-                key: timerkey,
-                run: id.into(),
-                at_ms,
-                intent: None,
-            },
-        );
-    }
-    Ok(())
-}
-fn refresh_intent(s: &mut State, id: &str) -> Result<()> {
-    let was_uncertain = s.indexes.uncertain_contract_membership.remove(id);
-    if let Some(key) = &was_uncertain {
-        remove_member(&mut s.indexes.uncertain_completion_contracts, key, id);
-    }
-    let result = refresh_intent_indexes(s, id);
-    // A hold through an uncertain completion begins or ends: the events of
-    // that contract and scope are judged again (`retention::rejoin`).
-    let is_uncertain = s.indexes.uncertain_contract_membership.get(id).cloned();
-    // An operation never dispatched holds nothing either way (a membership
-    // it loses here is one an older engine recorded): nothing to judge.
-    let after = match s.intents.get(id) {
-        Some(i) => i.dispatch_sequence,
-        // Gone from the State: every event (0).
-        None => Some(0),
-    };
-    if was_uncertain != is_uncertain
-        && let Some(after) = after
-    {
-        // Only events accepted after the dispatch can be its completion.
-        for key in was_uncertain.into_iter().chain(is_uncertain) {
-            let entry = s.replay_touched.contract_keys.entry(key).or_insert(after);
-            *entry = (*entry).min(after);
-        }
-    }
-    result
-}
-fn refresh_intent_indexes(s: &mut State, id: &str) -> Result<()> {
-    let token = format!("intent:{id}");
-    if let Some(keys) = s.indexes.run_subscriptions.remove(&token) {
-        for key in keys {
-            remove_lazy_member(&mut s.indexes.waiters, &key, &token);
-            s.replay_touched.wait_keys.insert(key);
-        }
-    }
-    if let Some(memberships) = s.indexes.effect_memberships.remove(id) {
-        for (kind, scope) in memberships {
-            if let Some(scopes) = s.indexes.effects.get_mut(&kind)
-                && let Some(ids) = scopes.get_mut(&scope)
-            {
-                ids.remove(id);
-                if ids.is_empty() {
-                    scopes.remove(&scope);
-                    s.indexes
-                        .effect_item_cursor
-                        .remove(&format!("{kind}:{scope}"));
-                }
-            }
-        }
-    }
-    remove_timer(s, &format!("effect:{id}"));
-    let Some(i) = s.intents.get(id).cloned() else {
-        s.indexes.completion_ready.remove(id);
-        if let Some(root) = s.indexes.intent_roots.remove(id) {
-            if let Some(ids) = s.indexes.root_effects.get_mut(&root) {
-                ids.remove(id);
-            }
-            if let Some(ids) = s.indexes.root_intents.get_mut(&root) {
-                ids.remove(id);
-                if ids.is_empty() {
-                    s.indexes.root_intents.remove(&root);
-                }
-            }
-        }
-        return Ok(());
-    };
-    let root = s
-        .runs
-        .get(&i.run)
-        .map(|r| r.root.clone())
-        .or_else(|| s.indexes.run_roots.get(&i.run).cloned());
-    if let Some(root) = root {
-        s.indexes.intent_roots.insert(id.into(), root.clone());
-        if !s
-            .indexes
-            .root_intents
-            .get(&root)
-            .is_some_and(|ids| ids.contains(id))
-        {
-            s.indexes
-                .root_intents
-                .entry(root.clone())
-                .or_default()
-                .insert(id.into());
-        }
-        if matches!(
-            i.status,
-            IntentStatus::Completed | IntentStatus::Rejected | IntentStatus::Cancelled
-        ) {
-            if let Some(ids) = s.indexes.root_effects.get_mut(&root) {
-                ids.remove(id);
-            }
-        } else {
-            s.indexes
-                .root_effects
-                .entry(root)
-                .or_default()
-                .insert(id.into());
-        }
-    }
-    if i.completion_event.is_some() {
-        s.indexes.completion_ready.remove(id);
-    }
-    let mut kinds = vec![];
-    if i.status == IntentStatus::Prepared {
-        kinds.push(EffectQueueKind::Dispatch)
-    }
-    if i.cancel_requested
-        && !i.cancel_dispatched
-        && !matches!(
-            i.status,
-            IntentStatus::Completed | IntentStatus::Rejected | IntentStatus::Cancelled
-        )
-    {
-        kinds.push(EffectQueueKind::Cancel)
-    }
-    if matches!(i.status, IntentStatus::Dispatched | IntentStatus::Unknown)
-        || i.cancel_requested
-            && i.cancel_dispatched
-            && !matches!(
-                i.status,
-                IntentStatus::Completed | IntentStatus::Rejected | IntentStatus::Cancelled
-            )
-    {
-        kinds.push(EffectQueueKind::Recovery)
-    }
-    for kind in kinds {
-        s.indexes
-            .effects
-            .entry(kind.key().into())
-            .or_default()
-            .entry(i.authority.scope.clone())
-            .or_default()
-            .insert(id.into());
-        s.indexes
-            .effect_memberships
-            .entry(id.into())
-            .or_default()
-            .push((kind.key().into(), i.authority.scope.clone()));
-    }
-    if matches!(i.status, IntentStatus::Dispatched | IntentStatus::Accepted) {
-        timer(
-            s,
-            TimerIndex {
-                key: format!("effect:{id}"),
-                run: i.run.clone(),
-                at_ms: i.deadline_at_ms,
-                intent: Some(id.into()),
-            },
-        );
-    }
-    if let Some(asynchronous) = &i.command.asynchronous
-        && uncertain(&i)
-        && !hold_lapsed(s, &i)
-    {
-        let event = &s.artifacts[&s.runs[&i.run].artifact]
-            .content
-            .registry
-            .events[&asynchronous.completion_event];
-        let key = trigger_key(
-            &ContractRef {
-                name: event.name.clone(),
-                fingerprint: event.fingerprint()?,
-            },
-            &i.authority.scope,
-        )?;
-        s.indexes
-            .uncertain_completion_contracts
-            .entry(key.clone())
-            .or_default()
-            .insert(id.into());
-        s.indexes
-            .uncertain_contract_membership
-            .insert(id.into(), key);
-    }
-    if let (Some(a), Some(handle)) = (&i.command.asynchronous, &i.handle)
-        && i.completion_event.is_none()
-    {
-        let event = &s.artifacts[&s.runs[&i.run].artifact]
-            .content
-            .registry
-            .events[&a.completion_event];
-        let key = field_key(
-            &ContractRef {
-                name: event.name.clone(),
-                fingerprint: event.fingerprint()?,
-            },
-            &i.authority.scope,
-            &a.correlation_field,
-            handle,
-        )?;
-        let token = format!("intent:{id}");
-        s.replay_touched.wait_keys.insert(key.clone());
-        s.indexes
-            .waiters
-            .entry(key.clone())
-            .or_default()
-            .insert(token.clone());
-        s.indexes
-            .run_subscriptions
-            .entry(token)
-            .or_default()
-            .push(key.clone());
-        if s.indexes.events.get(&key).is_some_and(|e| !e.is_empty()) {
-            s.indexes.completion_ready.insert(id.into());
-        }
-    }
-    wake_dependents(s, id);
-    mark_run(s, &i.run);
-    Ok(())
-}
+mod runs;
+use runs::refresh_run;
+
+mod intents;
+use intents::refresh_intent;
+
 /// Whether `i` (asynchronous) may still be completed by an event its handle
 /// does not name: it was dispatched, has no handle and is not settled. A
 /// recovery that prepares it again does not end that: the first issue may
@@ -1062,36 +499,48 @@ pub(crate) fn backfill_dispatch_sequences(s: &mut State) -> bool {
     if !s.indexes.initialized || s.indexes.dispatch_sequences_complete {
         return false;
     }
-    let candidates: Vec<(String, String)> = s
+    let candidates: Vec<LegacyDispatch> = s
         .intents
         .values()
         .filter(|i| {
             i.command.asynchronous.is_some() && i.handle.is_none() && i.dispatch_sequence.is_none()
         })
-        .map(|i| (i.id.clone(), i.run.clone()))
+        .map(|i| LegacyDispatch {
+            id: i.id.clone(),
+            run: i.run.clone(),
+        })
         .collect();
-    for (id, run) in candidates {
-        let first = s
-            .indexes
+    for candidate in candidates {
+        let first = candidate.first_sequence(s);
+        if let Some(intent) = s.intents.get_mut(&candidate.id) {
+            intent.dispatch_sequence = first;
+        }
+        mark_intent(s, &candidate.id);
+    }
+    s.indexes.dispatch_sequences_complete = true;
+    true
+}
+
+struct LegacyDispatch {
+    id: String,
+    run: String,
+}
+impl LegacyDispatch {
+    fn first_sequence(&self, s: &State) -> Option<u64> {
+        s.indexes
             .receipts
-            .get(&run)
+            .get(&self.run)
             .into_iter()
             .flat_map(|offsets| offsets.values().copied())
             .filter_map(|offset| s.receipts.get(offset))
             .filter(|r| {
-                r.run == run
+                r.run == self.run
                     && r.kind == "dispatch"
-                    && r.detail.get("operation").and_then(|v| v.as_str()) == Some(id.as_str())
+                    && r.detail.get("operation").and_then(|v| v.as_str()) == Some(self.id.as_str())
             })
             .map(|r| r.sequence)
-            .min();
-        if let Some(intent) = s.intents.get_mut(&id) {
-            intent.dispatch_sequence = first;
-        }
-        mark_intent(s, &id);
+            .min()
     }
-    s.indexes.dispatch_sequences_complete = true;
-    true
 }
 
 fn remove_lazy_member(map: &mut LazyMap<String, BTreeSet<String>>, key: &str, member: &str) {

@@ -1,12 +1,12 @@
+#[path = "fixtures/interrupted_storage.rs"]
+mod interrupted_storage;
 use aq_playbooks_model::*;
 use aq_playbooks_runner::*;
+use interrupted_storage::{CommitOutcome, InterruptedStorage};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{
-        Arc,
-        atomic::{AtomicU8, Ordering},
-    },
+    sync::Arc,
 };
 pub fn authority() -> Authority {
     Authority {
@@ -145,64 +145,11 @@ fn deprecated_limits_refuse_no_admission_and_replay_stays_read_only() {
     assert_eq!(e.admit_once(r, 3).unwrap().receipt, first.receipt);
     assert_eq!(before, e.store.load("keyed").unwrap().revision);
 }
-#[derive(Clone, Default)]
-struct Fault {
-    store: MemoryStorage,
-    mode: Arc<AtomicU8>,
-}
-impl Storage for Fault {
-    fn persists_history(&self) -> bool {
-        self.store.persists_history()
-    }
-    fn history_page(
-        &self,
-        n: &str,
-        q: &InspectionQuery,
-    ) -> std::result::Result<Vec<HistoryItem>, StorageError> {
-        self.store.history_page(n, q)
-    }
-    fn delete_history(
-        &self,
-        n: &str,
-        o: &str,
-        before_ms: i64,
-    ) -> std::result::Result<u64, StorageError> {
-        self.store.delete_history(n, o, before_ms)
-    }
-    fn load(&self, n: &str) -> std::result::Result<storage::VersionedState, StorageError> {
-        self.store.load(n)
-    }
-    fn acquire(&self, n: &str, o: &str) -> std::result::Result<(), StorageError> {
-        self.store.acquire(n, o)
-    }
-    fn release(&self, n: &str, o: &str) -> std::result::Result<(), StorageError> {
-        self.store.release(n, o)
-    }
-    fn compare_and_swap(
-        &self,
-        n: &str,
-        o: &str,
-        v: u64,
-        s: &State,
-    ) -> std::result::Result<u64, StorageError> {
-        let mode = self.mode.swap(0, Ordering::SeqCst);
-        if mode == 1 {
-            return Err(StorageError::Conflict);
-        }
-        let committed = self.store.compare_and_swap(n, o, v, s)?;
-        if mode == 2 {
-            return Err(StorageError::Backend(
-                "synthetic lost commit response".into(),
-            ));
-        }
-        Ok(committed)
-    }
-}
 #[test]
 fn before_cas_refusal_is_atomic_and_after_commit_unknown_replays_after_restart() {
-    let store = Fault::default();
+    let store = InterruptedStorage::default();
     let (e, r) = setup(store.clone());
-    store.mode.store(1, Ordering::SeqCst);
+    store.next_commit(CommitOutcome::Conflict);
     assert!(matches!(
         e.admit_once(r.clone(), 1),
         Err(Error::Storage(StorageError::Conflict))
@@ -210,7 +157,7 @@ fn before_cas_refusal_is_atomic_and_after_commit_unknown_replays_after_restart()
     let snapshot = e.snapshot().unwrap();
     assert!(snapshot.runs.is_empty());
     assert!(snapshot.keyed_admissions.is_empty());
-    store.mode.store(2, Ordering::SeqCst);
+    store.next_commit(CommitOutcome::LostResponse);
     assert!(matches!(
         e.admit_once(r.clone(), 2),
         Err(Error::Storage(StorageError::Backend(_)))
@@ -292,68 +239,12 @@ fn bounds_and_activation_ceiling_refuse_before_retention() {
     assert!(e.snapshot().unwrap().keyed_admissions.is_empty());
 }
 
-#[derive(Clone)]
-struct Racing {
-    store: MemoryStorage,
-    remaining: Arc<std::sync::atomic::AtomicUsize>,
-    barrier: Arc<std::sync::Barrier>,
-}
-impl Storage for Racing {
-    fn persists_history(&self) -> bool {
-        self.store.persists_history()
-    }
-    fn history_page(
-        &self,
-        n: &str,
-        q: &InspectionQuery,
-    ) -> std::result::Result<Vec<HistoryItem>, StorageError> {
-        self.store.history_page(n, q)
-    }
-    fn delete_history(
-        &self,
-        n: &str,
-        o: &str,
-        before_ms: i64,
-    ) -> std::result::Result<u64, StorageError> {
-        self.store.delete_history(n, o, before_ms)
-    }
-    fn load(&self, n: &str) -> std::result::Result<storage::VersionedState, StorageError> {
-        let loaded = self.store.load(n)?;
-        if self
-            .remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
-            .is_ok()
-        {
-            self.barrier.wait();
-        }
-        Ok(loaded)
-    }
-    fn acquire(&self, n: &str, o: &str) -> std::result::Result<(), StorageError> {
-        self.store.acquire(n, o)
-    }
-    fn release(&self, n: &str, o: &str) -> std::result::Result<(), StorageError> {
-        self.store.release(n, o)
-    }
-    fn compare_and_swap(
-        &self,
-        n: &str,
-        o: &str,
-        v: u64,
-        s: &State,
-    ) -> std::result::Result<u64, StorageError> {
-        self.store.compare_and_swap(n, o, v, s)
-    }
-}
 #[test]
 fn simultaneous_same_key_cas_has_one_commit_and_exact_recovery() {
-    let backend = Racing {
-        store: MemoryStorage::retaining_settled(),
-        remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        barrier: Arc::new(std::sync::Barrier::new(2)),
-    };
+    let backend = InterruptedStorage::new(MemoryStorage::retaining_settled());
     let (e, r) = setup(backend.clone());
     let e = Arc::new(e);
-    backend.remaining.store(2, Ordering::SeqCst);
+    backend.synchronize_reads(2);
     let mut threads = vec![];
     for _ in 0..2 {
         let e = e.clone();

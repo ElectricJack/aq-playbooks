@@ -43,19 +43,7 @@ fn bench_keyring() -> ProtectionKeyring {
 fn upgrade(runs: usize, steady_bytes: i64, url: &str) {
     let inner = PostgresStorage::connect_protected(url, bench_keyring()).unwrap();
     // The legacy runs, read before the open commit drains any of them.
-    let legacy_state = inner.load(growth::NS).unwrap().state;
-    let legacy: BTreeSet<String> = legacy_state
-        .runs
-        .keys()
-        .filter(|id| id.starts_with("run-"))
-        .cloned()
-        .collect();
-    let legacy_finished = legacy_state
-        .runs
-        .values()
-        .filter(|r| r.status.terminal())
-        .count();
-    drop(legacy_state);
+    let (legacy, legacy_finished) = legacy_runs(&inner);
     let started = Instant::now();
     let e = Engine::new(
         growth::Measured::new(inner, url, u64::MAX),
@@ -86,56 +74,101 @@ fn upgrade(runs: usize, steady_bytes: i64, url: &str) {
         timed: true,
     };
     drop(state);
-    let mut host = growth::BenchHost;
     let base = 1000 * 100_000 + 86_400_000 + 1_000;
     let mut new_ids = vec![];
     for k in 1..=runs {
         let now = base + (k as i64 - 1) * growth::STEADY_SPACING_MS;
-        new_ids.push(growth::serve_run(&bench, &mut host, k, now, 10).0);
+        new_ids.push(
+            growth::serve_run(
+                &bench,
+                growth::RunSample {
+                    number: k,
+                    at_ms: now,
+                    step_ms: 10,
+                },
+            )
+            .0,
+        );
         e.store.close_unchanged();
         e.store.drain();
     }
     let elapsed_s = started.elapsed().as_secs_f64();
-    let items = growth::all_runs(&e);
-    let by_id: BTreeMap<&str, &serde_json::Value> = items
-        .iter()
-        .map(|v| (v["id"].as_str().unwrap(), v))
+    UpgradeSummary {
+        legacy,
+        new_ids,
+        elapsed_s,
+        steady_bytes,
+    }
+    .report(&e);
+}
+fn legacy_runs(inner: &PostgresStorage) -> (BTreeSet<String>, usize) {
+    let legacy_state = inner.load(growth::NS).unwrap().state;
+    let legacy: BTreeSet<String> = legacy_state
+        .runs
+        .keys()
+        .filter(|id| id.starts_with("run-"))
+        .cloned()
         .collect();
-    let state = e.snapshot().unwrap();
-    let missing_legacy = legacy
-        .iter()
-        .filter(|id| !by_id.contains_key(id.as_str()) || state.runs.contains_key(*id))
+    let legacy_finished = legacy_state
+        .runs
+        .values()
+        .filter(|r| r.status.terminal())
         .count();
-    let completed = serde_json::to_value(RunStatus::Completed).unwrap();
-    let new_ok = new_ids
-        .iter()
-        .filter(|id| {
-            by_id
-                .get(id.as_str())
-                .is_some_and(|v| v["status"] == completed && v["outcome"] == "ok")
-        })
-        .count();
-    let commits = e.store.commits.lock().unwrap().clone();
-    let done_at = commits.iter().find(|c| c.2).map(|c| c.0);
-    let after_done: Vec<i64> = commits.iter().filter(|c| c.2).map(|c| c.1).collect();
-    let max_after_done = after_done.iter().copied().max();
-    let final_bytes = commits.last().map(|c| c.1);
-    let limit = steady_bytes as f64 * 1.2;
-    let bounded = max_after_done.is_some_and(|m| m as f64 <= limit);
-    let pass = done_at.is_some() && missing_legacy == 0 && new_ok == runs && bounded;
-    println!(
-        "{}",
-        json!({"kind":"verdict","acceptance":4,"pass":pass,
-               "legacy_runs":legacy.len(),"legacy_missing_from_history":missing_legacy,
-               "new_runs":runs,"new_runs_ok":new_ok,
+    (legacy, legacy_finished)
+}
+
+struct UpgradeSummary {
+    legacy: BTreeSet<String>,
+    new_ids: Vec<String>,
+    elapsed_s: f64,
+    steady_bytes: i64,
+}
+impl UpgradeSummary {
+    fn report(&self, e: &Engine<growth::Measured>) {
+        let items = growth::all_runs(e);
+        let by_id: BTreeMap<&str, &serde_json::Value> = items
+            .iter()
+            .map(|v| (v["id"].as_str().unwrap(), v))
+            .collect();
+        let state = e.snapshot().unwrap();
+        let missing_legacy = self
+            .legacy
+            .iter()
+            .filter(|id| !by_id.contains_key(id.as_str()) || state.runs.contains_key(*id))
+            .count();
+        let completed = serde_json::to_value(RunStatus::Completed).unwrap();
+        let new_ok = self
+            .new_ids
+            .iter()
+            .filter(|id| {
+                by_id
+                    .get(id.as_str())
+                    .is_some_and(|v| v["status"] == completed && v["outcome"] == "ok")
+            })
+            .count();
+        let commits = e.store.commits.lock().unwrap().clone();
+        let done_at = commits.iter().find(|c| c.2).map(|c| c.0);
+        let after_done: Vec<i64> = commits.iter().filter(|c| c.2).map(|c| c.1).collect();
+        let max_after_done = after_done.iter().copied().max();
+        let final_bytes = commits.last().map(|c| c.1);
+        let limit = self.steady_bytes as f64 * 1.2;
+        let bounded = max_after_done.is_some_and(|m| m as f64 <= limit);
+        let pass =
+            done_at.is_some() && missing_legacy == 0 && new_ok == self.new_ids.len() && bounded;
+        println!(
+            "{}",
+            json!({"kind":"verdict","acceptance":4,"pass":pass,
+               "legacy_runs":self.legacy.len(),"legacy_missing_from_history":missing_legacy,
+               "new_runs":self.new_ids.len(),"new_runs_ok":new_ok,
                "drain_done_at_commit":done_at,"commits":commits.len(),
                "record_bytes_at_done":done_at.and_then(|n| commits.iter().find(|c| c.0 == n)).map(|c| c.1),
                "record_bytes_max_after_done":max_after_done,"record_bytes_final":final_bytes,
-               "steady_bytes":steady_bytes,"limit_bytes":limit,
-               "max_after_done_ratio":max_after_done.map(|m| m as f64 / steady_bytes as f64),
-               "final_ratio":final_bytes.map(|m| m as f64 / steady_bytes as f64),
-               "live_runs_left":state.runs.len(),"elapsed_s":elapsed_s})
-    );
+               "steady_bytes":self.steady_bytes,"limit_bytes":limit,
+               "max_after_done_ratio":max_after_done.map(|m| m as f64 / self.steady_bytes as f64),
+               "final_ratio":final_bytes.map(|m| m as f64 / self.steady_bytes as f64),
+               "live_runs_left":state.runs.len(),"elapsed_s":self.elapsed_s})
+        );
+    }
 }
 
 fn main() {
@@ -146,21 +179,15 @@ fn main() {
     }
     let limit: usize = args[2].parse().unwrap();
     let url = &args[3];
+    drain(config, limit, url);
+}
+fn drain(config: &str, limit: usize, url: &str) {
     let store = match config {
         "a" => PostgresStorage::connect_protected(url, bench_keyring()).unwrap(),
         "c" => PostgresStorage::connect_records(url).unwrap(),
         _ => PostgresStorage::connect(url).unwrap(),
     };
     let mut monitor = Client::connect(url, NoTls).unwrap();
-    let mut lsn = || -> i64 {
-        monitor
-            .query_one(
-                "SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(),'0/0')::bigint",
-                &[],
-            )
-            .unwrap()
-            .get(0)
-    };
     let e = Engine::new(store, "growth", "bench-drain").unwrap();
     let state = e.snapshot().unwrap();
     let runs0 = state.runs.len();
@@ -184,11 +211,11 @@ fn main() {
     drop(state);
     loop {
         let before = e.store.transition_stats();
-        let l0 = lsn();
+        let l0 = wal_position(&mut monitor);
         let t0 = Instant::now();
         let report = e.collect_garbage(now, limit).unwrap();
         let us = t0.elapsed().as_micros() as u64;
-        let wal = lsn() - l0;
+        let wal = wal_position(&mut monitor) - l0;
         let after = e.store.transition_stats();
         let s = e.snapshot().unwrap();
         println!(
@@ -202,11 +229,24 @@ fn main() {
                    "record_reads":after.record_reads-before.record_reads})
         );
         now += 1;
-        if !report.more
-            && ((s.runs.is_empty() && s.events.is_empty())
-                || (report.runs == 0 && report.events == 0))
-        {
+        if drain_complete(&report, &s) {
             break;
         }
     }
+}
+
+fn wal_position(monitor: &mut Client) -> i64 {
+    monitor
+        .query_one(
+            "SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(),'0/0')::bigint",
+            &[],
+        )
+        .unwrap()
+        .get(0)
+}
+
+fn drain_complete(report: &GcReport, state: &State) -> bool {
+    let empty = state.runs.is_empty() && state.events.is_empty();
+    let idle = report.runs == 0 && report.events == 0;
+    !report.more && (empty || idle)
 }

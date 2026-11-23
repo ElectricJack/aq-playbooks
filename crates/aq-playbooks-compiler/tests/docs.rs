@@ -10,26 +10,15 @@ use aq_playbooks_compiler::draft::{self, MAX_DRAFT_JSON_BYTES, MAX_DRAFT_STEPS, 
 use aq_playbooks_model::{Expr, MAX_DRAFT_EXPANSION, MAX_DRAFT_EXPANSION_TOTAL, MAX_DRAFT_SCOPE};
 use serde_json::{Value, json};
 
+#[path = "docs/bounds.rs"]
+mod bounds;
+#[path = "docs/diagnostic_codes.rs"]
+mod diagnostic_codes;
+#[path = "docs/snippets.rs"]
+mod snippets;
+
 const DOCUMENTS: [(&str, &str); 2] = [("GUIDE.md", GUIDE), ("LANGUAGE.md", LANGUAGE)];
 const EXAMPLES: [&str; 2] = ["escalate-on-judgment", "notify-when-ready"];
-/// Where the codes come from: every `issue(…, "<code>", …)` and
-/// `Diagnostic::error("<code>", …)` call.
-const SOURCES: [&str; 4] = [
-    include_str!("../../aq-playbooks-model/src/lib.rs"),
-    include_str!("../../aq-playbooks-model/src/draft.rs"),
-    include_str!("../src/draft.rs"),
-    include_str!("../src/lib.rs"),
-];
-/// Codes built with `format!`, which the scan cannot read.
-const FORMATTED_CODES: [&str; 7] = [
-    "unknown_command",
-    "unknown_event",
-    "draft_format",
-    "record_format",
-    "catalog_format",
-    "extensions_format",
-    "facts_format",
-];
 const CLI_AUTHORING: &str = include_str!("../../aq-playbooks-cli/src/authoring.rs");
 
 /// A fenced block: its info words, its text (fence indentation removed), the
@@ -165,97 +154,6 @@ fn diagnostics(ws: &Workspace) -> Vec<Value> {
         .collect()
 }
 
-fn reference(root: &str, path: &[&str]) -> Value {
-    json!({"op": "ref", "root": root, "path": path})
-}
-/// `b0 = {k: input}`, `bj = {a: b(j-1), b: b(j-1)}`: a value that doubles at
-/// every level.
-fn doubling(depth: usize, prefix: &str) -> Value {
-    let mut bindings = vec![
-        json!({"name": format!("{prefix}0"), "value": {"op": "object", "fields": {"k": reference("input", &[])}}}),
-    ];
-    for j in 1..depth {
-        let before = format!("{prefix}{}", j - 1);
-        bindings.push(
-            json!({"name": format!("{prefix}{j}"), "value": {"op": "object",
-            "fields": {"a": reference(&before, &[]), "b": reference(&before, &[])}}}),
-        );
-    }
-    json!({"op": "let", "bindings": bindings,
-           "body": {"op": "exists", "value": reference(&format!("{prefix}{}", depth - 1), &[])}})
-}
-fn decide(predicate: Value, next: &str) -> Value {
-    json!({"op": {"kind": "decide", "predicate": predicate},
-           "edges": {"true": next, "false": next, "unknown": "failed"}, "on_error": null})
-}
-/// The notify-when-ready workspace made to pass one bound the documents
-/// name.
-fn past_the_bound(limit: &str) -> Workspace {
-    let mut ws = workspace("notify-when-ready");
-    let steps = ws.draft["steps"].as_object_mut().unwrap();
-    match limit {
-        "steps" => {
-            let ret = steps["failed"].clone();
-            let missing = MAX_DRAFT_STEPS + 1 - steps.len();
-            for i in 0..missing {
-                steps.insert(format!("r{i}"), ret.clone());
-            }
-        }
-        "bytes" => {
-            ws.draft["purpose"] = json!("x".repeat(MAX_DRAFT_JSON_BYTES));
-        }
-        "expression" => {
-            steps["ready"]["op"]["predicate"] = json!({"op": "and", "values": [doubling(16, "b")]});
-        }
-        "total" => {
-            for i in 0..8 {
-                let next = if i < 7 {
-                    format!("d{}", i + 1)
-                } else {
-                    "wait".into()
-                };
-                steps.insert(
-                    format!("d{i}"),
-                    decide(doubling(14, &format!("x{i}_")), &next),
-                );
-            }
-            steps["ready"]["edges"]["true"] = json!("d0");
-        }
-        "scope" => {
-            for i in 0..200 {
-                let next = if i < 199 {
-                    format!("d{}", i + 1)
-                } else {
-                    "wait".into()
-                };
-                steps.insert(
-                    format!("d{i}"),
-                    decide(json!({"op": "literal", "value": true}), &next),
-                );
-            }
-            steps["ready"]["edges"]["true"] = json!("d0");
-            let input = &mut ws.draft["entries"]["main"]["input"]["properties"];
-            for i in 0..1500 {
-                input[format!("p{i}")] = json!({"type": "boolean"});
-            }
-        }
-        "shapes" => {
-            let rows = vec![json!({"k": "a"}); 12_000];
-            let reads: Vec<Value> = (0..100)
-                .map(|i| {
-                    json!({"op": "map", "collection": reference("t", &[]), "item": format!("r{i}"),
-                                "value": reference(&format!("r{i}"), &["k"]), "max_items": 12_000})
-                })
-                .collect();
-            steps["ready"]["op"]["predicate"] = json!({"op": "let",
-                "bindings": [{"name": "t", "value": {"op": "literal", "value": rows}}],
-                "body": {"op": "exists", "value": {"op": "array", "items": reads}}});
-        }
-        other => panic!("no such bound in the test: {other}"),
-    }
-    ws
-}
-
 #[test]
 fn the_docs_module_returns_the_documents_and_the_examples() {
     assert!(GUIDE.starts_with("---\nname: aq-playbook-author\n"));
@@ -353,85 +251,26 @@ fn every_json_block_in_language_md_parses_as_an_expr_or_step() {
 }
 fn collect_ops(value: &Value, ops: &mut std::collections::BTreeSet<String>) {
     match value {
-        Value::Object(map) => {
-            if let Some(Value::String(op)) = map.get("op") {
-                ops.insert(op.clone());
-            }
-            for (key, inner) in map {
-                if key != "value" || !map.contains_key("op") || map["op"] != "literal" {
-                    collect_ops(inner, ops);
-                }
-            }
-        }
+        Value::Object(map) => collect_object_ops(map, ops),
         Value::Array(items) => items.iter().for_each(|v| collect_ops(v, ops)),
-        _ => {}
+        _ => (),
     }
 }
 
-/// The string literal that follows each `marker(<first argument>,` (or
-/// `marker(` itself when `first` is false).
-fn codes_after(
-    source: &str,
-    marker: &str,
-    skip_first: bool,
-    codes: &mut std::collections::BTreeSet<String>,
+fn collect_object_ops(
+    map: &serde_json::Map<String, Value>,
+    ops: &mut std::collections::BTreeSet<String>,
 ) {
-    let mut rest = source;
-    while let Some(at) = rest.find(marker) {
-        rest = &rest[at + marker.len()..];
-        let mut args = rest.trim_start();
-        if skip_first {
-            let Some(comma) = args.find(',') else { break };
-            if args[..comma].contains(['(', ')', '"']) {
-                continue;
-            }
-            args = args[comma + 1..].trim_start();
-        }
-        if let Some(text) = args.strip_prefix('"') {
-            let code: String = text.chars().take_while(|c| *c != '"').collect();
-            if code.len() > 1 && code.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
-                codes.insert(code);
-            }
+    let op = map.get("op").and_then(Value::as_str);
+    if let Some(op) = op {
+        ops.insert(op.to_owned());
+    }
+    let literal = op == Some("literal");
+    for (key, inner) in map {
+        if !(literal && key == "value") {
+            collect_ops(inner, ops);
         }
     }
-}
-
-#[test]
-fn every_validation_code_has_an_entry() {
-    let mut codes = std::collections::BTreeSet::new();
-    for source in SOURCES {
-        codes_after(source, "issue(", true, &mut codes);
-        codes_after(source, "Diagnostic::error(", false, &mut codes);
-    }
-    codes.extend(FORMATTED_CODES.map(String::from));
-    // The scan finds the codes it must: a code from each source.
-    for code in [
-        "unhandled_outcome",
-        "draft_limit",
-        "workspace_file",
-        "source_header",
-        "call",
-    ] {
-        assert!(codes.contains(code), "the scan missed {code}");
-    }
-    let headings: std::collections::BTreeSet<String> = LANGUAGE
-        .split("\n## Diagnostic codes\n")
-        .nth(1)
-        .expect("LANGUAGE.md has a Diagnostic codes section")
-        .lines()
-        .filter_map(|l| l.strip_prefix("### "))
-        .map(String::from)
-        .collect();
-    let missing: Vec<&String> = codes.difference(&headings).collect();
-    assert!(
-        missing.is_empty(),
-        "codes without an entry in LANGUAGE.md: {missing:?}"
-    );
-    let unknown: Vec<&String> = headings.difference(&codes).collect();
-    assert!(
-        unknown.is_empty(),
-        "entries for codes no tool reports: {unknown:?}"
-    );
 }
 
 /// The notes cover every contract of the pinned catalog exactly (the
@@ -570,63 +409,6 @@ fn the_guide_documents_the_case_format() {
             "the case format shows no `json {role}` block"
         );
     }
-}
-
-#[test]
-fn every_draft_snippet_checks_as_shown() {
-    let mut shown = 0;
-    for (name, doc) in DOCUMENTS {
-        let found = blocks(doc);
-        for (i, block) in found.iter().enumerate() {
-            let at = format!("{name} line {}", block.line);
-            let next = found
-                .get(i + 1)
-                .filter(|b| role(b) == ("json", "diagnostic"));
-            match role(block) {
-                ("json", "draft") => {
-                    let example = block
-                        .info
-                        .get(2)
-                        .unwrap_or_else(|| panic!("{at}: name the example"));
-                    let snippet: Value =
-                        serde_json::from_str(&block.body).unwrap_or_else(|e| panic!("{at}: {e}"));
-                    let mut ws = workspace(example);
-                    patch(&mut ws.draft, &snippet);
-                    let got = diagnostics(&ws);
-                    match next {
-                        Some(want) => {
-                            let want: Value = serde_json::from_str(&want.body).unwrap();
-                            assert!(
-                                got.iter().any(|d| fits(&want, d)),
-                                "{at}: no diagnostic is {want:#}; the check says {got:#?}"
-                            );
-                        }
-                        None => assert!(got.is_empty(), "{at}: shown as right, but {got:#?}"),
-                    }
-                    shown += 1;
-                }
-                ("json", "diagnostic") => {
-                    let want: Value =
-                        serde_json::from_str(&block.body).unwrap_or_else(|e| panic!("{at}: {e}"));
-                    let follows_a_draft = i > 0 && role(&found[i - 1]) == ("json", "draft");
-                    match option(block, "limit") {
-                        Some(limit) => {
-                            let got = diagnostics(&past_the_bound(limit));
-                            assert!(
-                                got.iter().any(|d| fits(&want, d)),
-                                "{at}: past the {limit} bound the check says {got:#?}"
-                            );
-                            shown += 1;
-                        }
-                        None => assert!(follows_a_draft, "{at}: a diagnostic follows its draft"),
-                    }
-                }
-                ("json", "") => panic!("{at}: give every json block a role"),
-                _ => {}
-            }
-        }
-    }
-    assert!(shown >= 15, "only {shown} draft snippets were checked");
 }
 
 #[test]

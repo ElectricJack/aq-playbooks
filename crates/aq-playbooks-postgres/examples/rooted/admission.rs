@@ -73,30 +73,83 @@ pub struct Plan {
     pub after: Value,
     pub disposition: EventDisposition,
 }
-pub fn plan(
-    tree: &mut Tree<'_, '_>,
-    root: &Link,
-    producer: &str,
-    event: EventEnvelope,
-    epoch: u64,
-    now: i64,
-) -> Result<Plan> {
-    let key = digest(&(producer, epoch, &event.event_id))?;
-    let trigger = indexes::trigger_key(&event.contract, &event.scope)?;
-    let mut correlations = vec![indexes::correlation_key(
-        &event.contract,
-        &event.scope,
-        &event.correlation,
-    )?];
-    for (field, value) in &event.correlation {
-        correlations.push(indexes::field_key(
+pub struct Admission<'a> {
+    pub producer: &'a str,
+    pub event: EventEnvelope,
+    pub epoch: u64,
+    pub now: i64,
+}
+impl Admission<'_> {
+    pub fn plan(self, tree: &mut Tree<'_, '_>, root: &Link) -> Result<Plan> {
+        let keys = self.read_set()?;
+        keys.prefetch(tree, root)?;
+        let view = keys.view(tree, root)?;
+        self.admit(view)
+    }
+    fn read_set(&self) -> Result<ReadSet<'_>> {
+        let event = &self.event;
+        let key = digest(&(self.producer, self.epoch, &event.event_id))?;
+        let trigger = indexes::trigger_key(&event.contract, &event.scope)?;
+        let mut correlations = vec![indexes::correlation_key(
             &event.contract,
             &event.scope,
-            field,
-            value,
-        )?);
+            &event.correlation,
+        )?];
+        for (field, value) in &event.correlation {
+            correlations.push(indexes::field_key(
+                &event.contract,
+                &event.scope,
+                field,
+                value,
+            )?);
+        }
+        Ok(ReadSet {
+            producer: self.producer,
+            key,
+            trigger,
+            correlations,
+        })
     }
-    if tree.batched {
+    fn admit(self, view: Value) -> Result<Plan> {
+        // Complete read-set established. Other source collections are deliberately
+        // omitted, not asserted empty: see PB04 prototype read-set document.
+        let state: State = serde_json::from_value(view.clone())?;
+        let store = MemoryStorage::default();
+        store.acquire("prototype-view", "owner")?;
+        store.compare_and_swap("prototype-view", "owner", 0, &state)?;
+        let engine = Engine {
+            store,
+            namespace: "prototype-view".into(),
+            owner: "owner".into(),
+            config: EngineConfig::default(),
+            metrics: metrics::Metrics::default(),
+        };
+        let disposition =
+            engine.admit_event_in_epoch(self.producer, self.event, self.epoch, self.now)?;
+        Ok(Plan {
+            before: view,
+            after: serde_json::to_value(engine.snapshot()?)?,
+            disposition,
+        })
+    }
+}
+struct ReadSet<'a> {
+    producer: &'a str,
+    key: String,
+    trigger: String,
+    correlations: Vec<String>,
+}
+fn ready_for_admission(indexes: &Value) -> bool {
+    indexes["initialized"] == json!(true)
+        && ["dirty_runs", "dirty_intents"]
+            .iter()
+            .all(|k| indexes[k] == json!([]))
+}
+impl ReadSet<'_> {
+    fn prefetch(&self, tree: &mut Tree<'_, '_>, root: &Link) -> Result<()> {
+        if !tree.batched {
+            return Ok(());
+        }
         let mut paths = vec![
             vec!["artifacts"],
             vec!["catalog_revision"],
@@ -108,154 +161,143 @@ pub fn plan(
             vec!["indexes", "dirty_runs"],
             vec!["indexes", "dirty_intents"],
             vec!["retention", "policy"],
-            vec!["retention", "producer_epochs", producer],
-            vec!["retention", "event_tombstones", &key],
-            vec!["retention", "event_expires_at_ms", &key],
-            vec!["retention", "event_epochs", &key],
-            vec!["events", &key],
-            vec!["indexes", "triggers", &trigger],
-            vec!["indexes", "event_memberships", &key],
+            vec!["retention", "producer_epochs", self.producer],
+            vec!["retention", "event_tombstones", &self.key],
+            vec!["retention", "event_expires_at_ms", &self.key],
+            vec!["retention", "event_epochs", &self.key],
+            vec!["events", &self.key],
+            vec!["indexes", "triggers", &self.trigger],
+            vec!["indexes", "event_memberships", &self.key],
         ];
-        for correlation in &correlations {
+        for correlation in &self.correlations {
             paths.push(vec!["indexes", "waiters", correlation]);
             paths.push(vec!["indexes", "events", correlation]);
         }
         tree.prefetch_paths(root, &paths)?;
         let artifacts = tree.path(root, &["artifacts"])?.ok_or("missing catalog")?;
         tree.prefetch_subtree(&artifacts)?;
+
+        Ok(())
     }
-    let mut view = serde_json::to_value(State::default())?;
-    fields(&view, STATE_FIELDS)?;
-    fields(&view["retention"], RETENTION_FIELDS)?;
-    fields(&view["indexes"], INDEX_FIELDS)?;
-    // Whole catalog needed by find_event's ordered artifact search and protection
-    // checks. This is O(A), explicitly not a history-constant catalog lookup.
-    for field in ["artifacts", "catalog_revision", "sequence"] {
-        copy(tree, root, &mut view, &[field])?;
-    }
-    for field in ["initialized", "dirty_runs", "dirty_intents"] {
-        copy(tree, root, &mut view, &["indexes", field])?;
-    }
-    if view["indexes"]["initialized"] != json!(true)
-        || view["indexes"]["dirty_runs"] != json!([])
-        || view["indexes"]["dirty_intents"] != json!([])
-    {
-        return Err("fallback: initialization or dirty-index synchronization".into());
-    }
-    for path in [
-        vec!["retention", "policy"],
-        vec!["retention", "producer_epochs", producer],
-        vec!["retention", "event_tombstones", &key],
-        vec!["retention", "event_expires_at_ms", &key],
-        vec!["retention", "event_epochs", &key],
-        vec!["events", &key],
-    ] {
-        copy(tree, root, &mut view, &path)?;
-    }
-    if tree
-        .at(root, &["indexes", "triggers", &trigger])?
-        .is_some_and(|v| v != json!([]))
-    {
-        return Err("fallback: relevant consumer".into());
-    }
-    for correlation in correlations {
-        // Absence is traversed from the authoritative root, never SQL mirror.
+    fn event_indexes(&self, tree: &mut Tree<'_, '_>, root: &Link, view: &mut Value) -> Result<()> {
         if tree
-            .at(root, &["indexes", "waiters", &correlation])?
+            .at(root, &["indexes", "triggers", &self.trigger])?
             .is_some_and(|v| v != json!([]))
         {
-            return Err("fallback: relevant waiter".into());
+            return Err("fallback: relevant consumer".into());
         }
-        // Existing groups need only an existence marker: their old members are
-        // preserved by leaf patches. index_event inserts only the fresh sequence.
-        if tree
-            .path(root, &["indexes", "events", &correlation])?
-            .is_some()
-        {
-            assign(&mut view, &["indexes", "events", &correlation], json!({}));
+        for correlation in &self.correlations {
+            // Absence is traversed from the authoritative root, never SQL mirror.
+            if tree
+                .at(root, &["indexes", "waiters", correlation])?
+                .is_some_and(|v| v != json!([]))
+            {
+                return Err("fallback: relevant waiter".into());
+            }
+            // Existing groups need only an existence marker: their old members are
+            // preserved by leaf patches. index_event inserts only the fresh sequence.
+            if tree
+                .path(root, &["indexes", "events", correlation])?
+                .is_some()
+            {
+                assign(view, &["indexes", "events", correlation], json!({}));
+            }
         }
+        copy(
+            tree,
+            root,
+            view,
+            &["indexes", "event_memberships", &self.key],
+        )?;
+        Ok(())
     }
-    copy(
-        tree,
-        root,
-        &mut view,
-        &["indexes", "event_memberships", &key],
-    )?;
-    // Complete read-set established. Other source collections are deliberately
-    // omitted, not asserted empty: see PB04 prototype read-set document.
-    let state: State = serde_json::from_value(view.clone())?;
-    let store = MemoryStorage::default();
-    store.acquire("prototype-view", "owner")?;
-    store.compare_and_swap("prototype-view", "owner", 0, &state)?;
-    let engine = Engine {
-        store,
-        namespace: "prototype-view".into(),
-        owner: "owner".into(),
-        config: EngineConfig::default(),
-        metrics: metrics::Metrics::default(),
-    };
-    let disposition = engine.admit_event_in_epoch(producer, event, epoch, now)?;
-    Ok(Plan {
-        before: view,
-        after: serde_json::to_value(engine.snapshot()?)?,
-        disposition,
-    })
+    fn view(&self, tree: &mut Tree<'_, '_>, root: &Link) -> Result<Value> {
+        let mut view = serde_json::to_value(State::default())?;
+        fields(&view, STATE_FIELDS)?;
+        fields(&view["retention"], RETENTION_FIELDS)?;
+        fields(&view["indexes"], INDEX_FIELDS)?;
+        // Whole catalog needed by find_event's ordered artifact search and protection
+        // checks. This is O(A), explicitly not a history-constant catalog lookup.
+        for field in ["artifacts", "catalog_revision", "sequence"] {
+            copy(tree, root, &mut view, &[field])?;
+        }
+        for field in ["initialized", "dirty_runs", "dirty_intents"] {
+            copy(tree, root, &mut view, &["indexes", field])?;
+        }
+        if !ready_for_admission(&view["indexes"]) {
+            return Err("fallback: initialization or dirty-index synchronization".into());
+        }
+        for path in [
+            vec!["retention", "policy"],
+            vec!["retention", "producer_epochs", self.producer],
+            vec!["retention", "event_tombstones", &self.key],
+            vec!["retention", "event_expires_at_ms", &self.key],
+            vec!["retention", "event_epochs", &self.key],
+            vec!["events", &self.key],
+        ] {
+            copy(tree, root, &mut view, &path)?;
+        }
+        self.event_indexes(tree, root, &mut view)?;
+        Ok(view)
+    }
 }
 /// Only insertion/replacement leaves. No deletes, receipt-offset maintenance,
 /// array edits, or unsupported transitions can enter this isolated prototype.
 /// Old expected values are checked against freshly authenticated rooted values.
 pub fn patch(tree: &mut Tree<'_, '_>, root: &Link, before: &Value, after: &Value) -> Result<Link> {
-    fn walk(
-        tree: &mut Tree<'_, '_>,
-        root: &Link,
-        path: &mut Vec<String>,
-        before: &Value,
-        after: &Value,
-    ) -> Result<Link> {
-        if before == after {
+    Change { before, after }.apply(tree, root, &mut vec![])
+}
+struct Change<'a> {
+    before: &'a Value,
+    after: &'a Value,
+}
+impl Change<'_> {
+    fn apply(&self, tree: &mut Tree<'_, '_>, root: &Link, path: &mut Vec<String>) -> Result<Link> {
+        if self.before == self.after {
             return Ok(root.clone());
         }
-        if let (Some(a), Some(b)) = (before.as_object(), after.as_object()) {
-            if a.keys().any(|k| !b.contains_key(k)) {
-                return Err("fallback: deletion".into());
-            }
-            let mut root = root.clone();
-            for (k, v) in b {
-                path.push(k.clone());
-                root = walk(tree, &root, path, a.get(k).unwrap_or(&Value::Null), v)?;
-                path.pop();
-            }
-            return Ok(root);
+        match (self.before, self.after) {
+            (Value::Object(_) | Value::Null, Value::Object(_)) => self.object(tree, root, path),
+            _ => self.leaf(tree, root, path),
         }
-        // A newly introduced object must be merged leafwise because the partial
-        // planner may know only an authenticated group's existence, not history.
-        if before.is_null()
-            && let Some(object) = after.as_object()
-        {
-            let refs: Vec<&str> = path.iter().map(String::as_str).collect();
-            if tree.path(root, &refs)?.is_none() {
-                return tree.set(root, &refs, after);
+    }
+    fn leaf(&self, tree: &mut Tree<'_, '_>, root: &Link, path: &[String]) -> Result<Link> {
+        let refs: Vec<&str> = path.iter().map(String::as_str).collect();
+        if let Some(actual) = tree.at(root, &refs)? {
+            if &actual != self.before {
+                return Err("patch expected-value mismatch".into());
             }
-            let mut root = root.clone();
-            for (k, v) in object {
-                path.push(k.clone());
-                root = walk(tree, &root, path, &Value::Null, v)?;
-                path.pop();
-            }
-            return Ok(root);
-        }
-        let path: Vec<&str> = path.iter().map(String::as_str).collect();
-        let actual = tree.at(root, &path)?;
-        if actual.as_ref().is_some_and(|v| v != before) {
-            return Err("patch expected-value mismatch".into());
-        }
-        if before.is_array() || after.is_array() {
-            // New membership array is safe; changing retained arrays is not.
-            if actual.is_some() {
+            if self.before.is_array() || self.after.is_array() {
                 return Err("fallback: existing array edit".into());
             }
         }
-        tree.set(root, &path, after)
+        tree.set(root, &refs, self.after)
     }
-    walk(tree, root, &mut vec![], before, after)
+
+    fn object(&self, tree: &mut Tree<'_, '_>, root: &Link, path: &mut Vec<String>) -> Result<Link> {
+        let after = self.after.as_object().unwrap();
+        let before = self.before.as_object();
+        if let Some(before) = before {
+            if before.keys().any(|k| !after.contains_key(k)) {
+                return Err("fallback: deletion".into());
+            }
+        } else {
+            // A new object may already have members omitted from the partial planner view.
+            let refs: Vec<&str> = path.iter().map(String::as_str).collect();
+            if tree.path(root, &refs)?.is_none() {
+                return tree.set(root, &refs, self.after);
+            }
+        }
+        let mut next = root.clone();
+        for (k, v) in after {
+            path.push(k.clone());
+            next = Change {
+                before: before.and_then(|b| b.get(k)).unwrap_or(&Value::Null),
+                after: v,
+            }
+            .apply(tree, &next, path)?;
+            path.pop();
+        }
+        Ok(next)
+    }
 }

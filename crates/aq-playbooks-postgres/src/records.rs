@@ -20,11 +20,9 @@ use aq_playbooks_runner::transition::{
     header_state, schema, take_patch,
 };
 use aq_playbooks_runner::{Error, State, StorageError};
-use postgres::Statement;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::panic::Location;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 pub(crate) const FORMAT: i32 = 3;
 pub(crate) const MARKER_SQL: &str = "SELECT set_config('aq_playbooks.writer_namespace',$1,true),set_config('aq_playbooks.writer_format',$2,true)";
@@ -231,162 +229,40 @@ pub(crate) fn replace_all(
         &[&namespace],
     )
     .map_err(backend)?;
-    upsert(tx, namespace, &export.fields, &export.keys, &export.values)
-}
-fn upsert(
-    tx: &mut ObservedTransaction<'_>,
-    namespace: &str,
-    fields: &[String],
-    keys: &[Vec<u8>],
-    values: &[Vec<u8>],
-) -> Result<(), StorageError> {
-    if fields.is_empty() {
-        return Ok(());
+    Columns {
+        fields: &export.fields,
+        keys: &export.keys,
+        values: &export.values,
     }
-    tx.execute("INSERT INTO aq_playbooks.state_records(namespace,field,sort_key,value) SELECT $1,f,k,v FROM unnest($2::text[],$3::bytea[],$4::bytea[]) AS r(f,k,v) ON CONFLICT(namespace,field,sort_key) DO UPDATE SET value=EXCLUDED.value",&[&namespace,&fields,&keys,&values]).map_err(backend)?;
-    Ok(())
+    .upsert(tx, namespace)
 }
-
-/// Prepared once per connection, outside any transaction.
-#[derive(Clone)]
-pub(crate) struct Statements {
-    get: Statement,
-    first: Statement,
-    after: Statement,
-    scan: Statement,
+struct Columns<'a> {
+    fields: &'a [String],
+    keys: &'a [Vec<u8>],
+    values: &'a [Vec<u8>],
 }
-impl Statements {
-    pub(crate) fn prepare(client: &mut postgres::Client) -> Result<Self, StorageError> {
-        let mut p = |sql: &str| client.prepare(sql).map_err(backend);
-        Ok(Self {
-            get: p(
-                "SELECT value FROM aq_playbooks.state_records WHERE namespace=$1 AND field=$2 AND sort_key=$3",
-            )?,
-            first: p(
-                "SELECT sort_key,value FROM aq_playbooks.state_records WHERE namespace=$1 AND field=$2 ORDER BY sort_key LIMIT $3",
-            )?,
-            after: p(
-                "SELECT sort_key,value FROM aq_playbooks.state_records WHERE namespace=$1 AND field=$2 AND sort_key>$3 ORDER BY sort_key LIMIT $4",
-            )?,
-            scan: p(
-                "SELECT sort_key,value FROM aq_playbooks.state_records WHERE namespace=$1 AND field=$2 ORDER BY sort_key",
-            )?,
-        })
+impl Columns<'_> {
+    fn upsert(self, tx: &mut ObservedTransaction<'_>, namespace: &str) -> Result<(), StorageError> {
+        let Self {
+            fields,
+            keys,
+            values,
+        } = self;
+        if fields.is_empty() {
+            return Ok(());
+        }
+        tx.execute("INSERT INTO aq_playbooks.state_records(namespace,field,sort_key,value) SELECT $1,f,k,v FROM unnest($2::text[],$3::bytea[],$4::bytea[]) AS r(f,k,v) ON CONFLICT(namespace,field,sort_key) DO UPDATE SET value=EXCLUDED.value",&[&namespace,&fields,&keys,&values]).map_err(backend)?;
+        Ok(())
     }
 }
 
-/// The row-locked transaction, lent to the bound State for the plan.
-struct PgSource {
-    // SAFETY: the 'static lifetime is erased from a transaction borrowing the
-    // storage connection guard. `Lent` reclaims (or drops) it before that guard
-    // is released; after reclamation every access fails and poisons.
-    tx: Mutex<Option<ObservedTransaction<'static>>>,
-    namespace: String,
-    statements: Statements,
-    counts: BTreeMap<&'static str, usize>,
-    reads: Mutex<u64>,
-    fallbacks: Mutex<Vec<String>>,
-    poison: Mutex<Option<String>>,
-}
+mod source;
+pub(crate) use source::Statements;
+use source::{Lent, PgSource};
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
-impl PgSource {
-    fn rows(
-        &self,
-        statement: &Statement,
-        params: &[&(dyn postgres::types::ToSql + Sync)],
-    ) -> Result<Vec<postgres::Row>, String> {
-        let mut tx = lock(&self.tx);
-        let tx = tx
-            .as_mut()
-            .ok_or_else(|| "transition record source used after the plan".to_string())?;
-        tx.query(statement, params).map_err(|e| e.to_string())
-    }
-    fn path(path: &ContainerPath) -> Result<&'static str, String> {
-        if path.outer.is_some() {
-            return Err(format!("{path:?}: nested containers are not stored"));
-        }
-        Ok(path.field)
-    }
-    fn pairs(
-        &self,
-        name: &str,
-        rows: Vec<postgres::Row>,
-    ) -> Result<Vec<(TreeKey, Vec<u8>)>, String> {
-        *lock(&self.reads) += rows.len().max(1) as u64;
-        rows.into_iter()
-            .map(|r| Ok((decode_key(name, r.get::<_, &[u8]>(0))?, r.get(1))))
-            .collect()
-    }
-    fn check(&self) -> Result<(), Error> {
-        match lock(&self.poison).clone() {
-            Some(e) => Err(Error::Storage(backend(format!(
-                "transition source failed: {e}"
-            )))),
-            None => Ok(()),
-        }
-    }
-}
-impl RecordSource for PgSource {
-    fn get(&self, path: &ContainerPath, key: &TreeKey) -> Result<Option<Vec<u8>>, String> {
-        let name = Self::path(path)?;
-        let rows = self.rows(
-            &self.statements.get,
-            &[&self.namespace, &name, &encode_key(key)],
-        )?;
-        *lock(&self.reads) += 1;
-        Ok(rows.into_iter().next().map(|r| r.get(0)))
-    }
-    fn after(
-        &self,
-        path: &ContainerPath,
-        after: Option<&TreeKey>,
-        limit: usize,
-    ) -> Result<Vec<(TreeKey, Vec<u8>)>, String> {
-        let name = Self::path(path)?;
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows = match after {
-            None => self.rows(&self.statements.first, &[&self.namespace, &name, &limit])?,
-            Some(key) => self.rows(
-                &self.statements.after,
-                &[&self.namespace, &name, &encode_key(key), &limit],
-            )?,
-        };
-        self.pairs(name, rows)
-    }
-    fn len(&self, path: &ContainerPath) -> Result<usize, String> {
-        let name = Self::path(path)?;
-        Ok(self.counts.get(name).copied().unwrap_or(0))
-    }
-    fn scan(&self, path: &ContainerPath) -> Result<Vec<(TreeKey, Vec<u8>)>, String> {
-        let name = Self::path(path)?;
-        let rows = self.rows(&self.statements.scan, &[&self.namespace, &name])?;
-        self.pairs(name, rows)
-    }
-    fn fallback(&self, path: &ContainerPath, at: &'static Location<'static>) {
-        lock(&self.fallbacks).push(format!("{} at {}:{}", path.field, at.file(), at.line()));
-    }
-    fn fail(&self, error: String) {
-        lock(&self.poison).get_or_insert(error);
-    }
-}
-/// Reclaims the lent transaction on every exit path, before the connection
-/// guard (declared earlier) is released.
-struct Lent(Arc<PgSource>);
-impl Lent {
-    fn reclaim(&self) -> Result<ObservedTransaction<'static>, Error> {
-        lock(&self.0.tx)
-            .take()
-            .ok_or_else(|| Error::Storage(backend("transition transaction already reclaimed")))
-    }
-}
-impl Drop for Lent {
-    fn drop(&mut self) {
-        drop(lock(&self.0.tx).take());
-    }
-}
-
 /// Deleting one of these records always takes the complete path, where
 /// `retention::verify_removals` checks it against the whole State.
 const HISTORY_REMOVALS: &[&str] = &["runs", "intents", "retention.disposals"];
@@ -399,6 +275,14 @@ const WINDOWS: &[(&str, &str)] = &[
 ];
 const IDENTITIES: &[(&str, &str)] = &[("events", "event"), ("runs", "run"), ("intents", "intent")];
 
+mod write;
+use write::{Head, Planned};
+struct Opened<'a> {
+    tx: ObservedTransaction<'a>,
+    statements: Statements,
+    head: Head,
+    artifacts: BTreeMap<String, Artifact>,
+}
 impl PostgresStorage {
     /// Records representation is used for namespaces this connection creates.
     pub(crate) fn transition_records(
@@ -409,19 +293,76 @@ impl PostgresStorage {
     ) -> aq_playbooks_runner::Result<TransitionOutcome> {
         check_name(namespace)?;
         let mut conn = self.connection()?;
+        let Some(Opened {
+            tx,
+            statements,
+            head,
+            artifacts,
+        }) = self.open_records(&mut conn, namespace, owner)?
+        else {
+            return Ok(TransitionOutcome::Unsupported);
+        };
+        let lent = Lent::new(tx, namespace, statements, &head.accounting);
+        let source = lent.source.clone();
+        let mut state = bind_state(&head.header, source.clone())?;
+        if !state.indexes.initialized {
+            return Ok(TransitionOutcome::Unsupported);
+        }
+        state.artifacts = artifacts.clone();
+        let outcome = Planned::run(request, &mut state, &source, &head.header);
+        let fallback = self.count_plan(&source);
+        let Some(plan) = outcome? else {
+            self.count(|s| s.unchanged += 1);
+            return Ok(TransitionOutcome::Unchanged);
+        };
+        let mut tx: ObservedTransaction<'_> = lent.reclaim()?;
+        let prepared = head.prepare(&mut tx, namespace, (&state, &plan))?;
+        source.check()?;
+        let heavy = prepared.needs_full(fallback, &state, &artifacts)?;
+        if heavy {
+            let mut next = prepared.staged.rebuild(&mut tx, namespace, plan.patch)?;
+            next.settled = std::mem::take(&mut state.settled);
+            drop(tx);
+            drop(conn);
+            drop(state);
+            let revision = crate::snapshot::Commit {
+                storage: self,
+                namespace,
+                owner,
+                state: &next,
+                force_artifact_refresh: false,
+            }
+            .write(head.expected as u64)?;
+            self.count(|s| s.heavy += 1);
+            return Ok(TransitionOutcome::Committed { revision });
+        }
+        let published = prepared
+            .incremental(namespace, &state, &plan.stripped)
+            .publish(self, &mut tx)?;
+        if let Err(error) = tx.commit() {
+            if let Some(lease) = conn.leases.get_mut(namespace) {
+                lease.catalog_uncertain = true;
+            }
+            return Err(backend(error).into());
+        }
+        Ok(published.committed(self, namespace))
+    }
+    fn open_records<'a>(
+        &self,
+        conn: &'a mut crate::Connection,
+        namespace: &str,
+        owner: &str,
+    ) -> Result<Option<Opened<'a>>, Error> {
         let lease = conn
             .leases
             .get(namespace)
             .filter(|l| l.owner == owner)
             .ok_or(StorageError::Ownership)?;
         if lease.format != FORMAT {
-            return Ok(TransitionOutcome::Unsupported);
+            return Ok(None);
         }
         let incarnation = lease.incarnation;
-        if conn.statements.is_none() {
-            conn.statements = Some(Statements::prepare(&mut conn.client)?);
-        }
-        let statements = conn.statements.clone().expect("prepared above");
+        let statements = conn.record_statements()?;
         let mut tx = ObservedTransaction::new(
             conn.client.transaction().map_err(backend)?,
             self.profiling.clone(),
@@ -432,182 +373,26 @@ impl PostgresStorage {
         if !owns_lock(&mut tx, namespace)? {
             return Err(StorageError::Ownership.into());
         }
-        let row = tx.query_opt("SELECT revision,owner,incarnation,owner_backend_pid=pg_backend_pid(),writer_format,state_header,state_accounting,catalog_projected_revision,catalog_metadata_revision,catalog_definition_count,catalog_activation_count,catalog_actual_definition_count,catalog_actual_activation_count FROM aq_playbooks.namespaces WHERE namespace=$1 FOR UPDATE", &[&namespace]).map_err(backend)?.ok_or(StorageError::Ownership)?;
-        owns_row(&row, owner, incarnation)?;
-        if row.get::<_, i32>("writer_format") != FORMAT {
-            return Ok(TransitionOutcome::Unsupported);
-        }
-        let expected: i64 = row.get(0);
-        let catalog_projected: Option<i64> = row.get("catalog_projected_revision");
-        let catalog_metadata: Option<i64> = row.get("catalog_metadata_revision");
-        if catalog_projected.is_some_and(|p| p != expected)
-            || catalog_projected.is_some() != catalog_metadata.is_some()
-        {
-            return Err(backend("catalog projection revision mismatch").into());
-        }
-        crate::catalog::validate_counts(&row)?;
-        let header: Vec<u8> = row.get("state_header");
-        let accounting = accounting_from(&row.get::<_, Value>("state_accounting"))?;
+        let Some(head) = Head::read(&mut tx, namespace, (owner, incarnation))? else {
+            return Ok(None);
+        };
         let artifacts = self.read_artifacts(&mut tx, namespace, false)?;
-        let source = Arc::new(PgSource {
-            // SAFETY: see `PgSource::tx`; `lent` is dropped before `conn`.
-            tx: Mutex::new(Some(unsafe {
-                std::mem::transmute::<ObservedTransaction<'_>, ObservedTransaction<'static>>(tx)
-            })),
-            namespace: namespace.to_string(),
+        Ok(Some(Opened {
+            tx,
             statements,
-            counts: accounting.fields.clone(),
-            reads: Mutex::new(0),
-            fallbacks: Mutex::new(vec![]),
-            poison: Mutex::new(None),
-        });
-        let lent = Lent(source.clone());
-        let mut state = bind_state(&header, source.clone())?;
-        if !state.indexes.initialized {
-            return Ok(TransitionOutcome::Unsupported);
-        }
-        state.artifacts = artifacts.clone();
-        type Planned = (StatePatch, Vec<u8>, BTreeSet<(Window, String)>);
-        let outcome: Result<Option<Planned>, Error> = (|| {
-            let changed = (request.plan)(&mut state)?;
-            source.check()?;
-            if !changed {
-                return Ok(None);
-            }
-            // Bound lookups, while the transaction is still lent.
-            aq_playbooks_runner::history::check_not_live(
-                &state,
-                &aq_playbooks_runner::history_items(&state.settled),
-            )?;
-            source.check()?;
-            let patch = take_patch(&mut state)?;
-            let evicted = licensed_evictions(&source, &header, &patch, &state)?;
-            let stripped = stripped_header(&mut state)?;
-            source.check()?;
-            Ok(Some((patch, stripped, evicted)))
-        })();
-        let reads = *lock(&source.reads);
-        let fallbacks = std::mem::take(&mut *lock(&source.fallbacks));
+            head,
+            artifacts,
+        }))
+    }
+    fn count_plan(&self, source: &PgSource) -> bool {
+        let reads = source.reads();
+        let fallbacks = source.take_fallbacks();
         self.count(|s| {
             s.transitions += 1;
             s.record_reads += reads;
             s.fallbacks.extend(fallbacks.iter().cloned());
         });
-        let Some((patch, stripped, evicted)) = outcome? else {
-            self.count(|s| s.unchanged += 1);
-            return Ok(TransitionOutcome::Unchanged);
-        };
-        let mut tx: ObservedTransaction<'_> = lent.reclaim()?;
-        let previous = header_state(&header)?;
-        // A commit with an admin licence (clock rebase, floor lowering)
-        // takes the complete path: only `verify_removals` judges a licence.
-        let rebase = aq_playbooks_runner::retention::carries_licence(&state);
-        let staged = stage(
-            &mut tx,
-            namespace,
-            &accounting,
-            &patch,
-            state.retention.clock_ms,
-            &state.retention.policy,
-            rebase,
-            &evicted,
-        )?;
-        let live_keys = aq_playbooks_runner::history::patch_live_keys(&patch)?;
-        source.check()?;
-        let heavy = !fallbacks.is_empty()
-            || rebase
-            || staged.replaced
-            || staged.history_removed
-            || state.artifacts != artifacts
-            || !same(&state.bindings, &previous.bindings)?
-            || state.execution_denied != previous.execution_denied
-            || !same(&state.retention.policy, &previous.retention.policy)?
-            || !same(
-                &state.retention.artifact_disposals,
-                &previous.retention.artifact_disposals,
-            )?
-            || catalog_metadata.is_none();
-        if heavy {
-            let mut records = all_records(&mut tx, namespace)?;
-            apply(&mut records, patch)?;
-            let mut next = assemble_state(&staged.full_header, |f| {
-                Ok(records
-                    .remove(f)
-                    .map(|c| c.into_iter().collect())
-                    .unwrap_or_default())
-            })?;
-            // `settled` is not in the header; `commit_state` writes it.
-            next.settled = std::mem::take(&mut state.settled);
-            drop(tx);
-            drop(lent);
-            drop(conn);
-            drop(state);
-            let revision = self.commit_state(namespace, owner, expected as u64, &next, false)?;
-            self.count(|s| s.heavy += 1);
-            return Ok(TransitionOutcome::Committed { revision });
-        }
-        verify_header(&previous, &state)?;
-        let next = expected
-            .checked_add(1)
-            .ok_or_else(|| backend("revision exhausted"))?;
-        if !staged.created.is_empty() {
-            let (kinds, ids): (Vec<_>, Vec<_>) = staged.created.iter().cloned().unzip();
-            if let Some(reused) = tx.query_opt("SELECT kind FROM aq_playbooks.disposal_tombstones WHERE namespace=$1 AND (kind,identity) IN (SELECT * FROM unnest($2::text[],$3::text[])) LIMIT 1",&[&namespace,&kinds,&ids]).map_err(backend)? {
-                return Err(backend(format!("disposed {} identity cannot be reused", reused.get::<_, String>(0))).into());
-            }
-        }
-        if state.retention.last_gc_at_ms != previous.retention.last_gc_at_ms {
-            crate::retention::collect(&mut tx, namespace, &state)?;
-        }
-        // The drain of legacy tombstone rows, after the identity check
-        // above; a bounded commit writes no legacy row.
-        let drain_limit = self.tombstone_drain_limit(namespace, &state);
-        let rows = crate::retention::TombstoneRows {
-            deleted: match drain_limit {
-                Some(limit) => Some(crate::retention::drain_tombstones(
-                    &mut tx, namespace, limit,
-                )?),
-                None => None,
-            },
-        };
-        let retired: Vec<&String> = staged.retired_event_tombstones.iter().collect();
-        crate::retention::forget_event_tombstones(&mut tx, namespace, &retired)?;
-        if !staged.deleted_fields.is_empty() {
-            tx.execute("DELETE FROM aq_playbooks.state_records r USING unnest($2::text[],$3::bytea[]) AS d(f,k) WHERE r.namespace=$1 AND r.field=d.f AND r.sort_key=d.k",&[&namespace,&staged.deleted_fields,&staged.deleted_keys]).map_err(backend)?;
-        }
-        upsert(
-            &mut tx,
-            namespace,
-            &staged.fields,
-            &staged.keys,
-            &staged.values,
-        )?;
-        crate::history::check_unrecorded(&mut tx, namespace, &live_keys)?;
-        crate::history::insert(
-            &mut tx,
-            namespace,
-            &aq_playbooks_runner::history_items(&state.settled),
-            &state.retention.policy,
-        )?;
-        let published = tx.execute("UPDATE aq_playbooks.namespaces SET state_header=$2,state_accounting=$3,revision=$4,catalog_projected_revision=$4,updated_at=clock_timestamp() WHERE namespace=$1 AND revision=$5",&[&namespace,&stripped,&accounting_json(&staged.accounting),&next,&expected]).map_err(backend)?;
-        if published != 1 {
-            return Err(backend("record namespace publication mismatch").into());
-        }
-        let written = (staged.fields.len() + staged.deleted_fields.len()) as u64;
-        if let Err(error) = tx.commit() {
-            if let Some(lease) = conn.leases.get_mut(namespace) {
-                lease.catalog_uncertain = true;
-            }
-            return Err(backend(error).into());
-        }
-        self.tombstones_committed(namespace, drain_limit, rows);
-        self.count(|s| {
-            s.incremental += 1;
-            s.records_written += written;
-        });
-        Ok(TransitionOutcome::Committed {
-            revision: next as u64,
-        })
+        !fallbacks.is_empty()
     }
     pub(crate) fn count(&self, f: impl FnOnce(&mut TransitionStats)) {
         f(&mut lock(&self.stats));
@@ -628,10 +413,9 @@ pub(crate) fn owns_row(
     owner: &str,
     incarnation: i64,
 ) -> Result<(), StorageError> {
-    if row.get::<_, Option<String>>(1).as_deref() != Some(owner)
-        || row.get::<_, i64>(2) != incarnation
-        || row.get::<_, Option<bool>>(3) != Some(true)
-    {
+    let matches_owner = row.get::<_, Option<String>>(1).as_deref() == Some(owner)
+        && row.get::<_, i64>(2) == incarnation;
+    if !matches_owner || row.get::<_, Option<bool>>(3) != Some(true) {
         return Err(StorageError::Ownership);
     }
     Ok(())
@@ -646,7 +430,7 @@ pub(crate) fn owns_lock(
     Ok(tx.query_one("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid() AND classid::bigint=$1 AND objid::bigint=$2 AND objsubid=1 AND granted)", &[&high,&low]).map_err(backend)?.get(0))
 }
 
-/// Header-only invariants of `retention::verify_and_record` and
+/// Header-only invariants of `retention::Changes::verify_and_record` and
 /// `retention::verify_removals` for a transition that removes no retained
 /// history (other than expired window entries, see `stage`) and leaves
 /// artifacts unchanged.
@@ -698,369 +482,33 @@ struct Staged {
     deleted_fields: Vec<String>,
     deleted_keys: Vec<Vec<u8>>,
 }
-/// The evictions of a bounded commit ([`retention::check_evictions`]),
-/// judged while the transaction is still lent: the window entries the patch
-/// deletes, their stored records and expiries, and the order keys it adds,
-/// read one record each. A violation refuses the commit. A patch that
-/// replaces one of these containers whole licenses nothing here: it takes
-/// the complete path, where `verify_removals` judges it.
-fn licensed_evictions(
-    source: &PgSource,
-    header: &[u8],
-    patch: &StatePatch,
-    next: &State,
-) -> Result<BTreeSet<(Window, String)>, Error> {
-    const ITEMS: [&str; 2] = ["keyed_admissions", "events"];
-    const ORDER: &str = "retention.replay_order";
-    let get = |field: &'static str, key: &str| -> Result<Option<Vec<u8>>, StorageError> {
-        source
-            .get(&ContainerPath::field(field), &TreeKey::Str(key.to_string()))
-            .map_err(backend)
-    };
-    let mut previous = header_state(header)?;
-    let mut added = vec![];
-    let mut removed = false;
-    for (path, change) in &patch.changes {
-        let field = path.field;
-        if !ITEMS.contains(&field) && field != ORDER {
-            continue;
-        }
-        let ContainerChange::Entries(rows) = change else {
-            return Ok(BTreeSet::new());
-        };
-        for (key, new) in rows {
-            let TreeKey::Str(key) = key else {
-                return Err(backend(format!("{field}: unexpected record key")).into());
-            };
-            if field == ORDER {
-                if new.is_some() && get(ORDER, key)?.is_none() {
-                    added.push(key.clone());
-                }
-                continue;
-            }
-            if new.is_some() {
-                continue;
-            }
-            let Some(bytes) = get(field, key)? else {
-                continue;
-            };
-            removed = true;
-            let at = |expiry: &'static str| -> Result<Option<i64>, StorageError> {
-                get(expiry, key)?
-                    .map(|b| serde_json::from_slice(&b).map_err(backend))
-                    .transpose()
-            };
-            if field == "events" {
-                previous.events.insert(
-                    key.clone(),
-                    serde_json::from_slice(&bytes).map_err(backend)?,
-                );
-                if let Some(at) = at("retention.event_expires_at_ms")? {
-                    previous
-                        .retention
-                        .event_expires_at_ms
-                        .insert(key.clone(), at);
-                }
-            } else {
-                previous.keyed_admissions.insert(
-                    key.clone(),
-                    serde_json::from_slice(&bytes).map_err(backend)?,
-                );
-                if let Some(at) = at("retention.admission_expires_at_ms")? {
-                    previous
-                        .retention
-                        .admission_expires_at_ms
-                        .insert(key.clone(), at);
-                }
-            }
-        }
-    }
-    if !removed && added.is_empty() {
-        return Ok(BTreeSet::new());
-    }
-    Ok(retention::check_evictions(
-        &previous,
-        next,
-        &mut added.into_iter(),
-        &retention::Stored {
-            ordered: &|key| Ok(get(ORDER, key)?.is_some()),
-            memberships: &|key| {
-                get("indexes.event_memberships", key)?
-                    .map(|b| serde_json::from_slice(&b).map_err(backend))
-                    .transpose()
-            },
-            waiters: &|key| {
-                get("indexes.waiters", key)?
-                    .map(|b| serde_json::from_slice(&b).map_err(backend))
-                    .transpose()
-            },
-        },
-    )?)
-}
-/// Exact record counts of the patch against the current records (one read of
-/// every touched key), plus the keyed admission immutability check. A
-/// keyed admission or event deletion stays bounded only when the same patch
-/// deletes its expiry record with an expiry `clock_ms` has reached (and, for
-/// an event, writes no legacy tombstone for it); otherwise it sets
-/// `history_removed`, so the complete path runs `verify_removals`. In a
-/// commit that carries an admin licence (`rebase`), a lowered expiry is left
-/// to that path too (it is refused here otherwise).
-#[allow(clippy::too_many_arguments)]
-fn stage(
-    tx: &mut ObservedTransaction<'_>,
-    namespace: &str,
-    accounting: &Accounting,
-    patch: &StatePatch,
-    clock_ms: Option<i64>,
-    policy: &aq_playbooks_runner::RetentionPolicy,
-    rebase: bool,
-    evicted: &BTreeSet<(Window, String)>,
-) -> Result<Staged, StorageError> {
-    let mut staged = Staged {
-        full_header: patch.header.clone(),
-        accounting: accounting.clone(),
-        replaced: false,
-        history_removed: false,
-        retired_event_tombstones: vec![],
-        created: vec![],
-        fields: vec![],
-        keys: vec![],
-        values: vec![],
-        deleted_fields: vec![],
-        deleted_keys: vec![],
-    };
-    staged.accounting.header_len = patch.header.len();
-    let mut touched_fields = vec![];
-    let mut touched_keys = vec![];
-    for (path, change) in &patch.changes {
-        let (name, _) = field(path.field).map_err(backend)?;
-        if path.outer.is_some() {
-            return Err(backend("nested record container"));
-        }
-        match change {
-            ContainerChange::Entries(rows) => {
-                for (key, _) in rows {
-                    touched_fields.push(name.to_string());
-                    touched_keys.push(encode_key(key));
-                }
-            }
-            ContainerChange::Replace(_) => staged.replaced = true,
-        }
-    }
-    let mut old: BTreeMap<(String, Vec<u8>), Vec<u8>> = BTreeMap::new();
-    if !touched_fields.is_empty() {
-        for row in tx.query("SELECT r.field,r.sort_key,r.value FROM aq_playbooks.state_records r JOIN unnest($2::text[],$3::bytea[]) AS t(f,k) ON r.field=t.f AND r.sort_key=t.k WHERE r.namespace=$1",&[&namespace,&touched_fields,&touched_keys]).map_err(backend)? {
-            old.insert((row.get(0), row.get(1)), row.get(2));
-        }
-    }
-    // Deleted records (field, key) with their old value, and the event
-    // tombstones this patch writes.
-    let mut deleted: BTreeMap<(&'static str, Vec<u8>), Vec<u8>> = BTreeMap::new();
-    let mut tombstoned: BTreeSet<Vec<u8>> = BTreeSet::new();
-    // Records written (field, key) and expiry records touched, with their
-    // stored and written values.
-    let mut written: BTreeMap<(&'static str, Vec<u8>), Vec<u8>> = BTreeMap::new();
-    type ExpiryChange = (&'static str, Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>);
-    let mut expiry_changes: Vec<ExpiryChange> = vec![];
-    let mut replaced_old: BTreeMap<&'static str, BTreeMap<TreeKey, Vec<u8>>> = BTreeMap::new();
-    for (path, change) in &patch.changes {
-        let (name, _) = field(path.field).map_err(backend)?;
-        match change {
-            ContainerChange::Entries(rows) => {
-                let mut seen = BTreeSet::new();
-                for (key, new) in rows {
-                    let encoded = encode_key(key);
-                    if !seen.insert(encoded.clone()) {
-                        return Err(backend("duplicate record key in one patch"));
-                    }
-                    let before = old.get(&(name.to_string(), encoded.clone()));
-                    staged
-                        .accounting
-                        .record(name, before.is_some(), new.is_some())
-                        .map_err(storage)?;
-                    // Audit receipts are positional: overwriting or deleting
-                    // a stored one removes it, which the complete path judges.
-                    if name == "receipts" && before.is_some() {
-                        staged.history_removed = true;
-                    }
-                    if WINDOWS.iter().any(|(_, expiry)| *expiry == name) && before != new.as_ref() {
-                        expiry_changes.push((name, encoded.clone(), before.cloned(), new.clone()));
-                    }
-                    if let Some(value) = new {
-                        written.insert((name, encoded.clone()), value.clone());
-                    }
-                    // An accepted event's identity never changes.
-                    if name == "events"
-                        && let (Some(before), Some(new)) = (before, new)
-                        && before != new
-                    {
-                        let decode = |b: &[u8]| -> Result<
-                            aq_playbooks_runner::AcceptedEvent,
-                            StorageError,
-                        > {
-                            serde_json::from_slice(b).map_err(backend)
-                        };
-                        retention::check_event_change(&decode(before)?, &decode(new)?)?;
-                    }
-                    // A changed receipt is refused; a deleted one is a window
-                    // removal (see below).
-                    if name == "keyed_admissions"
-                        && new.is_some()
-                        && before.is_some()
-                        && before != new.as_ref()
-                    {
-                        return Err(backend(
-                            "immutable keyed admission receipt removed or changed",
-                        ));
-                    }
-                    match new {
-                        Some(value) => {
-                            if name == "retention.event_tombstones" {
-                                tombstoned.insert(encoded.clone());
-                            }
-                            if before.is_none()
-                                && let Some((_, kind)) = IDENTITIES.iter().find(|(f, _)| *f == name)
-                                && let TreeKey::Str(id) = key
-                            {
-                                staged.created.push((kind.to_string(), id.clone()));
-                            }
-                            staged.fields.push(name.to_string());
-                            staged.keys.push(encoded);
-                            staged.values.push(value.clone());
-                        }
-                        None => {
-                            if let Some(before) = before {
-                                if HISTORY_REMOVALS.contains(&name) {
-                                    staged.history_removed = true;
-                                }
-                                if name == "retention.event_tombstones"
-                                    && let TreeKey::Str(id) = key
-                                {
-                                    staged.retired_event_tombstones.push(id.clone());
-                                }
-                                deleted.insert((name, encoded.clone()), before.clone());
-                            }
-                            staged.deleted_fields.push(name.to_string());
-                            staged.deleted_keys.push(encoded);
-                        }
-                    }
-                }
-            }
-            ContainerChange::Replace(rows) => {
-                if !replaced_old.contains_key(name) {
-                    let mut current = BTreeMap::new();
-                    for row in tx.query("SELECT sort_key,value FROM aq_playbooks.state_records WHERE namespace=$1 AND field=$2",&[&namespace,&name]).map_err(backend)? {
-                        current.insert(decode_key(name, row.get::<_, &[u8]>(0)).map_err(backend)?, row.get::<_, Vec<u8>>(1));
-                    }
-                    replaced_old.insert(name, current);
-                }
-                let current = &replaced_old[name];
-                for _ in current {
-                    staged
-                        .accounting
-                        .record(name, true, false)
-                        .map_err(storage)?;
-                }
-                for _ in rows {
-                    staged
-                        .accounting
-                        .record(name, false, true)
-                        .map_err(storage)?;
-                }
-                // A replaced container takes the complete path, where removals
-                // are checked; a changed receipt is refused here.
-                if name == "keyed_admissions"
-                    && rows
-                        .iter()
-                        .any(|(k, v)| current.get(k).is_some_and(|before| before != v))
-                {
-                    return Err(backend(
-                        "immutable keyed admission receipt removed or changed",
-                    ));
-                }
-            }
-        }
-    }
-    // Expiry records (`retention::check_expiry_change`): judged here when the
-    // patch shows the item, otherwise on the complete path.
-    let window_ms = |item: &str| match item {
-        "events" => policy.event_replay_ms,
-        _ => policy.admission_replay_ms,
-    };
-    for (expiry, key, before, after) in expiry_changes {
-        let (item, _) = WINDOWS
-            .iter()
-            .find(|(_, e)| *e == expiry)
-            .expect("an expiry field");
-        let at = |bytes: &Option<Vec<u8>>| -> Result<Option<i64>, StorageError> {
-            bytes
-                .as_deref()
-                .map(|b| serde_json::from_slice(b).map_err(backend))
-                .transpose()
-        };
-        let (old, new) = (at(&before)?, at(&after)?);
-        match (old, new) {
-            (Some(before), Some(after)) if rebase && after < before => {
-                staged.history_removed = true
-            }
-            (Some(_), Some(_)) => {
-                aq_playbooks_runner::retention::check_expiry_change(old, new, true, None)?
-            }
-            (Some(_), None) if deleted.contains_key(&(*item, key.clone())) => {}
-            (None, Some(_)) if written.contains_key(&(*item, key.clone())) => {
-                let value: Value =
-                    serde_json::from_slice(&written[&(*item, key.clone())]).map_err(backend)?;
-                let fallback = value["accepted_at_ms"].as_i64().map(|accepted| {
-                    accepted.saturating_add(i64::try_from(window_ms(item)).unwrap_or(i64::MAX))
-                });
-                aq_playbooks_runner::retention::check_expiry_change(old, new, true, fallback)?
-            }
-            _ => staged.history_removed = true,
-        }
-    }
-    for (item, expiry) in WINDOWS {
-        for (field, key) in deleted.keys() {
-            if field != item {
-                continue;
-            }
-            let at: Option<i64> = deleted
-                .get(&(*expiry, key.clone()))
-                .and_then(|bytes| serde_json::from_slice(bytes).ok());
-            let expired =
-                at.is_some_and(|at| aq_playbooks_runner::retention::expired(at, clock_ms));
-            // An eviction the bounded fence licensed (`licensed_evictions`)
-            // stays bounded too.
-            let window = if *item == "events" {
-                Window::Event
-            } else {
-                Window::Admission
-            };
-            let licensed = std::str::from_utf8(key)
-                .is_ok_and(|key| evicted.contains(&(window, key.to_string())));
-            if !(expired || licensed) || (*item == "events" && tombstoned.contains(key)) {
-                staged.history_removed = true;
-            }
-        }
-    }
-    Ok(staged)
-}
+mod evictions;
+use evictions::licensed_evictions;
+mod staging;
 fn apply(records: &mut Containers, patch: StatePatch) -> Result<(), Error> {
     for (path, change) in patch.changes {
         let (name, _) = field(path.field).map_err(backend)?;
         let container = records.entry(name).or_default();
         match change {
             ContainerChange::Entries(rows) => {
-                for (key, new) in rows {
-                    match new {
-                        Some(bytes) => container.insert(key, bytes),
-                        None => container.remove(&key),
-                    };
-                }
+                apply_entries(container, rows);
             }
             ContainerChange::Replace(rows) => *container = rows.into_iter().collect(),
         }
     }
     Ok(())
+}
+
+fn apply_entries(
+    container: &mut BTreeMap<TreeKey, Vec<u8>>,
+    rows: Vec<aq_playbooks_runner::lazy::RecordChange>,
+) {
+    for (key, new) in rows {
+        match new {
+            Some(bytes) => container.insert(key, bytes),
+            None => container.remove(&key),
+        };
+    }
 }
 
 impl PostgresStorage {
@@ -1072,10 +520,7 @@ impl PostgresStorage {
         namespace: &str,
         query: &aq_playbooks_runner::IndexQuery,
     ) -> Result<Option<aq_playbooks_runner::IndexPage>, StorageError> {
-        if conn.statements.is_none() {
-            conn.statements = Some(Statements::prepare(&mut conn.client)?);
-        }
-        let statements = conn.statements.clone().expect("prepared above");
+        let statements = conn.record_statements()?;
         let mut tx = ObservedTransaction::new(
             conn.client.transaction().map_err(backend)?,
             self.profiling.clone(),
@@ -1095,19 +540,8 @@ impl PostgresStorage {
         }
         let header: Vec<u8> = row.get(1);
         let accounting = accounting_from(&row.get::<_, Value>(2))?;
-        let source = Arc::new(PgSource {
-            // SAFETY: see `PgSource::tx`; `lent` is dropped before `conn`.
-            tx: Mutex::new(Some(unsafe {
-                std::mem::transmute::<ObservedTransaction<'_>, ObservedTransaction<'static>>(tx)
-            })),
-            namespace: namespace.to_string(),
-            statements,
-            counts: accounting.fields.clone(),
-            reads: Mutex::new(0),
-            fallbacks: Mutex::new(vec![]),
-            poison: Mutex::new(None),
-        });
-        let lent = Lent(source.clone());
+        let lent = Lent::new(tx, namespace, statements, &accounting);
+        let source = lent.source.clone();
         let state = bind_state(&header, source.clone()).map_err(storage)?;
         let page = if state.indexes.initialized {
             let page = state.indexes.query(&state, query);
@@ -1123,7 +557,7 @@ impl PostgresStorage {
             tx.commit().map_err(backend)?;
             state.indexes.query(&state, query)
         };
-        let reads = *lock(&source.reads);
+        let reads = source.reads();
         self.count(|s| s.record_reads += reads);
         Ok(Some(page))
     }

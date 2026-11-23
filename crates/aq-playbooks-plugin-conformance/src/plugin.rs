@@ -265,7 +265,7 @@ impl Plugin {
             .collect()
     }
 
-    async fn execute(&self, input: &[u8], deadline_ms: u64) -> Result<Vec<u8>, Failure> {
+    fn spawn_plugin(&self) -> Result<Child, Failure> {
         let mut command = Command::new(&self.executable);
         command
             .arg("invoke")
@@ -282,9 +282,13 @@ impl Plugin {
         #[cfg(unix)]
         command.process_group(0);
 
-        let mut child = command.spawn().map_err(|_| {
-            Failure::new(FailureKind::Unavailable, "could not start plugin process")
-        })?;
+        command
+            .spawn()
+            .map_err(|_| Failure::new(FailureKind::Unavailable, "could not start plugin process"))
+    }
+
+    async fn execute(&self, input: &[u8], deadline_ms: u64) -> Result<Vec<u8>, Failure> {
+        let mut child = self.spawn_plugin()?;
         let pid = child.id();
         let mut stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");

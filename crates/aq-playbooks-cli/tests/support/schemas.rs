@@ -1,7 +1,8 @@
 //! Schema builders and the 1.0.0 vocabularies, for tests that write or
 //! check host contracts by hand. The product reads its catalogs from the
 //! published JSON (`aq_playbooks_cli::catalog`); nothing in it builds one.
-use aq_playbooks_model::Schema;
+use aq_playbooks_model::{Registry, Schema};
+use serde_json::Value;
 use std::collections::BTreeSet;
 
 pub fn strings(items: &[&str]) -> BTreeSet<String> {
@@ -57,3 +58,31 @@ pub const CHANGE_VARIANTS: &[&str] = &[
     "hold",
     "release_hold",
 ];
+
+fn validate_fixture(registry: &Registry, fixture: &Value) -> Option<String> {
+    let name = fixture["name"].as_str().unwrap();
+    let contract = fixture["contract"].as_str().unwrap();
+    let kind = fixture["kind"].as_str().unwrap();
+    let schema = match kind {
+        "input" => &registry.commands[contract].input,
+        "output" => &registry.commands[contract].outcomes[fixture["outcome"].as_str().unwrap()],
+        "event" => &registry.events[contract].payload,
+        other => panic!("unknown fixture kind {other}"),
+    };
+    let valid = fixture["valid"].as_bool().unwrap();
+    assert_eq!(schema.validate(&fixture["value"]).is_ok(), valid, "{name}");
+    valid.then(|| match kind {
+        "output" => format!("{contract}.{}", fixture["outcome"].as_str().unwrap()),
+        "input" => format!("{contract}.input"),
+        _ => contract.to_string(),
+    })
+}
+
+pub fn assert_fixture_cases(registry: &Registry, fixtures: &Value) -> BTreeSet<String> {
+    fixtures["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|case| validate_fixture(registry, case))
+        .collect()
+}

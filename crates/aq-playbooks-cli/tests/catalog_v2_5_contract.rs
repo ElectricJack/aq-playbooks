@@ -240,14 +240,14 @@ fn environment_commands(accepted: &Schema) -> Vec<CommandContract> {
 fn completed(commands: &[CommandContract]) -> EventContract {
     let mut outcomes = BTreeSet::new();
     let mut variants: Vec<Schema> = vec![];
-    for command in commands {
-        for (name, schema) in &command.outcomes {
-            if name != "accepted" {
-                outcomes.insert(name.clone());
-                if !variants.contains(schema) {
-                    variants.push(schema.clone());
-                }
-            }
+    for (name, schema) in commands
+        .iter()
+        .flat_map(|command| &command.outcomes)
+        .filter(|(name, _)| *name != "accepted")
+    {
+        outcomes.insert(name.clone());
+        if !variants.contains(schema) {
+            variants.push(schema.clone());
         }
     }
     event(
@@ -309,11 +309,6 @@ fn build_catalog() -> Registry {
     registry
 }
 
-fn pretty(value: &impl serde::Serialize) -> String {
-    // A Value orders keys, as every published bundle does.
-    let value = serde_json::to_value(value).unwrap();
-    serde_json::to_string_pretty(&value).unwrap() + "\n"
-}
 fn manifest(registry: &Registry) -> Value {
     let v23: Value = serde_json::from_str(catalog::MANIFEST_2_3_JSON).unwrap();
     let v24: Value = serde_json::from_str(catalog::MANIFEST_2_4_JSON).unwrap();
@@ -330,415 +325,6 @@ fn manifest(registry: &Registry) -> Value {
         "work_kinds": v23["work_kinds"],
         "work_change_variants": v23["work_change_variants"],
     })
-}
-
-fn fingerprints<'a, T: 'a>(
-    items: impl Iterator<Item = (&'a String, &'a T)>,
-    keep: impl Fn(&str) -> bool,
-    fingerprint: impl Fn(&T) -> Hash,
-) -> Value {
-    items
-        .filter(|(n, _)| keep(n))
-        .map(|(n, c)| (n.clone(), json!(fingerprint(c))))
-        .collect::<serde_json::Map<_, _>>()
-        .into()
-}
-
-fn name_cases(cases: &mut Vec<Value>, prefix: &str, from: Value) {
-    for case in from["cases"].as_array().unwrap() {
-        let mut case = case.clone();
-        if case.get("name").is_none() {
-            let place = case.get("outcome").and_then(Value::as_str).unwrap_or("");
-            let validity = if case["valid"].as_bool().unwrap() {
-                "valid"
-            } else {
-                "invalid"
-            };
-            case["name"] = json!(format!(
-                "{prefix}: {validity} {} {} {place}",
-                case["contract"].as_str().unwrap(),
-                case["kind"].as_str().unwrap()
-            ));
-        }
-        cases.push(case);
-    }
-}
-fn case(contract: &str, kind: &str, outcome: Option<&str>, valid: bool, value: Value) -> Value {
-    let mut case = json!({
-        "contract": contract, "kind": kind, "valid": valid, "value": value,
-        "name": format!(
-            "{} {contract} {kind} {}",
-            if valid { "valid" } else { "invalid" },
-            outcome.unwrap_or("")
-        ).trim().to_string()
-    });
-    if let Some(outcome) = outcome {
-        case["outcome"] = json!(outcome);
-    }
-    case
-}
-fn sample_build() -> Value {
-    json!({"name": "rust", "digest": "sha256:aaaa", "recipe_hash": "sha256:bbbb",
-        "toolchains": [{"name": "rustc", "version": "1.90.0"}]})
-}
-fn sample_facts() -> Value {
-    json!({"base": "2222222222222222222222222222222222222222", "branch": "aq/task-1",
-    "changed": true, "charged_failures": 0, "description": "Add a parser.",
-    "ended_attempts": 0, "head": "1111111111111111111111111111111111111111",
-    "kind": "feature", "level_hint": "", "main_head": "3333333333333333333333333333333333333333",
-    "origin": "owner", "outcome": "completed", "pull_request": null, "returns": 0,
-    "route": "none", "title": "Add a parser",
-    "needs": ["rust", "postgres"], "default_environment": "rust",
-    "environments": [
-        {"id": "rust", "provides": ["rust"]},
-        {"id": "rust-postgres", "provides": ["rust", "postgres"]}
-    ]})
-}
-fn fixtures(registry: &Registry) -> Value {
-    let v23: Value = serde_json::from_str(include_str!(
-        "../../../contracts/aq-host-2.3.0/fixtures.json"
-    ))
-    .unwrap();
-    let v24: Value = serde_json::from_str(include_str!(
-        "../../../contracts/aq-host-2.4.0/fixtures.json"
-    ))
-    .unwrap();
-    let mut cases: Vec<Value> = vec![];
-    // The 2.3.0 cases; a valid `work.read` answer also carries the new facts.
-    for case in v23["cases"].as_array().unwrap() {
-        let mut case = case.clone();
-        if case["contract"] == "work.read" && case["outcome"] == "observed" {
-            if let Some(facts) = case["value"]["facts"].as_object_mut() {
-                for (name, value) in sample_facts().as_object().unwrap() {
-                    if ["needs", "default_environment", "environments"].contains(&name.as_str()) {
-                        facts.insert(name.clone(), value.clone());
-                    }
-                }
-            }
-        }
-        cases.push(case);
-    }
-    name_cases(&mut cases, "2.4.0", v24.clone());
-    let sub = json!({"id": "task-1", "revision": 3});
-    let observed = |facts: Value| json!({"reference": "task-1@3", "subject": sub, "facts": facts});
-    let mut no_needs = sample_facts();
-    no_needs.as_object_mut().unwrap().remove("needs");
-    let mut bad_environment = sample_facts();
-    bad_environment["environments"] = json!([{"id": "rust"}]);
-    cases.extend([
-        case(
-            "work.read",
-            "output",
-            Some("observed"),
-            true,
-            observed(sample_facts()),
-        ),
-        case(
-            "work.read",
-            "output",
-            Some("observed"),
-            false,
-            observed(no_needs),
-        ),
-        case(
-            "work.read",
-            "output",
-            Some("observed"),
-            false,
-            observed(bad_environment),
-        ),
-    ]);
-    let route = |environment: Option<Value>| {
-        let mut value = json!({"classification": null, "harnesses": [], "hold": false,
-            "level": "standard-high", "prefer": [], "providers": [],
-            "reasons": [{"code": "level_from_kind", "detail": "Features are Standard."}],
-            "subject": sub});
-        if let Some(environment) = environment {
-            value["environment"] = environment;
-        }
-        value
-    };
-    cases.extend([
-        case(
-            "work.route",
-            "input",
-            None,
-            true,
-            route(Some(json!("rust-postgres"))),
-        ),
-        case("work.route", "input", None, true, route(None)),
-        case("work.route", "input", None, false, route(Some(json!(7)))),
-    ]);
-    let accepted = json!({"handle": "op-1"});
-    let tasks = json!({"subject": sub});
-    let project = json!({"project": "project-1"});
-    let with_builds = |target: &Value| {
-        let mut value = target.clone();
-        value["builds"] = json!([sample_build()]);
-        value
-    };
-    cases.extend([
-        case("environment.build", "input", None, true, tasks.clone()),
-        case("environment.build", "input", None, true, project.clone()),
-        case(
-            "environment.build",
-            "input",
-            None,
-            false,
-            json!({"subject": {"id": "task-1"}}),
-        ),
-        case(
-            "environment.build",
-            "output",
-            Some("accepted"),
-            true,
-            accepted.clone(),
-        ),
-        case(
-            "environment.build",
-            "output",
-            Some("accepted"),
-            false,
-            json!({}),
-        ),
-        case(
-            "environment.build",
-            "output",
-            Some("unchanged"),
-            true,
-            json!({}),
-        ),
-        case(
-            "environment.build",
-            "output",
-            Some("built"),
-            true,
-            json!({"builds": [sample_build()]}),
-        ),
-        case(
-            "environment.build",
-            "output",
-            Some("built"),
-            false,
-            json!({}),
-        ),
-        case(
-            "environment.build",
-            "output",
-            Some("failed"),
-            true,
-            json!({"recipe": "rust", "step": "check: cargo test", "log": "error: test failed"}),
-        ),
-        case(
-            "environment.build",
-            "output",
-            Some("failed"),
-            false,
-            json!({"recipe": "rust", "log": "error: test failed"}),
-        ),
-        case(
-            "environment.admit",
-            "input",
-            None,
-            true,
-            with_builds(&tasks),
-        ),
-        case(
-            "environment.admit",
-            "input",
-            None,
-            true,
-            with_builds(&project),
-        ),
-        case("environment.admit", "input", None, false, tasks.clone()),
-        case(
-            "environment.admit",
-            "output",
-            Some("accepted"),
-            true,
-            accepted,
-        ),
-        case(
-            "environment.admit",
-            "output",
-            Some("admitted"),
-            true,
-            json!({}),
-        ),
-        case(
-            "environment.admit",
-            "output",
-            Some("refused"),
-            true,
-            json!({"reason": "unknown_build", "step": "registry"}),
-        ),
-        case(
-            "environment.admit",
-            "output",
-            Some("refused"),
-            false,
-            json!({"reason": "because", "step": "registry"}),
-        ),
-        case(
-            COMPLETION,
-            "event",
-            None,
-            true,
-            json!({"outcome": "built", "output": {"builds": [sample_build()]}}),
-        ),
-        case(
-            COMPLETION,
-            "event",
-            None,
-            true,
-            json!({"outcome": "admitted", "output": {}}),
-        ),
-        case(
-            COMPLETION,
-            "event",
-            None,
-            false,
-            json!({"outcome": "accepted", "output": {}}),
-        ),
-        case(BASE_CHANGED, "event", None, true, project.clone()),
-        case(BASE_CHANGED, "event", None, false, json!({})),
-    ]);
-    let v22 = catalog::catalog_v2_2();
-    let v23_registry = catalog::catalog_v2_3();
-    let added = |n: &str| ADDED_COMMANDS.contains(&n) || ADDED_EVENTS.contains(&n);
-    let changed = |n: &str| CHANGED_COMMANDS.contains(&n) || CHANGED_EVENTS.contains(&n);
-    let unchanged = |n: &str| !added(n) && !changed(n);
-    let command_fp = |c: &CommandContract| c.fingerprint().unwrap();
-    let event_fp = |e: &EventContract| e.fingerprint().unwrap();
-    let m22: Value = serde_json::from_str(catalog::MANIFEST_2_2_JSON).unwrap();
-    let m23: Value = serde_json::from_str(catalog::MANIFEST_2_3_JSON).unwrap();
-    let m24: Value = serde_json::from_str(catalog::MANIFEST_2_4_JSON).unwrap();
-    let changes = |old: &Registry| -> Value {
-        CHANGED_COMMANDS
-            .iter()
-            .map(|n| {
-                (
-                    n.to_string(),
-                    json!({
-                        "capabilities": registry.commands[*n].capabilities,
-                        "from": old.commands[*n].version,
-                        "to": registry.commands[*n].version,
-                    }),
-                )
-            })
-            .collect::<serde_json::Map<_, _>>()
-            .into()
-    };
-    json!({
-        "assessed_guarantee": v23["assessed_guarantee"],
-        "cases": cases,
-        "compatibility": {
-            "base": {
-                "version": m23["version"], "fingerprint": m23["fingerprint"],
-                "registry_sha256": hash_bytes(catalog::REGISTRY_2_3_JSON.as_bytes()),
-            },
-            "includes": {
-                "version": m24["version"], "fingerprint": m24["fingerprint"],
-                "registry_sha256": hash_bytes(catalog::REGISTRY_2_4_JSON.as_bytes()),
-            },
-            "routing_base": {
-                "version": m22["version"], "fingerprint": m22["fingerprint"],
-                "registry_sha256": hash_bytes(catalog::REGISTRY_2_2_JSON.as_bytes()),
-            },
-            "unchanged_commands": fingerprints(registry.commands.iter(), unchanged, command_fp),
-            "unchanged_events": fingerprints(registry.events.iter(), unchanged, event_fp),
-            "changed_commands": changes(&v23_registry),
-            "changed_events": fingerprints(registry.events.iter(), |n| changed(n), event_fp),
-            "added_commands": fingerprints(registry.commands.iter(), added, command_fp),
-            "added_events": fingerprints(registry.events.iter(), added, event_fp),
-            "routing_commands_unchanged": v22.commands.keys()
-                .filter(|n| unchanged(n)).collect::<Vec<_>>(),
-        }
-    })
-}
-
-fn notes() -> Value {
-    let mut notes: Value = serde_json::from_str(docs::CATALOG_2_3_NOTES).unwrap();
-    let v24: Value = serde_json::from_str(docs::CATALOG_2_4_NOTES).unwrap();
-    notes["about"] = json!(
-        "What the host says about each contract of catalog 2.5.0, for an authoring agent. Rendered into CATALOG.md for the commands and events a source may use (aq_playbooks_compiler::docs::catalog). An empty string means the catalog does not say. Kept beside registry.json so that the registry, and every fingerprint, stays unchanged. 2.5.0 is catalog 2.3.0 with the changes of 2.4.0 (decision notes and `work.activate`), the sandbox environment commands and events, an optional `environment` on `work.route` and the environment facts of `work.read`; every other note is the one of 2.3.0."
-    );
-    for name in FROM_2_4 {
-        if let Some(note) = v24["commands"].get(name) {
-            notes["commands"][name] = note.clone();
-        }
-    }
-    for name in CHANGED_EVENTS {
-        notes["events"][name] = v24["events"][name].clone();
-    }
-    notes["commands"]["work.read"]["purpose"] = json!(
-        "Reads the facts of a task as it is now, with those of its latest result (whether it changed anything, its branch and pull request, and how many times delivery has sent it back) and its sandbox environment facts: what it needs and which environments its project allows."
-    );
-    notes["commands"]["work.read"]["notes"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!(
-            "The environment facts, always present: `needs` (at most 64 capability names the task asks for, from its `aq:needs` metadata; empty when it asks for none); `default_environment` (the id of the project's default environment, or `\"\"` when it has none); `environments` (the project's allowed environments, at most 64 `{id, provides}`, where `provides` lists at most 64 capability names the environment provides). To choose an environment, pick one whose `provides` holds every name in `needs`; the document says how to choose among them."
-        ));
-    notes["commands"]["work.route"]["input"]["environment"] = json!(
-        "The id of the environment the task runs in, one of the `id` values of `environments` from `work.read`. Leave it out to keep the task's current environment, or the project's default when it has none. The host refuses an environment the project does not allow or one that lacks a capability in `needs`, and offers the task only to a node that can run it."
-    );
-    notes["commands"]["work.route"]["outcomes"]["refused"] = json!(
-        "Nothing was written; end. `not_offered`: nothing at that level (or in a non-empty list) is offered, and the host raises the task itself; never try a route the document does not give. `owner_route`, `not_on_router`, `unknown_task`: end."
-    );
-    notes["commands"]["environment.build"] = json!({
-        "purpose": "Builds the environment recipes under `.aq/environments/` whose bytes differ from the project's admitted version, for a task's result head or for the project's admitted recipes on the current base. It answers later, on `aq.environment.completed`.",
-        "input": {
-            "subject": "The task whose result head to build, at the revision of the trigger. Give `subject` or `project`, not both.",
-            "project": "The project whose admitted recipes to rebuild on the current base (after `aq.environment.base_changed`). Give `project` or `subject`, not both."
-        },
-        "outcomes": {
-            "accepted": "The build is queued on the builder; the edge binds `{handle}`. Join the handle under a key.",
-            "unchanged": "No recipe differs from the admitted version; there is nothing to admit.",
-            "built": "Every changed recipe was built, checked, scanned and published by digest. `builds` has one entry per recipe: its `name`, image `digest`, `recipe_hash` and `toolchains` (`{name, version}`). Pass `builds` to `environment.admit` unchanged.",
-            "failed": "A recipe did not build. `recipe` names it, `step` the step that failed and `log` is the redacted log. The previous environment version stays in place; nothing was registered."
-        },
-        "notes": [
-            "The build runs on the builder, outside attempt capacity, and compares recipe bytes itself: no fact about changed files is needed.",
-            "Build before the merge, so that a broken recipe never merges: on `failed`, send the task back with `work.return` and the failure as its detail."
-        ]
-    });
-    notes["commands"]["environment.admit"] = json!({
-        "purpose": "Records each build as the project's next environment version, adds it to the project's environments and makes it available to nodes. It answers later, on `aq.environment.completed`.",
-        "input": {
-            "subject": "The task whose builds are admitted. Give `subject` or `project`, not both.",
-            "project": "The project whose rebuilt environments are admitted. Give `project` or `subject`, not both.",
-            "builds": "The `builds` of the `built` answer of `environment.build`, unchanged."
-        },
-        "outcomes": {
-            "accepted": "The admission is queued; the edge binds `{handle}`. Join the handle under a key.",
-            "admitted": "Every build is now the project's next environment version and is available to nodes. An attempt already placed keeps its environment.",
-            "refused": "Nothing was admitted and the previous version stays. `reason` is `unknown_build` (no such build was published), `unknown_task`, `unknown_project` or `unreachable` (the registry did not answer); `step` names the failing step."
-        },
-        "notes": [
-            "Admit after the merge: when `pull_request.merge` completes with `merged`. A squash merge makes a new commit with the same recipe bytes, so the builds still match."
-        ]
-    });
-    notes["events"][COMPLETION] = json!({
-        "purpose": "The answer to a sandbox environment command that answers later: `environment.build` or `environment.admit`.",
-        "sent": "Only as the completion of an operation a playbook started with one of those commands, once per operation. Join the handle, which types the answer per outcome; do not wait on this event or start a playbook on it.",
-        "payload": {
-            "outcome": "The outcome of the command that was called: one of its business outcomes, never `accepted`.",
-            "output": "That outcome's output: `builds` for `built`, `recipe`, `step` and `log` for `failed`, `reason` and `step` for `refused`."
-        },
-        "notes": ["It carries no task or revision: the join correlates it by the operation."]
-    });
-    notes["events"][BASE_CHANGED] = json!({
-        "purpose": "A new base template was admitted, so a project's environments must be rebuilt on it.",
-        "sent": "Today the host sends it once per project when it admits a new base template (a new OS or runtime image in the builder's configuration).",
-        "payload": {
-            "project": "The project's id. Pass it as `project` to `environment.build` and then `environment.admit`."
-        },
-        "notes": [
-            "A project whose rebuild fails stays on its previous environment; report the failure to the project's supervisor. Other projects are not affected."
-        ]
-    });
-    notes
 }
 
 #[test]
@@ -758,22 +344,45 @@ fn write_catalog_v2_5() {
 fn generated_catalog_files_are_pinned() {
     let registry = catalog::catalog_v2_5();
     assert_eq!(registry, build_catalog());
-    assert_eq!(catalog::REGISTRY_2_5_JSON, pretty(&registry));
-    assert_eq!(catalog::MANIFEST_2_5_JSON, pretty(&manifest(&registry)));
-    assert_eq!(
-        include_str!("../../../contracts/aq-host-2.5.0/fixtures.json"),
-        pretty(&fixtures(&registry))
-    );
-    assert_eq!(docs::CATALOG_2_5_NOTES, pretty(&notes()));
-    assert_eq!(catalog::VERSION_2_5, "2.5.0");
+    for (name, shipped, generated) in [
+        ("registry", catalog::REGISTRY_2_5_JSON, pretty(&registry)),
+        (
+            "manifest",
+            catalog::MANIFEST_2_5_JSON,
+            pretty(&manifest(&registry)),
+        ),
+        (
+            "fixtures",
+            include_str!("../../../contracts/aq-host-2.5.0/fixtures.json"),
+            pretty(&fixtures(&registry)),
+        ),
+        ("notes", docs::CATALOG_2_5_NOTES, pretty(&notes())),
+    ] {
+        assert_eq!(shipped, generated, "{name}");
+    }
+}
 
+#[test]
+fn catalog_2_5_pins_its_version_and_lineage() {
+    let registry = catalog::catalog_v2_5();
+    assert_eq!(catalog::VERSION_2_5, "2.5.0");
     let manifest: Value = serde_json::from_str(catalog::MANIFEST_2_5_JSON).unwrap();
     assert_eq!(
         manifest["fingerprint"],
         digest(&(catalog::VERSION_2_5, &registry)).unwrap()
     );
-    assert_eq!(manifest["supersedes"]["version"], "2.3.0");
-    assert_eq!(manifest["includes"]["version"], "2.4.0");
+    assert_eq!(
+        (
+            &manifest["supersedes"]["version"],
+            &manifest["includes"]["version"]
+        ),
+        (&json!("2.3.0"), &json!("2.4.0"))
+    );
+}
+
+#[test]
+fn catalog_2_5_schema_definitions_and_new_fingerprints_validate() {
+    let registry = catalog::catalog_v2_5();
     assert_eq!(registry.commands.len(), 16 + 10 + 2 + 1);
     assert_eq!(registry.events.len(), 11 + 2 + 2);
     for (name, command) in &registry.commands {
@@ -807,35 +416,9 @@ fn every_command_the_routing_and_delivery_records_use_is_present_and_unchanged()
     let compat = &fixtures_file()["compatibility"];
     let v22 = catalog::catalog_v2_2();
     let v23 = catalog::catalog_v2_3();
-    let v24 = catalog::catalog_v2_4();
     let v25 = catalog::catalog_v2_5();
     for (lineage, old) in [("2.2.0", &v22), ("2.3.0", &v23)] {
-        for (name, old_command) in &old.commands {
-            let new = v25
-                .commands
-                .get(name)
-                .unwrap_or_else(|| panic!("{lineage}: {name} is missing from 2.5.0"));
-            if CHANGED_COMMANDS.contains(&name.as_str()) {
-                continue;
-            }
-            assert_eq!(new, old_command, "{lineage}: {name}");
-            assert_eq!(
-                canonical_bytes(new).unwrap(),
-                canonical_bytes(old_command).unwrap(),
-                "{lineage}: {name}"
-            );
-            assert_eq!(
-                compat["unchanged_commands"][name],
-                json!(old_command.fingerprint().unwrap()),
-                "{lineage}: {name}"
-            );
-        }
-        for (name, old_event) in &old.events {
-            if CHANGED_EVENTS.contains(&name.as_str()) {
-                continue;
-            }
-            assert_eq!(&v25.events[name], old_event, "{lineage}: {name}");
-        }
+        verify_lineage(lineage, old, &v25, compat);
     }
     // The routing record's 2.2.0 commands that stay byte-identical are listed.
     assert!(
@@ -844,6 +427,12 @@ fn every_command_the_routing_and_delivery_records_use_is_present_and_unchanged()
             .unwrap()
             .contains(&json!("judgment.assess"))
     );
+}
+
+#[test]
+fn previous_decision_contracts_match_catalog_2_4() {
+    let v24 = catalog::catalog_v2_4();
+    let v25 = catalog::catalog_v2_5();
     // The commands and events 2.4.0 changed are exactly 2.4.0's.
     for name in FROM_2_4 {
         assert_eq!(v25.commands[name], v24.commands[name], "{name}");
@@ -851,6 +440,12 @@ fn every_command_the_routing_and_delivery_records_use_is_present_and_unchanged()
     for name in CHANGED_EVENTS {
         assert_eq!(v25.events[name], v24.events[name], "{name}");
     }
+}
+
+#[test]
+fn environment_additions_match_the_manifest() {
+    let v23 = catalog::catalog_v2_3();
+    let v25 = catalog::catalog_v2_5();
     // The added contracts are exactly the declared ones.
     let added: BTreeSet<&str> = v25
         .commands
@@ -866,6 +461,11 @@ fn every_command_the_routing_and_delivery_records_use_is_present_and_unchanged()
         .map(String::as_str)
         .collect();
     assert_eq!(added, BTreeSet::from(ADDED_EVENTS));
+}
+
+#[test]
+fn published_unchanged_commands_retain_their_old_text() {
+    let v23 = catalog::catalog_v2_3();
     // Each 2.3.0 entry other than the changed ones appears unchanged in the file.
     for name in v23
         .commands
@@ -918,7 +518,12 @@ fn work_read_and_work_route_only_gain_fields() {
             .chain(["environment"])
             .collect::<BTreeSet<_>>()
     );
+}
 
+#[test]
+fn work_read_preserves_existing_facts() {
+    let v23 = catalog::catalog_v2_3();
+    let v25 = catalog::catalog_v2_5();
     // `work.read`: the facts of 2.3.0, and three more, always present.
     let (old, new) = (&v23.commands["work.read"], &v25.commands["work.read"]);
     assert_eq!(new.version, "2.5.0");
@@ -968,17 +573,22 @@ fn environment_commands_complete_on_one_event() {
     for name in ENVIRONMENT_COMMANDS {
         let c = &v25.commands[name];
         let a = c.asynchronous.as_ref().unwrap();
-        assert_eq!(c.version, "1.0.0");
-        assert_eq!(c.capabilities, strings(&[name]));
-        assert_eq!(c.scopes, strings(&["project"]));
-        assert_eq!(c.deadline_ms, 60_000);
         assert_eq!(
-            (&c.effect, &c.recovery),
-            (&Effect::Mutation, &Recovery::KeyedIdempotent)
+            (c.version.as_str(), &c.capabilities, &c.scopes),
+            ("1.0.0", &strings(&[name]), &strings(&["project"]))
         );
-        assert_eq!(a.completion_event, COMPLETION);
-        assert_eq!(a.correlation_field, "operation");
-        assert_eq!(a.reconciliation_command, "operation.get");
+        assert_eq!(
+            (&c.effect, &c.recovery, c.deadline_ms),
+            (&Effect::Mutation, &Recovery::KeyedIdempotent, 60_000)
+        );
+        assert_eq!(
+            (
+                a.completion_event.as_str(),
+                a.correlation_field.as_str(),
+                a.reconciliation_command.as_str()
+            ),
+            (COMPLETION, "operation", "operation.get")
+        );
         assert!(a.completion.assignable_to(&event.payload), "{name}");
         let Schema::Object { properties, .. } = &a.completion else {
             panic!("completion is an object")
@@ -1028,27 +638,7 @@ fn environment_commands_complete_on_one_event() {
 #[test]
 fn valid_and_invalid_fixture_cases_validate_as_declared() {
     let registry = catalog::catalog_v2_5();
-    let mut covered = BTreeSet::new();
-    for fixture in fixtures_file()["cases"].as_array().unwrap() {
-        let name = fixture["name"].as_str().unwrap();
-        let contract = fixture["contract"].as_str().unwrap();
-        let kind = fixture["kind"].as_str().unwrap();
-        let schema = match kind {
-            "input" => &registry.commands[contract].input,
-            "output" => &registry.commands[contract].outcomes[fixture["outcome"].as_str().unwrap()],
-            "event" => &registry.events[contract].payload,
-            other => panic!("unknown fixture kind {other}"),
-        };
-        let valid = fixture["valid"].as_bool().unwrap();
-        assert_eq!(schema.validate(&fixture["value"]).is_ok(), valid, "{name}");
-        if valid {
-            covered.insert(match kind {
-                "output" => format!("{contract}.{}", fixture["outcome"].as_str().unwrap()),
-                "input" => format!("{contract}.input"),
-                _ => contract.to_string(),
-            });
-        }
-    }
+    let covered = schemas::assert_fixture_cases(&registry, &fixtures_file());
     // A valid case for every input and outcome of the environment commands
     // and for both environment events.
     for name in ENVIRONMENT_COMMANDS {
@@ -1146,28 +736,34 @@ fn the_environment_delivery_example_checks_and_seals_against_catalog_2_5_0() {
     );
     // It builds before the merge, admits after it, and rebuilds on a new base.
     let steps = ws.draft["steps"].as_object().unwrap();
-    let command = |step: &str| steps[step]["op"]["command"].as_str().unwrap().to_string();
-    assert_eq!(command("publish"), "branch.publish");
-    assert_eq!(
-        ws.draft["steps"]["await_publish"]["edges"]["completed"],
-        "build"
-    );
-    assert_eq!(command("build"), "environment.build");
+    for (step, expected) in [
+        ("publish", "branch.publish"),
+        ("build", "environment.build"),
+        ("merge", "pull_request.merge"),
+        ("admit", "environment.admit"),
+        ("rb_build", "environment.build"),
+        ("rb_admit", "environment.admit"),
+        ("rb_notify", "supervisor.notify"),
+        ("send_back_build", "work.return"),
+    ] {
+        assert_eq!(steps[step]["op"]["command"], expected, "{step}");
+    }
+    for (step, target) in [
+        ("await_publish", "build"),
+        ("await_merge", "admit"),
+        ("await_failure", "may_return_build"),
+    ] {
+        assert_eq!(steps[step]["edges"]["completed"], target, "{step}");
+    }
     assert_eq!(
         steps["build"]["op"]["input"]["fields"]["subject"]["op"],
         "object"
     );
-    assert_eq!(command("merge"), "pull_request.merge");
-    assert_eq!(steps["await_merge"]["edges"]["completed"], "admit");
-    assert_eq!(command("admit"), "environment.admit");
-    assert_eq!(command("rb_build"), "environment.build");
-    assert_eq!(command("rb_admit"), "environment.admit");
     assert!(
         steps["rb_build"]["op"]["input"]["fields"]
             .get("project")
             .is_some()
     );
-    assert_eq!(command("rb_notify"), "supervisor.notify");
     let triggers: BTreeSet<&str> = ws.draft["triggers"]
         .as_array()
         .unwrap()
@@ -1178,16 +774,50 @@ fn the_environment_delivery_example_checks_and_seals_against_catalog_2_5_0() {
         triggers,
         BTreeSet::from(["aq.work.result_ready", BASE_CHANGED])
     );
-    // A recipe that fails to build is sent back, not merged: nothing between
-    // a failed build and the merge opens a pull request.
-    assert_eq!(command("send_back_build"), "work.return");
-    assert_eq!(
-        steps["await_failure"]["edges"]["completed"],
-        "may_return_build"
-    );
     // The strict rules still bite: the builds of a join that may be
     // `unchanged` or `failed` cannot be read without the `built` edge.
     let mut wrong = ws;
     wrong.draft["steps"]["await_build"]["op"]["accepted_outcomes"] = json!(["built", "unchanged"]);
     assert!(!check(&wrong).is_empty());
+}
+
+#[path = "support/catalog_fixtures.rs"]
+mod catalog_fixtures;
+use catalog_fixtures::{fingerprints, pretty};
+
+#[path = "catalog_v2_5/cases.rs"]
+mod cases;
+use cases::fixtures;
+#[path = "catalog_v2_5/notes.rs"]
+mod catalog_notes;
+use catalog_notes::notes;
+
+fn verify_lineage(lineage: &str, old: &Registry, v25: &Registry, compat: &Value) {
+    for (name, old_command) in &old.commands {
+        let new = v25
+            .commands
+            .get(name)
+            .unwrap_or_else(|| panic!("{lineage}: {name} is missing from 2.5.0"));
+        if CHANGED_COMMANDS.contains(&name.as_str()) {
+            continue;
+        }
+        assert_eq!(new, old_command, "{lineage}: {name}");
+        assert_eq!(
+            canonical_bytes(new).unwrap(),
+            canonical_bytes(old_command).unwrap(),
+            "{lineage}: {name}"
+        );
+        assert_eq!(
+            compat["unchanged_commands"][name],
+            json!(old_command.fingerprint().unwrap()),
+            "{lineage}: {name}"
+        );
+    }
+    for (name, old_event) in old
+        .events
+        .iter()
+        .filter(|(name, _)| !CHANGED_EVENTS.contains(&name.as_str()))
+    {
+        assert_eq!(&v25.events[name], old_event, "{lineage}: {name}");
+    }
 }

@@ -126,6 +126,22 @@ pub fn new_live_keys(previous: &State, next: &State) -> Vec<ItemKey> {
         .map(|r| (InspectionKind::Receipts, receipt_key(r.sequence)));
     runs.chain(intents).chain(receipts).collect()
 }
+fn live_item_key(
+    kind: InspectionKind,
+    key: &TreeKey,
+    value: &[u8],
+) -> Result<ItemKey, StorageError> {
+    Ok(match (kind, key) {
+        (InspectionKind::Receipts, _) => {
+            let receipt: Receipt = serde_json::from_slice(value)
+                .map_err(|e| StorageError::Backend(format!("receipt record decode: {e}")))?;
+            (kind, receipt_key(receipt.sequence))
+        }
+        (_, TreeKey::Str(id)) => (kind, id.clone()),
+        _ => return Err(StorageError::Backend("unexpected record key".into())),
+    })
+}
+
 /// Item keys a transition patch writes as live (bounded by the patch).
 pub fn patch_live_keys(patch: &StatePatch) -> Result<Vec<ItemKey>, StorageError> {
     let mut keys = vec![];
@@ -144,16 +160,7 @@ pub fn patch_live_keys(patch: &StatePatch) -> Result<Vec<ItemKey>, StorageError>
             ContainerChange::Replace(rows) => rows.iter().map(|(k, v)| (k, v.as_slice())).collect(),
         };
         for (key, value) in written {
-            keys.push(match (kind, key) {
-                (InspectionKind::Receipts, _) => {
-                    let receipt: Receipt = serde_json::from_slice(value).map_err(|e| {
-                        StorageError::Backend(format!("receipt record decode: {e}"))
-                    })?;
-                    (kind, receipt_key(receipt.sequence))
-                }
-                (_, TreeKey::Str(id)) => (kind, id.clone()),
-                _ => return Err(StorageError::Backend("unexpected record key".into())),
-            });
+            keys.push(live_item_key(kind, key, value)?);
         }
     }
     Ok(keys)

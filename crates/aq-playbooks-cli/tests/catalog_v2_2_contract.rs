@@ -76,404 +76,6 @@ fn contracts_dir() -> PathBuf {
 
 // ---- The generator: 2.1.0 plus the additive contracts. ----
 
-fn string(max_length: usize) -> Schema {
-    Schema::string(max_length)
-}
-fn code(values: &[&str]) -> Schema {
-    Schema::String {
-        max_length: 64,
-        values: strings(values),
-    }
-}
-fn array(items: Schema, max_items: usize) -> Schema {
-    Schema::Array {
-        items: Box::new(items),
-        max_items,
-    }
-}
-fn range(minimum: i64, maximum: i64) -> Schema {
-    Schema::Integer { minimum, maximum }
-}
-/// `reference` and `subject`, then `extra`.
-fn outcome(extra: &[(&str, Schema)]) -> Schema {
-    let Schema::Object {
-        mut properties,
-        mut required,
-    } = result()
-    else {
-        unreachable!("result() is an object")
-    };
-    for (name, schema) in extra {
-        properties.insert((*name).into(), schema.clone());
-        required.insert((*name).into());
-    }
-    Schema::Object {
-        properties,
-        required,
-    }
-}
-fn level(extra: &[&str]) -> Schema {
-    Schema::String {
-        max_length: 64,
-        values: LEVELS.iter().chain(extra).map(|s| (*s).into()).collect(),
-    }
-}
-fn without_required(schema: Schema, optional: &[&str]) -> Schema {
-    let Schema::Object {
-        properties,
-        mut required,
-    } = schema
-    else {
-        unreachable!("an object")
-    };
-    for name in optional {
-        required.remove(*name);
-    }
-    Schema::Object {
-        properties,
-        required,
-    }
-}
-struct Shape {
-    effect: Effect,
-    recovery: Recovery,
-    deadline_ms: u64,
-    public: &'static [&'static str],
-}
-fn command(
-    name: &str,
-    input: Schema,
-    outcomes: &[(&str, Schema)],
-    shape: Shape,
-    asynchronous: Option<AsyncContract>,
-) -> CommandContract {
-    CommandContract {
-        name: name.into(),
-        version: "1.0.0".into(),
-        input,
-        outcomes: outcomes
-            .iter()
-            .map(|(k, v)| ((*k).to_string(), v.clone()))
-            .collect(),
-        capabilities: strings(&[name]),
-        scopes: strings(&["project"]),
-        effect: shape.effect,
-        recovery: shape.recovery,
-        asynchronous,
-        cancellation: false,
-        public_result_fields: strings(shape.public),
-        sensitive_input_fields: BTreeSet::new(),
-        sensitive_output_fields: BTreeSet::new(),
-        max_payload_bytes: 65_536,
-        deadline_ms: shape.deadline_ms,
-    }
-}
-fn event(name: &str, payload: Schema, correlation: &[&str], subject_path: &str) -> EventContract {
-    EventContract {
-        sensitive_payload_fields: BTreeSet::new(),
-        name: name.into(),
-        version: "1.0.0".into(),
-        payload,
-        trusted_producers: strings(&["aq.host.bridge@1"]),
-        scopes: strings(&["project"]),
-        correlation_fields: strings(correlation),
-        subject_field: Some(format!("{subject_path}.id")),
-        revision_field: Some(format!("{subject_path}.revision")),
-        max_payload_bytes: 65_536,
-        retention_ms: 86_400_000,
-    }
-}
-
-fn work_read() -> CommandContract {
-    let facts = object(&[
-        ("kind", string(64)),
-        ("title", string(512)),
-        ("description", string(8192)),
-        (
-            "origin",
-            enumeration(&["owner", "agent", "supervisor", "playbook", "unknown"]),
-        ),
-        // `""` when none was asked for.
-        ("level_hint", level(&[""])),
-        ("charged_failures", range(0, 1000)),
-        ("ended_attempts", range(0, 1000)),
-        ("route", enumeration(&["none", "router", "owner"])),
-    ]);
-    command(
-        "work.read",
-        object(&[("subject", subject())]),
-        &[
-            ("observed", outcome(&[("facts", facts)])),
-            (
-                "refused",
-                outcome(&[("reason", enumeration(&["unknown_task", "not_on_router"]))]),
-            ),
-        ],
-        Shape {
-            effect: Effect::Observation,
-            recovery: Recovery::Observation,
-            deadline_ms: 10_000,
-            public: &["reference", "subject"],
-        },
-        None,
-    )
-}
-fn classification() -> Schema {
-    object(&[
-        ("reference", text()),
-        ("fields", array(string(64), 16)),
-        ("labels", array(string(128), 16)),
-        ("flags", array(string(64), 32)),
-        ("rationale", string(4096)),
-    ])
-}
-/// A reason: a fixed code, and optionally a literal sentence shown on the task.
-fn reasons() -> Schema {
-    let reason = without_required(
-        object(&[("code", code(&ROUTE_REASONS)), ("detail", string(256))]),
-        &["detail"],
-    );
-    array(reason, 16)
-}
-/// "The document allows nobody for this task": the host leaves the task
-/// unrouted and visible, shows the reasons and raises it.
-fn work_unroutable() -> CommandContract {
-    command(
-        "work.unroutable",
-        object(&[("subject", subject()), ("reasons", reasons())]),
-        &[
-            ("recorded", result()),
-            ("stale", result()),
-            (
-                "refused",
-                outcome(&[(
-                    "reason",
-                    enumeration(&["no_reasons", "owner_route", "not_on_router", "unknown_task"]),
-                )]),
-            ),
-        ],
-        Shape {
-            effect: Effect::Mutation,
-            recovery: Recovery::KeyedIdempotent,
-            deadline_ms: 10_000,
-            public: &["reference", "subject"],
-        },
-        None,
-    )
-}
-fn work_route() -> CommandContract {
-    let names = || array(string(64), MAX_ROUTE_NAMES);
-    command(
-        "work.route",
-        object(&[
-            ("subject", subject()),
-            ("level", level(&[])),
-            ("harnesses", names()),
-            ("providers", names()),
-            ("prefer", names()),
-            ("hold", Schema::Boolean),
-            ("reasons", reasons()),
-            (
-                "classification",
-                Schema::Nullable {
-                    inner: Box::new(classification()),
-                },
-            ),
-        ]),
-        &[
-            // What remained of each list after the host intersected it
-            // with what the level offers.
-            (
-                "routed",
-                outcome(&[
-                    ("harnesses", names()),
-                    ("providers", names()),
-                    ("prefer", names()),
-                ]),
-            ),
-            ("stale", result()),
-            (
-                "refused",
-                outcome(&[(
-                    "reason",
-                    enumeration(&[
-                        "not_offered",
-                        "owner_route",
-                        "not_on_router",
-                        "unknown_task",
-                    ]),
-                )]),
-            ),
-        ],
-        Shape {
-            effect: Effect::Mutation,
-            recovery: Recovery::KeyedIdempotent,
-            deadline_ms: 10_000,
-            public: &["reference", "subject"],
-        },
-        None,
-    )
-}
-fn judgment_outcomes(v21: &Registry) -> [(&'static str, Schema); 3] {
-    let Schema::Object { properties, .. } = &v21.commands["judgment.request"].outcomes["assessed"]
-    else {
-        unreachable!("judgment.request assessed is an object")
-    };
-    let provenance = properties["provenance"].clone();
-    [
-        (
-            "assessed",
-            outcome(&[
-                ("labels", array(string(128), 16)),
-                ("flags", array(string(64), 32)),
-                ("rationale", string(4096)),
-                ("provenance", provenance),
-            ]),
-        ),
-        (
-            "failed",
-            outcome(&[(
-                "reason",
-                enumeration(&[
-                    "indeterminate",
-                    "provider_error",
-                    "provider_unavailable",
-                    "deadline_exceeded",
-                ]),
-            )]),
-        ),
-        (
-            "refused",
-            outcome(&[(
-                "reason",
-                enumeration(&["invalid_request", "budget_exceeded"]),
-            )]),
-        ),
-    ]
-}
-fn judgment_completion(v21: &Registry) -> Schema {
-    let outcomes = judgment_outcomes(v21);
-    object(&[
-        (
-            "outcome",
-            enumeration(&outcomes.iter().map(|(n, _)| *n).collect::<Vec<_>>()),
-        ),
-        (
-            "output",
-            Schema::Union {
-                variants: outcomes.into_iter().map(|(_, s)| s).collect(),
-            },
-        ),
-    ])
-}
-fn judgment_assess(v21: &Registry) -> CommandContract {
-    let accepted = v21.commands["judgment.request"].outcomes["accepted"].clone();
-    let mut outcomes = vec![("accepted", accepted)];
-    outcomes.extend(judgment_outcomes(v21));
-    command(
-        "judgment.assess",
-        object(&[
-            ("subject", subject()),
-            ("question", text()),
-            (
-                "context",
-                object(&[(
-                    "items",
-                    array(
-                        object(&[("label", string(128)), ("text", string(8192))]),
-                        16,
-                    ),
-                )]),
-            ),
-            (
-                "fields",
-                array(
-                    object(&[
-                        ("id", string(64)),
-                        ("description", string(1024)),
-                        ("choices", array(string(128), 64)),
-                    ]),
-                    16,
-                ),
-            ),
-            (
-                "flags",
-                array(
-                    object(&[("id", string(64)), ("description", string(1024))]),
-                    32,
-                ),
-            ),
-            ("rationale_max_bytes", range(0, 4096)),
-            (
-                "budget",
-                object(&[
-                    ("deadline_ms", range(1000, 600_000)),
-                    ("max_output_tokens", range(1, 65_536)),
-                ]),
-            ),
-        ]),
-        &outcomes,
-        Shape {
-            effect: Effect::Mutation,
-            recovery: Recovery::KeyedIdempotent,
-            deadline_ms: 60_000,
-            public: &[],
-        },
-        Some(AsyncContract {
-            completion_event: "aq.judgment.assessed".into(),
-            completion: judgment_completion(v21),
-            correlation_field: "operation".into(),
-            reconciliation_command: "operation.get".into(),
-        }),
-    )
-}
-/// 2.1.0, unchanged, plus the five additive contracts.
-fn build_v2_2() -> Registry {
-    let v21 = catalog::catalog_v2_1();
-    let mut registry = v21.clone();
-    for c in [
-        work_read(),
-        work_route(),
-        work_unroutable(),
-        judgment_assess(&v21),
-    ] {
-        registry.commands.insert(c.name.clone(), c);
-    }
-    for e in [
-        event(
-            "aq.judgment.assessed",
-            judgment_completion(&v21),
-            &["operation"],
-            "output.subject",
-        ),
-        event(
-            "aq.work.route_needed",
-            object(&[("subject", subject())]),
-            &[],
-            "subject",
-        ),
-    ] {
-        registry.events.insert(e.name.clone(), e);
-    }
-    registry
-}
-fn pretty(value: &impl serde::Serialize) -> String {
-    // A Value orders keys, as every published bundle does.
-    let value = serde_json::to_value(value).unwrap();
-    serde_json::to_string_pretty(&value).unwrap() + "\n"
-}
-fn fingerprints<'a, T: 'a>(
-    items: impl Iterator<Item = (&'a String, &'a T)>,
-    keep: impl Fn(&str) -> bool,
-    fingerprint: impl Fn(&T) -> Hash,
-) -> Value {
-    items
-        .filter(|(n, _)| keep(n))
-        .map(|(n, c)| (n.clone(), json!(fingerprint(c))))
-        .collect::<serde_json::Map<_, _>>()
-        .into()
-}
-
 #[test]
 #[ignore = "writes contracts/aq-host-2.2.0; run by hand after changing the generator"]
 fn write_catalog_v2_2() {
@@ -512,282 +114,6 @@ fn write_catalog_v2_2() {
 }
 
 // ---- Conformance. ----
-
-#[test]
-fn catalog_v2_2_manifest_and_fixtures_are_pinned() {
-    let registry: Registry = serde_json::from_str(catalog::REGISTRY_2_2_JSON).unwrap();
-    let manifest: Value = serde_json::from_str(catalog::MANIFEST_2_2_JSON).unwrap();
-    let v21_manifest: Value = serde_json::from_str(catalog::MANIFEST_2_1_JSON).unwrap();
-    assert_eq!(registry, catalog::catalog_v2_2());
-    // The committed bytes are exactly what the generator writes.
-    assert_eq!(registry, build_v2_2());
-    assert_eq!(catalog::REGISTRY_2_2_JSON, pretty(&registry));
-    assert_eq!(catalog::VERSION_2_2, "2.2.0");
-    assert_eq!(manifest["version"], catalog::VERSION_2_2);
-    assert_eq!(
-        manifest["fingerprint"],
-        digest(&(catalog::VERSION_2_2, &registry)).unwrap()
-    );
-    assert_ne!(manifest["fingerprint"], v21_manifest["fingerprint"]);
-    assert_eq!(manifest["supersedes"]["version"], "2.1.0");
-    assert_eq!(
-        manifest["supersedes"]["fingerprint"],
-        v21_manifest["fingerprint"]
-    );
-    assert_eq!(manifest["commands_added"], json!(ADDED_COMMANDS));
-    assert_eq!(manifest["events_added"], json!(ADDED_EVENTS));
-    for key in ["context_views", "work_kinds", "work_change_variants"] {
-        assert_eq!(manifest[key], v21_manifest[key], "{key}");
-    }
-    assert_eq!(registry.commands.len(), 16);
-    assert_eq!(registry.events.len(), 11);
-    for (name, command) in &registry.commands {
-        assert_eq!(name, &command.name);
-        command.input.validate_definition().unwrap();
-        for output in command.outcomes.values() {
-            output.validate_definition().unwrap();
-        }
-    }
-    for (name, event) in &registry.events {
-        assert_eq!(name, &event.name);
-        event.payload.validate_definition().unwrap();
-    }
-    let compat = &fixtures()["compatibility"];
-    for name in ADDED_COMMANDS {
-        let c = &registry.commands[name];
-        assert_eq!(c.version, "1.0.0");
-        assert_eq!(c.capabilities, strings(&[name]), "{name}");
-        assert_eq!(c.scopes, strings(&["project"]), "{name}");
-        assert_eq!(c.max_payload_bytes, 65_536, "{name}");
-        assert!(!c.cancellation, "{name}");
-        assert_eq!(
-            compat["added_commands"][name],
-            json!(c.fingerprint().unwrap())
-        );
-    }
-    for name in ADDED_EVENTS {
-        let e = &registry.events[name];
-        assert_eq!(e.version, "1.0.0");
-        assert_eq!(e.trusted_producers, strings(&["aq.host.bridge@1"]));
-        assert_eq!(e.retention_ms, 86_400_000);
-        assert_eq!(e.max_payload_bytes, 65_536);
-        assert_eq!(
-            compat["added_events"][name],
-            json!(e.fingerprint().unwrap())
-        );
-    }
-    let read = &registry.commands["work.read"];
-    assert_eq!(
-        (&read.effect, &read.recovery, read.deadline_ms),
-        (&Effect::Observation, &Recovery::Observation, 10_000)
-    );
-    let route = &registry.commands["work.route"];
-    assert_eq!(
-        (&route.effect, &route.recovery, route.deadline_ms),
-        (&Effect::Mutation, &Recovery::KeyedIdempotent, 10_000)
-    );
-    let unroutable = &registry.commands["work.unroutable"];
-    assert_eq!(
-        (
-            &unroutable.effect,
-            &unroutable.recovery,
-            unroutable.deadline_ms
-        ),
-        (&Effect::Mutation, &Recovery::KeyedIdempotent, 10_000)
-    );
-    for c in [read, route, unroutable] {
-        assert_eq!(c.public_result_fields, strings(&["reference", "subject"]));
-    }
-    // An unroutable task gives its reasons exactly as a route does.
-    let Schema::Object {
-        properties: unroutable_input,
-        ..
-    } = &unroutable.input
-    else {
-        panic!("work.unroutable input is an object")
-    };
-    let Schema::Object {
-        properties: route_input,
-        ..
-    } = &route.input
-    else {
-        panic!("work.route input is an object")
-    };
-    assert_eq!(unroutable_input["reasons"], route_input["reasons"]);
-    let assess = &registry.commands["judgment.assess"];
-    let a = assess.asynchronous.as_ref().unwrap();
-    assert_eq!(
-        (
-            a.completion_event.as_str(),
-            a.correlation_field.as_str(),
-            a.reconciliation_command.as_str()
-        ),
-        ("aq.judgment.assessed", "operation", "operation.get")
-    );
-    let needed = &registry.events["aq.work.route_needed"];
-    assert!(needed.correlation_fields.is_empty());
-    assert_eq!(needed.subject_field.as_deref(), Some("subject.id"));
-    assert_eq!(needed.revision_field.as_deref(), Some("subject.revision"));
-    let assessed = &registry.events["aq.judgment.assessed"];
-    assert_eq!(assessed.correlation_fields, strings(&["operation"]));
-    assert_eq!(assessed.subject_field.as_deref(), Some("output.subject.id"));
-    assert_eq!(
-        assessed.revision_field.as_deref(),
-        Some("output.subject.revision")
-    );
-    // A route's classification is exactly what an assessed answer holds.
-    let Schema::Object { properties, .. } = &route.input else {
-        panic!("work.route input is an object")
-    };
-    let Schema::Nullable { inner } = &properties["classification"] else {
-        panic!("classification is nullable")
-    };
-    let Schema::Object {
-        properties: answer, ..
-    } = &assess.outcomes["assessed"]
-    else {
-        panic!("assessed is an object")
-    };
-    let Schema::Object {
-        properties: kept, ..
-    } = inner.as_ref()
-    else {
-        panic!("classification is an object")
-    };
-    for field in ["labels", "flags", "rationale"] {
-        assert_eq!(kept[field], answer[field], "{field}");
-    }
-    // ...plus the judgment's reference and the field ids, to show it alone.
-    assert_eq!(kept["reference"], answer["reference"]);
-    assert_eq!(kept["fields"], array(string(64), 16));
-    // Levels are the closed set of classes; no hint is "".
-    assert_eq!(properties["level"], level(&[]));
-    let Schema::Object {
-        properties: observed,
-        ..
-    } = &read.outcomes["observed"]
-    else {
-        panic!("observed is an object")
-    };
-    let Schema::Object {
-        properties: facts,
-        required,
-    } = &observed["facts"]
-    else {
-        panic!("facts is an object")
-    };
-    assert_eq!(facts["level_hint"], level(&[""]));
-    assert!(required.contains("level_hint"));
-    assert!(!facts.contains_key("priority"));
-    // A reason's sentence is optional; no code pins "nothing allowed".
-    let Schema::Array { items, .. } = &properties["reasons"] else {
-        panic!("reasons is an array")
-    };
-    let Schema::Object {
-        properties: reason,
-        required,
-    } = items.as_ref()
-    else {
-        panic!("a reason is an object")
-    };
-    assert_eq!(required, &strings(&["code"]));
-    assert_eq!(reason["detail"], string(256));
-    assert_eq!(reason["code"], code(&ROUTE_REASONS));
-    for c in ["policy", "risk_relaxed", "deep_reserved", "second_opinion"] {
-        assert!(ROUTE_REASONS.contains(&c), "{c}");
-    }
-    assert!(!ROUTE_REASONS.contains(&"nothing_allowed"));
-    // `routed` reports what remained of each list at the level.
-    let Schema::Object {
-        properties: remained,
-        ..
-    } = &route.outcomes["routed"]
-    else {
-        panic!("routed is an object")
-    };
-    for list in ["harnesses", "providers", "prefer"] {
-        assert_eq!(remained[list], properties[list], "{list}");
-        assert_eq!(
-            properties[list],
-            array(string(64), MAX_ROUTE_NAMES),
-            "{list}"
-        );
-    }
-}
-
-#[test]
-fn catalog_v2_2_keeps_every_2_1_0_contract_byte_identical() {
-    let compat = &fixtures()["compatibility"];
-    let v21 = catalog::catalog_v2_1();
-    let v22 = catalog::catalog_v2_2();
-    let v21_manifest: Value = serde_json::from_str(catalog::MANIFEST_2_1_JSON).unwrap();
-    assert_eq!(compat["base"]["version"], "2.1.0");
-    assert_eq!(compat["base"]["fingerprint"], v21_manifest["fingerprint"]);
-    assert_eq!(
-        hash_bytes(catalog::REGISTRY_2_1_JSON.as_bytes()),
-        compat["base"]["registry_sha256"]
-    );
-    assert_eq!(compat["changed_commands"], json!({}));
-    assert_eq!(v21.commands.len(), 12);
-    assert_eq!(v21.events.len(), 9);
-    assert_eq!(compat["unchanged_commands"].as_object().unwrap().len(), 12);
-    assert_eq!(compat["unchanged_events"].as_object().unwrap().len(), 9);
-    for (name, old) in &v21.commands {
-        let new = &v22.commands[name];
-        assert_eq!(new, old, "{name}");
-        assert_eq!(canonical_bytes(new).unwrap(), canonical_bytes(old).unwrap());
-        assert_eq!(
-            new.fingerprint().unwrap(),
-            old.fingerprint().unwrap(),
-            "{name}"
-        );
-        assert_eq!(
-            compat["unchanged_commands"][name],
-            json!(old.fingerprint().unwrap()),
-            "{name}"
-        );
-    }
-    for (name, old) in &v21.events {
-        let new = &v22.events[name];
-        assert_eq!(new, old, "{name}");
-        assert_eq!(
-            new.fingerprint().unwrap(),
-            old.fingerprint().unwrap(),
-            "{name}"
-        );
-        assert_eq!(
-            compat["unchanged_events"][name],
-            json!(old.fingerprint().unwrap()),
-            "{name}"
-        );
-    }
-    // Everything else is an addition, named in the manifest and fixtures.
-    let added: BTreeSet<&str> = v22
-        .commands
-        .keys()
-        .filter(|n| !v21.commands.contains_key(*n))
-        .map(String::as_str)
-        .collect();
-    assert_eq!(added, BTreeSet::from(ADDED_COMMANDS));
-    let added: BTreeSet<&str> = v22
-        .events
-        .keys()
-        .filter(|n| !v21.events.contains_key(*n))
-        .map(String::as_str)
-        .collect();
-    assert_eq!(added, BTreeSet::from(ADDED_EVENTS));
-    // Each old entry's published text appears unchanged in the 2.2.0 file.
-    for name in v21.commands.keys() {
-        let entry =
-            serde_json::to_string_pretty(&serde_json::to_value(&v21.commands[name]).unwrap())
-                .unwrap()
-                .replace('\n', "\n    ");
-        assert!(
-            catalog::REGISTRY_2_2_JSON.contains(&format!("\"{name}\": {entry}")),
-            "{name}"
-        );
-    }
-}
 
 /// A 2.1.0 workspace using an async judgment, a check and a candidate.
 fn v21_workspace(catalog: Registry) -> Workspace {
@@ -929,28 +255,7 @@ fn satisfies(request: &Value, answer: &Value) -> bool {
 fn valid_and_invalid_fixture_cases_validate_as_declared() {
     let registry = catalog::catalog_v2_2();
     let fixtures = fixtures();
-    let mut covered = BTreeSet::new();
-    for fixture in fixtures["cases"].as_array().unwrap() {
-        let name = fixture["name"].as_str().unwrap();
-        let contract = fixture["contract"].as_str().unwrap();
-        let kind = fixture["kind"].as_str().unwrap();
-        let schema = match kind {
-            "input" => &registry.commands[contract].input,
-            "output" => &registry.commands[contract].outcomes[fixture["outcome"].as_str().unwrap()],
-            "event" => &registry.events[contract].payload,
-            other => panic!("unknown fixture kind {other}"),
-        };
-        let valid = fixture["valid"].as_bool().unwrap();
-        assert_eq!(schema.validate(&fixture["value"]).is_ok(), valid, "{name}");
-        if valid {
-            let place = match kind {
-                "output" => format!("{contract}.{}", fixture["outcome"].as_str().unwrap()),
-                "input" => format!("{contract}.input"),
-                _ => contract.to_string(),
-            };
-            covered.insert(place);
-        }
-    }
+    let covered = schemas::assert_fixture_cases(&registry, &fixtures);
     // A valid case for every new input, outcome and event.
     let mut expected = BTreeSet::new();
     for name in ADDED_COMMANDS {
@@ -963,6 +268,12 @@ fn valid_and_invalid_fixture_cases_validate_as_declared() {
         expected.insert(name.to_string());
     }
     assert_eq!(covered, expected);
+}
+
+#[test]
+fn the_assessed_guarantee_requires_one_declared_label_per_field() {
+    let registry = catalog::catalog_v2_2();
+    let fixtures = fixtures();
     // The assessed guarantee: one declared label per field, in field order.
     let assess = &registry.commands["judgment.assess"];
     let guarantee = &fixtures["assessed_guarantee"];
@@ -1080,6 +391,11 @@ fn the_routing_document_draft_checks_against_catalog_2_2_0() {
     for name in ["aq.work.route_needed", "aq.judgment.assessed"] {
         assert!(retained.events.contains_key(name), "{name}");
     }
+}
+
+#[test]
+fn only_a_completed_assessment_can_read_the_labels() {
+    let ws = routing_workspace();
     // The labels are read by position only where `judgment.assess` answered
     // `assessed` (one label per requested field): in the `route` step, which
     // only the join's `completed` edge reaches, and the join accepts only
@@ -1126,9 +442,13 @@ fn the_routing_document_draft_checks_against_catalog_2_2_0() {
         ws.draft["steps"]["await"]["op"]["accepted_outcomes"],
         json!(["assessed"])
     );
+}
+
+#[test]
+fn unassessed_labels_are_refused() {
     // The strict draft rules still bite: reading the labels where the
     // judgment may have failed is refused.
-    let mut wrong = ws.clone();
+    let mut wrong = routing_workspace();
     wrong.draft["steps"]["await"]["op"]["accepted_outcomes"] = json!(["assessed", "failed"]);
     let diagnostics = check(&wrong);
     assert!(
@@ -1137,9 +457,13 @@ fn the_routing_document_draft_checks_against_catalog_2_2_0() {
             .any(|d| d.code == "expression_type" && d.message.contains("labels")),
         "{diagnostics:#?}"
     );
+}
+
+#[test]
+fn a_failed_judgment_cannot_be_read_at_route() {
     // And so is reading the judgment's answer on the fallback path, which
     // the judgment's `on_error` (nothing bound) also reaches.
-    let mut wrong = ws.clone();
+    let mut wrong = routing_workspace();
     wrong.draft["steps"]["assume"]["op"]["input"]["body"]["fields"]["classification"] = json!({
         "op": "object", "fields": {
             "reference": {"op": "literal", "value": ""},
@@ -1154,8 +478,12 @@ fn the_routing_document_draft_checks_against_catalog_2_2_0() {
             .any(|d| d.code == "expression_type" && d.path == "draft.json:steps.assume"),
         "{diagnostics:#?}"
     );
+}
+
+#[test]
+fn unknown_literal_reason_is_refused() {
     // A route that gives a reason outside the fixed list does not check.
-    let mut wrong = ws.clone();
+    let mut wrong = routing_workspace();
     wrong.draft["steps"]["assume"]["op"]["input"]["body"]["fields"]["reasons"] = json!({"op": "literal",
         "value": [{"code": "because_i_said_so", "detail": "Free text cannot be a code."}]});
     let diagnostics = check(&wrong);
@@ -1165,8 +493,12 @@ fn the_routing_document_draft_checks_against_catalog_2_2_0() {
             && d.message.contains("because_i_said_so")),
         "{diagnostics:#?}"
     );
+}
+
+#[test]
+fn unavailable_priority_is_refused() {
     // The task's priority is not a fact a playbook can read.
-    let mut wrong = ws.clone();
+    let mut wrong = routing_workspace();
     wrong.draft["steps"]["ask"]["op"]["input"]["fields"]["context"]["fields"]["items"]["items"]
         [0]["fields"]["text"] = json!({"op": "ref", "root": "task", "path": ["facts", "priority"]});
     let diagnostics = check(&wrong);
@@ -1176,8 +508,12 @@ fn the_routing_document_draft_checks_against_catalog_2_2_0() {
             .any(|d| d.path == "draft.json:steps.ask" && d.message.contains("priority")),
         "{diagnostics:#?}"
     );
+}
+
+#[test]
+fn unknown_computed_reason_is_refused() {
     // Also when the reason is chosen by the playbook's own filter and map.
-    let mut wrong = ws;
+    let mut wrong = routing_workspace();
     wrong.draft["steps"]["route"]["op"]["input"]["body"]["fields"]["reasons"]["collection"]["collection"]
         ["items"][0]["fields"]["code"] = json!({"op": "literal", "value": "because_i_said_so"});
     let diagnostics = check(&wrong);
@@ -1202,9 +538,7 @@ fn route_for(task: &Task) -> Value {
     let input: Expr =
         serde_json::from_value(ws.draft["steps"][step]["op"]["input"].clone()).unwrap();
     let subject = json!({"id": "task-1", "revision": 3});
-    let facts = json!({"kind": task.filed_kind, "title": "A task", "description": "",
-        "origin": "owner", "level_hint": task.hint, "charged_failures": task.failures,
-        "ended_attempts": task.failures, "route": "none"});
+    let facts = reported_facts(task);
     let v22 = catalog::catalog_v2_2();
     let read = json!({"reference": "task-1@3", "subject": subject, "facts": facts});
     v22.commands["work.read"].outcomes["observed"]
@@ -1254,600 +588,23 @@ fn host_keeps(route: &Value) -> Option<Value> {
             .iter()
             .filter(|n| at[offered].as_array().unwrap().contains(n))
             .collect();
-        if list != "prefer" && !asked.is_empty() && left.is_empty() {
+        let restricts = list != "prefer" && !asked.is_empty();
+        if restricts && left.is_empty() {
             return None;
         }
         kept[list] = json!(left);
     }
     Some(kept)
 }
-#[derive(Clone)]
-struct Task {
-    filed_kind: &'static str,
-    hint: &'static str,
-    failures: i64,
-    /// The judgment's `[kind, risk]`; `None` when it gave no answer.
-    labels: Option<[&'static str; 2]>,
-    flags: &'static [&'static str],
-}
-struct Expected {
-    level: &'static str,
-    harnesses: &'static [&'static str],
-    prefer: &'static [&'static str],
-    hold: bool,
-    codes: &'static [&'static str],
-}
-const NT: &[&str] = &["narrow", "covered_by_test"];
-const HARD: &[&str] = &["needs_deep_reasoning"];
-const CC: &[&str] = &["claude", "codex"];
-const ANY: &[&str] = &[];
-fn task(kind: &'static str, risk: &'static str, flags: &'static [&'static str]) -> Task {
-    Task {
-        filed_kind: kind,
-        hint: "",
-        failures: 0,
-        labels: Some([kind, risk]),
-        flags,
-    }
-}
-fn expect(
-    level: &'static str,
-    harnesses: &'static [&'static str],
-    codes: &'static [&'static str],
-) -> Expected {
-    Expected {
-        level,
-        harnesses,
-        prefer: &[],
-        hold: false,
-        codes,
-    }
-}
+#[path = "catalog_v2_2/routing_cases.rs"]
+mod routing_cases;
+use routing_cases::{Expected, HARD, NT, ROWS, Task, failed, hint, task};
 
-/// Each row is a concrete task and the route the owner's routing document
-/// (aq-server `docs/specs/0011-routing-policy-default.md`, current text) gives
-/// it; the comment quotes the sentence, with its line.
 #[test]
 fn the_routing_draft_routes_as_the_document_says() {
-    let hint = |t: Task, hint| Task { hint, ..t };
-    let failed = |t: Task, failures| Task { failures, ..t };
-    let unclassified = |filed_kind| Task {
-        labels: None,
-        flags: &[],
-        ..task(filed_kind, "", &[])
-    };
-    let prefer = |e: Expected, prefer| Expected { prefer, ..e };
-    let held = |e: Expected| Expected { hold: true, ..e };
-    let rows: Vec<(&str, Task, Expected)> = vec![
-        // 16: "Features, bug fixes, refactors, tests and docs are Standard, high effort."
-        // 72: "Anything not mentioned here, takes only low risk work." Low risk: anyone.
-        (
-            "feature, low",
-            task("feature", "low", &[]),
-            expect("standard-high", ANY, &["level_from_kind"]),
-        ),
-        // 67: "High and very high risk work goes only to Claude or Codex."
-        // 58: "Medium and high risk work is at least Standard, high effort."
-        (
-            "refactor, high",
-            task("refactor", "high", &[]),
-            expect(
-                "standard-high",
-                CC,
-                &["level_from_kind", "harnesses_limited"],
-            ),
-        ),
-        // 68: "Medium risk work goes to Claude or Codex."
-        (
-            "bugfix, medium",
-            task("bugfix", "medium", &[]),
-            expect(
-                "standard-high",
-                CC,
-                &["level_from_kind", "harnesses_limited"],
-            ),
-        ),
-        // 70: "Low risk work that is narrow and covered by a test should go to a local model first, ..."
-        (
-            "test, low, narrow and covered",
-            task("test", "low", NT),
-            prefer(
-                expect(
-                    "standard-high",
-                    ANY,
-                    &["level_from_kind", "harness_preferred"],
-                ),
-                &["opencode"],
-            ),
-        ),
-        (
-            "docs, low, narrow and covered",
-            task("docs", "low", NT),
-            prefer(
-                expect(
-                    "standard-high",
-                    ANY,
-                    &["level_from_kind", "harness_preferred"],
-                ),
-                &["opencode"],
-            ),
-        ),
-        // 18: "Chores and syncs are Simple, high effort."
-        (
-            "chore, low",
-            task("chore", "low", &[]),
-            expect("simple-high", ANY, &["level_from_kind"]),
-        ),
-        // 18 + 58: a medium-risk sync is raised to the risk floor.
-        (
-            "sync, medium",
-            task("sync", "medium", &[]),
-            expect(
-                "standard-high",
-                CC,
-                &["level_from_kind", "raised_for_risk", "harnesses_limited"],
-            ),
-        ),
-        // 19: "Specs, designs, implementation plans and reviews of someone else's work are Complex, high effort."
-        (
-            "spec, medium",
-            task("spec", "medium", &[]),
-            expect(
-                "complex-high",
-                CC,
-                &["level_from_kind", "harnesses_limited"],
-            ),
-        ),
-        (
-            "review, medium",
-            task("review", "medium", &[]),
-            expect(
-                "complex-high",
-                CC,
-                &["level_from_kind", "harnesses_limited"],
-            ),
-        ),
-        // 73: "Design and planning go to Claude first, and to Codex only when Claude can't take them."
-        (
-            "design, low, not flagged hard",
-            task("design", "low", NT),
-            prefer(
-                expect(
-                    "complex-high",
-                    CC,
-                    &["level_from_kind", "harness_preferred"],
-                ),
-                &["claude"],
-            ),
-        ),
-        (
-            "plan, high",
-            task("plan", "high", &[]),
-            prefer(
-                expect(
-                    "complex-high",
-                    CC,
-                    &["level_from_kind", "harness_preferred"],
-                ),
-                &["claude"],
-            ),
-        ),
-        // 21: "Research is Standard, high effort, unless it is clearly harder, in which case it is Complex, high effort."
-        (
-            "research, low",
-            task("research", "low", &[]),
-            expect("standard-high", ANY, &["level_from_kind"]),
-        ),
-        (
-            "research, low, clearly harder",
-            task("research", "low", &["clearly_harder"]),
-            expect("complex-high", ANY, &["level_from_kind"]),
-        ),
-        // 23: "Deep, high effort, is only for analysis, planning, spec writing, design or
-        //      review that needs advanced mathematics or unusually hard reasoning."
-        (
-            "analysis, medium, flagged hard",
-            task("analysis", "medium", HARD),
-            expect("deep-high", CC, &["deep_reserved", "harnesses_limited"]),
-        ),
-        (
-            "plan, medium, flagged hard",
-            task("plan", "medium", HARD),
-            prefer(
-                expect("deep-high", CC, &["deep_reserved", "harness_preferred"]),
-                &["claude"],
-            ),
-        ),
-        (
-            "spec, low, flagged hard",
-            task("spec", "low", HARD),
-            expect("deep-high", ANY, &["deep_reserved"]),
-        ),
-        (
-            "design, low, flagged hard",
-            task("design", "low", HARD),
-            prefer(
-                expect("deep-high", CC, &["deep_reserved", "harness_preferred"]),
-                &["claude"],
-            ),
-        ),
-        (
-            "review, high, flagged hard",
-            task("review", "high", HARD),
-            expect("deep-high", CC, &["deep_reserved", "harnesses_limited"]),
-        ),
-        // 23: research is not among the Deep kinds; 21 gives it Complex only when clearly harder.
-        (
-            "research, low, flagged hard",
-            task("research", "low", HARD),
-            expect("standard-high", ANY, &["level_from_kind"]),
-        ),
-        // 27: "Analysis that doesn't need Deep is Standard, high effort."
-        (
-            "analysis, low",
-            task("analysis", "low", &[]),
-            expect("standard-high", ANY, &["level_from_kind"]),
-        ),
-        // 24: "A big task is not a Deep task, and neither is a risky one."
-        (
-            "review, very high, not flagged",
-            task("review", "very_high", &[]),
-            expect(
-                "complex-high",
-                CC,
-                &["level_from_kind", "harnesses_limited"],
-            ),
-        ),
-        // 75: "Art and visual design go to Codex, and wait for it rather than going elsewhere."
-        (
-            "art, medium",
-            task("art", "medium", &[]),
-            held(expect(
-                "standard-high",
-                &["codex"],
-                &["level_from_kind", "held_for_harness"],
-            )),
-        ),
-        (
-            "art, low, narrow and covered",
-            task("art", "low", NT),
-            held(expect(
-                "standard-high",
-                &["codex"],
-                &["level_from_kind", "held_for_harness"],
-            )),
-        ),
-        // 78: "Repairs to a failed integration or build never go to a local model."
-        (
-            "repair, low, narrow and covered",
-            task("repair", "low", NT),
-            expect(
-                "standard-high",
-                &["claude", "codex", "gemini"],
-                &["level_from_kind", "harness_excluded"],
-            ),
-        ),
-        (
-            "repair, medium, narrow and covered",
-            task("repair", "medium", NT),
-            expect(
-                "standard-high",
-                CC,
-                &["level_from_kind", "harnesses_limited", "harness_excluded"],
-            ),
-        ),
-        // 58: "Very high risk work is at least Complex, medium effort, ..."
-        (
-            "feature, very high",
-            task("feature", "very_high", &[]),
-            expect(
-                "complex-medium",
-                CC,
-                &["level_from_kind", "raised_for_risk", "harnesses_limited"],
-            ),
-        ),
-        // 59: "... unless it is narrow and covered by a test, in which case Standard, high effort is enough."
-        (
-            "feature, very high, narrow and covered",
-            task("feature", "very_high", NT),
-            expect(
-                "standard-high",
-                CC,
-                &["level_from_kind", "risk_relaxed", "harnesses_limited"],
-            ),
-        ),
-        // 68: "It may go to a local model only when the task is narrow, covered by a test, and Standard."
-        (
-            "refactor, medium, narrow and covered",
-            task("refactor", "medium", NT),
-            expect(
-                "standard-high",
-                &["claude", "codex", "opencode"],
-                &["level_from_kind", "harnesses_limited"],
-            ),
-        ),
-        (
-            "refactor, medium, narrow and covered, asked for Complex",
-            hint(task("refactor", "medium", NT), "complex-high"),
-            expect("complex-high", CC, &["hint_respected", "harnesses_limited"]),
-        ),
-        // 36: "A bug fix that has already failed once for a real reason moves up to Complex, high effort."
-        (
-            "bugfix, high, no failure",
-            task("bugfix", "high", &[]),
-            expect(
-                "standard-high",
-                CC,
-                &["level_from_kind", "harnesses_limited"],
-            ),
-        ),
-        (
-            "bugfix, high, one failure",
-            failed(task("bugfix", "high", &[]), 1),
-            expect(
-                "complex-high",
-                CC,
-                &[
-                    "level_from_kind",
-                    "escalated_after_failure",
-                    "harnesses_limited",
-                ],
-            ),
-        ),
-        (
-            "bugfix, high, two failures",
-            failed(task("bugfix", "high", &[]), 2),
-            expect(
-                "complex-high",
-                CC,
-                &[
-                    "level_from_kind",
-                    "escalated_after_failure",
-                    "harnesses_limited",
-                ],
-            ),
-        ),
-        // Failures only escalate bug fixes.
-        (
-            "feature, low, one failure",
-            failed(task("feature", "low", &[]), 1),
-            expect("standard-high", ANY, &["level_from_kind"]),
-        ),
-        // 77: "Never spend Deep on bug fixes, escalated or not." The recorded reason says so.
-        (
-            "bugfix, asked for Deep, two failures, flagged hard",
-            failed(hint(task("bugfix", "high", HARD), "deep-high"), 2),
-            expect("complex-high", CC, &["policy", "harnesses_limited"]),
-        ),
-        // 29: "If whoever filed the task asked for a level, respect it, ..."
-        (
-            "feature, asked for Standard low",
-            hint(task("feature", "low", &[]), "standard-low"),
-            expect("standard-low", ANY, &["hint_respected"]),
-        ),
-        (
-            "chore, asked for Simple low",
-            hint(task("chore", "low", &[]), "simple-low"),
-            expect("simple-low", ANY, &["hint_respected"]),
-        ),
-        // 58: the risk floor still applies to a level asked for; the hint did not decide it.
-        (
-            "bugfix, medium, asked for Simple low",
-            hint(task("bugfix", "medium", &[]), "simple-low"),
-            expect(
-                "standard-high",
-                CC,
-                &["raised_for_risk", "harnesses_limited"],
-            ),
-        ),
-        // 30: "... but don't go above Standard for tests, docs, chores and syncs, ..."
-        (
-            "docs, asked for Complex",
-            hint(task("docs", "low", &[]), "complex-high"),
-            expect("standard-high", ANY, &["hint_capped"]),
-        ),
-        (
-            "sync, asked for Deep",
-            hint(task("sync", "low", &[]), "deep-high"),
-            expect("standard-high", ANY, &["hint_capped"]),
-        ),
-        // 30: "... or above Complex for ordinary implementation work." The cap is the reason.
-        (
-            "feature, asked for Deep",
-            hint(task("feature", "low", &[]), "deep-high"),
-            expect("complex-high", ANY, &["hint_capped"]),
-        ),
-        // 31: "Asking for Deep is not enough to get it: ... otherwise it gets Complex, high effort."
-        (
-            "review, asked for Deep, not flagged",
-            hint(task("review", "low", &[]), "deep-high"),
-            expect("complex-high", ANY, &["deep_reserved"]),
-        ),
-        (
-            "analysis, asked for Deep, not flagged",
-            hint(task("analysis", "low", &[]), "deep-high"),
-            expect("complex-high", ANY, &["deep_reserved"]),
-        ),
-        (
-            "analysis, asked for Deep low, flagged hard",
-            hint(task("analysis", "low", HARD), "deep-low"),
-            expect("deep-low", ANY, &["hint_respected"]),
-        ),
-        // 33: "If the level asked for isn't available, use the nearest available level below it."
-        // It is then treated like any level asked for: it may be below the kind's level.
-        (
-            "feature, asked for Complex max (not offered)",
-            hint(task("feature", "low", &[]), "complex-max"),
-            expect("complex-high", ANY, &["policy"]),
-        ),
-        (
-            "spec, asked for Standard max (not offered)",
-            hint(task("spec", "low", &[]), "standard-max"),
-            expect("standard-high", ANY, &["policy"]),
-        ),
-        (
-            "chore, asked for Simple medium (not offered)",
-            hint(task("chore", "low", &[]), "simple-medium"),
-            expect("simple-low", ANY, &["policy"]),
-        ),
-        (
-            "analysis, asked for Deep medium (not offered), flagged hard",
-            hint(task("analysis", "low", HARD), "deep-medium"),
-            expect("deep-low", ANY, &["policy"]),
-        ),
-        // 34: "The risk and failure rules still apply to it, as to any level asked for."
-        (
-            "docs, medium, asked for Simple medium (not offered)",
-            hint(task("docs", "medium", &[]), "simple-medium"),
-            expect(
-                "standard-high",
-                CC,
-                &["policy", "raised_for_risk", "harnesses_limited"],
-            ),
-        ),
-        (
-            "bugfix, high, asked for Simple medium (not offered), one failure",
-            failed(hint(task("bugfix", "high", &[]), "simple-medium"), 1),
-            expect(
-                "complex-high",
-                CC,
-                &["policy", "escalated_after_failure", "harnesses_limited"],
-            ),
-        ),
-        // 30 with 33: a kind cap applies before the nearest available level is taken.
-        (
-            "docs, asked for Complex max (not offered)",
-            hint(task("docs", "low", &[]), "complex-max"),
-            expect("standard-high", ANY, &["hint_capped"]),
-        ),
-        // 86: "An unknown risk counts as medium, and you say that it was assumed."
-        // 89: "Keep the task on Claude or Codex." (no local model, though narrow and covered)
-        (
-            "feature, unknown risk, narrow and covered",
-            task("feature", "unknown", NT),
-            expect(
-                "standard-high",
-                CC,
-                &["level_from_kind", "risk_assumed", "harnesses_limited"],
-            ),
-        ),
-        // 88: "An unknown kind gets at least Standard, high effort."
-        (
-            "unknown kind, low, narrow and covered",
-            Task {
-                labels: Some(["unknown", "low"]),
-                ..task("", "low", NT)
-            },
-            expect("standard-high", CC, &["level_from_kind", "policy"]),
-        ),
-        // 88: the unknown-kind floor applies over a low level asked for, as the risk floors do.
-        (
-            "unknown kind, low, asked for Simple low",
-            Task {
-                labels: Some(["unknown", "low"]),
-                ..hint(task("", "low", &[]), "simple-low")
-            },
-            expect("standard-high", CC, &["policy"]),
-        ),
-        // 88: "A risk that is known still applies in full."
-        (
-            "unknown kind, very high",
-            Task {
-                labels: Some(["unknown", "very_high"]),
-                ..task("", "very_high", &[])
-            },
-            expect(
-                "complex-medium",
-                CC,
-                &[
-                    "level_from_kind",
-                    "raised_for_risk",
-                    "policy",
-                    "harnesses_limited",
-                ],
-            ),
-        ),
-        (
-            "unknown kind, unknown risk",
-            Task {
-                labels: Some(["unknown", "unknown"]),
-                ..task("", "unknown", &[])
-            },
-            expect(
-                "standard-high",
-                CC,
-                &[
-                    "level_from_kind",
-                    "risk_assumed",
-                    "policy",
-                    "harnesses_limited",
-                ],
-            ),
-        ),
-        // 87: "Use what is known." The task could not be classified at all: the kind
-        // whoever filed it gave, the level asked for and the failures still apply.
-        (
-            "unclassified, filed as a bug fix that failed once",
-            failed(unclassified("bugfix"), 1),
-            expect(
-                "complex-high",
-                CC,
-                &[
-                    "classification_failed",
-                    "level_from_kind",
-                    "escalated_after_failure",
-                    "risk_assumed",
-                    "harnesses_limited",
-                ],
-            ),
-        ),
-        (
-            "unclassified, filed as a chore",
-            unclassified("chore"),
-            expect(
-                "standard-high",
-                CC,
-                &[
-                    "classification_failed",
-                    "level_from_kind",
-                    "raised_for_risk",
-                    "risk_assumed",
-                    "harnesses_limited",
-                ],
-            ),
-        ),
-        (
-            "unclassified, no kind given",
-            unclassified(""),
-            expect(
-                "standard-high",
-                CC,
-                &[
-                    "classification_failed",
-                    "level_from_kind",
-                    "risk_assumed",
-                    "policy",
-                    "harnesses_limited",
-                ],
-            ),
-        ),
-        // 70 + host intersection: a local model first, but none is offered at Complex.
-        (
-            "spec, low, narrow and covered",
-            task("spec", "low", NT),
-            prefer(
-                expect(
-                    "complex-high",
-                    ANY,
-                    &["level_from_kind", "harness_preferred"],
-                ),
-                &["opencode"],
-            ),
-        ),
-    ];
-    assert!(rows.len() >= 16);
-    the_rows_run_as_cases(&rows);
-    for (name, task, want) in &rows {
+    assert!(ROWS.len() >= 16);
+    the_rows_run_as_cases(ROWS);
+    for (name, task, want) in ROWS {
         let r = route_for(task);
         let codes: Vec<&str> = r["reasons"]
             .as_array()
@@ -1855,11 +612,15 @@ fn the_routing_draft_routes_as_the_document_says() {
             .iter()
             .map(|r| r["code"].as_str().unwrap())
             .collect();
-        assert_eq!(r["level"], want.level, "{name}");
-        assert_eq!(r["harnesses"], json!(want.harnesses), "{name}");
-        assert_eq!(r["providers"], json!([]), "{name}");
-        assert_eq!(r["prefer"], json!(want.prefer), "{name}");
-        assert_eq!(r["hold"], want.hold, "{name}");
+        for (field, expected) in [
+            ("level", json!(want.level)),
+            ("harnesses", json!(want.harnesses)),
+            ("providers", json!([])),
+            ("prefer", json!(want.prefer)),
+            ("hold", json!(want.hold)),
+        ] {
+            assert_eq!(r[field], expected, "{name}: {field}");
+        }
         assert_eq!(codes, want.codes, "{name}");
         if task.labels.is_some() {
             assert_eq!(
@@ -1881,6 +642,10 @@ fn the_routing_draft_routes_as_the_document_says() {
         // Under the owner's Settings, nothing the document allows is refused.
         assert!(host_keeps(&r).is_some(), "{name}: {r}");
     }
+}
+
+#[test]
+fn hints_above_the_routing_ceiling_explain_why_they_were_lowered() {
     // A hint above its top is lowered for the true reason (lines 30, 31, 77).
     for (t, said) in [
         (
@@ -1912,6 +677,10 @@ fn the_routing_draft_routes_as_the_document_says() {
             "{said}: {details:?}"
         );
     }
+}
+
+#[test]
+fn an_unavailable_preference_keeps_the_route_usable() {
     // The host drops a preference the level does not offer; it never refuses.
     let spec = route_for(&task("spec", "low", NT));
     assert_eq!(host_keeps(&spec).unwrap()["prefer"], json!([]));
@@ -2022,74 +791,10 @@ fn the_routing_draft_uses_a_small_part_of_the_cost_bounds() {
 /// answer reaches `route` through the named join, and a failed judgment
 /// takes `assume`.
 fn the_rows_run_as_cases(rows: &[(&str, Task, Expected)]) {
-    use aq_playbooks_simulation::{
-        Case, CaseReturn, CaseStart, Expectation, ExpectedCall, run_case,
-    };
     let artifact = seal(&routing_workspace()).unwrap_or_else(|d| panic!("{d:#?}"));
     let subject = json!({"id": "task-1", "revision": 3});
     for (name, task, want) in rows {
-        let facts = json!({"kind": task.filed_kind, "title": "A task", "description": "",
-            "origin": "owner", "level_hint": task.hint, "charged_failures": task.failures,
-            "ended_attempts": task.failures, "route": "none"});
-        let judgment = match task.labels {
-            Some([kind, risk]) => CaseReturn::Answer {
-                outcome: "assessed".into(),
-                output: json!({"reference": "judgment:op-1", "subject": subject,
-                    "labels": [kind, risk], "flags": task.flags, "rationale": "Because.",
-                    "provenance": fixtures()["assessed_guarantee"]["assessed"]["provenance"]}),
-            },
-            None => CaseReturn::Answer {
-                outcome: "failed".into(),
-                output: json!({"reference": "judgment:op-1", "subject": subject,
-                    "reason": "provider_unavailable"}),
-            },
-        };
-        let case = Case {
-            name: name.to_string(),
-            situation: name.to_string(),
-            start: CaseStart::Event {
-                event: "aq.work.route_needed".into(),
-                payload: json!({"subject": subject}),
-                correlation: BTreeMap::new(),
-            },
-            returns: BTreeMap::from([
-                (
-                    "work.read".to_string(),
-                    vec![CaseReturn::Answer {
-                        outcome: "observed".into(),
-                        output: json!({"reference": "task-1@3", "subject": subject, "facts": facts}),
-                    }],
-                ),
-                ("judgment.assess".to_string(), vec![judgment]),
-                (
-                    "work.route".to_string(),
-                    vec![CaseReturn::Answer {
-                        outcome: "routed".into(),
-                        output: json!({"reference": "route-1", "subject": subject,
-                            "harnesses": [], "providers": [], "prefer": []}),
-                    }],
-                ),
-            ]),
-            // Every call the run makes, each with its whole input: the read,
-            // the question, and the one route the document gives.
-            expect: Expectation {
-                outcome: "routed".into(),
-                calls: vec![
-                    ExpectedCall {
-                        command: "work.read".into(),
-                        input: json!({"subject": subject}),
-                    },
-                    ExpectedCall {
-                        command: "judgment.assess".into(),
-                        input: ask_for(task),
-                    },
-                    ExpectedCall {
-                        command: "work.route".into(),
-                        input: route_for(task),
-                    },
-                ],
-            },
-        };
+        let case = routing_case(name, task, &subject);
         let route = &case.expect.calls[2].input;
         assert_eq!(route["level"], want.level, "{name}");
         assert_eq!(route["harnesses"], json!(want.harnesses), "{name}");
@@ -2120,9 +825,7 @@ fn ask_for(task: &Task) -> Value {
     let ws = routing_workspace();
     let input: Expr =
         serde_json::from_value(ws.draft["steps"]["ask"]["op"]["input"].clone()).unwrap();
-    let facts = json!({"kind": task.filed_kind, "title": "A task", "description": "",
-        "origin": "owner", "level_hint": task.hint, "charged_failures": task.failures,
-        "ended_attempts": task.failures, "route": "none"});
+    let facts = reported_facts(task);
     let read = json!({"reference": "task-1@3", "subject": {"id": "task-1", "revision": 3},
         "facts": facts});
     let context = EvalContext::from([
@@ -2139,3 +842,88 @@ fn ask_for(task: &Task) -> Value {
     };
     ask
 }
+
+#[path = "catalog_v2_2/registry.rs"]
+mod registry;
+use registry::{array, build_v2_2, code, level, string};
+
+#[path = "catalog_v2_2/manifest.rs"]
+mod manifest;
+
+fn reported_facts(task: &Task) -> Value {
+    json!({"kind": task.filed_kind, "title": "A task", "description": "",
+        "origin": "owner", "level_hint": task.hint, "charged_failures": task.failures,
+        "ended_attempts": task.failures, "route": "none"})
+}
+
+use aq_playbooks_simulation::{Case, CaseReturn, CaseStart, Expectation, ExpectedCall, run_case};
+fn expected_route_calls(task: &Task, subject: &Value) -> Expectation {
+    Expectation {
+        outcome: "routed".into(),
+        calls: vec![
+            ExpectedCall {
+                command: "work.read".into(),
+                input: json!({"subject": subject}),
+            },
+            ExpectedCall {
+                command: "judgment.assess".into(),
+                input: ask_for(task),
+            },
+            ExpectedCall {
+                command: "work.route".into(),
+                input: route_for(task),
+            },
+        ],
+    }
+}
+
+fn routing_case(name: &str, task: &Task, subject: &Value) -> Case {
+    let facts = reported_facts(task);
+    let judgment = match task.labels {
+        Some([kind, risk]) => CaseReturn::Answer {
+            outcome: "assessed".into(),
+            output: json!({"reference": "judgment:op-1", "subject": subject,
+                    "labels": [kind, risk], "flags": task.flags, "rationale": "Because.",
+                    "provenance": fixtures()["assessed_guarantee"]["assessed"]["provenance"]}),
+        },
+        None => CaseReturn::Answer {
+            outcome: "failed".into(),
+            output: json!({"reference": "judgment:op-1", "subject": subject,
+                    "reason": "provider_unavailable"}),
+        },
+    };
+    Case {
+        name: name.to_string(),
+        situation: name.to_string(),
+        start: CaseStart::Event {
+            event: "aq.work.route_needed".into(),
+            payload: json!({"subject": subject}),
+            correlation: BTreeMap::new(),
+        },
+        returns: BTreeMap::from([
+            (
+                "work.read".to_string(),
+                vec![CaseReturn::Answer {
+                    outcome: "observed".into(),
+                    output: json!({"reference": "task-1@3", "subject": subject, "facts": facts}),
+                }],
+            ),
+            ("judgment.assess".to_string(), vec![judgment]),
+            (
+                "work.route".to_string(),
+                vec![CaseReturn::Answer {
+                    outcome: "routed".into(),
+                    output: json!({"reference": "route-1", "subject": subject,
+                            "harnesses": [], "providers": [], "prefer": []}),
+                }],
+            ),
+        ]),
+        // Every call the run makes, each with its whole input: the read,
+        // the question, and the one route the document gives.
+        expect: expected_route_calls(task, subject),
+    }
+}
+
+#[path = "support/catalog_fixtures.rs"]
+mod catalog_fixtures;
+use catalog_fixtures::{fingerprints, pretty};

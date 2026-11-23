@@ -145,43 +145,11 @@ fn wait(deadline_ms: u64) -> Step {
 fn artifacts() -> Vec<(&'static str, Artifact)> {
     let mut out = vec![];
     for scope in ["a", "b", "c"] {
-        let binding = match scope {
-            "a" => "a",
-            "b" => "b",
-            _ => "c",
-        };
-        out.push((binding, artifact(&format!("return-{scope}"), scope, ret())));
+        out.push((scope, artifact(&format!("return-{scope}"), scope, ret())));
     }
     let child = artifact("child-wait", "a", wait(1_000_000));
     out.push(("child", child.clone()));
-    let mut parent = artifact(
-        "parent",
-        "a",
-        Step {
-            op: Operation::Call {
-                dependency: "child".into(),
-                entry: "main".into(),
-                input: Expr::literal(Value::Null),
-                mode: CallMode::OwnedAsync,
-                bind: "handle".into(),
-            },
-            edges: BTreeMap::from([("started".into(), "return".into())]),
-            on_error: None,
-        },
-    );
-    parent.content.dependencies.insert(
-        "child".into(),
-        CallableDependency {
-            binding: "child".into(),
-            selection: DependencySelection::Exact,
-            artifact: child.digest.clone(),
-            interfaces: child.content.playbook.entries.clone(),
-            capabilities: BTreeSet::new(),
-            scope: "a".into(),
-            dependencies: BTreeSet::new(),
-        },
-    );
-    out.push(("parent", Artifact::seal(parent.content).unwrap()));
+    out.push(("parent", parent_artifact(&child)));
     out.push(("deadline", artifact("deadline-wait", "a", wait(10))));
     let mut triggered = artifact("triggered", "a", ret());
     triggered.content.playbook.triggers.push(Trigger {
@@ -213,6 +181,36 @@ fn artifacts() -> Vec<(&'static str, Artifact)> {
         ),
     ));
     out
+}
+fn parent_artifact(child: &Artifact) -> Artifact {
+    let mut parent = artifact(
+        "parent",
+        "a",
+        Step {
+            op: Operation::Call {
+                dependency: "child".into(),
+                entry: "main".into(),
+                input: Expr::literal(Value::Null),
+                mode: CallMode::OwnedAsync,
+                bind: "handle".into(),
+            },
+            edges: BTreeMap::from([("started".into(), "return".into())]),
+            on_error: None,
+        },
+    );
+    parent.content.dependencies.insert(
+        "child".into(),
+        CallableDependency {
+            binding: "child".into(),
+            selection: DependencySelection::Exact,
+            artifact: child.digest.clone(),
+            interfaces: child.content.playbook.entries.clone(),
+            capabilities: BTreeSet::new(),
+            scope: "a".into(),
+            dependencies: BTreeSet::new(),
+        },
+    );
+    Artifact::seal(parent.content).unwrap()
 }
 fn host() -> FakeHost {
     let mut h = FakeHost::default();
@@ -304,14 +302,17 @@ impl Pair {
             "step {}: revision of {step}",
             self.steps
         );
-        let (mb, rb) = (
-            canonical_bytes(&m.state).unwrap(),
-            canonical_bytes(&r.state).unwrap(),
-        );
+        self.check_canonical_state(step, &m.state, &r.state);
+        self.check_inspection(step);
+        self.check_record_counts(step, &m.state);
+        self.check_queues(step);
+    }
+    fn check_canonical_state(&self, step: &str, m: &State, r: &State) {
+        let (mb, rb) = (canonical_bytes(m).unwrap(), canonical_bytes(r).unwrap());
         if mb != rb {
             let (mv, rv) = (
-                serde_json::to_value(&m.state).unwrap(),
-                serde_json::to_value(&r.state).unwrap(),
+                serde_json::to_value(m).unwrap(),
+                serde_json::to_value(r).unwrap(),
             );
             for (k, v) in mv.as_object().unwrap() {
                 assert_eq!(
@@ -323,6 +324,8 @@ impl Pair {
             }
             panic!("step {}: canonical state differs after {step}", self.steps);
         }
+    }
+    fn check_inspection(&self, step: &str) {
         // Settled cohorts leave both States: the history (and so every
         // inspection page over live state plus history) is the same too.
         for kind in [
@@ -343,10 +346,12 @@ impl Pair {
                 self.steps
             );
         }
+    }
+    fn check_record_counts(&self, step: &str, state: &State) {
         // The maintained record counts (what a bound container's `len`
         // reads) are those of the complete State.
         if self.r.store.stats.transitions.load(Ordering::Relaxed) > 0 {
-            let mut plain = m.state.clone();
+            let mut plain = state.clone();
             let patch = aq_playbooks_runner::transition::take_patch(&mut plain).unwrap();
             let counts: BTreeMap<&str, usize> = patch
                 .changes
@@ -375,6 +380,8 @@ impl Pair {
                 self.steps
             );
         }
+    }
+    fn check_queues(&self, step: &str) {
         for query in [
             IndexQuery::Ready {
                 scope_after: None,
@@ -404,7 +411,29 @@ impl Pair {
     }
 }
 
+fn keyed(p: &Pair, binding: &str, key: &str) -> KeyedAdmissionRequest {
+    KeyedAdmissionRequest {
+        key: key.into(),
+        binding: binding.into(),
+        expected_activation_revision: p.m.snapshot().unwrap().bindings[binding].revision,
+        entry: "main".into(),
+        input: Value::Null,
+        authority: authority("a"),
+    }
+}
+
 fn scenario(p: &mut Pair) {
+    completed_history(p);
+    pending_child_and_fanout(p);
+    cancellation_and_dispatch(p);
+    deadlines_and_ready_turns(p);
+    keyed_replays_and_epochs(p);
+    rebase_and_drop(p);
+    unlimited_admission(p);
+    rolling_history(p);
+}
+
+fn completed_history(p: &mut Pair) {
     // History: completed admissions and accepted events.
     for i in 0..12i64 {
         let id = both!(p, |e| e.admit("a", "main", Value::Null, authority("a"), i));
@@ -427,6 +456,9 @@ fn scenario(p: &mut Pair) {
         20
     ));
     both!(p, |e| e.admit_event("intruder", event("bad", "p"), 20));
+}
+
+fn pending_child_and_fanout(p: &mut Pair) {
     // Pending child.
     let parent = both!(p, |e| e.admit(
         "parent",
@@ -454,6 +486,9 @@ fn scenario(p: &mut Pair) {
     both!(p, |e| e.fanout(&key, 1, 41));
     both!(p, |e| e.fanout(&key, 1, 42));
     both!(p, |e| e.fanout("missing-event", 1, 42));
+}
+
+fn cancellation_and_dispatch(p: &mut Pair) {
     // Cancel.
     let victim = both!(p, |e| e.admit(
         "deadline",
@@ -494,6 +529,9 @@ fn scenario(p: &mut Pair) {
     };
     both!(p, |e| e.record_result(&accepted, done.clone(), 80));
     both!(p, |e| e.record_result(&accepted, done.clone(), 81));
+}
+
+fn deadlines_and_ready_turns(p: &mut Pair) {
     // Deadlines around zero: due = admitted + 10.
     for due in [-100i64, -10, -2, -1, 0, 9, 10, 100] {
         let id = both!(p, |e| e.admit(
@@ -527,6 +565,9 @@ fn scenario(p: &mut Pair) {
         both!(p, |e| e.drive(&mut host(), 201, limit));
         both!(p, |e| e.drive(&mut host(), 202, 1_000));
     }
+}
+
+fn keyed_replays_and_epochs(p: &mut Pair) {
     // Keyed admission: new, replay, changed.
     let revision = p.m.snapshot().unwrap().bindings["a"].revision;
     let request = |input: Value| KeyedAdmissionRequest {
@@ -589,6 +630,9 @@ fn scenario(p: &mut Pair) {
         authority("a"),
         i64::MIN
     ));
+}
+
+fn rebase_and_drop(p: &mut Pair) {
     // The clock is pinned at i64::MAX. Rebase it, then a window drop and a
     // deferral (a keyed receipt whose run is still live) on both paths.
     both!(p, |e| e.set_retention_policy(RetentionPolicy {
@@ -603,22 +647,14 @@ fn scenario(p: &mut Pair) {
         30_000
     ));
     assert!(rebased.starts_with("Ok("), "{rebased}");
-    let keyed = |binding: &str, key: &str, p: &Pair| KeyedAdmissionRequest {
-        key: key.into(),
-        binding: binding.into(),
-        expected_activation_revision: p.m.snapshot().unwrap().bindings[binding].revision,
-        entry: "main".into(),
-        input: Value::Null,
-        authority: authority("a"),
-    };
     for i in 0..3 {
-        let request = keyed("a", &format!("after-rebase-{i}"), p);
+        let request = keyed(p, "a", &format!("after-rebase-{i}"));
         both!(p, |e| e.admit_once(request.clone(), 30_000 + i));
     }
-    let held = keyed("child", "held", p);
+    let held = keyed(p, "child", "held");
     both!(p, |e| e.admit_once(held.clone(), 30_003));
     both!(p, |e| e.drive(&mut host(), 30_010, 64));
-    let request = keyed("a", "after-window", p);
+    let request = keyed(p, "a", "after-window");
     both!(p, |e| e.admit_once(request.clone(), 31_500));
     let s = p.m.snapshot().unwrap();
     assert!(
@@ -626,6 +662,9 @@ fn scenario(p: &mut Pair) {
         "dropped"
     );
     assert!(s.keyed_admissions.contains_key("held"), "deferred");
+}
+
+fn unlimited_admission(p: &mut Pair) {
     // No namespace limit refuses anything, on either path (spec 0003, "no
     // limits"): with every deprecated limit at its smallest, root
     // admissions, keyed admissions, an event, a child start and a cancel
@@ -640,7 +679,7 @@ fn scenario(p: &mut Pair) {
         };
     }
     for i in 0..8 {
-        let request = keyed("a", &format!("fill-{i}"), p);
+        let request = keyed(p, "a", &format!("fill-{i}"));
         let landed = both!(p, |e| e.admit_once(request.clone(), 31_750));
         assert!(landed.starts_with("Ok("), "{landed}");
     }
@@ -669,6 +708,9 @@ fn scenario(p: &mut Pair) {
     for config in [&mut p.m.config, &mut p.r.config] {
         *config = EngineConfig::default();
     }
+}
+
+fn rolling_history(p: &mut Pair) {
     // Repeat protection is a rolling set (Task 8b R1): lowering
     // `replay_keep` evicts the oldest unheld entries (at most 64 a commit);
     // each finished keyed run and each event then evicts the oldest, on
@@ -687,7 +729,7 @@ fn scenario(p: &mut Pair) {
         both!(p, |e| e.drive(&mut host(), 31_900, 1));
     }
     for i in 0..5 {
-        let request = keyed("a", &format!("rolling-{i}"), p);
+        let request = keyed(p, "a", &format!("rolling-{i}"));
         let admitted = both!(p, |e| e.admit_once(request.clone(), 31_910 + i));
         assert!(admitted.starts_with("Ok("), "{admitted}");
         both!(p, |e| e.drive(&mut host(), 31_910 + i, 8));

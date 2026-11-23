@@ -28,20 +28,19 @@ pub struct InspectionQuery {
     pub limit: usize,
 }
 impl InspectionQuery {
+    fn keys_in_bounds(&self) -> bool {
+        let valid_run = self
+            .run
+            .as_ref()
+            .is_none_or(|id| (1..=256).contains(&id.len()));
+        let valid_cursor = self.after.as_ref().is_none_or(|key| key.len() <= 256);
+        valid_run && valid_cursor
+    }
     pub fn validate(&self) -> Result<(), StorageError> {
-        if self.limit == 0
-            || self.limit > 1000
-            || self
-                .run
-                .as_ref()
-                .is_some_and(|s| s.is_empty() || s.len() > 256)
-            || self.after.as_ref().is_some_and(|s| s.len() > 256)
-        {
-            return Err(StorageError::Backend(
-                "invalid inspection page bounds".into(),
-            ));
-        }
-        Ok(())
+        let valid_limit = (1..=1000).contains(&self.limit);
+        (valid_limit && self.keys_in_bounds())
+            .then_some(())
+            .ok_or_else(|| StorageError::Backend("invalid inspection page bounds".into()))
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]

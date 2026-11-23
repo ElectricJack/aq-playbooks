@@ -110,6 +110,63 @@ pub struct StateMetrics {
     pub command_admission_latency: Distribution,
     pub command_completion_latency: Distribution,
 }
+#[derive(Default)]
+struct CommandTimes<'a> {
+    prepared: BTreeMap<&'a str, i64>,
+    dispatched: BTreeMap<&'a str, i64>,
+}
+
+impl<'a> CommandTimes<'a> {
+    fn observe_recovery(&self, operation: &str, now_ms: i64, age: &mut Distribution) {
+        if let Some(started) = self
+            .dispatched
+            .get(operation)
+            .or_else(|| self.prepared.get(operation))
+        {
+            age.observe_ms(*started, now_ms);
+        }
+    }
+    fn observe_dispatch(&self, operation: &str, end_ms: i64, latency: &mut Distribution) {
+        if let Some(&started) = self.dispatched.get(operation) {
+            latency.observe_ms(started, end_ms);
+        }
+    }
+    fn from_receipts(state: &'a State, metrics: &mut StateMetrics) -> Self {
+        let mut times = CommandTimes::default();
+        let mut accepted = BTreeSet::new();
+        let mut completed = BTreeSet::new();
+        for receipt in &state.receipts {
+            let Some(operation) = receipt.detail.get("operation").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            match receipt.kind.as_str() {
+                "intent" => {
+                    times.prepared.entry(operation).or_insert(receipt.at_ms);
+                }
+                "dispatch" => {
+                    times.dispatched.entry(operation).or_insert(receipt.at_ms);
+                }
+                "operation_accepted" if accepted.insert(operation) => {
+                    times.observe_dispatch(
+                        operation,
+                        receipt.at_ms,
+                        &mut metrics.command_admission_latency,
+                    );
+                }
+                "command_result" if completed.insert(operation) => {
+                    times.observe_dispatch(
+                        operation,
+                        receipt.at_ms,
+                        &mut metrics.command_completion_latency,
+                    );
+                }
+                _ => {}
+            }
+        }
+        times
+    }
+}
+
 impl StateMetrics {
     /// An explicit diagnostic scan, never used by the ready-work scheduler.
     pub fn from_state(state: &State, now_ms: i64) -> Result<Self> {
@@ -139,60 +196,23 @@ impl StateMetrics {
             out.queued_roots += 1;
             out.queued_root_age.observe_ms(run.admitted_at_ms, now_ms);
         }
-        let mut prepared = BTreeMap::new();
-        let mut dispatched = BTreeMap::new();
-        let mut accepted = BTreeSet::new();
-        let mut completed = BTreeSet::new();
-        for receipt in &state.receipts {
-            let Some(operation) = receipt.detail.get("operation").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            match receipt.kind.as_str() {
-                "intent" => {
-                    prepared.entry(operation).or_insert(receipt.at_ms);
+        let times = CommandTimes::from_receipts(state, &mut out);
+        out.record_intents(state, now_ms, &times);
+        Ok(out)
+    }
+
+    fn record_intents(&mut self, state: &State, now_ms: i64, times: &CommandTimes<'_>) {
+        for intent in state.intents.values() {
+            match intent.status {
+                IntentStatus::Dispatched | IntentStatus::Unknown => {
+                    self.outstanding_commands += 1;
+                    self.uncertain_commands += 1;
+                    times.observe_recovery(&intent.id, now_ms, &mut self.recovery_age);
                 }
-                "dispatch" => {
-                    dispatched.entry(operation).or_insert(receipt.at_ms);
-                }
-                "operation_accepted" if accepted.insert(operation) => {
-                    if let Some(start) = dispatched.get(operation) {
-                        out.command_admission_latency
-                            .observe_ms(*start, receipt.at_ms);
-                    }
-                }
-                "command_result" if completed.insert(operation) => {
-                    if let Some(start) = dispatched.get(operation) {
-                        out.command_completion_latency
-                            .observe_ms(*start, receipt.at_ms);
-                    }
-                }
+                IntentStatus::Prepared | IntentStatus::Accepted => self.outstanding_commands += 1,
                 _ => {}
             }
         }
-        for intent in state.intents.values() {
-            if matches!(
-                intent.status,
-                IntentStatus::Prepared
-                    | IntentStatus::Dispatched
-                    | IntentStatus::Accepted
-                    | IntentStatus::Unknown
-            ) {
-                out.outstanding_commands += 1;
-            }
-            if matches!(
-                intent.status,
-                IntentStatus::Dispatched | IntentStatus::Unknown
-            ) {
-                out.uncertain_commands += 1;
-                if let Some(start) = dispatched
-                    .get(intent.id.as_str())
-                    .or_else(|| prepared.get(intent.id.as_str()))
-                {
-                    out.recovery_age.observe_ms(*start, now_ms);
-                }
-            }
-        }
-        Ok(out)
     }
 }
 

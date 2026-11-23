@@ -242,21 +242,15 @@ fn abrupt_process_death_preserves_commit_and_rolls_back_inflight_transaction() {
         .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
-    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let output = BufReader::new(child.stdout.take().unwrap());
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match output.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    if line.contains("CRASH_READY") {
-                        let _ = ready_tx.send(());
-                        break;
-                    }
-                }
-            }
+        let ready = output
+            .lines()
+            .map_while(std::io::Result::ok)
+            .any(|line| line.contains("CRASH_READY"));
+        if ready {
+            let _ = ready_tx.send(());
         }
     });
     if ready_rx.recv_timeout(Duration::from_secs(15)).is_err() {

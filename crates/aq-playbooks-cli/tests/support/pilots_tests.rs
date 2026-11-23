@@ -3,32 +3,19 @@
 use crate::pilots::schemas::*;
 use crate::pilots::*;
 use aq_playbooks_cli::catalog::*;
+use aq_playbooks_compiler::draft::{SourceRecord, Workspace, retain_registry, seal, unfill};
 use aq_playbooks_model::*;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 #[test]
 fn catalog_v2_async_judgment_and_check_compile_and_join() {
     let r = catalog_v2();
-    let fixtures: Value = serde_json::from_str(include_str!(
-        "../../../../contracts/aq-host-2.0.0/fixtures.json"
-    ))
-    .unwrap();
-    let input = |name: &str| {
-        fixtures["replay_cases"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["command"] == name)
-            .unwrap()["input"]
-            .clone()
-    };
     let steps = BTreeMap::from([
         (
             "judgment".into(),
             invoke(
-                &r,
-                "judgment.request",
-                lit(input("judgment.request")),
+                &r.commands["judgment.request"],
+                lit(replay_input("judgment.request")),
                 "judgment",
                 &[("accepted", "check")],
             ),
@@ -36,9 +23,8 @@ fn catalog_v2_async_judgment_and_check_compile_and_join() {
         (
             "check".into(),
             invoke(
-                &r,
-                "check.request",
-                lit(input("check.request")),
+                &r.commands["check.request"],
+                lit(replay_input("check.request")),
                 "check",
                 &[("accepted", "wait")],
             ),
@@ -67,11 +53,13 @@ fn catalog_v2_async_judgment_and_check_compile_and_join() {
         ("done".into(), ret("success", lit(Value::Null))),
     ]);
     let artifact = build(
-        "v2-adapters",
+        PilotSpec {
+            id: "v2-adapters",
+            input: Schema::Null,
+            output: Schema::Null,
+            start: "judgment",
+        },
         r,
-        Schema::Null,
-        Schema::Null,
-        "judgment",
         steps,
         &[],
     )
@@ -81,6 +69,20 @@ fn catalog_v2_async_judgment_and_check_compile_and_join() {
     assert!(retained.events.contains_key("aq.judgment.completed"));
     assert!(retained.events.contains_key("aq.check.receipted"));
 }
+fn replay_input(name: &str) -> Value {
+    let fixtures: Value = serde_json::from_str(include_str!(
+        "../../../../contracts/aq-host-2.0.0/fixtures.json"
+    ))
+    .unwrap();
+    fixtures["replay_cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["command"] == name)
+        .unwrap()["input"]
+        .clone()
+}
+
 fn prepared_source_check(r: Registry) -> anyhow::Result<Artifact> {
     let check = json!({
         "id": "unit",
@@ -90,8 +92,7 @@ fn prepared_source_check(r: Registry) -> anyhow::Result<Artifact> {
         (
             "prepare".into(),
             invoke(
-                &r,
-                "candidate.prepare",
+                &r.commands["candidate.prepare"],
                 lit(json!({"base": subject_value(), "sources": [subject_value()]})),
                 "candidate",
                 &[("prepared", "check")],
@@ -100,8 +101,7 @@ fn prepared_source_check(r: Registry) -> anyhow::Result<Artifact> {
         (
             "check".into(),
             invoke(
-                &r,
-                "check.request",
+                &r.commands["check.request"],
                 fields(&[
                     ("subject", reference("candidate", &["subject"])),
                     ("check", lit(check)),
@@ -114,11 +114,13 @@ fn prepared_source_check(r: Registry) -> anyhow::Result<Artifact> {
         ("done".into(), ret("success", lit(Value::Null))),
     ]);
     build(
-        "prepared-source-check",
+        PilotSpec {
+            id: "prepared-source-check",
+            input: Schema::Null,
+            output: Schema::Null,
+            start: "prepare",
+        },
         r,
-        Schema::Null,
-        Schema::Null,
-        "prepare",
         steps,
         &[],
     )
@@ -186,7 +188,20 @@ fn coding_conflict_repairs_and_starts_independent_followup() {
 /// callable children it derives the same registry and capabilities.
 #[test]
 fn the_draft_filler_reproduces_every_pilot_artifact() {
-    use aq_playbooks_compiler::draft::{SourceRecord, Workspace, retain_registry, seal, unfill};
+    let (mut filled, mut derived) = (0, 0);
+    for (artifact, catalog) in pilot_artifacts() {
+        let (commands, events) = contract_names(&artifact.content);
+        if artifact.content.dependencies.is_empty() {
+            check_sealed(&artifact, catalog, commands, events);
+            filled += 1;
+        } else {
+            check_derived(&artifact, &catalog, commands, events);
+            derived += 1;
+        }
+    }
+    assert_eq!((filled, derived), (8, 2));
+}
+fn pilot_artifacts() -> Vec<(Artifact, Registry)> {
     let mut artifacts = vec![(
         prepared_source_check(catalog_v2_1()).unwrap(),
         catalog_v2_1(),
@@ -196,73 +211,92 @@ fn the_draft_filler_reproduces_every_pilot_artifact() {
             artifacts.push((a, catalog()));
         }
     }
-    let (mut filled, mut derived) = (0, 0);
-    for (artifact, catalog) in artifacts {
-        let c = &artifact.content;
-        let id = &c.playbook.id;
-        let (mut commands, mut events) = (BTreeSet::new(), BTreeSet::new());
-        for step in c.playbook.steps.values() {
-            match &step.op {
-                Operation::Invoke { command, .. } => {
-                    commands.insert(command.name.clone());
-                }
-                Operation::Wait { event: Some(e), .. } => {
-                    events.insert(e.name.clone());
-                }
-                _ => {}
+    artifacts
+}
+
+fn contract_names(content: &ArtifactContent) -> (BTreeSet<String>, BTreeSet<String>) {
+    let (mut commands, mut events) = (BTreeSet::new(), BTreeSet::new());
+    for step in content.playbook.steps.values() {
+        match &step.op {
+            Operation::Invoke { command, .. } => {
+                commands.insert(command.name.clone());
             }
-        }
-        if c.dependencies.is_empty() {
-            let draft = unfill(&artifact);
-            assert!(!draft.to_string().contains("fingerprint"), "{id}");
-            let ws = Workspace {
-                markdown: format!(
-                    "\n# {id}\n\nA synthetic bounded pilot. Domain services retain authority.\n"
-                ),
-                record: SourceRecord {
-                    id: id.clone(),
-                    binding: id.clone(),
-                    scope: c.playbook.scope.clone(),
-                    purpose: c.playbook.purpose.clone(),
-                    commands,
-                    events,
-                    capabilities: c.playbook.required_capabilities.clone(),
-                    facts_version: String::new(),
-                },
-                catalog,
-                facts: BTreeMap::new(),
-                draft,
-            };
-            let sealed = seal(&ws).unwrap_or_else(|d| panic!("{id}: {d:#?}"));
-            assert_eq!(
-                canonical_bytes(&sealed).unwrap(),
-                canonical_bytes(&artifact).unwrap(),
-                "{id}"
-            );
-            filled += 1;
-        } else {
-            let (registry, capabilities) = retain_registry(&catalog, &commands, &events).unwrap();
-            assert_eq!(registry, c.registry, "{id}");
-            let children = c.dependencies.values().flat_map(|d| d.capabilities.clone());
-            let all: BTreeSet<String> = capabilities.into_iter().chain(children).collect();
-            assert_eq!(all, c.playbook.required_capabilities, "{id}");
-            // Every operation, calls included, unfills to the model's own
-            // JSON with names in place of contract references.
-            let mut steps = serde_json::to_value(&c.playbook.steps).unwrap();
-            for step in steps.as_object_mut().unwrap().values_mut() {
-                let op = &mut step["op"];
-                for field in ["command", "event"] {
-                    if let Some(name) = op.get(field).and_then(|r| r.get("name")).cloned() {
-                        op[field] = name;
-                    }
-                }
+            Operation::Wait { event: Some(e), .. } => {
+                events.insert(e.name.clone());
             }
-            assert_eq!(unfill(&artifact)["steps"], steps, "{id}");
-            assert!(steps.to_string().contains("\"kind\":\"call\""), "{id}");
-            derived += 1;
+            _ => {}
         }
     }
-    assert_eq!((filled, derived), (8, 2));
+    (commands, events)
+}
+
+fn check_sealed(
+    artifact: &Artifact,
+    catalog: Registry,
+    commands: BTreeSet<String>,
+    events: BTreeSet<String>,
+) {
+    let c = &artifact.content;
+    let id = &c.playbook.id;
+    let draft = unfill(artifact);
+    assert!(!draft.to_string().contains("fingerprint"), "{id}");
+    let ws = Workspace {
+        markdown: format!(
+            "\n# {id}\n\nA synthetic bounded pilot. Domain services retain authority.\n"
+        ),
+        record: SourceRecord {
+            id: id.clone(),
+            binding: id.clone(),
+            scope: c.playbook.scope.clone(),
+            purpose: c.playbook.purpose.clone(),
+            commands,
+            events,
+            capabilities: c.playbook.required_capabilities.clone(),
+            facts_version: String::new(),
+        },
+        catalog,
+        facts: BTreeMap::new(),
+        draft,
+    };
+    let sealed = seal(&ws).unwrap_or_else(|d| panic!("{id}: {d:#?}"));
+    assert_eq!(
+        canonical_bytes(&sealed).unwrap(),
+        canonical_bytes(artifact).unwrap(),
+        "{id}"
+    );
+}
+
+fn check_derived(
+    artifact: &Artifact,
+    catalog: &Registry,
+    commands: BTreeSet<String>,
+    events: BTreeSet<String>,
+) {
+    let c = &artifact.content;
+    let id = &c.playbook.id;
+    let (registry, capabilities) = retain_registry(catalog, &commands, &events).unwrap();
+    assert_eq!(registry, c.registry, "{id}");
+    let children = c.dependencies.values().flat_map(|d| d.capabilities.clone());
+    let all: BTreeSet<String> = capabilities.into_iter().chain(children).collect();
+    assert_eq!(all, c.playbook.required_capabilities, "{id}");
+    check_unfilled_steps(artifact);
+}
+fn check_unfilled_steps(artifact: &Artifact) {
+    let c = &artifact.content;
+    let id = &c.playbook.id;
+    // Every operation, calls included, unfills to the model's own
+    // JSON with names in place of contract references.
+    let mut steps = serde_json::to_value(&c.playbook.steps).unwrap();
+    for step in steps.as_object_mut().unwrap().values_mut() {
+        let op = &mut step["op"];
+        for field in ["command", "event"] {
+            if let Some(name) = op.get(field).and_then(|r| r.get("name")).cloned() {
+                op[field] = name;
+            }
+        }
+    }
+    assert_eq!(unfill(artifact)["steps"], steps, "{id}");
+    assert!(steps.to_string().contains("\"kind\":\"call\""), "{id}");
 }
 #[test]
 fn report_fallback_and_late_author_publish_once() {

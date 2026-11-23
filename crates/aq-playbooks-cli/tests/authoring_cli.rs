@@ -96,9 +96,44 @@ fn observed() -> Value {
         "facts": {"kind": "feature", "title": "A task", "description": "", "origin": "owner",
             "level_hint": "", "charged_failures": 0, "ended_attempts": 0, "route": "none"}}})
 }
-fn assessed(kind: &str, risk: &str) -> Value {
+#[derive(Clone, Copy)]
+struct Routing {
+    kind: &'static str,
+    risk: &'static str,
+    level: &'static str,
+}
+const CHORE: Routing = Routing {
+    kind: "chore",
+    risk: "low",
+    level: "simple-high",
+};
+const DESIGN: Routing = Routing {
+    kind: "design",
+    risk: "low",
+    level: "complex-high",
+};
+const ROUTING_CASES: [Routing; 5] = [
+    CHORE,
+    Routing {
+        kind: "feature",
+        risk: "low",
+        level: "standard-high",
+    },
+    DESIGN,
+    Routing {
+        kind: "bugfix",
+        risk: "medium",
+        level: "standard-high",
+    },
+    Routing {
+        kind: "docs",
+        risk: "low",
+        level: "standard-high",
+    },
+];
+fn assessed(routing: Routing) -> Value {
     json!({"outcome": "assessed", "output": {"reference": "judgment:op-1", "subject": subject(),
-        "labels": [kind, risk], "flags": [], "rationale": "Because.",
+        "labels": [routing.kind, routing.risk], "flags": [], "rationale": "Because.",
         "provenance": {"context_digest": "sha256:a", "credential_profile": "profile/a",
             "model": "model-a", "output_digest": null, "prompt_digest": "sha256:c",
             "provider": "provider-a",
@@ -133,9 +168,10 @@ fn step_input(step: &str, roots: &[(&str, Value)]) -> Value {
     }
 }
 /// A case that lists every call the run makes, each with its whole input.
-fn routing_case(name: &str, kind: &str, risk: &str, level: &str) -> Value {
+fn routing_case(name: &str, routing: Routing) -> Value {
     let task = observed()["output"].clone();
-    let answer = assessed(kind, risk)["output"].clone();
+    let assessment = assessed(routing);
+    let answer = assessment["output"].clone();
     let route = step_input(
         "route",
         &[
@@ -146,13 +182,13 @@ fn routing_case(name: &str, kind: &str, risk: &str, level: &str) -> Value {
             ),
         ],
     );
-    assert_eq!(route["level"], level, "{name}");
+    assert_eq!(route["level"], routing.level, "{name}");
     json!({
         "name": name,
-        "situation": format!("A {risk} risk {kind} task needs a route"),
+        "situation": format!("A {} risk {} task needs a route", routing.risk, routing.kind),
         "start": {"kind": "event", "event": "aq.work.route_needed",
                   "payload": {"subject": subject()}},
-        "returns": {"work.read": [observed()], "judgment.assess": [assessed(kind, risk)],
+        "returns": {"work.read": [observed()], "judgment.assess": [assessment],
                     "work.route": [routed()]},
         "expect": {"outcome": "routed", "calls": [
             {"command": "work.read", "input": {"subject": subject()}},
@@ -189,47 +225,22 @@ fn workspace(name: &str) -> Dir {
     write(d, "catalog.json", &serde_json::to_value(&catalog).unwrap());
     write(d, "facts.json", &facts());
     fs::write(d.join("draft.json"), ROUTING_DRAFT).unwrap();
-    for (file, kind, risk, level) in [
-        ("chore", "chore", "low", "simple-high"),
-        ("feature", "feature", "low", "standard-high"),
-        ("design", "design", "low", "complex-high"),
-        ("bugfix", "bugfix", "medium", "standard-high"),
-        ("docs", "docs", "low", "standard-high"),
-    ] {
+    for routing in ROUTING_CASES {
+        let file = routing.kind;
         write(
             d,
             &format!("cases/{file}.json"),
-            &routing_case(file, kind, risk, level),
+            &routing_case(file, routing),
         );
     }
     dir
 }
 
-#[test]
-fn check_try_compare_save_on_a_workspace() {
-    let ws = workspace("save");
-    let d = &ws.0;
-    let (ok, check) = json_of(d, &["check"]);
-    assert!(ok, "{check:#}");
-    assert_eq!(check["diagnostics"], json!([]));
-    assert!(
-        check["order"].as_str().unwrap().contains("First"),
-        "{check:#}"
-    );
+fn outcome_file(d: &Path) -> Value {
+    serde_json::from_slice(&fs::read(d.join("out/outcome.json")).unwrap()).unwrap()
+}
 
-    let (ok, report) = json_of(d, &["try", "cases/design.json"]);
-    assert!(ok, "{report:#}");
-    assert_eq!(report["passed"], true);
-    assert_eq!(report["outcome"], "routed");
-    let commands: Vec<&str> = report["calls"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|c| c["command"].as_str().unwrap())
-        .collect();
-    assert_eq!(commands, ["work.read", "judgment.assess", "work.route"]);
-    assert_eq!(report["calls"][2]["input"]["level"], "complex-high");
-
+fn seal_and_compare(d: &Path) -> String {
     // No previous playbook yet.
     let (ok, compared) = json_of(d, &["compare"]);
     assert!(ok, "{compared:#}");
@@ -262,20 +273,35 @@ fn check_try_compare_save_on_a_workspace() {
     assert_eq!(compared["change"], "identical");
     assert_eq!(compared["abilities_changed"], false);
 
-    let (ok, facts) = json_of(d, &["facts"]);
-    assert!(ok, "{facts:#}");
-    assert_eq!(facts["facts"]["levels"][0], "simple-high");
-    assert_eq!(
-        facts["facts"]["offers"]["deep-high"]["harnesses"],
-        json!(["claude", "codex", "gemini", "opencode"])
-    );
+    digest
+}
 
+fn compare_changed_documents(d: &Path) {
+    // A change to the document alone compares as wording only; a change to
+    // what the playbook asks, as behaviour.
+    fs::write(
+        d.join("source.md"),
+        markdown().replace("Sentence 3 of", "Sentence three of"),
+    )
+    .unwrap();
+    let (ok, compared) = json_of(d, &["compare"]);
+    assert!(ok, "{compared:#}");
+    assert_eq!(compared["change"], "presentation", "{compared:#}");
+    let mut draft: Value = serde_json::from_str(ROUTING_DRAFT).unwrap();
+    draft["steps"]["ask"]["op"]["input"]["fields"]["question"]["value"] = json!("Classify.");
+    write(d, "draft.json", &draft);
+    let (ok, compared) = json_of(d, &["compare"]);
+    assert!(ok, "{compared:#}");
+    assert_eq!(compared["change"], "executable", "{compared:#}");
+}
+
+fn verify_saved_outcome(d: &Path, digest: &str, facts: &Value) {
     let (ok, saved) = json_of(d, &["save"]);
     assert!(ok, "{saved:#}");
     let bytes = fs::read(d.join("out/outcome.json")).unwrap();
     let outcome: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(outcome["kind"], "saved");
-    assert_eq!(outcome["artifact"], digest.as_str());
+    assert_eq!(outcome["artifact"], digest);
     assert_eq!(outcome["facts_digest"], facts["digest"]);
     assert_eq!(
         outcome["draft"],
@@ -305,28 +331,9 @@ fn check_try_compare_save_on_a_workspace() {
     let (ok, _) = json_of(d, &["save"]);
     assert!(ok);
     assert_eq!(fs::read(d.join("out/outcome.json")).unwrap(), bytes);
-    // A change to the document alone compares as wording only; a change to
-    // what the playbook asks, as behaviour.
-    fs::write(
-        d.join("source.md"),
-        markdown().replace("Sentence 3 of", "Sentence three of"),
-    )
-    .unwrap();
-    let (ok, compared) = json_of(d, &["compare"]);
-    assert!(ok, "{compared:#}");
-    assert_eq!(compared["change"], "presentation", "{compared:#}");
-    let mut draft: Value = serde_json::from_str(ROUTING_DRAFT).unwrap();
-    draft["steps"]["ask"]["op"]["input"]["fields"]["question"]["value"] = json!("Classify.");
-    write(d, "draft.json", &draft);
-    let (ok, compared) = json_of(d, &["compare"]);
-    assert!(ok, "{compared:#}");
-    assert_eq!(compared["change"], "executable", "{compared:#}");
 }
 
-#[test]
-fn extension_contracts_compile_and_run_in_authoring_cases() {
-    let ws = temp("extension");
-    let d = &ws.0;
+fn write_extension_workspace(d: &Path) {
     fs::write(d.join("source.md"), "# Echo\n\nEcho a test ping.\n").unwrap();
     write(
         d,
@@ -353,7 +360,104 @@ fn extension_contracts_compile_and_run_in_authoring_cases() {
         include_str!("data/test-extension-case.json"),
     )
     .unwrap();
+}
 
+fn verify_file_faults(d: &Path) {
+    // A fault in one of the host's files names the file, not a sentence.
+    fs::remove_file(d.join("out/outcome.json")).unwrap();
+    let fault = "record.json allows a command catalog.json lacks.";
+    let (ok, printed) = json_of(d, &["unable", "--file", "catalog.json", fault]);
+    assert!(ok, "{printed:#}");
+    let outcome = outcome_file(d);
+    assert_eq!(
+        outcome,
+        json!({"kind": "unable", "reason": fault, "file": "catalog.json"})
+    );
+    fs::remove_file(d.join("out/outcome.json")).unwrap();
+    for args in [
+        &["unable", "--file", "draft.json", fault][..],
+        &["unable", "--file", "catalog.json", "--line", "51", fault],
+    ] {
+        let (ok, refused) = json_of(d, args);
+        assert!(!ok, "{args:?}");
+        assert!(refused["error"].is_string(), "{refused:#}");
+    }
+    assert!(!d.join("out/outcome.json").exists());
+}
+
+#[cfg(unix)]
+fn verify_link_boundaries(d: &Path, absolute: &Path, outside: &Path) {
+    std::os::unix::fs::symlink(absolute, d.join("cases/linked.json")).unwrap();
+    let (ok, refused) = json_of(d, &["try", "cases/linked.json"]);
+    assert!(!ok);
+    assert!(
+        refused["error"].as_str().unwrap().contains("symbolic link"),
+        "{refused:#}"
+    );
+    // save reads every case, and refuses the link too.
+    let (ok, refused) = json_of(d, &["save"]);
+    assert!(!ok);
+    assert!(refused.to_string().contains("symbolic link"), "{refused:#}");
+    fs::remove_file(d.join("cases/linked.json")).unwrap();
+    fs::hard_link(d.join("cases/chore.json"), d.join("hard.json")).unwrap();
+    let (ok, refused) = json_of(d, &["try", "hard.json"]);
+    assert!(!ok);
+    assert!(
+        refused["error"].as_str().unwrap().contains("hard link"),
+        "{refused:#}"
+    );
+    fs::remove_file(d.join("hard.json")).unwrap();
+    std::os::unix::fs::symlink(outside, d.join("out")).unwrap();
+    let (ok, refused) = json_of(d, &["ask", "--line", "21", "Which level?"]);
+    assert!(!ok, "{refused:#}");
+    assert!(!outside.join("outcome.json").exists());
+    fs::remove_file(d.join("out")).unwrap();
+}
+
+#[test]
+fn check_try_compare_save_on_a_workspace() {
+    let ws = workspace("save");
+    let d = &ws.0;
+    let (ok, check) = json_of(d, &["check"]);
+    assert!(ok, "{check:#}");
+    assert_eq!(check["diagnostics"], json!([]));
+    assert!(
+        check["order"].as_str().unwrap().contains("First"),
+        "{check:#}"
+    );
+
+    let (ok, report) = json_of(d, &["try", "cases/design.json"]);
+    assert!(ok, "{report:#}");
+    assert_eq!(report["passed"], true);
+    assert_eq!(report["outcome"], "routed");
+    let commands: Vec<&str> = report["calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["command"].as_str().unwrap())
+        .collect();
+    assert_eq!(commands, ["work.read", "judgment.assess", "work.route"]);
+    assert_eq!(report["calls"][2]["input"]["level"], "complex-high");
+
+    let digest = seal_and_compare(d);
+
+    let (ok, facts) = json_of(d, &["facts"]);
+    assert!(ok, "{facts:#}");
+    assert_eq!(facts["facts"]["levels"][0], "simple-high");
+    assert_eq!(
+        facts["facts"]["offers"]["deep-high"]["harnesses"],
+        json!(["claude", "codex", "gemini", "opencode"])
+    );
+
+    verify_saved_outcome(d, &digest, &facts);
+    compare_changed_documents(d);
+}
+
+#[test]
+fn extension_contracts_compile_and_run_in_authoring_cases() {
+    let ws = temp("extension");
+    let d = &ws.0;
+    write_extension_workspace(d);
     let (ok, refused) = json_of(d, &["check"]);
     assert!(!ok);
     assert!(
@@ -487,7 +591,7 @@ fn extensions_refuse_bad_names_outcomes_and_collisions() {
 fn save_refuses_a_failing_case_and_writes_no_outcome() {
     let ws = workspace("refuse");
     let d = &ws.0;
-    let mut wrong = routing_case("design", "design", "low", "complex-high");
+    let mut wrong = routing_case("design", DESIGN);
     wrong["expect"]["calls"][2]["input"]["level"] = json!("standard-high");
     write(d, "cases/design.json", &wrong);
     let (ok, refused) = json_of(d, &["save"]);
@@ -551,8 +655,7 @@ fn ask_and_unable_write_the_outcome_with_the_sentence() {
     let reason = "No command can wait for a person to approve.";
     let (ok, printed) = json_of(d, &["unable", "--line", "51", reason]);
     assert!(ok, "{printed:#}");
-    let outcome: Value =
-        serde_json::from_slice(&fs::read(d.join("out/outcome.json")).unwrap()).unwrap();
+    let outcome = outcome_file(d);
     assert_eq!(
         outcome,
         json!({"kind": "unable", "reason": reason, "line": 51, "sentence": LINE_51})
@@ -561,34 +664,13 @@ fn ask_and_unable_write_the_outcome_with_the_sentence() {
     fs::remove_file(d.join("out/outcome.json")).unwrap();
     let (ok, printed) = json_of(d, &["unable", "--lines", "21-22", reason]);
     assert!(ok, "{printed:#}");
-    let outcome: Value =
-        serde_json::from_slice(&fs::read(d.join("out/outcome.json")).unwrap()).unwrap();
+    let outcome = outcome_file(d);
     assert_eq!(
         outcome,
         json!({"kind": "unable", "reason": reason, "line": 21, "end_line": 22,
                "sentence": format!("{LINE_21}\n{LINE_22}")})
     );
-    // A fault in one of the host's files names the file, not a sentence.
-    fs::remove_file(d.join("out/outcome.json")).unwrap();
-    let fault = "record.json allows a command catalog.json lacks.";
-    let (ok, printed) = json_of(d, &["unable", "--file", "catalog.json", fault]);
-    assert!(ok, "{printed:#}");
-    let outcome: Value =
-        serde_json::from_slice(&fs::read(d.join("out/outcome.json")).unwrap()).unwrap();
-    assert_eq!(
-        outcome,
-        json!({"kind": "unable", "reason": fault, "file": "catalog.json"})
-    );
-    fs::remove_file(d.join("out/outcome.json")).unwrap();
-    for args in [
-        &["unable", "--file", "draft.json", fault][..],
-        &["unable", "--file", "catalog.json", "--line", "51", fault],
-    ] {
-        let (ok, refused) = json_of(d, args);
-        assert!(!ok, "{args:?}");
-        assert!(refused["error"].is_string(), "{refused:#}");
-    }
-    assert!(!d.join("out/outcome.json").exists());
+    verify_file_faults(d);
     // A blank line is not a sentence; one sentence is named once.
     for args in [
         &["unable", "--line", "2", reason][..],
@@ -613,8 +695,7 @@ fn one_question_can_name_two_sentences() {
     let question = "Which level does research that is clearly harder get, and which Complex level is \"at least Complex\"?";
     let (ok, printed) = json_of(d, &["ask", "--line", "21", "--line", "51", question]);
     assert!(ok, "{printed:#}");
-    let outcome: Value =
-        serde_json::from_slice(&fs::read(d.join("out/outcome.json")).unwrap()).unwrap();
+    let outcome = outcome_file(d);
     assert_eq!(
         outcome["sentences"],
         json!([{"line": 21, "text": LINE_21}, {"line": 51, "text": LINE_51}])
@@ -631,8 +712,7 @@ fn one_question_can_name_two_sentences() {
     // A sentence over lines 21-22, with another; recorded in document order.
     let (ok, printed) = json_of(d, &["ask", "--line", "51", "--lines", "21-22", question]);
     assert!(ok, "{printed:#}");
-    let outcome: Value =
-        serde_json::from_slice(&fs::read(d.join("out/outcome.json")).unwrap()).unwrap();
+    let outcome = outcome_file(d);
     assert_eq!(
         outcome["sentences"],
         json!([{"line": 21, "end_line": 22, "text": format!("{LINE_21}\n{LINE_22}")},
@@ -710,11 +790,7 @@ fn the_tools_accept_only_paths_inside_the_workspace() {
     let ws = workspace("paths");
     let d = &ws.0;
     let outside = temp("outside");
-    write(
-        &outside.0,
-        "case.json",
-        &routing_case("x", "chore", "low", "simple-high"),
-    );
+    write(&outside.0, "case.json", &routing_case("x", CHORE));
     let absolute = outside.0.join("case.json");
     for path in [
         absolute.to_str().unwrap(),
@@ -732,33 +808,7 @@ fn the_tools_accept_only_paths_inside_the_workspace() {
         );
     }
     #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(&absolute, d.join("cases/linked.json")).unwrap();
-        let (ok, refused) = json_of(d, &["try", "cases/linked.json"]);
-        assert!(!ok);
-        assert!(
-            refused["error"].as_str().unwrap().contains("symbolic link"),
-            "{refused:#}"
-        );
-        // save reads every case, and refuses the link too.
-        let (ok, refused) = json_of(d, &["save"]);
-        assert!(!ok);
-        assert!(refused.to_string().contains("symbolic link"), "{refused:#}");
-        fs::remove_file(d.join("cases/linked.json")).unwrap();
-        fs::hard_link(d.join("cases/chore.json"), d.join("hard.json")).unwrap();
-        let (ok, refused) = json_of(d, &["try", "hard.json"]);
-        assert!(!ok);
-        assert!(
-            refused["error"].as_str().unwrap().contains("hard link"),
-            "{refused:#}"
-        );
-        fs::remove_file(d.join("hard.json")).unwrap();
-        std::os::unix::fs::symlink(&outside.0, d.join("out")).unwrap();
-        let (ok, refused) = json_of(d, &["ask", "--line", "21", "Which level?"]);
-        assert!(!ok, "{refused:#}");
-        assert!(!outside.0.join("outcome.json").exists());
-        fs::remove_file(d.join("out")).unwrap();
-    }
+    verify_link_boundaries(d, &absolute, &outside.0);
     // Discovery in a subdirectory of a workspace is refused too.
     let (ok, refused) = json_of(&d.join("cases"), &["commands", "list"]);
     assert!(!ok);
@@ -846,20 +896,13 @@ fn a_forty_case_routing_save_fits_the_outcome_bound() {
     let ws = workspace("forty");
     let d = &ws.0;
     fs::remove_dir_all(d.join("cases")).unwrap();
-    let rows = [
-        ("chore", "low", "simple-high"),
-        ("feature", "low", "standard-high"),
-        ("design", "low", "complex-high"),
-        ("bugfix", "medium", "standard-high"),
-        ("docs", "low", "standard-high"),
-    ];
     for n in 0..MAX_CASES {
-        let (kind, risk, level) = rows[n % rows.len()];
+        let routing = ROUTING_CASES[n % ROUTING_CASES.len()];
         let name = format!("case-{n:02}");
         write(
             d,
             &format!("cases/{name}.json"),
-            &routing_case(&name, kind, risk, level),
+            &routing_case(&name, routing),
         );
     }
     let (ok, saved) = json_of(d, &["save"]);

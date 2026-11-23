@@ -118,20 +118,7 @@ fn catalog_pages_are_atomic_and_unrelated_progress_preserves_metadata_stamp() {
 #[test]
 fn protected_catalog_bytes_context_rotation_and_tampering_are_fenced() {
     let n = namespace("catalog-private");
-    let mut state = state(&n);
-    let mut content = state.artifacts.values().next().unwrap().content.clone();
-    content.playbook.purpose = "PRIVATE_PURPOSE_SENTINEL".into();
-    let value = Artifact::seal(content).unwrap();
-    state.artifacts.clear();
-    state.artifacts.insert(value.digest.clone(), value.clone());
-    for run in state.runs.values_mut() {
-        run.artifact = value.digest.clone();
-    }
-    state
-        .bindings
-        .get_mut("PRIVATE_BINDING_SENTINEL")
-        .unwrap()
-        .artifact = value.digest;
+    let mut state = private_catalog_state(&n);
     let store = configured_store(true);
     store.acquire(&n, "owner").unwrap();
     store.compare_and_swap(&n, "owner", 0, &state).unwrap();
@@ -147,24 +134,7 @@ fn protected_catalog_bytes_context_rotation_and_tampering_are_fenced() {
             .unwrap()
             .contains("PRIVATE_PURPOSE_SENTINEL")
     );
-    let rows=client().query("SELECT item_key,plain_bytes,encrypted_bytes FROM aq_playbooks.catalog_rows WHERE namespace=$1",&[&n]).unwrap();
-    for row in rows {
-        assert!(row.get::<_, Option<Vec<u8>>>(1).is_none());
-        let ciphertext: Vec<u8> = row.get(2);
-        let key: String = row.get(0);
-        for secret in [
-            "PRIVATE_PURPOSE_SENTINEL",
-            "PRIVATE_BINDING_SENTINEL",
-            "PRIVATE_INPUT_SENTINEL",
-        ] {
-            assert!(!key.contains(secret));
-            assert!(
-                !ciphertext
-                    .windows(secret.len())
-                    .any(|part| part == secret.as_bytes())
-            );
-        }
-    }
+    assert_encrypted_rows(&n);
     let stored = || {
         client().query("SELECT item_key,row_revision,protection_nonce,encrypted_bytes FROM aq_playbooks.catalog_rows WHERE namespace=$1 ORDER BY kind,item_key", &[&n]).unwrap().into_iter().map(|row| (row.get::<_,String>(0),row.get::<_,i64>(1),row.get::<_,Vec<u8>>(2),row.get::<_,Vec<u8>>(3))).collect::<Vec<_>>()
     };
@@ -213,6 +183,44 @@ fn protected_catalog_bytes_context_rotation_and_tampering_are_fenced() {
             )
             .is_err()
     );
+}
+
+fn private_catalog_state(n: &str) -> State {
+    let mut state = state(n);
+    let mut content = state.artifacts.values().next().unwrap().content.clone();
+    content.playbook.purpose = "PRIVATE_PURPOSE_SENTINEL".into();
+    let value = Artifact::seal(content).unwrap();
+    state.artifacts.clear();
+    state.artifacts.insert(value.digest.clone(), value.clone());
+    for run in state.runs.values_mut() {
+        run.artifact = value.digest.clone();
+    }
+    state
+        .bindings
+        .get_mut("PRIVATE_BINDING_SENTINEL")
+        .unwrap()
+        .artifact = value.digest;
+    state
+}
+fn assert_encrypted_rows(n: &str) {
+    let rows=client().query("SELECT item_key,plain_bytes,encrypted_bytes FROM aq_playbooks.catalog_rows WHERE namespace=$1",&[&n]).unwrap();
+    for row in rows {
+        assert!(row.get::<_, Option<Vec<u8>>>(1).is_none());
+        let ciphertext: Vec<u8> = row.get(2);
+        let key: String = row.get(0);
+        for secret in [
+            "PRIVATE_PURPOSE_SENTINEL",
+            "PRIVATE_BINDING_SENTINEL",
+            "PRIVATE_INPUT_SENTINEL",
+        ] {
+            assert!(!key.contains(secret));
+            assert!(
+                !ciphertext
+                    .windows(secret.len())
+                    .any(|part| part == secret.as_bytes())
+            );
+        }
+    }
 }
 
 #[test]
@@ -529,50 +537,12 @@ fn missing_rows_refuse_reads_and_cas_without_repair_and_counts_are_guarded() {
     ] {
         assert_eq!(original.get::<_, i64>(column), 1);
     }
-    {
-        let mut conn = store.connection().unwrap();
-        // Row and trigger-maintained count disappear together on rollback.
-        let mut tx = conn.client.transaction().unwrap();
-        tx.query_one(WRITE_MARKER_SQL, &[&n]).unwrap();
-        tx.execute(
-            "DELETE FROM aq_playbooks.catalog_rows WHERE namespace=$1 AND kind='definitions'",
-            &[&n],
-        )
-        .unwrap();
-        assert_eq!(tx.query_one("SELECT catalog_actual_definition_count FROM aq_playbooks.namespaces WHERE namespace=$1", &[&n]).unwrap().get::<_,i64>(0),0);
-        tx.rollback().unwrap();
-        // TRUNCATE cannot bypass row transitions, even from the live owner.
-        let mut tx = conn.client.transaction().unwrap();
-        tx.query_one(WRITE_MARKER_SQL, &[&n]).unwrap();
-        assert!(
-            tx.batch_execute("TRUNCATE aq_playbooks.catalog_rows")
-                .is_err()
-        );
-    }
+    check_rollback_and_truncate(&store, &n);
     assert_eq!(
         store.inspect_catalog(&n, "owner", &query).unwrap().items,
         before.items
     );
-    {
-        let mut conn = store.connection().unwrap();
-        let mut tx = conn.client.transaction().unwrap();
-        tx.query_one(WRITE_MARKER_SQL, &[&n]).unwrap();
-        tx.execute(
-            "DELETE FROM aq_playbooks.catalog_rows WHERE namespace=$1 AND kind='definitions'",
-            &[&n],
-        )
-        .unwrap();
-        tx.commit().unwrap();
-        // A direct counter/header reset cannot disguise the missing row.
-        for sql in [
-            "UPDATE aq_playbooks.namespaces SET catalog_actual_definition_count=1 WHERE namespace=$1",
-            "UPDATE aq_playbooks.namespaces SET catalog_definition_count=0 WHERE namespace=$1",
-        ] {
-            let mut tx = conn.client.transaction().unwrap();
-            tx.query_one(WRITE_MARKER_SQL, &[&n]).unwrap();
-            assert!(tx.execute(sql, &[&n]).is_err());
-        }
-    }
+    remove_definition_and_check_counts(&store, &n);
     assert!(
         matches!(store.inspect_catalog(&n, "owner", &query),Err(CatalogError::Backend(reason)) if reason.contains("row count mismatch"))
     );
@@ -584,4 +554,45 @@ fn missing_rows_refuse_reads_and_cas_without_repair_and_counts_are_guarded() {
     assert_eq!(missing.get::<_, i64>("catalog_definition_count"), 1);
     assert_eq!(missing.get::<_, i64>("catalog_actual_definition_count"), 0);
     assert_eq!(client().query_one("SELECT count(*) FROM aq_playbooks.catalog_rows WHERE namespace=$1 AND kind='definitions'", &[&n]).unwrap().get::<_,i64>(0),0, "CAS must refuse rather than repair missing rows");
+}
+
+fn check_rollback_and_truncate(store: &PostgresStorage, n: &str) {
+    let mut conn = store.connection().unwrap();
+    // Row and trigger-maintained count disappear together on rollback.
+    let mut tx = conn.client.transaction().unwrap();
+    tx.query_one(WRITE_MARKER_SQL, &[&n]).unwrap();
+    tx.execute(
+        "DELETE FROM aq_playbooks.catalog_rows WHERE namespace=$1 AND kind='definitions'",
+        &[&n],
+    )
+    .unwrap();
+    assert_eq!(tx.query_one("SELECT catalog_actual_definition_count FROM aq_playbooks.namespaces WHERE namespace=$1", &[&n]).unwrap().get::<_,i64>(0),0);
+    tx.rollback().unwrap();
+    // TRUNCATE cannot bypass row transitions, even from the live owner.
+    let mut tx = conn.client.transaction().unwrap();
+    tx.query_one(WRITE_MARKER_SQL, &[&n]).unwrap();
+    assert!(
+        tx.batch_execute("TRUNCATE aq_playbooks.catalog_rows")
+            .is_err()
+    );
+}
+fn remove_definition_and_check_counts(store: &PostgresStorage, n: &str) {
+    let mut conn = store.connection().unwrap();
+    let mut tx = conn.client.transaction().unwrap();
+    tx.query_one(WRITE_MARKER_SQL, &[&n]).unwrap();
+    tx.execute(
+        "DELETE FROM aq_playbooks.catalog_rows WHERE namespace=$1 AND kind='definitions'",
+        &[&n],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    // A direct counter/header reset cannot disguise the missing row.
+    for sql in [
+        "UPDATE aq_playbooks.namespaces SET catalog_actual_definition_count=1 WHERE namespace=$1",
+        "UPDATE aq_playbooks.namespaces SET catalog_definition_count=0 WHERE namespace=$1",
+    ] {
+        let mut tx = conn.client.transaction().unwrap();
+        tx.query_one(WRITE_MARKER_SQL, &[&n]).unwrap();
+        assert!(tx.execute(sql, &[&n]).is_err());
+    }
 }
