@@ -1,5 +1,7 @@
 //! Execute one deterministic run transition under its root and playbook budgets.
 use super::*;
+mod advance;
+pub(super) use advance::advance;
 mod calls;
 mod effects;
 mod iteration;
@@ -8,7 +10,7 @@ use calls::ChildEntry;
 use iteration::ForEachStep;
 use waits::{EventSelector, JoinStep};
 
-pub(super) fn advance_inner(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
+fn advance_inner(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
     match r.status {
         RunStatus::Cancelling => return settle_cancel(s, r, now),
         RunStatus::Finishing => return settle_finishing(s, r, now),

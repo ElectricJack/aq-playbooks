@@ -12,6 +12,7 @@ pub mod metrics;
 pub mod storage;
 pub mod transition;
 pub use inspection::{InspectionKind, InspectionPage, InspectionQuery};
+mod commits;
 mod completions;
 use completions::process_completions;
 mod clock_rebase;
@@ -27,7 +28,7 @@ mod events;
 use events::{EventIngress, fanout_event, find_event};
 mod execution;
 pub mod indexes;
-use execution::advance_inner;
+use execution::advance;
 mod pending;
 pub mod retention;
 use pending::poll_pending;
@@ -617,101 +618,6 @@ impl<S: Storage> Engine<S> {
         })
         .map(|(value, _)| value)
     }
-    /// One commit, and what its retention work moved out of the State. When
-    /// the plan changes the State, both paths run `candidate_roots`,
-    /// `indexes::sync`, `finish_commit` (clock, settled cohorts, admin
-    /// receipts) and `indexes::sync` again, so a cohort leaves in the commit
-    /// that settles it.
-    fn transaction_report_at<T>(
-        &self,
-        now_ms: Finish,
-        f: impl FnOnce(&mut State) -> Result<(T, bool)>,
-    ) -> Result<(T, retention::CommitReport)> {
-        // `started`: the namespace sequence the commit began at.
-        fn finish(
-            state: &mut State,
-            mode: Finish,
-            started: u64,
-        ) -> Result<retention::CommitReport> {
-            let Finish::Host(now_ms) = mode else {
-                indexes::sync(state)?;
-                let report = retention::finish_licensed_commit(state, started)?;
-                indexes::sync(state)?;
-                return Ok(report);
-            };
-            let candidates = retention::candidate_roots(state);
-            indexes::sync(state)?;
-            let report = retention::finish_commit(state, now_ms, candidates, started)?;
-            indexes::sync(state)?;
-            Ok(report)
-        }
-        let protection = self.store.protection_available();
-        let mut f = Some(f);
-        let mut result = None;
-        let mut report = retention::CommitReport::default();
-        let metrics = &self.metrics;
-        let mut plan = |state: &mut State| -> Result<bool> {
-            let f = f
-                .take()
-                .ok_or_else(|| Error::Conflict("transition plan ran twice".into()))?;
-            state.protection_available = protection;
-            let sequence = state.sequence;
-            let started = std::time::Instant::now();
-            let evaluated = f(state);
-            metrics.record_time(metrics::Timing::Transition, started.elapsed());
-            let (value, changed) = evaluated?;
-            result = Some(value);
-            if changed {
-                report = finish(state, now_ms, sequence)?;
-            }
-            Ok(changed)
-        };
-        let started = std::time::Instant::now();
-        let outcome = self.store.transition_v1(
-            &self.namespace,
-            &self.owner,
-            &mut TransitionRequest {
-                operation: "transaction",
-                plan: &mut plan,
-            },
-        );
-        let outcome = outcome?;
-        if outcome != TransitionOutcome::Unsupported {
-            self.metrics
-                .record_time(metrics::Timing::Commit, started.elapsed());
-            let value =
-                result.ok_or_else(|| Error::Conflict("transition plan did not run".into()))?;
-            return Ok((value, report));
-        }
-        let f = f.ok_or_else(|| Error::Conflict("unsupported transition ran the plan".into()))?;
-        let started = std::time::Instant::now();
-        let loaded = self.store.load(&self.namespace);
-        self.metrics
-            .record_time(metrics::Timing::Load, started.elapsed());
-        let mut v = loaded?;
-        if !v.state.indexes.initialized {
-            indexes::rebuild(&mut v.state)?;
-        }
-        v.state.protection_available = protection;
-        let sequence = v.state.sequence;
-        let started = std::time::Instant::now();
-        let evaluated = f(&mut v.state);
-        self.metrics
-            .record_time(metrics::Timing::Transition, started.elapsed());
-        let (result, changed) = evaluated?;
-        if !changed {
-            return Ok((result, retention::CommitReport::default()));
-        }
-        let report = finish(&mut v.state, now_ms, sequence)?;
-        let started = std::time::Instant::now();
-        let committed =
-            self.store
-                .compare_and_swap(&self.namespace, &self.owner, v.revision, &v.state);
-        self.metrics
-            .record_time(metrics::Timing::Commit, started.elapsed());
-        committed?;
-        Ok((result, report))
-    }
     pub fn install(&self, artifact: Artifact) -> Result<()> {
         artifact.verify()?;
         self.transaction_at(None, |s| {
@@ -1008,81 +914,6 @@ fn record_binding_change(s: &mut State, binding: &str, now_ms: i64) -> Result<()
     indexes::index_activation(s, binding)
 }
 
-fn advance(s: &mut State, id: &str, now: i64) -> Result<bool> {
-    process_completions(s)?;
-    process_operation_deadlines(s, now);
-    indexes::unqueue(s, id);
-    let mut r = s
-        .runs
-        .get(id)
-        .ok_or_else(|| Error::NotFound(id.into()))?
-        .clone();
-    if r.status.terminal() {
-        return Ok(false);
-    }
-    let before = serde_json::to_value(&r).map_err(|e| Error::Refused(e.to_string()))?;
-    let checkpoint = s.clone();
-    let original = r.clone();
-    let result = advance_inner(s, &mut r, now);
-    if let Err(error) = result {
-        if is_invariant(&error) {
-            return Err(error);
-        }
-        *s = checkpoint;
-        r = original;
-        let message = error.to_string();
-        if matches!(error, Error::Exhausted(_)) {
-            fail_run(s, &mut r, message, now)?;
-        } else {
-            let step = s.artifacts[&r.artifact]
-                .content
-                .playbook
-                .steps
-                .get(&r.step)
-                .cloned();
-            receipt(s, &r.id, &r.step, now, "error", json!({"reason":message}));
-            if let Some(frame) = r.loops.last().cloned() {
-                match frame.failure {
-                    IterationFailure::Continue => {
-                        r.step = frame.site;
-                        r.pending = None;
-                        r.status = RunStatus::Running;
-                    }
-                    IterationFailure::Stop => {
-                        r.loops.pop();
-                        if let Some(previous) = frame.previous {
-                            r.variables.insert(frame.item, previous);
-                        } else {
-                            r.variables.remove(&frame.item);
-                        }
-                        let target = s.artifacts[&r.artifact].content.playbook.steps[&frame.site]
-                            .on_error
-                            .clone();
-                        if let Some(target) = target {
-                            r.step = target;
-                            r.pending = None;
-                            r.status = RunStatus::Running;
-                        } else {
-                            r.status = RunStatus::Blocked;
-                            r.reason = Some(message);
-                        }
-                    }
-                }
-            } else if let Some(target) = step.and_then(|x| x.on_error) {
-                r.step = target;
-                r.pending = None;
-                r.status = RunStatus::Running;
-            } else {
-                r.status = RunStatus::Blocked;
-                r.reason = Some(message);
-            }
-        }
-    }
-    let changed = before != serde_json::to_value(&r).map_err(|e| Error::Refused(e.to_string()))?;
-    s.runs.insert(id.into(), r);
-    indexes::mark_run(s, id);
-    Ok(changed)
-}
 fn deadline(now: i64, duration: u64) -> Result<i64> {
     let duration =
         i64::try_from(duration).map_err(|_| Error::Refused("deadline overflow".into()))?;
