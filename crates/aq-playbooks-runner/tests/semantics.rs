@@ -1,82 +1,13 @@
+#[path = "fixtures/async_operation.rs"]
+mod async_operation;
+use async_operation::*;
+#[path = "fixtures/engine.rs"]
+mod engine_fixtures;
 use aq_playbooks_model::*;
 use aq_playbooks_runner::*;
+use engine_fixtures::*;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-fn set(xs: &[&str]) -> BTreeSet<String> {
-    xs.iter().map(|s| s.to_string()).collect()
-}
-fn authority() -> Authority {
-    Authority {
-        actor: "alice".into(),
-        scope: "project".into(),
-        capabilities: set(&["execute"]),
-    }
-}
-fn edges(xs: &[(&str, &str)]) -> BTreeMap<String, String> {
-    xs.iter()
-        .map(|(a, b)| (a.to_string(), b.to_string()))
-        .collect()
-}
-fn ret(outcome: &str) -> Step {
-    Step {
-        op: Operation::Return {
-            outcome: outcome.into(),
-            output: Expr::literal(Value::Null),
-        },
-        edges: BTreeMap::new(),
-        on_error: None,
-    }
-}
-fn artifact(
-    id: &str,
-    start: &str,
-    steps: BTreeMap<String, Step>,
-    registry: Registry,
-    dependencies: BTreeMap<String, CallableDependency>,
-) -> Artifact {
-    Artifact::seal(ArtifactContent {
-        format_version: 1,
-        compiler: "test".into(),
-        source: SourceBinding {
-            digest: hash_bytes(b"source"),
-            header: SourceHeader {
-                format_version: 1,
-                id: id.into(),
-                scope: "project".into(),
-                interfaces: set(&["main"]),
-                definitions: BTreeSet::new(),
-            },
-        },
-        playbook: Playbook {
-            id: id.into(),
-            purpose: "semantics test".into(),
-            scope: "project".into(),
-            entries: BTreeMap::from([(
-                "main".into(),
-                EntryPoint {
-                    input: Schema::Null,
-                    outcomes: BTreeMap::from([
-                        ("ok".into(), Schema::Null),
-                        ("error".into(), Schema::Null),
-                    ]),
-                    start: start.into(),
-                },
-            )]),
-            steps,
-            triggers: vec![],
-            limits: Limits::default(),
-            required_capabilities: set(&["execute"]),
-        },
-        registry,
-        dependencies,
-        definitions: BTreeMap::new(),
-        source_map: BTreeMap::new(),
-    })
-    .unwrap()
-}
-fn engine() -> Engine<MemoryStorage> {
-    Engine::new(MemoryStorage::retaining_settled(), "test", "incarnation-1").unwrap()
-}
 /// A finished run as its cohort left the State (spec 0003: settled cohorts
 /// leave in the commit that settles them). Asserts that it has left.
 fn settled(e: &Engine<MemoryStorage>, id: &str) -> Run {
@@ -113,133 +44,6 @@ fn inspected_run(e: &Engine<MemoryStorage>, id: &str) -> Value {
     let runs = inspected(e, InspectionKind::Runs, Some(id));
     assert_eq!(runs.len(), 1, "run {id}");
     runs.into_iter().next().unwrap()
-}
-fn install(e: &Engine<MemoryStorage>, a: Artifact, binding: &str) -> String {
-    let d = a.digest.clone();
-    e.install(a).unwrap();
-    e.activate(binding, &d, authority()).unwrap();
-    d
-}
-fn command(recovery: Recovery) -> CommandContract {
-    CommandContract {
-        name: "test.command".into(),
-        version: "1".into(),
-        input: Schema::Null,
-        outcomes: BTreeMap::from([("ok".into(), Schema::Null), ("retry".into(), Schema::Null)]),
-        capabilities: set(&["execute"]),
-        scopes: set(&["project"]),
-        effect: Effect::Mutation,
-        recovery,
-        asynchronous: None,
-        cancellation: false,
-        public_result_fields: BTreeSet::new(),
-        sensitive_input_fields: BTreeSet::new(),
-        sensitive_output_fields: BTreeSet::new(),
-        max_payload_bytes: 1024,
-        deadline_ms: 100,
-    }
-}
-fn invoke_artifact(c: CommandContract, retry: Option<RetryPolicy>) -> Artifact {
-    let reference = ContractRef {
-        name: c.name.clone(),
-        fingerprint: c.fingerprint().unwrap(),
-    };
-    artifact(
-        "invoke",
-        "invoke",
-        BTreeMap::from([
-            (
-                "invoke".into(),
-                Step {
-                    op: Operation::Invoke {
-                        command: reference,
-                        input: Expr::literal(Value::Null),
-                        bind: "result".into(),
-                        retry,
-                    },
-                    edges: edges(&[("ok", "ok"), ("retry", "error")]),
-                    on_error: Some("error".into()),
-                },
-            ),
-            ("ok".into(), ret("ok")),
-            ("error".into(), ret("error")),
-        ]),
-        Registry {
-            commands: BTreeMap::from([(c.name.clone(), c)]),
-            events: BTreeMap::new(),
-        },
-        BTreeMap::new(),
-    )
-}
-fn event_contract() -> EventContract {
-    EventContract {
-        sensitive_payload_fields: BTreeSet::new(),
-        name: "test.completed".into(),
-        version: "1".into(),
-        payload: Schema::Null,
-        trusted_producers: set(&["host"]),
-        scopes: set(&["project"]),
-        correlation_fields: set(&["invocation"]),
-        subject_field: Some("subject".into()),
-        revision_field: Some("revision".into()),
-        max_payload_bytes: 1024,
-        retention_ms: 1000,
-    }
-}
-fn wait_artifact() -> Artifact {
-    let c = event_contract();
-    artifact(
-        "waiter",
-        "wait",
-        BTreeMap::from([
-            (
-                "wait".into(),
-                Step {
-                    op: Operation::Wait {
-                        event: Some(ContractRef {
-                            name: c.name.clone(),
-                            fingerprint: c.fingerprint().unwrap(),
-                        }),
-                        correlation: BTreeMap::from([(
-                            "invocation".into(),
-                            Expr::literal("exact-invocation"),
-                        )]),
-                        minimum_revision: Some(Expr::literal(2)),
-                        deadline_ms: 100,
-                        bind: "completion".into(),
-                    },
-                    edges: edges(&[("received", "ok"), ("timeout", "error")]),
-                    on_error: Some("error".into()),
-                },
-            ),
-            ("ok".into(), ret("ok")),
-            ("error".into(), ret("error")),
-        ]),
-        Registry {
-            commands: BTreeMap::new(),
-            events: BTreeMap::from([(c.name.clone(), c)]),
-        },
-        BTreeMap::new(),
-    )
-}
-fn event(id: &str, rev: u64) -> EventEnvelope {
-    let c = event_contract();
-    EventEnvelope {
-        producer: "host".into(),
-        event_id: id.into(),
-        contract: ContractRef {
-            name: c.name.clone(),
-            fingerprint: c.fingerprint().unwrap(),
-        },
-        scope: "project".into(),
-        correlation: BTreeMap::from([("invocation".into(), "exact-invocation".into())]),
-        subject: Some("object".into()),
-        revision: Some(rev),
-        causation: None,
-        occurred_at_ms: Some(0),
-        observed_at_ms: None,
-        payload: Value::Null,
-    }
 }
 #[test]
 fn event_before_wait_restart_stale_revision_and_backlog_deadline() {
@@ -382,48 +186,6 @@ fn unsafe_ambiguity_is_never_automatically_repeated_or_cancelled() {
         RunStatus::Cancelling
     );
 }
-fn child_dependency(a: &Artifact) -> CallableDependency {
-    CallableDependency {
-        selection: DependencySelection::Exact,
-        binding: a.content.playbook.id.clone(),
-        artifact: a.digest.clone(),
-        interfaces: a.content.playbook.entries.clone(),
-        capabilities: set(&["execute"]),
-        scope: "project".into(),
-        dependencies: BTreeSet::new(),
-    }
-}
-fn parent_artifact(child: &Artifact, mode: CallMode) -> Artifact {
-    let synchronous = mode == CallMode::Wait;
-    artifact(
-        "parent",
-        "call",
-        BTreeMap::from([
-            (
-                "call".into(),
-                Step {
-                    op: Operation::Call {
-                        dependency: "child".into(),
-                        entry: "main".into(),
-                        input: Expr::literal(Value::Null),
-                        mode,
-                        bind: "child_handle".into(),
-                    },
-                    edges: if synchronous {
-                        edges(&[("ok", "ok"), ("error", "error")])
-                    } else {
-                        edges(&[("started", "ok")])
-                    },
-                    on_error: Some("error".into()),
-                },
-            ),
-            ("ok".into(), ret("ok")),
-            ("error".into(), ret("error")),
-        ]),
-        Registry::default(),
-        BTreeMap::from([("child".into(), child_dependency(child))]),
-    )
-}
 #[test]
 fn all_three_child_modes_are_atomic_and_independent_cancellation_survives() {
     for mode in [CallMode::Wait, CallMode::OwnedAsync, CallMode::Independent] {
@@ -432,8 +194,7 @@ fn all_three_child_modes_are_atomic_and_independent_cancellation_survives() {
             "child",
             "ok",
             BTreeMap::from([("ok".into(), ret("ok"))]),
-            Registry::default(),
-            BTreeMap::new(),
+            FixtureContracts::default(),
         );
         e.install(child.clone()).unwrap();
         install(&e, parent_artifact(&child, mode.clone()), "parent");
@@ -499,106 +260,6 @@ fn memory_store_cas_and_owner_fence_full_boundary() {
         Err(StorageError::Ownership)
     );
 }
-fn async_artifact() -> (Artifact, EventContract) {
-    let admission = Schema::object(BTreeMap::from([("handle".into(), Schema::string(256))]));
-    let completion = Schema::object(BTreeMap::from([
-        (
-            "outcome".into(),
-            Schema::String {
-                max_length: 10,
-                values: set(&["ok", "retry"]),
-            },
-        ),
-        ("output".into(), Schema::Null),
-    ]));
-    let mut ev = event_contract();
-    ev.name = "async.completed".into();
-    ev.payload = completion.clone();
-    ev.correlation_fields = set(&["operation"]);
-    ev.subject_field = None;
-    ev.revision_field = None;
-    let mut c = command(Recovery::Reconcilable);
-    c.cancellation = true;
-    c.outcomes.insert("accepted".into(), admission);
-    c.asynchronous = Some(AsyncContract {
-        completion_event: ev.name.clone(),
-        completion,
-        correlation_field: "operation".into(),
-        reconciliation_command: "operation.get".into(),
-    });
-    let mut get = command(Recovery::Observation);
-    get.name = "operation.get".into();
-    get.effect = Effect::Observation;
-    let a = artifact(
-        "async",
-        "invoke",
-        BTreeMap::from([
-            (
-                "invoke".into(),
-                Step {
-                    op: Operation::Invoke {
-                        command: ContractRef {
-                            name: c.name.clone(),
-                            fingerprint: c.fingerprint().unwrap(),
-                        },
-                        input: Expr::literal(Value::Null),
-                        bind: "handle".into(),
-                        retry: None,
-                    },
-                    edges: edges(&[("accepted", "join"), ("ok", "ok"), ("retry", "error")]),
-                    on_error: Some("error".into()),
-                },
-            ),
-            (
-                "join".into(),
-                Step {
-                    op: Operation::Join {
-                        member_keys: vec![],
-                        members: vec![Expr::reference("handle")],
-                        mode: JoinMode::All,
-                        accepted_outcomes: set(&["ok"]),
-                        deadline_ms: 100,
-                        remaining: RemainingPolicy::Cancel,
-                        bind: "joined".into(),
-                    },
-                    edges: edges(&[
-                        ("completed", "ok"),
-                        ("no_match", "error"),
-                        ("timeout", "fallback"),
-                    ]),
-                    on_error: Some("error".into()),
-                },
-            ),
-            ("ok".into(), ret("ok")),
-            ("error".into(), ret("error")),
-            ("fallback".into(), ret("error")),
-        ]),
-        Registry {
-            commands: BTreeMap::from([(c.name.clone(), c), (get.name.clone(), get)]),
-            events: BTreeMap::from([(ev.name.clone(), ev.clone())]),
-        },
-        BTreeMap::new(),
-    );
-    (a, ev)
-}
-fn async_event(c: &EventContract, id: &str) -> EventEnvelope {
-    EventEnvelope {
-        producer: "host".into(),
-        event_id: id.into(),
-        contract: ContractRef {
-            name: c.name.clone(),
-            fingerprint: c.fingerprint().unwrap(),
-        },
-        scope: "project".into(),
-        correlation: BTreeMap::from([("operation".into(), "server-operation".into())]),
-        subject: None,
-        revision: None,
-        causation: None,
-        occurred_at_ms: None,
-        observed_at_ms: None,
-        payload: json!({"outcome":"ok","output":null}),
-    }
-}
 #[test]
 fn owned_operation_join_uses_exact_pinned_completion_and_retained_admission() {
     let e = engine();
@@ -624,11 +285,13 @@ fn owned_operation_join_uses_exact_pinned_completion_and_retained_admission() {
         "alternate",
         "ok",
         BTreeMap::from([("ok".into(), ret("ok"))]),
-        Registry {
-            commands: BTreeMap::new(),
-            events: BTreeMap::from([(other.name.clone(), other.clone())]),
+        FixtureContracts {
+            registry: Registry {
+                commands: BTreeMap::new(),
+                events: BTreeMap::from([(other.name.clone(), other.clone())]),
+            },
+            ..Default::default()
         },
-        BTreeMap::new(),
     );
     e.install(alternate).unwrap();
     e.admit_event("host", async_event(&other, "wrong-contract"), 10)
@@ -720,8 +383,7 @@ fn history_budget_stops_without_disposing_existing_records() {
         "small",
         "ok",
         BTreeMap::from([("ok".into(), ret("ok"))]),
-        Registry::default(),
-        BTreeMap::new(),
+        FixtureContracts::default(),
     )
     .content;
     a.playbook.limits.max_payload_bytes = 32;
@@ -822,8 +484,7 @@ fn missing_dependency_destination_is_durably_blocked_then_resumes_exact_bytes() 
         "missing-child",
         "ok",
         BTreeMap::from([("ok".into(), ret("ok"))]),
-        Registry::default(),
-        BTreeMap::new(),
+        FixtureContracts::default(),
     );
     let mut parent = parent_artifact(&child, CallMode::Wait).content;
     let c = event_contract();
@@ -869,52 +530,7 @@ fn iteration_failure_policy_skips_or_stops_without_resetting_captured_membership
         (IterationFailure::Stop, "error", 1),
     ] {
         let e = engine();
-        let c = command(Recovery::KeyedIdempotent);
-        let a = artifact(
-            "iteration",
-            "loop",
-            BTreeMap::from([
-                (
-                    "loop".into(),
-                    Step {
-                        op: Operation::ForEach {
-                            collection: Expr::literal(json!([null, null])),
-                            item: "item".into(),
-                            body: "invoke".into(),
-                            next: "ok".into(),
-                            max_items: 2,
-                            concurrency: 1,
-                            on_failure: policy,
-                        },
-                        edges: BTreeMap::new(),
-                        on_error: Some("error".into()),
-                    },
-                ),
-                (
-                    "invoke".into(),
-                    Step {
-                        op: Operation::Invoke {
-                            command: ContractRef {
-                                name: c.name.clone(),
-                                fingerprint: c.fingerprint().unwrap(),
-                            },
-                            input: Expr::literal(Value::Null),
-                            bind: "result".into(),
-                            retry: None,
-                        },
-                        edges: edges(&[("ok", "loop"), ("retry", "loop")]),
-                        on_error: Some("error".into()),
-                    },
-                ),
-                ("ok".into(), ret("ok")),
-                ("error".into(), ret("error")),
-            ]),
-            Registry {
-                commands: BTreeMap::from([(c.name.clone(), c)]),
-                events: BTreeMap::new(),
-            },
-            BTreeMap::new(),
-        );
+        let a = iteration_artifact(policy);
         install(&e, a, "iteration");
         let id = e
             .admit("iteration", "main", Value::Null, authority(), 0)
@@ -935,8 +551,10 @@ fn iteration_failure_policy_skips_or_stops_without_resetting_captured_membership
         };
         e.drive(&mut host, 0, 50).unwrap();
         let run = settled(&e, &id);
-        assert_eq!(run.outcome.as_deref(), Some(expected));
-        assert_eq!(host.dispatched.len(), calls);
+        assert_eq!(
+            (run.outcome.as_deref(), host.dispatched.len()),
+            (Some(expected), calls)
+        );
         assert!(run.loops.is_empty());
         assert!(!run.variables.contains_key("item"));
     }
@@ -1179,8 +797,7 @@ fn bounded_driver_uses_persisted_fair_scope_queue_and_noop_does_not_commit() {
             scope,
             "ok",
             BTreeMap::from([("ok".into(), ret("ok"))]),
-            Registry::default(),
-            BTreeMap::new(),
+            FixtureContracts::default(),
         )
         .content;
         a.playbook.scope = scope.into();
@@ -1294,8 +911,7 @@ fn gc_preserves_bound_transitive_closure_then_collects_terminal_cohorts_in_pages
         "leaf",
         "ok",
         BTreeMap::from([("ok".into(), ret("ok"))]),
-        Registry::default(),
-        BTreeMap::new(),
+        FixtureContracts::default(),
     );
     let middle = parent_artifact(&leaf, CallMode::Wait);
     let mut root = parent_artifact(&middle, CallMode::Wait).content;
@@ -1702,11 +1318,13 @@ fn protected_event_fields_and_protected_trigger_closures_refuse_payload_persiste
         "event-registry",
         "ok",
         BTreeMap::from([("ok".into(), ret("ok"))]),
-        Registry {
-            commands: BTreeMap::new(),
-            events: BTreeMap::from([(c.name.clone(), c.clone())]),
+        FixtureContracts {
+            registry: Registry {
+                commands: BTreeMap::new(),
+                events: BTreeMap::from([(c.name.clone(), c.clone())]),
+            },
+            ..Default::default()
         },
-        BTreeMap::new(),
     );
     e.install(a).unwrap();
     let mut envelope = event("protected-event", 2);
@@ -1902,4 +1520,55 @@ fn interval_cursor_survives_reconfiguration_and_reactivation_starts_a_fresh_inte
         .activate_at(binding, &artifact.digest, authority(), 70_000)
         .unwrap();
     assert_eq!((collect(99_999), collect(100_000)), (0, 1));
+}
+
+fn iteration_artifact(policy: IterationFailure) -> Artifact {
+    let c = command(Recovery::KeyedIdempotent);
+    artifact(
+        "iteration",
+        "loop",
+        BTreeMap::from([
+            (
+                "loop".into(),
+                Step {
+                    op: Operation::ForEach {
+                        collection: Expr::literal(json!([null, null])),
+                        item: "item".into(),
+                        body: "invoke".into(),
+                        next: "ok".into(),
+                        max_items: 2,
+                        concurrency: 1,
+                        on_failure: policy,
+                    },
+                    edges: BTreeMap::new(),
+                    on_error: Some("error".into()),
+                },
+            ),
+            (
+                "invoke".into(),
+                Step {
+                    op: Operation::Invoke {
+                        command: ContractRef {
+                            name: c.name.clone(),
+                            fingerprint: c.fingerprint().unwrap(),
+                        },
+                        input: Expr::literal(Value::Null),
+                        bind: "result".into(),
+                        retry: None,
+                    },
+                    edges: edges(&[("ok", "loop"), ("retry", "loop")]),
+                    on_error: Some("error".into()),
+                },
+            ),
+            ("ok".into(), ret("ok")),
+            ("error".into(), ret("error")),
+        ]),
+        FixtureContracts {
+            registry: Registry {
+                commands: BTreeMap::from([(c.name.clone(), c)]),
+                events: BTreeMap::new(),
+            },
+            ..Default::default()
+        },
+    )
 }
