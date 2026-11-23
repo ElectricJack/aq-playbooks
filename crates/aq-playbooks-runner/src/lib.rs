@@ -17,6 +17,7 @@ use completions::process_completions;
 mod clock_rebase;
 use clock_rebase::rebase_plan;
 pub use clock_rebase::{ClockRebaseReport, DeadlineAdjustment, REBASE_ADJUSTMENTS_LISTED};
+mod driver;
 mod events;
 use events::{EventIngress, fanout_event, find_event};
 mod execution;
@@ -1193,139 +1194,6 @@ impl<S: Storage> Engine<S> {
             n += 1;
         }
         Ok(n)
-    }
-    pub fn drive(
-        &self,
-        host: &mut impl Host,
-        now_ms: i64,
-        max_transitions: usize,
-    ) -> Result<usize> {
-        let mut total = 0;
-        while total < max_transitions {
-            let due = self
-                .store
-                .query(&self.namespace, &IndexQuery::DueTimers { now_ms, limit: 1 })?;
-            let completions = self.store.query(
-                &self.namespace,
-                &IndexQuery::Effects {
-                    kind: EffectQueueKind::Completion,
-                    scope_after: None,
-                    limit: 1,
-                },
-            )?;
-            if !due.items.is_empty() || !completions.items.is_empty() {
-                self.transaction_at(Some(now_ms), |s| {
-                    process_completions(s)?;
-                    process_operation_deadlines(s, now_ms);
-                    let timers = s
-                        .indexes
-                        .query(s, &IndexQuery::DueTimers { now_ms, limit: 64 })
-                        .items;
-                    for item in timers {
-                        if let Some(timer) = s.indexes.timers.get(&item.key).cloned() {
-                            indexes::remove_timer(s, &item.key);
-                            if timer.intent.is_none() {
-                                indexes::wake(s, &timer.run);
-                            }
-                        }
-                    }
-                    Ok(())
-                })?;
-            }
-            let item = self
-                .store
-                .query(
-                    &self.namespace,
-                    &IndexQuery::Ready {
-                        scope_after: None,
-                        limit: 1,
-                    },
-                )?
-                .items
-                .into_iter()
-                .next();
-            let dispatch = self.store.query(
-                &self.namespace,
-                &IndexQuery::Effects {
-                    kind: EffectQueueKind::Dispatch,
-                    scope_after: None,
-                    limit: 1,
-                },
-            )?;
-            let cancel = self.store.query(
-                &self.namespace,
-                &IndexQuery::Effects {
-                    kind: EffectQueueKind::Cancel,
-                    scope_after: None,
-                    limit: 1,
-                },
-            )?;
-            let has_effect = !dispatch.items.is_empty() || !cancel.items.is_empty();
-            if item.is_none() && !has_effect {
-                break;
-            }
-            let mut advancing = false;
-            let turn = self.transaction_at(Some(now_ms), |s| {
-                if has_effect && (s.indexes.dispatch_turn || item.is_none()) {
-                    s.indexes.dispatch_turn = false;
-                    Ok((true, None))
-                } else if let Some(item) = item.clone() {
-                    let mut queued_ms = None;
-                    if s.indexes.ready_tokens.contains_key(&item.key) {
-                        advancing = true;
-                        s.indexes.scope_cursor = Some(item.scope);
-                        indexes::unqueue(s, &item.key);
-                        let elapsed = s
-                            .runs
-                            .get(&item.key)
-                            .filter(|r| r.visits == 0)
-                            .map(|r| now_ms.saturating_sub(r.admitted_at_ms).max(0) as u64);
-                        if advance(s, &item.key, now_ms)? {
-                            queued_ms = elapsed;
-                        }
-                    }
-                    s.indexes.dispatch_turn = true;
-                    Ok((false, queued_ms))
-                } else {
-                    Ok((false, None))
-                }
-            });
-            let (effect_turn, queued_ms) = match turn {
-                Ok(turn) => turn,
-                Err(error) => {
-                    // A run whose step cannot commit (for example a cohort
-                    // whose settling commit is refused) must not hold the
-                    // head of its queue: it moves behind the other ready
-                    // runs, and the error still reaches the host. Lost
-                    // ownership and write races are not the run's fault.
-                    if advancing
-                        && let Some(item) = &item
-                        && !matches!(
-                            error,
-                            Error::Storage(StorageError::Conflict | StorageError::Ownership)
-                        )
-                    {
-                        let _ = self.transaction_at(Some(now_ms), |s| {
-                            if s.indexes.ready_tokens.contains_key(&item.key) {
-                                indexes::unqueue(s, &item.key);
-                                indexes::wake(s, &item.key);
-                                s.indexes.scope_cursor = Some(item.scope.clone());
-                            }
-                            Ok(())
-                        });
-                    }
-                    return Err(error);
-                }
-            };
-            if let Some(elapsed) = queued_ms {
-                self.metrics.record_queue(elapsed);
-            }
-            if effect_turn {
-                self.dispatch_next(host, now_ms)?;
-            }
-            total += 1;
-        }
-        Ok(total)
     }
 }
 fn check_bytes(value: &Value, limit: usize) -> Result<()> {
