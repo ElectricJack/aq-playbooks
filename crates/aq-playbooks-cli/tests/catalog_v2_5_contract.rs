@@ -1011,7 +1011,7 @@ fn environment_commands_complete_on_one_event() {
 #[test]
 fn valid_and_invalid_fixture_cases_validate_as_declared() {
     let registry = catalog::catalog_v2_5();
-    let covered = validate_fixtures(&registry, &fixtures_file());
+    let covered = schemas::assert_fixture_cases(&registry, &fixtures_file());
     // A valid case for every input and outcome of the environment commands
     // and for both environment events.
     for name in ENVIRONMENT_COMMANDS {
@@ -1157,4 +1157,4 @@ fn the_environment_delivery_example_checks_and_seals_against_catalog_2_5_0() {
 
 #[path = "support/catalog_fixtures.rs"]
 mod catalog_fixtures;
-use catalog_fixtures::{fingerprints, pretty, validate_fixtures};
+use catalog_fixtures::{fingerprints, pretty};

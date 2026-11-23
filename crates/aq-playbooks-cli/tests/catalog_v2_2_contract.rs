@@ -255,7 +255,7 @@ fn satisfies(request: &Value, answer: &Value) -> bool {
 fn valid_and_invalid_fixture_cases_validate_as_declared() {
     let registry = catalog::catalog_v2_2();
     let fixtures = fixtures();
-    let covered = validate_fixtures(&registry, &fixtures);
+    let covered = schemas::assert_fixture_cases(&registry, &fixtures);
     // A valid case for every new input, outcome and event.
     let mut expected = BTreeSet::new();
     for name in ADDED_COMMANDS {
@@ -926,4 +926,4 @@ fn routing_case(name: &str, task: &Task, subject: &Value) -> Case {
 
 #[path = "support/catalog_fixtures.rs"]
 mod catalog_fixtures;
-use catalog_fixtures::{fingerprints, pretty, validate_fixtures};
+use catalog_fixtures::{fingerprints, pretty};
