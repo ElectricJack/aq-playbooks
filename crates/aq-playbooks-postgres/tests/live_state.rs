@@ -522,16 +522,6 @@ fn history_that_is_also_live_is_refused_on_every_commit_path() {
 
 // --- Task 4: retention clock, window fields and removal fences ------------
 
-fn receipt(key: &str, accepted_at_ms: i64) -> KeyedAdmissionReceipt {
-    KeyedAdmissionReceipt {
-        key: key.into(),
-        request_digest: format!("digest-{key}"),
-        run_id: format!("run-{key}"),
-        activation_revision: 1,
-        catalog_revision: 1,
-        accepted_at_ms,
-    }
-}
 /// A terminal root run `id` with no children.
 fn completed_run(id: &str) -> Run {
     synthetic_cohort(id, 1, &[]).runs.remove(0)
@@ -593,16 +583,6 @@ fn removal_fences_hold(store: &PostgresStorage, ns: &str) {
 fn removal_fences_hold_on_postgres() {
     removal_fences_hold(&support::protected(), &support::namespace("fence_f2"));
     removal_fences_hold(&support::records(), &support::namespace("fence_f3"));
-}
-fn audit(sequence: u64, run: &str) -> Receipt {
-    Receipt {
-        sequence,
-        run: run.into(),
-        step: "s".into(),
-        at_ms: 1,
-        kind: "terminal".into(),
-        detail: json!({}),
-    }
 }
 fn accepted_event(key: &str, accepted_at_ms: i64) -> AcceptedEvent {
     AcceptedEvent {
@@ -693,523 +673,112 @@ fn long_artifact() -> aq_playbooks_model::Artifact {
     content.registry.events.insert(c.name.clone(), c);
     aq_playbooks_model::Artifact::seal(content).unwrap()
 }
-type Case = (&'static str, &'static str, Box<dyn Fn(&mut State)>);
+#[path = "../../aq-playbooks-runner/tests/fixtures/rebase_cases.rs"]
+mod rebase_cases;
+use rebase_cases::*;
+fn settle_during_rebase(n: &mut State) {
+    let run = n.runs.remove("run-a").unwrap();
+    n.receipts.retain(|r| r.sequence != 1);
+    let mut c = cohort_of(run);
+    c.receipts.push(audit(1, "run-a"));
+    n.settled.push(c);
+}
 /// The refusals every commit path must make, each as a change of
 /// `fence_state()`.
 fn refusal_cases() -> Vec<Case> {
     let early = retention::REFUSE_EARLY_REMOVAL;
     let shortened = retention::REFUSE_EXPIRY;
     let mut cases: Vec<Case> = vec![
-        (
-            "run",
-            retention::REFUSE_RUN_REMOVAL,
-            Box::new(|n| {
-                n.runs.remove("run-a");
-            }),
-        ),
+        ("run", retention::REFUSE_RUN_REMOVAL, |n| {
+            n.runs.remove("run-a");
+        }),
         (
             "running settled run",
             "unresolved run obligations cannot be disposed",
-            Box::new(|n| {
+            |n| {
                 let running = n.runs.remove("run-b").unwrap();
                 n.receipts.retain(|r| r.sequence != 2);
                 let mut c = cohort_of(running);
                 c.receipts.push(audit(2, "run-b"));
                 n.settled.push(c);
-            }),
+            },
         ),
-        (
-            "keyed admission",
-            early,
-            Box::new(|n| {
-                n.retention.clock_ms = Some(2_999);
-                n.keyed_admissions.remove("k");
-                n.retention.admission_expires_at_ms.remove("k");
-            }),
-        ),
-        (
-            "keyed admission, policy window",
-            early,
-            Box::new(|n| {
-                n.retention.clock_ms = Some(1_999);
-                n.keyed_admissions.remove("fallback");
-            }),
-        ),
-        (
-            "event",
-            early,
-            Box::new(|n| {
-                n.retention.clock_ms = Some(3_999);
-                n.events.remove("ev");
-                n.retention.event_expires_at_ms.remove("ev");
-            }),
-        ),
-        (
-            "forged legacy tombstone",
-            early,
-            Box::new(|n| {
-                n.events.remove("ev");
-                n.retention.event_expires_at_ms.remove("ev");
-                n.retention
-                    .event_tombstones
-                    .insert("ev".into(), tombstone("digest-ev"));
-            }),
-        ),
+        ("keyed admission", early, |n| {
+            n.retention.clock_ms = Some(2_999);
+            n.keyed_admissions.remove("k");
+            n.retention.admission_expires_at_ms.remove("k");
+        }),
+        ("keyed admission, policy window", early, |n| {
+            n.retention.clock_ms = Some(1_999);
+            n.keyed_admissions.remove("fallback");
+        }),
+        ("event", early, |n| {
+            n.retention.clock_ms = Some(3_999);
+            n.events.remove("ev");
+            n.retention.event_expires_at_ms.remove("ev");
+        }),
+        ("forged legacy tombstone", early, |n| {
+            n.events.remove("ev");
+            n.retention.event_expires_at_ms.remove("ev");
+            n.retention
+                .event_tombstones
+                .insert("ev".into(), tombstone("digest-ev"));
+        }),
         (
             "changed receipt",
             "immutable keyed admission receipt removed or changed",
-            Box::new(|n| {
+            |n| {
                 n.keyed_admissions.get_mut("k").unwrap().run_id = "other".into();
-            }),
+            },
         ),
         (
             "receipt of a live run",
             retention::REFUSE_RUN_REMOVAL,
-            Box::new(|n| {
+            |n| {
                 n.receipts.retain(|r| r.sequence != 2);
-            }),
+            },
         ),
-        (
-            "receipt overwritten",
-            retention::REFUSE_RUN_REMOVAL,
-            Box::new(|n| {
-                *n.receipts.get_mut(1).unwrap() = audit(3, "run-b");
-            }),
-        ),
+        ("receipt overwritten", retention::REFUSE_RUN_REMOVAL, |n| {
+            *n.receipts.get_mut(1).unwrap() = audit(3, "run-b");
+        }),
         (
             "receipt of a settled run without its history",
             retention::REFUSE_RUN_REMOVAL,
-            Box::new(|n| {
+            |n| {
                 let run = n.runs.remove("run-a").unwrap();
                 n.receipts.retain(|r| r.sequence != 1);
                 n.settled.push(cohort_of(run));
-            }),
+            },
         ),
-        (
-            "lowered expiry",
-            shortened,
-            Box::new(|n| {
-                n.retention
-                    .admission_expires_at_ms
-                    .insert("k".into(), 2_500);
-            }),
-        ),
-        (
-            "expiry deleted, item kept",
-            shortened,
-            Box::new(|n| {
-                n.retention.event_expires_at_ms.remove("ev");
-            }),
-        ),
+        ("lowered expiry", shortened, |n| {
+            n.retention
+                .admission_expires_at_ms
+                .insert("k".into(), 2_500);
+        }),
+        ("expiry deleted, item kept", shortened, |n| {
+            n.retention.event_expires_at_ms.remove("ev");
+        }),
         (
             "new expiry below the fallback, stored item",
             shortened,
-            Box::new(|n| {
+            |n| {
                 n.retention
                     .admission_expires_at_ms
                     .insert("fallback".into(), 1_999);
-            }),
+            },
         ),
-        (
-            "new expiry below the fallback, new item",
-            shortened,
-            Box::new(|n| {
-                n.keyed_admissions.insert("new".into(), receipt("new", 100));
-                n.retention
-                    .admission_expires_at_ms
-                    .insert("new".into(), 2_099);
-            }),
-        ),
-        (
-            "clock",
-            retention::REFUSE_CLOCK,
-            Box::new(|n| {
-                n.retention.clock_ms = Some(499);
-            }),
-        ),
+        ("new expiry below the fallback, new item", shortened, |n| {
+            n.keyed_admissions.insert("new".into(), receipt("new", 100));
+            n.retention
+                .admission_expires_at_ms
+                .insert("new".into(), 2_099);
+        }),
+        ("clock", retention::REFUSE_CLOCK, |n| {
+            n.retention.clock_ms = Some(499);
+        }),
     ];
     cases.extend(rebase_refusal_cases());
     cases
-}
-/// An admin licence receipt of `kind` from `from_ms` to `to_ms`.
-fn licence_receipt(kind: &str, sequence: u64, from_ms: i64, to_ms: i64) -> Receipt {
-    Receipt {
-        sequence,
-        run: "admin".into(),
-        step: "retention".into(),
-        at_ms: to_ms,
-        kind: kind.into(),
-        detail: json!({"from_ms": from_ms, "to_ms": to_ms}),
-    }
-}
-/// That receipt as history written by the commit.
-fn licence_cohort(receipts: Vec<Receipt>) -> SettledCohort {
-    SettledCohort {
-        root: "admin".into(),
-        finished_at_ms: 1,
-        runs: vec![],
-        intents: vec![],
-        receipts,
-    }
-}
-/// Write a licence receipt of `kind` as the commit's one new sequence
-/// number, as the engine does.
-fn license(n: &mut State, kind: &str, from_ms: i64, to_ms: i64) {
-    n.sequence += 1;
-    n.settled.push(licence_cohort(vec![licence_receipt(
-        kind, n.sequence, from_ms, to_ms,
-    )]));
-}
-/// The commit a rebase from 500 to 100 makes on `fence_state()`: clock 100,
-/// each expiry capped at 100 plus its own window ("ev-long" by its
-/// contract's 5_000), a stale floor.
-fn rebased(n: &mut State) {
-    n.retention.clock_ms = Some(100);
-    n.retention
-        .admission_expires_at_ms
-        .insert("k".into(), 2_100);
-    n.retention.event_expires_at_ms.insert("ev".into(), 3_100);
-    n.retention
-        .event_expires_at_ms
-        .insert("ev-long".into(), 5_100);
-    n.retention.stale_floor_ms = Some(50);
-    license(n, retention::CLOCK_REBASE, 500, 100);
-}
-/// Rulings 1 and 2 (round 2): a commit with a licence receipt must be
-/// exactly that licence and do nothing else; without one, the clock never
-/// decreases and the floor never changes. Cases on `fence_state()` (clock
-/// 500; windows 2_000 and 3_000; "k" 3_000, "ev" 4_000, "ev-long" 9_000
-/// with a 5_000 contract window), each (label, refusal, change).
-fn rebase_refusal_cases() -> Vec<Case> {
-    let shortened = retention::REFUSE_EXPIRY;
-    let licence = retention::REFUSE_LICENCE;
-    let floor = retention::REFUSE_STALE_FLOOR;
-    vec![
-        (
-            "clock lowered without a rebase",
-            retention::REFUSE_CLOCK,
-            Box::new(|n| n.retention.clock_ms = Some(100)),
-        ),
-        (
-            "clock lowered, rebase receipt left live",
-            retention::REFUSE_CLOCK,
-            Box::new(|n| {
-                n.retention.clock_ms = Some(100);
-                n.sequence += 1;
-                n.receipts.push(licence_receipt(
-                    retention::CLOCK_REBASE,
-                    n.sequence,
-                    500,
-                    100,
-                ));
-            }),
-        ),
-        (
-            "clock lowered, rebase from another clock",
-            licence,
-            Box::new(|n| {
-                n.retention.clock_ms = Some(100);
-                license(n, retention::CLOCK_REBASE, 600, 100);
-            }),
-        ),
-        (
-            "clock lowered, rebase to another clock",
-            licence,
-            Box::new(|n| {
-                n.retention.clock_ms = Some(100);
-                license(n, retention::CLOCK_REBASE, 500, 200);
-            }),
-        ),
-        (
-            "review probe: a receipt from 7 to 500, the clock left at 500, expiries lowered",
-            licence,
-            Box::new(|n| {
-                license(n, retention::CLOCK_REBASE, 7, 500);
-                n.retention
-                    .admission_expires_at_ms
-                    .insert("k".into(), 2_500);
-                n.retention.event_expires_at_ms.insert("ev".into(), 3_500);
-            }),
-        ),
-        (
-            "rebase upwards",
-            licence,
-            Box::new(|n| {
-                n.retention.clock_ms = Some(600);
-                license(n, retention::CLOCK_REBASE, 500, 600);
-            }),
-        ),
-        (
-            "replayed rebase receipt (not this commit's sequence)",
-            licence,
-            Box::new(|n| {
-                rebased(n);
-                let replayed = n.sequence - 1;
-                n.settled[0].receipts[0].sequence = replayed;
-            }),
-        ),
-        (
-            "rebase that also admits",
-            licence,
-            Box::new(|n| {
-                rebased(n);
-                n.sequence += 1;
-                n.keyed_admissions.insert("new".into(), receipt("new", 100));
-            }),
-        ),
-        (
-            "rebase that also accepts an event",
-            licence,
-            Box::new(|n| {
-                rebased(n);
-                n.events
-                    .insert("ev-new".into(), accepted_event("ev-new", 100));
-            }),
-        ),
-        (
-            "rebase that also settles a run",
-            licence,
-            Box::new(|n| {
-                rebased(n);
-                let run = n.runs.remove("run-a").unwrap();
-                n.receipts.retain(|r| r.sequence != 1);
-                let mut c = cohort_of(run);
-                c.receipts.push(audit(1, "run-a"));
-                n.settled.push(c);
-            }),
-        ),
-        (
-            "two licences in one commit",
-            licence,
-            Box::new(|n| {
-                rebased(n);
-                n.settled[0].receipts.push(licence_receipt(
-                    retention::STALE_FLOOR_LOWERED,
-                    77,
-                    50,
-                    10,
-                ));
-            }),
-        ),
-        (
-            "expiry lowered without a rebase",
-            shortened,
-            Box::new(|n| {
-                n.retention
-                    .admission_expires_at_ms
-                    .insert("k".into(), 2_100);
-            }),
-        ),
-        (
-            "expiry lowered with a rebase the clock did not take",
-            licence,
-            Box::new(|n| {
-                license(n, retention::CLOCK_REBASE, 500, 100);
-                n.retention
-                    .admission_expires_at_ms
-                    .insert("k".into(), 2_100);
-            }),
-        ),
-        (
-            "expiry capped below its cap",
-            shortened,
-            Box::new(|n| {
-                rebased(n);
-                n.retention
-                    .admission_expires_at_ms
-                    .insert("k".into(), 2_099);
-            }),
-        ),
-        (
-            "expiry lowered, but not to its cap",
-            shortened,
-            Box::new(|n| {
-                rebased(n);
-                n.retention
-                    .admission_expires_at_ms
-                    .insert("k".into(), 2_200);
-            }),
-        ),
-        (
-            "event expiry capped below its cap",
-            shortened,
-            Box::new(|n| {
-                rebased(n);
-                n.retention.event_expires_at_ms.insert("ev".into(), 3_099);
-            }),
-        ),
-        (
-            "event capped to the policy window, its contract window is longer",
-            shortened,
-            Box::new(|n| {
-                rebased(n);
-                n.retention
-                    .event_expires_at_ms
-                    .insert("ev-long".into(), 3_100);
-            }),
-        ),
-        (
-            "floor raised without a licence",
-            floor,
-            Box::new(|n| n.retention.stale_floor_ms = Some(50)),
-        ),
-        (
-            "review probe C2: a rebase that also sets both windows to 1 and caps to 101",
-            licence,
-            Box::new(|n| {
-                rebased(n);
-                n.retention.policy.admission_replay_ms = 1;
-                n.retention.policy.event_replay_ms = 1;
-                n.retention.admission_expires_at_ms.insert("k".into(), 101);
-                n.retention.event_expires_at_ms.insert("ev".into(), 101);
-            }),
-        ),
-        (
-            "rebase that also changes the policy",
-            licence,
-            Box::new(|n| {
-                rebased(n);
-                n.retention.policy.audit_ms += 1;
-            }),
-        ),
-        (
-            "rebase that also installs an artifact",
-            licence,
-            Box::new(|n| {
-                rebased(n);
-                let extra = n.artifacts.values().next().unwrap().clone();
-                let mut content = extra.content.clone();
-                content.compiler = "another".into();
-                let a = aq_playbooks_model::Artifact::seal(content).unwrap();
-                n.artifacts.insert(a.digest.clone(), a);
-            }),
-        ),
-        (
-            "rebase that also changes a producer epoch",
-            licence,
-            Box::new(|n| {
-                rebased(n);
-                n.retention.producer_epochs.insert("host".into(), 1);
-            }),
-        ),
-        (
-            "rebase that also moves the catalog",
-            licence,
-            Box::new(|n| {
-                rebased(n);
-                n.catalog_revision += 1;
-            }),
-        ),
-        (
-            "rebase that also changes the catalog history",
-            licence,
-            Box::new(|n| {
-                rebased(n);
-                n.catalog_history_at_ms.insert(99, 1);
-            }),
-        ),
-        (
-            "rebase that also changes an event's contract to shrink its cap",
-            // Task 8b fix round 1: an accepted event's envelope is immutable,
-            // so this is refused before its cap is judged.
-            retention::REFUSE_EVENT_CHANGE,
-            Box::new(|n| {
-                rebased(n);
-                let mut e = n.events.get("ev-long").unwrap().clone();
-                e.envelope.contract.name = "test.other".into();
-                n.events.insert("ev-long".into(), e);
-                n.retention
-                    .event_expires_at_ms
-                    .insert("ev-long".into(), 3_100);
-            }),
-        ),
-        (
-            "rebase raises the floor past its target",
-            floor,
-            Box::new(|n| {
-                rebased(n);
-                n.retention.stale_floor_ms = Some(101);
-            }),
-        ),
-    ]
-}
-/// After that commit no licence is left, and the floor changes only with
-/// its own exact receipt. Changes of the stored state after the rebase
-/// (clock 100, floor 50).
-fn after_rebase_refusal_cases() -> Vec<Case> {
-    let licence = retention::REFUSE_LICENCE;
-    let floor = retention::REFUSE_STALE_FLOOR;
-    vec![
-        (
-            "clock lowered again",
-            retention::REFUSE_CLOCK,
-            Box::new(|n| n.retention.clock_ms = Some(90)),
-        ),
-        (
-            "stale floor lowered without a licence",
-            floor,
-            Box::new(|n| n.retention.stale_floor_ms = Some(40)),
-        ),
-        (
-            "stale floor raised without a licence",
-            floor,
-            Box::new(|n| n.retention.stale_floor_ms = Some(60)),
-        ),
-        (
-            "stale floor removed",
-            floor,
-            Box::new(|n| n.retention.stale_floor_ms = None),
-        ),
-        (
-            "floor lowered to another value than its receipt",
-            licence,
-            Box::new(|n| {
-                n.retention.stale_floor_ms = Some(30);
-                license(n, retention::STALE_FLOOR_LOWERED, 50, 40);
-            }),
-        ),
-        (
-            "floor lowering from another floor",
-            licence,
-            Box::new(|n| {
-                n.retention.stale_floor_ms = Some(40);
-                license(n, retention::STALE_FLOOR_LOWERED, 60, 40);
-            }),
-        ),
-        (
-            "floor lowering that also moves the clock",
-            licence,
-            Box::new(|n| {
-                n.retention.stale_floor_ms = Some(40);
-                n.retention.clock_ms = Some(200);
-                license(n, retention::STALE_FLOOR_LOWERED, 50, 40);
-            }),
-        ),
-        (
-            "floor lowering that also changes the policy",
-            licence,
-            Box::new(|n| {
-                n.retention.policy.admission_replay_ms = 1;
-                floor_lowered(n);
-            }),
-        ),
-        (
-            "floor lowering that also changes an expiry",
-            retention::REFUSE_EXPIRY,
-            Box::new(|n| {
-                n.retention.stale_floor_ms = Some(40);
-                n.retention
-                    .admission_expires_at_ms
-                    .insert("k".into(), 9_000);
-                license(n, retention::STALE_FLOOR_LOWERED, 50, 40);
-            }),
-        ),
-    ]
-}
-/// The floor lowering the fence accepts after `rebased`: 50 to 40.
-fn floor_lowered(n: &mut State) {
-    n.retention.stale_floor_ms = Some(40);
-    license(n, retention::STALE_FLOOR_LOWERED, 50, 40);
 }
 /// A licensed rebase commits on every full path (protected and plain
 /// format 2, format 3 compare-and-swap) and through a format 3 transition
@@ -1302,7 +871,7 @@ fn a_clock_rebase_is_licensed_on_every_commit_path() {
         (Some(100), Some(50), Some(3_100))
     );
     for (case, text, f) in after_rebase_refusal_cases() {
-        let result = transition(f.as_ref());
+        let result = transition(&f);
         assert!(refused_with(result.clone(), text), "{case}: {result:?}");
     }
     // The floor lowered with its own receipt, also on the complete path.
@@ -1434,12 +1003,12 @@ fn format_3_transitions_hold_the_removal_fences() {
     cases.push((
         "early removal, heavy",
         retention::REFUSE_EARLY_REMOVAL,
-        Box::new(|n| {
+        |n| {
             n.execution_denied.insert("x".into());
             n.retention.clock_ms = Some(2_999);
             n.keyed_admissions.remove("k");
             n.retention.admission_expires_at_ms.remove("k");
-        }),
+        },
     ));
     // Refused by the bounded commit itself, before any complete path.
     let bounded = [
@@ -1452,7 +1021,7 @@ fn format_3_transitions_hold_the_removal_fences() {
     for (case, text, f) in &cases {
         let (ns, base) = fresh();
         store.set_profiling(true);
-        let result = transition(&ns, f.as_ref());
+        let result = transition(&ns, f);
         let complete_path = store
             .profiling_snapshot()
             .unwrap()

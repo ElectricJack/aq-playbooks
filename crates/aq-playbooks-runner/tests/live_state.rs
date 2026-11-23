@@ -62,16 +62,6 @@ fn synthetic_cohort(id: &str, finished_at_ms: i64, receipts: &[u64]) -> SettledC
 
 // --- Task 4: retention clock, window fields and removal fences ------------
 
-fn receipt(key: &str, accepted_at_ms: i64) -> KeyedAdmissionReceipt {
-    KeyedAdmissionReceipt {
-        key: key.into(),
-        request_digest: format!("digest-{key}"),
-        run_id: format!("run-{key}"),
-        activation_revision: 1,
-        catalog_revision: 1,
-        accepted_at_ms,
-    }
-}
 /// A terminal root run `id` with no children.
 fn completed_run(id: &str) -> Run {
     synthetic_cohort(id, 1, &[]).runs.remove(0)
@@ -302,16 +292,6 @@ fn commits_without_host_time_do_not_move_the_clock() {
     e.activate("b", &digest, authority()).unwrap();
     assert_eq!(e.snapshot().unwrap().retention.clock_ms, Some(7));
 }
-fn audit(sequence: u64, run: &str) -> Receipt {
-    Receipt {
-        sequence,
-        run: run.into(),
-        step: "s".into(),
-        at_ms: 1,
-        kind: "terminal".into(),
-        detail: json!({}),
-    }
-}
 fn cohort(run: Run, intents: Vec<Intent>, receipts: Vec<Receipt>) -> SettledCohort {
     SettledCohort {
         root: run.root.clone(),
@@ -398,50 +378,6 @@ fn tombstone(digest: &str) -> retention::EventTombstone {
         digest: digest.into(),
         disposed_at_ms: 5,
     }
-}
-/// An admin licence receipt of `kind` from `from_ms` to `to_ms`.
-fn licence_receipt(kind: &str, sequence: u64, from_ms: i64, to_ms: i64) -> Receipt {
-    Receipt {
-        sequence,
-        run: "admin".into(),
-        step: "retention".into(),
-        at_ms: to_ms,
-        kind: kind.into(),
-        detail: json!({"from_ms": from_ms, "to_ms": to_ms}),
-    }
-}
-/// That receipt as history written by the commit.
-fn licence_cohort(receipts: Vec<Receipt>) -> SettledCohort {
-    SettledCohort {
-        root: "admin".into(),
-        finished_at_ms: 1,
-        runs: vec![],
-        intents: vec![],
-        receipts,
-    }
-}
-/// Write a licence receipt of `kind` as the commit's one new sequence
-/// number, as the engine does.
-fn license(n: &mut State, kind: &str, from_ms: i64, to_ms: i64) {
-    n.sequence += 1;
-    n.settled.push(licence_cohort(vec![licence_receipt(
-        kind, n.sequence, from_ms, to_ms,
-    )]));
-}
-/// The commit a rebase from 500 to 100 makes on `fence_state()`: clock 100,
-/// each expiry capped at 100 plus its own window ("ev-long" by its
-/// contract's 5_000), a stale floor.
-fn rebased(n: &mut State) {
-    n.retention.clock_ms = Some(100);
-    n.retention
-        .admission_expires_at_ms
-        .insert("k".into(), 2_100);
-    n.retention.event_expires_at_ms.insert("ev".into(), 3_100);
-    n.retention
-        .event_expires_at_ms
-        .insert("ev-long".into(), 5_100);
-    n.retention.stale_floor_ms = Some(50);
-    license(n, retention::CLOCK_REBASE, 500, 100);
 }
 /// Legacy event tombstones and correlation fences (no engine writes them
 /// any more) may always be removed; an expired event leaves by its window.
@@ -6291,9 +6227,11 @@ fn a_second_lapse_rejudges_from_the_earliest_change() {
     assert_eq!(joined, [0, 10, 20, 30, 30]);
 }
 
+#[path = "fixtures/rebase_cases.rs"]
+mod rebase_cases;
 #[path = "live_state/rebase_fences.rs"]
 mod rebase_fences;
-use rebase_fences::{after_rebase_refusal_cases, floor_lowered, rebase_refusal_cases};
+use rebase_cases::*;
 
 #[path = "live_state/transition_fences.rs"]
 mod transition_fences;
@@ -6302,7 +6240,7 @@ mod transition_fences;
 mod fences;
 #[path = "live_state/removal_fences.rs"]
 mod removal_fences;
-use fences::{Case, check_refusal, seed_state};
+use fences::{check_refusal, seed_state};
 
 #[path = "live_state/history_retention.rs"]
 mod history_retention;
@@ -6310,3 +6248,11 @@ mod history_retention;
 #[path = "live_state/history_storage.rs"]
 mod history_storage;
 use history_storage::{live_receipt, page, refused_as_also_live};
+
+fn settle_during_rebase(n: &mut State) {
+    let run = n.runs.remove("run-a").unwrap();
+    let op = n.intents.remove("op-a").unwrap();
+    n.receipts.retain(|r| r.sequence != 1);
+    n.settled
+        .push(cohort(run, vec![op], vec![audit(1, "run-a")]));
+}

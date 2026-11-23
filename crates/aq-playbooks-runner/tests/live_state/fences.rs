@@ -1,7 +1,5 @@
 use super::*;
 
-pub(super) type Case = (&'static str, &'static str, fn(&mut State));
-
 pub(super) fn seed_state(store: &dyn Storage, namespace: &str, initial: &State) -> u64 {
     store.acquire(namespace, "w").unwrap();
     store.compare_and_swap(namespace, "w", 0, initial).unwrap()
