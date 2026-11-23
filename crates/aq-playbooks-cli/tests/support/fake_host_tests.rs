@@ -203,9 +203,15 @@ fn partial_observation_can_add_positive_findings_without_clearing_unseen_episode
         .0,
         "reconciled"
     );
-    assert!(h.episodes["watcher/new-alert"].active);
-    assert!(h.episodes["watcher/stuck"].active);
-    assert_eq!(h.outbox.len(), 2);
+    assert_eq!(
+        (
+            h.episodes["watcher/new-alert"].active,
+            h.episodes["watcher/stuck"].active,
+            h.outbox.len()
+        ),
+        (true, true, 2),
+        "the partial observation records its new finding and retains the earlier episode",
+    );
 }
 
 #[test]
@@ -349,29 +355,7 @@ fn finite_frozen_context_pages_and_report_work_respect_visibility() {
     scan.view = "project".into();
     scan.pages.push(json!({"second":"page"}));
     h.capture_observation(scan).unwrap();
-    let context = |id: &str, page: u64| {
-        intent(
-            id,
-            "context.read",
-            json!({"view":"project","subject":subject(),"snapshot":"report-context","page":page}),
-        )
-    };
-    let (first, output) = outcome(h.dispatch(&context("page0", 0)));
-    assert_eq!(first, "incomplete");
-    assert_eq!(output["next_page"], 1);
-    assert_eq!(outcome(h.dispatch(&context("page1", 1))).0, "observed");
-    assert!(matches!(
-        h.dispatch(&context("outside", 2)),
-        DispatchResult::Rejected { .. }
-    ));
-    let mut forbidden = context("forbidden", 0);
-    forbidden.authority.actor = "outsider".into();
-    h.grants
-        .insert("outsider".into(), h.grants["alice"].clone());
-    assert!(matches!(
-        h.dispatch(&forbidden),
-        DispatchResult::Rejected { .. }
-    ));
+    check_frozen_pages(&mut h);
     let work = intent(
         "author",
         "work.ensure",
@@ -395,6 +379,10 @@ fn finite_frozen_context_pages_and_report_work_respect_visibility() {
         "team",
     )
     .unwrap();
+    check_fallback_message(&mut h);
+}
+
+fn check_fallback_message(h: &mut FakeHost) {
     let message = intent(
         "fallback",
         "message.send",
@@ -407,6 +395,32 @@ fn finite_frozen_context_pages_and_report_work_respect_visibility() {
     assert!(matches!(h.dispatch(&late), DispatchResult::Rejected { .. }));
     assert_eq!(h.messages.len(), 1);
     assert_eq!(h.messages["report:2026-10-30"]["body"], "fallback");
+}
+
+fn check_frozen_pages(h: &mut FakeHost) {
+    let context = |id: &str, page: u64| {
+        intent(
+            id,
+            "context.read",
+            json!({"view":"project","subject":subject(),"snapshot":"report-context","page":page}),
+        )
+    };
+    let (first, output) = outcome(h.dispatch(&context("page0", 0)));
+    assert_eq!(first, "incomplete");
+    assert_eq!(output["next_page"], 1);
+    assert_eq!(outcome(h.dispatch(&context("page1", 1))).0, "observed");
+    assert!(matches!(
+        h.dispatch(&context("outside", 2)),
+        DispatchResult::Rejected { .. }
+    ));
+    let mut forbidden = context("forbidden", 0);
+    forbidden.authority.actor = "outsider".into();
+    h.grants
+        .insert("outsider".into(), h.grants["alice"].clone());
+    assert!(matches!(
+        h.dispatch(&forbidden),
+        DispatchResult::Rejected { .. }
+    ));
 }
 
 #[test]
@@ -524,8 +538,11 @@ fn async_decision_rejects_stale_responses_and_expires_or_cancels_truthfully() {
         json!({"handle":"expires"}),
     );
     assert_eq!(outcome(h.dispatch(&lookup)).1["outcome"], "expired");
+    check_cancellation(&mut h, decision);
+}
+
+fn check_cancellation(h: &mut FakeHost, mut decision: Intent) {
     h.now_ms = 0;
-    let mut decision = decision;
     decision.id = "cancel-me".into();
     assert!(matches!(
         h.dispatch(&decision),
@@ -548,25 +565,30 @@ fn host_calendar_occurrences_pin_timezone_misfire_and_configuration_across_resta
         },
     );
     let occurrence = h
-        .admit_occurrence("report-2026-11-01", "morning-report", 1793523600000, 7)
+        .admit_occurrence("report-2026-11-01", ("morning-report", 7), 1793523600000)
         .unwrap();
     h = h.restart();
     h.calendars.get_mut("morning-report").unwrap().revision = 8;
     h.calendars.get_mut("morning-report").unwrap().timezone = "UTC".into();
     assert_eq!(
-        h.admit_occurrence("report-2026-11-01", "morning-report", 1793523600000, 8)
+        h.admit_occurrence("report-2026-11-01", ("morning-report", 8), 1793523600000)
             .unwrap(),
         occurrence
     );
-    assert_eq!(occurrence.configuration_revision, 7);
-    assert_eq!(occurrence.timezone, "America/Los_Angeles");
-    assert_eq!(occurrence.misfire, "coalesce");
+    assert_eq!(
+        (
+            occurrence.configuration_revision,
+            occurrence.timezone.as_str(),
+            occurrence.misfire.as_str()
+        ),
+        (7, "America/Los_Angeles", "coalesce"),
+    );
     assert!(
-        h.admit_occurrence("new-occurrence", "morning-report", 1793610000000, 7)
+        h.admit_occurrence("new-occurrence", ("morning-report", 7), 1793610000000)
             .is_err()
     );
     assert!(
-        h.admit_occurrence("report-2026-11-01", "morning-report", 1793610000000, 8)
+        h.admit_occurrence("report-2026-11-01", ("morning-report", 8), 1793610000000)
             .is_err()
     );
 }
