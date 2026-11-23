@@ -568,7 +568,13 @@ fn verify_patch_removals(data: &RecordData, patch: &StatePatch, next: &State) ->
                 let before = before.map(|b| at(field, b)).transpose()?;
                 let after = after.map(|b| at(field, b)).transpose()?;
                 if before != after {
-                    crate::retention::check_expiry_record(&caps, next, window, id, before, after)?;
+                    crate::retention::ExpiryChange {
+                        window,
+                        key: id,
+                        old: before,
+                        new: after,
+                    }
+                    .check(&caps, next)?;
                 }
             }
         } else if field == "receipts" {
