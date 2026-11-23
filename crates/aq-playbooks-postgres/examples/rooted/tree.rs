@@ -94,10 +94,7 @@ impl<'a, 'b> Tree<'a, 'b> {
     fn put(&mut self, node: Node) -> Result<Link> {
         let link = node.link()?;
         let bytes = canonical_bytes(&node)?;
-        if bytes.len() > 16 * 1024 * 1024
-            || self.pending.len() >= 262144
-            || self.cache.len() >= 262144
-        {
+        if bytes.len() > 16 * 1024 * 1024 || self.pending.len().max(self.cache.len()) >= 262144 {
             return Err("prototype transaction node bound".into());
         }
         self.pending.insert(link.hash.clone(), bytes);
@@ -119,243 +116,23 @@ impl<'a, 'b> Tree<'a, 'b> {
                 &[&link.hash],
             )?
             .get(0);
-        self.work.fetched_nodes += 1;
-        self.work.fetched_bytes += bytes.len();
-        if self.work.fetched_bytes > 128 * 1024 * 1024 || self.cache.len() >= 262144 {
+        if !self.account_fetch(bytes.len()) {
             return Err("prototype read bound".into());
         }
         let node: Node = serde_json::from_slice(&bytes)?;
-        if hash_bytes(&bytes) != link.hash
-            || node.link()? != *link
-            || canonical_bytes(&node)? != bytes
-        {
+        let matches_link = hash_bytes(&bytes) == link.hash && node.link()? == *link;
+        if !matches_link || canonical_bytes(&node)? != bytes {
             return Err("node integrity".into());
         }
         self.cache.insert(link.hash.clone(), node.clone());
         Ok(node)
     }
-    fn fetch_many(&mut self, links: &[Link]) -> Result<()> {
-        let expected: BTreeMap<_, _> = links
-            .iter()
-            .filter(|r| !self.cache.contains_key(&r.hash))
-            .map(|r| (r.hash.clone(), r.clone()))
-            .collect();
-        if expected.is_empty() {
-            return Ok(());
-        }
-        if expected.len() > 4096 {
-            return Err("prototype frontier >4096 nodes".into());
-        }
-        if std::env::var_os("AQ_PB04_LOOKAHEAD").is_some() {
-            return self.fetch_lookahead(&expected);
-        }
-        let keys: Vec<_> = expected.keys().cloned().collect();
-        self.work.read_sql_calls += 1;
-        let rows = self.tx.query(
-            "SELECT hash,payload FROM pb04_nodes WHERE hash=ANY($1)",
-            &[&keys],
-        )?;
-        if rows.len() != keys.len() {
-            return Err("missing proof node".into());
-        }
-        for row in rows {
-            let hash: String = row.get(0);
-            let bytes: Vec<u8> = row.get(1);
-            self.work.fetched_nodes += 1;
-            self.work.fetched_bytes += bytes.len();
-            if self.work.fetched_bytes > 128 * 1024 * 1024 || self.cache.len() >= 262144 {
-                return Err("prototype read bound".into());
-            }
-            let node: Node = serde_json::from_slice(&bytes)?;
-            if hash_bytes(&bytes) != hash
-                || canonical_bytes(&node)? != bytes
-                || node.link()? != expected[&hash]
-            {
-                return Err("proof node integrity".into());
-            }
-            self.cache.insert(hash, node);
-        }
-        Ok(())
+    fn account_fetch(&mut self, bytes: usize) -> bool {
+        self.work.fetched_nodes += 1;
+        self.work.fetched_bytes += bytes;
+        self.work.fetched_bytes <= 128 * 1024 * 1024 && self.cache.len() < 262144
     }
-    // SQL only supplies bounded candidate bytes. Local hash/canonical checks and
-    // the ordinary expected-edge walk still establish membership and absence.
-    // This isolated experiment does not change the authoritative tree format.
-    fn fetch_lookahead(&mut self, expected: &BTreeMap<String, Link>) -> Result<()> {
-        let keys: Vec<_> = expected.keys().cloned().collect();
-        // Unrequested values may be opaque arrays containing all retained
-        // history. Default to map structure only; retain the broad experiment
-        // behind a second switch so its measured byte slope stays reproducible.
-        let values = std::env::var_os("AQ_PB04_LOOKAHEAD_VALUES").is_some();
-        for roots in keys.chunks(128) {
-            self.work.read_sql_calls += 1;
-            let rows = self.tx.query(
-                "WITH RECURSIVE candidates(hash,payload,depth) AS (
-                   SELECT hash,payload,0 FROM pb04_nodes WHERE hash=ANY($1)
-                   UNION
-                   SELECT n.hash,n.payload,c.depth+1 FROM candidates c
-                   CROSS JOIN LATERAL (SELECT pb04_probe_json(c.payload) AS body) d
-                   CROSS JOIN LATERAL (VALUES
-                     (d.body#>>'{Object,hash}'),
-                     (CASE WHEN $2 THEN d.body#>>'{Entry,value,hash}' ELSE NULL END),
-                     (d.body#>>'{Entry,left,hash}'),
-                     (d.body#>>'{Entry,right,hash}')
-                   ) child(hash)
-                   JOIN pb04_nodes n ON n.hash=child.hash
-                   WHERE c.depth<2
-                 ) SELECT DISTINCT ON(hash) hash,payload FROM candidates ORDER BY hash LIMIT 4097",
-                &[&roots, &values],
-            )?;
-            if rows.len() > 4096 {
-                return Err("prototype lookahead node bound".into());
-            }
-            for row in rows {
-                let hash: String = row.get(0);
-                let bytes: Vec<u8> = row.get(1);
-                self.work.fetched_nodes += 1;
-                self.work.fetched_bytes += bytes.len();
-                if bytes.len() > 16 * 1024 * 1024
-                    || self.work.fetched_bytes > 128 * 1024 * 1024
-                    || self.cache.len() >= 262144
-                {
-                    return Err("prototype lookahead byte bound".into());
-                }
-                let node: Node = match serde_json::from_slice(&bytes) {
-                    Ok(node) => node,
-                    Err(_) if !expected.contains_key(&hash) => continue,
-                    Err(e) => return Err(e.into()),
-                };
-                let actual = match node.link() {
-                    Ok(link) => link,
-                    Err(_) if !expected.contains_key(&hash) => continue,
-                    Err(e) => return Err(e),
-                };
-                if hash_bytes(&bytes) != hash
-                    || actual.hash != hash
-                    || canonical_bytes(&node)? != bytes
-                    || expected.get(&hash).is_some_and(|link| link != &actual)
-                {
-                    if expected.contains_key(&hash) {
-                        return Err("lookahead node integrity".into());
-                    }
-                    // Speculative neighbors do not widen the original read set's
-                    // corruption semantics. A later required-edge read fetches
-                    // these bytes normally and must fail its integrity check.
-                    continue;
-                }
-                self.cache.insert(hash, node);
-            }
-        }
-        if expected.keys().any(|hash| !self.cache.contains_key(hash)) {
-            return Err("missing lookahead proof root".into());
-        }
-        Ok(())
-    }
-    // Returns the first uncached node required to establish one exact path.
-    // The SQL result never decides absence: local verified edges do.
-    fn missing_path(&self, root: &Link, path: &[&str]) -> Result<Option<Link>> {
-        let mut current = root.clone();
-        for key in path {
-            let Some(node) = self.cache.get(&current.hash) else {
-                return Ok(Some(current));
-            };
-            if node.link()? != current {
-                return Err("cached root integrity".into());
-            }
-            let Node::Object(mut map) = node.clone() else {
-                return Err("not object".into());
-            };
-            let mut found = None;
-            for depth in 0..64 {
-                let Some(link) = map else { break };
-                let Some(node) = self.cache.get(&link.hash) else {
-                    return Ok(Some(link));
-                };
-                if node.link()?.ne(&link) {
-                    return Err("cached map integrity".into());
-                }
-                let Node::Entry {
-                    key: k,
-                    value,
-                    left,
-                    right,
-                } = node
-                else {
-                    return Err("not entry".into());
-                };
-                match key.cmp(&k.as_str()) {
-                    std::cmp::Ordering::Equal => {
-                        found = Some(value.clone());
-                        break;
-                    }
-                    std::cmp::Ordering::Less => map = left.clone(),
-                    std::cmp::Ordering::Greater => map = right.clone(),
-                }
-                if depth == 63 {
-                    return Err("prototype lookup depth".into());
-                }
-            }
-            let Some(next) = found else { return Ok(None) };
-            current = next;
-        }
-        // Target metadata is already authenticated by its parent. Do not fetch
-        // opaque history leaves merely to read count/byte quota metadata.
-        Ok(None)
-    }
-    pub fn prefetch_paths(&mut self, root: &Link, paths: &[Vec<&str>]) -> Result<()> {
-        if paths.len() > 128 || paths.iter().any(|p| p.len() > 8) {
-            return Err("prototype path set bound".into());
-        }
-        for _ in 0..512 {
-            let missing: Vec<_> = paths
-                .iter()
-                .map(|p| self.missing_path(root, p))
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .flatten()
-                .collect();
-            if missing.is_empty() {
-                return Ok(());
-            }
-            self.fetch_many(&missing)?;
-        }
-        Err("prototype path proof depth".into())
-    }
-    /// Explicit bounded subtree audit. Used for whole installed catalog reads,
-    /// and OUTSIDE measurement for cold full-State differential audits.
-    pub fn prefetch_subtree(&mut self, root: &Link) -> Result<()> {
-        let mut frontier = vec![root.clone()];
-        let mut seen = std::collections::BTreeSet::new();
-        for _ in 0..256 {
-            if frontier.is_empty() {
-                return Ok(());
-            }
-            for chunk in frontier.chunks(4096) {
-                self.fetch_many(chunk)?;
-            }
-            let mut next = vec![];
-            for link in frontier {
-                if !seen.insert(link.hash.clone()) {
-                    continue;
-                }
-                match self.read(&link)? {
-                    Node::Object(map) => next.extend(map),
-                    Node::Entry {
-                        value, left, right, ..
-                    } => {
-                        next.push(value);
-                        next.extend(left);
-                        next.extend(right)
-                    }
-                    Node::Leaf(_) => {}
-                }
-            }
-            if seen.len() > 262144 {
-                return Err("prototype subtree node bound".into());
-            }
-            frontier = next;
-        }
-        Err("prototype subtree depth bound".into())
-    }
+
     pub fn build(&mut self, value: &Value) -> Result<Link> {
         if let Value::Object(map) = value {
             let entries: Vec<_> = map.iter().collect();
@@ -374,16 +151,14 @@ impl<'a, 'b> Tree<'a, 'b> {
         let right = self.build_map(&entries[mid + 1..])?;
         let value = self.build(entries[mid].1)?;
         Ok(Some(self.entry(
-            entries[mid].0.clone(),
-            value,
+            (entries[mid].0.clone(), value),
             left,
             right,
         )?))
     }
     fn entry(
         &mut self,
-        key: String,
-        value: Link,
+        (key, value): (String, Link),
         left: Option<Link>,
         right: Option<Link>,
     ) -> Result<Link> {
@@ -396,7 +171,7 @@ impl<'a, 'b> Tree<'a, 'b> {
     }
     fn insert(&mut self, root: Option<Link>, key: &str, value: Link) -> Result<Link> {
         let Some(root) = root else {
-            return self.entry(key.into(), value, None, None);
+            return self.entry((key.into(), value), None, None);
         };
         let Node::Entry {
             key: k,
@@ -408,66 +183,83 @@ impl<'a, 'b> Tree<'a, 'b> {
             return Err("not entry".into());
         };
         match key.cmp(&k) {
-            std::cmp::Ordering::Equal => return self.entry(k, value, left, right),
+            std::cmp::Ordering::Equal => return self.entry((k, value), left, right),
             std::cmp::Ordering::Less => left = Some(self.insert(left, key, value)?),
             std::cmp::Ordering::Greater => right = Some(self.insert(right, key, value)?),
         }
-        // Standard AVL rotations; unchanged descendant refs remain authenticated.
         if h(&left) > h(&right) + 1 {
-            let Node::Entry {
-                key: lk,
-                value: lv,
-                left: ll,
-                right: lr,
-            } = self.read(left.as_ref().unwrap())?
-            else {
-                return Err("not entry".into());
-            };
-            if h(&ll) >= h(&lr) {
-                let r = self.entry(k, v, lr, right)?;
-                return self.entry(lk, lv, ll, Some(r));
-            }
-            let Node::Entry {
-                key: mk,
-                value: mv,
-                left: ml,
-                right: mr,
-            } = self.read(lr.as_ref().unwrap())?
-            else {
-                return Err("not entry".into());
-            };
-            let l = self.entry(lk, lv, ll, ml)?;
-            let r = self.entry(k, v, mr, right)?;
-            return self.entry(mk, mv, Some(l), Some(r));
+            return self.rotate_right((k, v), left.unwrap(), right);
         }
         if h(&right) > h(&left) + 1 {
-            let Node::Entry {
-                key: rk,
-                value: rv,
-                left: rl,
-                right: rr,
-            } = self.read(right.as_ref().unwrap())?
-            else {
-                return Err("not entry".into());
-            };
-            if h(&rr) >= h(&rl) {
-                let l = self.entry(k, v, left, rl)?;
-                return self.entry(rk, rv, Some(l), rr);
-            }
-            let Node::Entry {
-                key: mk,
-                value: mv,
-                left: ml,
-                right: mr,
-            } = self.read(rl.as_ref().unwrap())?
-            else {
-                return Err("not entry".into());
-            };
-            let l = self.entry(k, v, left, ml)?;
-            let r = self.entry(rk, rv, mr, rr)?;
-            return self.entry(mk, mv, Some(l), Some(r));
+            return self.rotate_left((k, v), left, right.unwrap());
         }
-        self.entry(k, v, left, right)
+        self.entry((k, v), left, right)
+    }
+
+    fn rotate_right(
+        &mut self,
+        (k, v): (String, Link),
+        left: Link,
+        right: Option<Link>,
+    ) -> Result<Link> {
+        let Node::Entry {
+            key: lk,
+            value: lv,
+            left: ll,
+            right: lr,
+        } = self.read(&left)?
+        else {
+            return Err("not entry".into());
+        };
+        if h(&ll) >= h(&lr) {
+            let r = self.entry((k, v), lr, right)?;
+            return self.entry((lk, lv), ll, Some(r));
+        }
+        let Node::Entry {
+            key: mk,
+            value: mv,
+            left: ml,
+            right: mr,
+        } = self.read(lr.as_ref().unwrap())?
+        else {
+            return Err("not entry".into());
+        };
+        let l = self.entry((lk, lv), ll, ml)?;
+        let r = self.entry((k, v), mr, right)?;
+        self.entry((mk, mv), Some(l), Some(r))
+    }
+
+    fn rotate_left(
+        &mut self,
+        (k, v): (String, Link),
+        left: Option<Link>,
+        right: Link,
+    ) -> Result<Link> {
+        let Node::Entry {
+            key: rk,
+            value: rv,
+            left: rl,
+            right: rr,
+        } = self.read(&right)?
+        else {
+            return Err("not entry".into());
+        };
+        if h(&rr) >= h(&rl) {
+            let l = self.entry((k, v), left, rl)?;
+            return self.entry((rk, rv), Some(l), rr);
+        }
+        let Node::Entry {
+            key: mk,
+            value: mv,
+            left: ml,
+            right: mr,
+        } = self.read(rl.as_ref().unwrap())?
+        else {
+            return Err("not entry".into());
+        };
+        let l = self.entry((k, v), left, ml)?;
+        let r = self.entry((rk, rv), mr, rr)?;
+        self.entry((mk, mv), Some(l), Some(r))
     }
     pub fn child(&mut self, root: &Link, key: &str) -> Result<Option<Link>> {
         let Node::Object(mut map) = self.read(root)? else {
@@ -575,3 +367,9 @@ impl<'a, 'b> Tree<'a, 'b> {
         Ok(())
     }
 }
+
+#[path = "tree/proof.rs"]
+mod proof;
+
+#[path = "tree/lookup.rs"]
+mod lookup;
