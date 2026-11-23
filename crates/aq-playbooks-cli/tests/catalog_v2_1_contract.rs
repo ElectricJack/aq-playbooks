@@ -63,21 +63,7 @@ fn catalog_v2_1_manifest_schemas_and_fixtures_are_pinned() {
         let schema = serde_json::to_value(&prepare.outcomes[outcome]).unwrap();
         assert!(schema["properties"].get("source").is_none(), "{outcome}");
     }
-    for fixture in fixtures()["cases"].as_array().unwrap() {
-        let name = fixture["name"].as_str().unwrap();
-        let contract = fixture["contract"].as_str().unwrap();
-        let schema = match fixture["kind"].as_str().unwrap() {
-            "input" => &registry.commands[contract].input,
-            "output" => &registry.commands[contract].outcomes[fixture["outcome"].as_str().unwrap()],
-            "event" => &registry.events[contract].payload,
-            other => panic!("unknown fixture type {other}"),
-        };
-        assert_eq!(
-            schema.validate(&fixture["value"]).is_ok(),
-            fixture["valid"].as_bool().unwrap(),
-            "{name}"
-        );
-    }
+    schemas::assert_fixture_cases(&registry, &fixtures());
 }
 
 #[test]

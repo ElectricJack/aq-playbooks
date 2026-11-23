@@ -25,7 +25,7 @@ fn object<const N: usize>(fields: [(&str, Schema); N]) -> Schema {
     }
 }
 
-fn fixture(root: &Path) {
+fn registry() -> Registry {
     let command = CommandContract {
         name: "ext.test.ping".into(),
         version: "1".into(),
@@ -80,6 +80,17 @@ fn fixture(root: &Path) {
         retention_ms: 60_000,
         sensitive_payload_fields: Default::default(),
     };
+    Registry {
+        commands: [
+            (command.name.clone(), command),
+            (retry_command.name.clone(), retry_command),
+        ]
+        .into(),
+        events: [(event.name.clone(), event)].into(),
+    }
+}
+
+fn fixture(root: &Path) {
     let package = root.join("test");
     let vault = root.join("vault/plugins/test");
     fs::create_dir_all(package.join("bin")).unwrap();
@@ -99,14 +110,7 @@ secrets = ["plugins/test/token"]
 "#,
     )
     .unwrap();
-    let registry = Registry {
-        commands: [
-            (command.name.clone(), command),
-            (retry_command.name.clone(), retry_command),
-        ]
-        .into(),
-        events: [(event.name.clone(), event)].into(),
-    };
+    let registry = registry();
     fs::write(
         package.join("contracts/registry.json"),
         serde_json::to_vec(&registry).unwrap(),

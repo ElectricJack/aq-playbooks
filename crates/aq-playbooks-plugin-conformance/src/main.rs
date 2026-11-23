@@ -131,18 +131,12 @@ async fn run(args: &Args) -> Result<(bool, Value)> {
             !case.id.is_empty() && ids.insert(case.id.as_str()),
             "case ids must be nonempty and distinct"
         );
-        ensure!(
-            case.expect.failure.is_none()
-                || (case.expect.outcome.is_none()
-                    && case.expect.event_names.is_none()
-                    && case.expect.retry_after.is_none()),
-            "case {:?}: a terminal failure cannot be combined with success expectations",
-            case.id
-        );
+        case.expect.validate(&case.id)?;
         let namespace = format!("conformance:{}", args.project);
         let intent_id = format!("{namespace}:{}", case.id);
         let key = digest(&(&namespace, &intent_id))?;
-        let result = match check_case(args, &plugin, case, &intent_id, &key).await {
+        let identity = InvocationIdentity { intent_id, key };
+        let result = match check_case(args, &plugin, case, &identity).await {
             Ok(result) => result,
             Err(error) => {
                 passed = false;
@@ -154,7 +148,7 @@ async fn run(args: &Args) -> Result<(bool, Value)> {
         results.push(CaseResult {
             id: &case.id,
             command: &case.command,
-            idempotency_key: key,
+            idempotency_key: identity.key,
             result,
         });
     }
@@ -170,27 +164,80 @@ async fn run(args: &Args) -> Result<(bool, Value)> {
     ))
 }
 
+impl Expect {
+    fn validate(&self, case_id: &str) -> Result<()> {
+        ensure!(
+            self.failure.is_none()
+                || (self.outcome.is_none()
+                    && self.event_names.is_none()
+                    && self.retry_after.is_none()),
+            "case {:?}: a terminal failure cannot be combined with success expectations",
+            case_id
+        );
+        Ok(())
+    }
+    fn validate_response(&self, response: &Response) -> Result<()> {
+        if let Some(outcome) = &self.outcome {
+            ensure!(&response.outcome == outcome, "unexpected response outcome");
+        }
+        if let Some(names) = &self.event_names {
+            ensure!(
+                response.events.iter().map(|event| &event.name).eq(names),
+                "unexpected response event names or ordering"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn expected_failure(
+    first: Result<plugin::Validated, Failure>,
+    expected: FailureKind,
+) -> Result<Failure> {
+    match first {
+        Err(failure) if failure.kind == expected => Ok(failure),
+        Err(failure) => Err(anyhow::anyhow!("expected {expected}, observed {failure}")),
+        Ok(_) => Err(anyhow::anyhow!(
+            "expected {expected}, observed a valid response"
+        )),
+    }
+}
+
+struct InvocationIdentity {
+    intent_id: String,
+    key: String,
+}
+
+impl Case {
+    fn command_contract<'a>(
+        &self,
+        plugin: &'a Plugin,
+    ) -> Result<&'a aq_playbooks_model::CommandContract> {
+        let command = plugin
+            .extension
+            .registry()
+            .commands
+            .get(&self.command)
+            .context("fixture names a command outside the plugin contract")?;
+        command
+            .input
+            .validate(&self.input)
+            .context("invalid fixture input")?;
+        ensure!(
+            canonical_bytes(&self.input)?.len() <= command.max_payload_bytes,
+            "fixture input exceeds command payload limit"
+        );
+        Ok(command)
+    }
+}
+
 async fn check_case(
     args: &Args,
     plugin: &Plugin,
     case: &Case,
-    intent_id: &str,
-    key: &str,
+    identity: &InvocationIdentity,
 ) -> Result<Observation> {
-    let command = plugin
-        .extension
-        .registry()
-        .commands
-        .get(&case.command)
-        .context("fixture names a command outside the plugin contract")?;
-    command
-        .input
-        .validate(&case.input)
-        .context("invalid fixture input")?;
-    ensure!(
-        canonical_bytes(&case.input)?.len() <= command.max_payload_bytes,
-        "fixture input exceeds command payload limit"
-    );
+    let command = case.command_contract(plugin)?;
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
         .as_millis()
@@ -208,25 +255,18 @@ async fn check_case(
         plugin.invoke(plugin::Call {
             command,
             input: &case.input,
-            key,
+            key: &identity.key,
             project: args.project,
             binding,
-            intent_id,
+            intent_id: &identity.intent_id,
             now_ms,
             remaining_ms,
         })
     };
     let first = invoke(Some(deadline)).await;
     if let Some(expected) = case.expect.failure {
-        return match first {
-            Err(failure) if failure.kind == expected => {
-                Ok(Observation::ExpectedFailure { failure })
-            }
-            Err(failure) => Err(anyhow::anyhow!("expected {expected}, observed {failure}")),
-            Ok(_) => Err(anyhow::anyhow!(
-                "expected {expected}, observed a valid response"
-            )),
-        };
+        let failure = expected_failure(first, expected)?;
+        return Ok(Observation::ExpectedFailure { failure });
     }
     let (first, attempts) = if let Some(expected) = case.expect.retry_after {
         match first {
@@ -237,23 +277,7 @@ async fn check_case(
     } else {
         (first?, 2)
     };
-    if let Some(outcome) = &case.expect.outcome {
-        ensure!(
-            &first.response.outcome == outcome,
-            "unexpected response outcome"
-        );
-    }
-    if let Some(names) = &case.expect.event_names {
-        ensure!(
-            first
-                .response
-                .events
-                .iter()
-                .map(|event| &event.name)
-                .eq(names),
-            "unexpected response event names or ordering"
-        );
-    }
+    case.expect.validate_response(&first.response)?;
     let replay = invoke(None).await.context("replay failed")?;
     ensure!(
         first.bytes == replay.bytes,

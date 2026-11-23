@@ -9,27 +9,7 @@ use aq_playbooks_cli::catalog;
 use aq_playbooks_model::{Effect, Recovery, Registry, canonical_bytes, digest};
 use serde_json::{Value, json};
 
-#[test]
-fn published_catalog_manifest_schemas_and_fixtures_are_pinned() {
-    let registry: Registry =
-        serde_json::from_str(include_str!("../../../contracts/aq-host/registry.json")).unwrap();
-    let manifest: Value =
-        serde_json::from_str(include_str!("../../../contracts/aq-host/manifest.json")).unwrap();
-    assert_eq!(registry, catalog::catalog());
-    assert_eq!(manifest["version"], "1.0.0");
-    assert_eq!(
-        manifest["fingerprint"],
-        digest(&(manifest["version"].as_str().unwrap(), &registry)).unwrap()
-    );
-    assert_eq!(manifest["context_views"], json!(schemas::CONTEXT_VIEWS));
-    assert_eq!(manifest["work_kinds"], json!(schemas::WORK_KINDS));
-    assert_eq!(
-        manifest["work_change_variants"],
-        json!(schemas::CHANGE_VARIANTS)
-    );
-    assert_eq!(registry.commands.len(), 12);
-    assert!(registry.events.len() <= 16);
-    assert!(canonical_bytes(&registry).unwrap().len() <= 262_144);
+fn assert_registry_contracts(registry: &Registry) {
     for (name, command) in &registry.commands {
         assert_eq!(name, &command.name);
         assert_eq!(command.version, "1.0.0");
@@ -66,23 +46,33 @@ fn published_catalog_manifest_schemas_and_fixtures_are_pinned() {
         );
         assert_eq!(event.correlation_fields, schemas::strings(&["operation"]));
     }
+}
+
+#[test]
+fn published_catalog_manifest_schemas_and_fixtures_are_pinned() {
+    let registry: Registry =
+        serde_json::from_str(include_str!("../../../contracts/aq-host/registry.json")).unwrap();
+    let manifest: Value =
+        serde_json::from_str(include_str!("../../../contracts/aq-host/manifest.json")).unwrap();
+    assert_eq!(registry, catalog::catalog());
+    assert_eq!(manifest["version"], "1.0.0");
+    assert_eq!(
+        manifest["fingerprint"],
+        digest(&(manifest["version"].as_str().unwrap(), &registry)).unwrap()
+    );
+    assert_eq!(manifest["context_views"], json!(schemas::CONTEXT_VIEWS));
+    assert_eq!(manifest["work_kinds"], json!(schemas::WORK_KINDS));
+    assert_eq!(
+        manifest["work_change_variants"],
+        json!(schemas::CHANGE_VARIANTS)
+    );
+    assert_eq!(registry.commands.len(), 12);
+    assert!(registry.events.len() <= 16);
+    assert!(canonical_bytes(&registry).unwrap().len() <= 262_144);
+    assert_registry_contracts(&registry);
     let fixtures: Value =
         serde_json::from_str(include_str!("../../../contracts/aq-host/fixtures.json")).unwrap();
-    for fixture in fixtures["cases"].as_array().unwrap() {
-        let name = fixture["name"].as_str().unwrap();
-        let contract = fixture["contract"].as_str().unwrap();
-        let schema = match fixture["kind"].as_str().unwrap() {
-            "input" => &registry.commands[contract].input,
-            "output" => &registry.commands[contract].outcomes[fixture["outcome"].as_str().unwrap()],
-            "event" => &registry.events[contract].payload,
-            other => panic!("unknown fixture type {other}"),
-        };
-        assert_eq!(
-            schema.validate(&fixture["value"]).is_ok(),
-            fixture["valid"].as_bool().unwrap(),
-            "{name}"
-        );
-    }
+    schemas::assert_fixture_cases(&registry, &fixtures);
     assert!(!registry.events.contains_key("operation.changed"));
     assert!(
         !registry.commands["message.send"]
