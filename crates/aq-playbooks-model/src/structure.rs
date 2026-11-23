@@ -271,7 +271,11 @@ dependency_matches(name,d,p),"dependency requires a reference artifact, same sco
                     && !trigger_too_deep
                 {
                     let roots = BTreeMap::from([("event".into(), e.payload.clone())]);
-                    check_expr_compat(&t.input, &roots, &entry.input, &path, "input", issues);
+                    Compatibility::new(&roots, &path, issues).check(
+                        &t.input,
+                        &entry.input,
+                        "input",
+                    );
                 }
             }
             None => issue(issues, "unknown_event", &path, "unknown trigger event"),
@@ -289,7 +293,7 @@ dependency_matches(name,d,p),"dependency requires a reference artifact, same sco
             let mut local = BTreeSet::new();
             walk(&e.start, &p.steps, &mut local);
             reachable.extend(local.iter().cloned());
-            self.validate_types(name, e, &local, too_deep, issues);
+            typing::EntryTyping::new(self, name, e, too_deep).validate(&local, issues);
         }
         for name in p.steps.keys().filter(|name| !reachable.contains(*name)) {
             issue(
