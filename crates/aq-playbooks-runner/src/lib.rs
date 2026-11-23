@@ -18,6 +18,7 @@ use completions::process_completions;
 mod clock_rebase;
 use clock_rebase::rebase_plan;
 pub use clock_rebase::{ClockRebaseReport, DeadlineAdjustment, REBASE_ADJUSTMENTS_LISTED};
+mod controls;
 mod dependencies;
 use dependencies::{ensure_admission_protection, resolve, resolve_at};
 mod starts;
@@ -100,7 +101,7 @@ enum Finish {
 pub const STALE_REQUEST: &str = "stale request: producer time is older than the replay window";
 /// An admin operation's `actor` and `reason`: present and bounded.
 fn admin_text(actor: &str, reason: &str) -> Result<()> {
-    if actor.is_empty() || reason.is_empty() || actor.len() > 512 || reason.len() > 4096 {
+    if !(1..=512).contains(&actor.len()) || !(1..=4096).contains(&reason.len()) {
         return Err(Error::Refused(
             "admin operation requires bounded actor and reason".into(),
         ));
@@ -1314,56 +1315,7 @@ impl<S: Storage> Engine<S> {
         controls: ActivationControls,
         now_ms: i64,
     ) -> Result<()> {
-        self.transaction_at(Some(now_ms), |s| {
-            let a = s
-                .bindings
-                .get_mut(binding)
-                .ok_or_else(|| Error::NotFound(binding.into()))?;
-            a.controls = controls.clone();
-            a.revision += 1;
-            let artifact = a.artifact.clone();
-            if controls.execution_enabled {
-                s.execution_denied.remove(&artifact);
-            } else {
-                s.execution_denied.insert(artifact.clone());
-            }
-            s.catalog_revision += 1;
-            s.catalog_history
-                .insert(s.catalog_revision, s.bindings.clone());
-            s.catalog_history_at_ms.insert(s.catalog_revision, now_ms);
-            indexes::index_activation(s, binding)?;
-            let runs = s
-                .runs
-                .values()
-                .filter(|r| r.artifact == artifact && !r.status.terminal())
-                .map(|r| r.id.clone())
-                .collect::<Vec<_>>();
-            for id in runs {
-                if controls.execution_enabled {
-                    let r = s.runs.get_mut(&id).unwrap();
-                    if r.status == RunStatus::Blocked
-                        && r.reason.as_deref() == Some("execution authority revoked")
-                    {
-                        r.status = if r.pending.is_some() {
-                            RunStatus::Waiting
-                        } else {
-                            RunStatus::Running
-                        };
-                        r.reason = None;
-                    }
-                }
-                indexes::mark_run(s, &id);
-            }
-            receipt(
-                s,
-                "admin",
-                binding,
-                now_ms,
-                "activation_controls",
-                json!({"artifact":artifact,"controls":controls}),
-            );
-            Ok(())
-        })
+        self.transaction_at(Some(now_ms), |s| controls.apply(s, binding, now_ms))
     }
     pub fn set_execution_authority(
         &self,
@@ -1372,49 +1324,9 @@ impl<S: Storage> Engine<S> {
         revoked_capabilities: BTreeSet<String>,
         now_ms: i64,
     ) -> Result<()> {
+        let subject = controls::Subject { actor, scope };
         self.transaction_at(Some(now_ms), |s| {
-            s.authority_revocations
-                .insert(digest(&(actor, scope))?, revoked_capabilities.clone());
-            let ids = s
-                .runs
-                .values()
-                .filter(|r| {
-                    r.authority.actor == actor && r.authority.scope == scope && !r.status.terminal()
-                })
-                .map(|r| r.id.clone())
-                .collect::<Vec<_>>();
-            for id in ids {
-                let r = s.runs.get_mut(&id).unwrap();
-                if r.status == RunStatus::Blocked
-                    && r.reason.as_deref() == Some("execution authority revoked")
-                {
-                    r.status = if r.pending.is_some() {
-                        RunStatus::Waiting
-                    } else {
-                        RunStatus::Running
-                    };
-                    r.reason = None;
-                }
-                indexes::mark_run(s, &id);
-            }
-            let intents = s
-                .intents
-                .values()
-                .filter(|i| i.authority.actor == actor && i.authority.scope == scope)
-                .map(|i| i.id.clone())
-                .collect::<Vec<_>>();
-            for id in intents {
-                indexes::mark_intent(s, &id);
-            }
-            receipt(
-                s,
-                "admin",
-                "authority",
-                now_ms,
-                "authority_changed",
-                json!({"actor":actor,"scope":scope,"revoked_capabilities":revoked_capabilities}),
-            );
-            Ok(())
+            subject.revoke(s, revoked_capabilities, now_ms)
         })
     }
     /// Store `policy`. Its windows must be positive. The deprecated
@@ -1422,25 +1334,7 @@ impl<S: Storage> Engine<S> {
     /// read: there are no namespace limits, finished runs leave the State as
     /// history, and no tombstone is written for them.
     pub fn set_retention_policy(&self, policy: RetentionPolicy) -> Result<()> {
-        if policy.event_replay_ms == 0 || policy.admission_replay_ms == 0 || policy.audit_ms == 0 {
-            return Err(Error::Refused("retention windows must be positive".into()));
-        }
-        if policy.replay_keep == 0 {
-            return Err(Error::Refused("replay_keep must be positive".into()));
-        }
-        if policy.drain_cohorts_per_commit == 0 || policy.drain_entries_per_commit == 0 {
-            return Err(Error::Refused("drain bounds must be positive".into()));
-        }
-        if policy.window_drops_per_commit == 0
-            || policy.replay_evictions_per_commit == 0
-            || policy.history_trim_per_commit == 0
-            || policy.gc_page_limit == 0
-            || policy.settle_cohorts_per_commit == 0
-        {
-            return Err(Error::Refused(
-                "per-commit retention bounds must be positive".into(),
-            ));
-        }
+        policy.validate_bounds()?;
         self.transaction_at(None, |s| {
             s.retention.policy = policy;
             Ok(())
@@ -1571,7 +1465,21 @@ impl<S: Storage> Engine<S> {
                 "epoch retirement requires actor and reason".into(),
             ));
         }
-        self.transaction_at(Some(now_ms), |s|{let old=s.retention.producer_epochs.get(producer).copied().unwrap_or(0);if new_epoch<=old{return Err(Error::Refused("producer epoch must increase".into()))}s.retention.producer_epochs.insert(producer.into(),new_epoch);s.retention.event_tombstones.retain(|_,t|t.producer!=producer||t.epoch>=new_epoch);if s.indexes.root_active.values().all(BTreeSet::is_empty){s.retention.expired_correlations.retain(|_,(p,epoch)|p!=producer||*epoch>=new_epoch);}receipt(s,"admin","replay",now_ms,"producer_epoch_retired",json!({"producer":producer,"old_epoch":old,"new_epoch":new_epoch,"actor":actor,"reason":reason}));Ok(())})
+        self.transaction_at(Some(now_ms), |s| {
+            let old = s.retention.producer_epochs.get(producer).copied().unwrap_or(0);
+            if new_epoch <= old {
+                return Err(Error::Refused("producer epoch must increase".into()));
+            }
+            s.retention.producer_epochs.insert(producer.into(), new_epoch);
+            s.retention.event_tombstones.retain(|_, t| t.producer != producer || t.epoch >= new_epoch);
+            if s.indexes.root_active.values().all(BTreeSet::is_empty) {
+                s.retention.expired_correlations.retain(|_, (p, epoch)| p != producer || *epoch >= new_epoch);
+            }
+            receipt(s, "admin", "replay", now_ms, "producer_epoch_retired", json!({
+                "producer": producer, "old_epoch": old, "new_epoch": new_epoch, "actor": actor, "reason": reason,
+            }));
+            Ok(())
+        })
     }
     pub fn request_recovery(
         &self,
@@ -1581,17 +1489,7 @@ impl<S: Storage> Engine<S> {
         evidence_refs: Vec<String>,
         now_ms: i64,
     ) -> Result<String> {
-        if actor.is_empty()
-            || reason.is_empty()
-            || reason.len() > 4096
-            || evidence_refs.is_empty()
-            || evidence_refs.len() > 64
-            || evidence_refs.iter().any(|e| e.is_empty() || e.len() > 1024)
-        {
-            return Err(Error::Refused(
-                "recovery requires bounded actor, reason and evidence references".into(),
-            ));
-        }
+        RecoveryRequest::validate_evidence(actor, reason, &evidence_refs)?;
         self.transaction_at(Some(now_ms), |s| {
             let i = s
                 .intents
