@@ -36,7 +36,7 @@ fn the_eviction_licence_reads_its_bound_from_the_policy() {
     let revision = seed_eviction_state(&store, "ns", &state);
     let mut next = store.load("ns").unwrap().state;
     for key in ["b000", "b001", "b002"] {
-        evict_keyed(&mut next, key);
+        ReplayMember::Keyed(key).evict(&mut next);
     }
     assert!(refused_with(
         store.compare_and_swap("ns", "w", revision, &next),
@@ -44,7 +44,7 @@ fn the_eviction_licence_reads_its_bound_from_the_policy() {
     ));
     let mut next = store.load("ns").unwrap().state;
     for key in ["b000", "b001"] {
-        evict_keyed(&mut next, key);
+        ReplayMember::Keyed(key).evict(&mut next);
     }
     store.compare_and_swap("ns", "w", revision, &next).unwrap();
 }

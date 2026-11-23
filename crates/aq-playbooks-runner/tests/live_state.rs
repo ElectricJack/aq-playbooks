@@ -3293,97 +3293,9 @@ fn a_driven_join_at_the_pinned_time_is_capped_by_its_declared_deadline() {
 
 // --- Task 8b R1: the eviction licence (fence tests, every runner path) ----
 
-/// Window entries of the eviction fence states never expire (window
-/// 100_000, clock 500).
-const EVICTION_WINDOW: i64 = 100_000;
-fn running_run(id: &str) -> Run {
-    let mut run = completed_run(id);
-    run.status = RunStatus::Running;
-    run.outcome = None;
-    run.terminal_sequence = None;
-    run
-}
-/// A keyed admission receipt accepted at `sequence` (its run id carries
-/// it); with a live run when `live`; in the eviction order when `in_order`,
-/// else (live) waiting for its run in `replay_held`.
-fn keyed_entry(s: &mut State, key: &str, sequence: u64, live: bool, in_order: bool) {
-    let mut r = receipt(key, 0);
-    r.run_id = format!("run-{sequence:016x}");
-    s.keyed_admissions.insert(key.into(), r.clone());
-    s.retention
-        .admission_expires_at_ms
-        .insert(key.into(), EVICTION_WINDOW);
-    s.retention.expiry.insert(
-        retention::window_key(EVICTION_WINDOW, &format!("k:{key}")),
-        (),
-    );
-    if live {
-        s.runs.insert(r.run_id.clone(), running_run(&r.run_id));
-    }
-    if in_order {
-        s.retention
-            .replay_order
-            .insert(retention::admission_order_key(&r), ());
-    } else if live {
-        s.retention.replay_held.insert(r.run_id, key.into());
-    }
-}
-fn event_entry(s: &mut State, key: &str, sequence: u64, in_order: bool) {
-    let mut e = accepted_event(key, 0);
-    e.sequence = sequence;
-    if in_order {
-        s.retention
-            .replay_order
-            .insert(retention::event_order_key(&e), ());
-    }
-    s.events.insert(key.into(), e);
-    s.retention
-        .event_expires_at_ms
-        .insert(key.into(), EVICTION_WINDOW);
-    s.retention.expiry.insert(
-        retention::window_key(EVICTION_WINDOW, &format!("e:{key}")),
-        (),
-    );
-}
-/// Event `key` held by the live waiter `run-w`: a run waiting on a wait
-/// record whose correlation key is the event's, with the derived indexes.
-fn hold_by_waiter(s: &mut State, key: &str) {
-    let e = s.events.get(key).unwrap().clone();
-    let corr = indexes::correlation_key(
-        &e.envelope.contract,
-        &e.envelope.scope,
-        &e.envelope.correlation,
-    )
-    .unwrap();
-    let mut run = running_run("run-w");
-    run.status = RunStatus::Waiting;
-    run.pending = Some(Pending::Event {
-        wait: "wait-w".into(),
-    });
-    s.runs.insert("run-w".into(), run);
-    s.waits.insert(
-        "wait-w".into(),
-        WaitRecord {
-            id: "wait-w".into(),
-            run: "run-w".into(),
-            step: "wait".into(),
-            event: Some(e.envelope.contract.clone()),
-            scope: e.envelope.scope.clone(),
-            correlation: e.envelope.correlation.clone(),
-            minimum_revision: None,
-            deadline: EVICTION_WINDOW,
-            bind: "completion".into(),
-            winner: None,
-            expired: false,
-        },
-    );
-    s.indexes
-        .event_memberships
-        .insert(key.into(), vec![corr.clone()]);
-    s.indexes
-        .waiters
-        .insert(corr, BTreeSet::from(["run-w".to_string()]));
-}
+#[path = "fixtures/eviction_entries.rs"]
+mod eviction_entries;
+use eviction_entries::*;
 /// "eu" at the head of the order, held by an operation of its contract
 /// whose admission handle is lost (an uncertain completion), `replay_keep`
 /// 4, then k0..k4.
@@ -3437,42 +3349,15 @@ fn held_event_state() -> State {
     event_entry(&mut held_event, "ew", 0, true);
     hold_by_waiter(&mut held_event, "ew");
     for i in 0..5 {
-        keyed_entry(&mut held_event, &format!("k{i}"), i + 1, false, true);
+        keyed_entry(
+            &mut held_event,
+            &format!("k{i}"),
+            i + 1,
+            KeyPosition::Ordered,
+        );
     }
     held_event.sequence = 20;
     held_event
-}
-/// Evict keyed receipt `key` as `retention::evict` does: the item, its
-/// expiry record, its window key and its order key.
-fn evict_keyed(n: &mut State, key: &str) {
-    let r = n.keyed_admissions.remove(key).unwrap();
-    n.retention.admission_expires_at_ms.remove(key);
-    n.retention
-        .expiry
-        .remove(&retention::window_key(EVICTION_WINDOW, &format!("k:{key}")));
-    n.retention
-        .replay_order
-        .remove(&retention::admission_order_key(&r));
-}
-fn evict_event(n: &mut State, key: &str) {
-    let e = n.events.remove(key).unwrap();
-    n.retention.event_expires_at_ms.remove(key);
-    n.retention
-        .expiry
-        .remove(&retention::window_key(EVICTION_WINDOW, &format!("e:{key}")));
-    n.retention
-        .replay_order
-        .remove(&retention::event_order_key(&e));
-    n.indexes.event_memberships.remove(key);
-}
-/// Take keyed receipt `key`, whose run is live, out of the order into
-/// `replay_held`, as `retention::evict` does with a held head.
-fn hold_out(n: &mut State, key: &str) {
-    let r = n.keyed_admissions.get(key).unwrap().clone();
-    n.retention
-        .replay_order
-        .remove(&retention::admission_order_key(&r));
-    n.retention.replay_held.insert(r.run_id, key.into());
 }
 /// The eviction fence state: `replay_keep` 5; the order holds, oldest
 /// first, "kh" (sequence 0, its run live: held, as an entry whose hold began
@@ -3486,68 +3371,37 @@ fn eviction_state() -> State {
     s.retention.policy.admission_replay_ms = EVICTION_WINDOW as u64;
     s.retention.policy.event_replay_ms = EVICTION_WINDOW as u64;
     s.retention.policy.replay_keep = 5;
-    keyed_entry(&mut s, "kh", 0, true, true);
+    keyed_entry(&mut s, "kh", 0, KeyPosition::OrderedLive);
     for i in 0..4 {
-        keyed_entry(&mut s, &format!("k{i}"), i + 1, false, true);
+        keyed_entry(&mut s, &format!("k{i}"), i + 1, KeyPosition::Ordered);
     }
     event_entry(&mut s, "e4", 5, true);
     event_entry(&mut s, "ew", 7, true);
     hold_by_waiter(&mut s, "ew");
-    keyed_entry(&mut s, "kh2", 9, true, false);
+    keyed_entry(&mut s, "kh2", 9, KeyPosition::Held);
     event_entry(&mut s, "ex", 8, false);
     s.sequence = 20;
     s
 }
-/// The correct eviction of `eviction_state()`.
-fn evicted_correctly(n: &mut State) {
-    hold_out(n, "kh");
-    evict_keyed(n, "k0");
-}
 /// Each a (label, refusal, previous State, change): every way an eviction
 /// can break the licence.
-type EvictionCase = (&'static str, &'static str, State, Box<dyn Fn(&mut State)>);
+#[path = "fixtures/eviction_cases.rs"]
+mod eviction_cases;
+use eviction_cases::{EvictionCase, common_refusals};
 fn eviction_refusal_cases() -> Vec<EvictionCase> {
-    let licence = retention::REFUSE_EVICTION;
-    let early = retention::REFUSE_EARLY_REMOVAL;
     let base = eviction_state();
-    // "ew" (held by its waiter) at the head of the order.
-    let mut held_event = State::default();
-    held_event.retention.clock_ms = Some(500);
-    held_event.retention.policy.admission_replay_ms = EVICTION_WINDOW as u64;
-    held_event.retention.policy.event_replay_ms = EVICTION_WINDOW as u64;
-    held_event.retention.policy.replay_keep = 4;
-    event_entry(&mut held_event, "ew", 0, true);
-    hold_by_waiter(&mut held_event, "ew");
-    for i in 0..5 {
-        keyed_entry(&mut held_event, &format!("k{i}"), i + 1, false, true);
-    }
-    held_event.sequence = 20;
-    vec![
-        (
-            "a held keyed receipt",
-            licence,
-            base.clone(),
-            Box::new(|n| evict_keyed(n, "kh")),
-        ),
-        (
-            "an event a live waiter holds",
-            licence,
-            held_event,
-            Box::new(|n| evict_event(n, "ew")),
-        ),
-        (
-            "fewer than replay_keep left",
-            licence,
-            base.clone(),
-            Box::new(|n| {
-                hold_out(n, "kh");
-                evict_keyed(n, "k0");
-                evict_keyed(n, "k1");
-            }),
-        ),
+    let held_event = held_event_state();
+    let mut cases = common_refusals(&base, &held_event);
+    cases.extend(admission_and_order_boundaries(&base));
+    cases.extend(eviction_evidence(&base));
+    cases
+}
+
+fn admission_and_order_boundaries(base: &State) -> [EvictionCase; 4] {
+    [
         (
             "at replay_keep after a policy change",
-            licence,
+            retention::REFUSE_EVICTION,
             base.clone(),
             Box::new(|n| {
                 n.retention.policy.replay_keep = 6;
@@ -3555,29 +3409,17 @@ fn eviction_refusal_cases() -> Vec<EvictionCase> {
             }),
         ),
         (
-            "not the oldest",
-            licence,
-            base.clone(),
-            Box::new(|n| evict_keyed(n, "k1")),
-        ),
-        (
             "older than a kept entry",
-            licence,
+            retention::REFUSE_EVICTION,
             base.clone(),
             Box::new(|n| {
                 hold_out(n, "kh");
-                evict_keyed(n, "k1");
+                ReplayMember::Keyed("k1").evict(n);
             }),
         ),
         (
-            "an entry outside the order, not the oldest",
-            early,
-            base.clone(),
-            Box::new(|n| evict_event(n, "ex")),
-        ),
-        (
             "its order key kept",
-            early,
+            retention::REFUSE_EARLY_REMOVAL,
             base.clone(),
             Box::new(|n| {
                 hold_out(n, "kh");
@@ -3586,39 +3428,8 @@ fn eviction_refusal_cases() -> Vec<EvictionCase> {
             }),
         ),
         (
-            "an order entry without its item",
-            licence,
-            base.clone(),
-            Box::new(|n| {
-                n.retention
-                    .replay_order
-                    .insert(retention::replay_key(30, "k:ghost"), ());
-            }),
-        ),
-        (
-            "an order entry for a held item",
-            licence,
-            base.clone(),
-            Box::new(|n| {
-                let r = n.keyed_admissions.get("kh2").unwrap().clone();
-                n.retention
-                    .replay_order
-                    .insert(retention::admission_order_key(&r), ());
-            }),
-        ),
-        (
-            "an order entry at another sequence",
-            licence,
-            base.clone(),
-            Box::new(|n| {
-                n.retention
-                    .replay_order
-                    .insert(retention::replay_key(30, "k:k3"), ());
-            }),
-        ),
-        (
             "an order entry that inflates the count",
-            licence,
+            retention::REFUSE_EVICTION,
             base.clone(),
             Box::new(|n| {
                 n.retention
@@ -3628,28 +3439,15 @@ fn eviction_refusal_cases() -> Vec<EvictionCase> {
                     .replay_order
                     .insert(retention::replay_key(31, "k:ghost"), ());
                 hold_out(n, "kh");
-                evict_keyed(n, "k0");
-                evict_keyed(n, "k1");
+                ReplayMember::Keyed("k0").evict(n);
+                ReplayMember::Keyed("k1").evict(n);
             }),
         ),
-        // Review C1 (round 1): an accepted event's identity never changes,
-        // so it cannot be moved to the head of the order and evicted.
-        (
-            "an event re-sequenced to the head",
-            retention::REFUSE_EVENT_CHANGE,
-            base.clone(),
-            Box::new(|n| {
-                let mut e = n.events.get("e4").unwrap().clone();
-                n.retention
-                    .replay_order
-                    .remove(&retention::event_order_key(&e));
-                e.sequence = 0;
-                n.retention
-                    .replay_order
-                    .insert(retention::event_order_key(&e), ());
-                n.events.insert("e4".into(), e);
-            }),
-        ),
+    ]
+}
+
+fn eviction_evidence(base: &State) -> [EvictionCase; 5] {
+    [
         (
             "an event's digest changed",
             retention::REFUSE_EVENT_CHANGE,
@@ -3663,39 +3461,31 @@ fn eviction_refusal_cases() -> Vec<EvictionCase> {
             Box::new(|n| n.events.get_mut("e4").unwrap().accepted_at_ms = 7),
         ),
         (
-            "an event's envelope changed",
-            retention::REFUSE_EVENT_CHANGE,
-            base.clone(),
-            Box::new(|n| n.events.get_mut("e4").unwrap().envelope.payload = json!(1)),
-        ),
-        // Review C2 (round 1): the hold is judged from the waiter's real wait
-        // record, so dropping the derived index does not release it.
-        (
             "an event an uncertain completion holds, its index dropped",
-            licence,
+            retention::REFUSE_EVICTION,
             uncertain_event_state(),
             Box::new(|n| {
                 n.indexes.uncertain_completion_contracts.clear();
                 n.indexes.uncertain_contract_membership.clear();
-                evict_event(n, "eu");
+                ReplayMember::Event("eu").evict(n);
             }),
         ),
         (
             "a held event whose waiter index entry is dropped",
-            licence,
+            retention::REFUSE_EVICTION,
             held_event_state(),
             Box::new(|n| {
                 n.indexes.waiters.clear();
-                evict_event(n, "ew");
+                ReplayMember::Event("ew").evict(n);
             }),
         ),
         (
             "more than 64 in one commit",
-            licence,
+            retention::REFUSE_EVICTION,
             bulk_eviction_state(),
             Box::new(|n| {
                 for i in 0..65 {
-                    evict_keyed(n, &format!("b{i:03}"));
+                    ReplayMember::Keyed(&format!("b{i:03}")).evict(n);
                 }
             }),
         ),
@@ -3725,7 +3515,7 @@ fn bulk_eviction_state() -> State {
     s.retention.policy.event_replay_ms = EVICTION_WINDOW as u64;
     s.retention.policy.replay_keep = 1;
     for i in 0..70 {
-        keyed_entry(&mut s, &format!("b{i:03}"), i + 1, false, true);
+        keyed_entry(&mut s, &format!("b{i:03}"), i + 1, KeyPosition::Ordered);
     }
     s.sequence = 100;
     s
@@ -3764,7 +3554,7 @@ fn eviction_fences_hold_on_cas(store: &dyn Storage) {
             bulk_eviction_state(),
             Box::new(|n: &mut State| {
                 for i in 0..64 {
-                    evict_keyed(n, &format!("b{i:03}"));
+                    ReplayMember::Keyed(&format!("b{i:03}")).evict(n);
                 }
             }),
         ),
@@ -3844,7 +3634,7 @@ fn record_storage_transitions_hold_the_eviction_licence() {
             bulk_eviction_state(),
             Box::new(|n: &mut State| {
                 for i in 0..64 {
-                    evict_keyed(n, &format!("b{i:03}"));
+                    ReplayMember::Keyed(&format!("b{i:03}")).evict(n);
                 }
             }),
         ),
@@ -4180,7 +3970,12 @@ fn the_engine_takes_held_entries_at_the_head_out_of_the_order() {
     event_entry(&mut event_head, "ew", 0, true);
     hold_by_waiter(&mut event_head, "ew");
     for i in 0..5 {
-        keyed_entry(&mut event_head, &format!("k{i}"), i + 1, false, true);
+        keyed_entry(
+            &mut event_head,
+            &format!("k{i}"),
+            i + 1,
+            KeyPosition::Ordered,
+        );
     }
     event_head.sequence = 20;
     event_head.indexes.initialized = true;
