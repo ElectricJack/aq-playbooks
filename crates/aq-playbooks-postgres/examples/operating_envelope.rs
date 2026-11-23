@@ -428,6 +428,24 @@ fn fairness(config: &str, state: &State, h: usize, groups: [usize; 3]) {
     );
     e.release().unwrap();
 }
+fn concurrent_admission(
+    e: &Engine<Measured<PostgresStorage>>,
+    thread: usize,
+    operation: usize,
+) -> Value {
+    let start = Instant::now();
+    let now = NOW + (thread * 8 + operation) as i64;
+    let mut attempts = 0;
+    let result = loop {
+        attempts += 1;
+        match e.admit("a", "main", Value::Null, authority("a"), now) {
+            Err(Error::Storage(StorageError::Conflict)) if attempts < 8 => continue,
+            result => break result,
+        }
+    };
+    json!({"thread":thread,"operation":operation,"attempts":attempts,"success":result.is_ok(),
+        "wall_us":start.elapsed().as_micros()as u64,"error":result.err().map(|e|e.to_string())})
+}
 fn concurrent(config: &str, state: &State, threads: usize) {
     let (e, meter) = pg(config, &format!("concurrent-{threads}"), state);
     let e = Arc::new(e);
@@ -438,7 +456,12 @@ fn concurrent(config: &str, state: &State, threads: usize) {
     for tid in 0..threads {
         let e = e.clone();
         let barrier = barrier.clone();
-        handles.push(std::thread::spawn(move||{let mut outcomes=vec![];barrier.wait();for i in 0..8{let t=Instant::now();let mut attempts=0;let result=loop{attempts+=1;match e.admit("a","main",Value::Null,authority("a"),NOW+(tid*8+i)as i64){Err(Error::Storage(StorageError::Conflict))if attempts<8=>continue,r=>break r}};outcomes.push(json!({"thread":tid,"operation":i,"attempts":attempts,"success":result.is_ok(),"wall_us":t.elapsed().as_micros()as u64,"error":result.err().map(|e|e.to_string())}));}outcomes}));
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            (0..8)
+                .map(|operation| concurrent_admission(&e, tid, operation))
+                .collect::<Vec<_>>()
+        }));
     }
     let outcomes: Vec<_> = handles
         .into_iter()
@@ -485,16 +508,7 @@ fn pending(config: &str, n: usize) {
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().nth(1).as_deref() == Some("--check-fixtures") {
-        let e = base();
-        let id = e.admit("parent", "main", Value::Null, authority("a"), 0)?;
-        e.advance(&id, 0)?;
-        let child = e.snapshot()?.runs[&id].children[0].clone();
-        e.advance(&child, 0)?;
-        e.advance(&id, 0)?;
-        assert!(!e.snapshot()?.runs[&child].status.terminal());
-        e.admit_event("pb02", event("fixture-check"), 0)?;
-        emit(json!({"fixture_check":"passed","state":counts(&e.snapshot()?)}));
-        return Ok(());
+        return check_fixtures();
     }
     if cfg!(debug_assertions) {
         return Err("release benchmark only".into());
@@ -520,31 +534,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         emit(json!({"scenario":"complete","profile":"minimal","rss_kib":rss_kib()}));
         return Ok(());
     }
+    full(&config)
+}
+fn check_fixtures() -> Result<(), Box<dyn std::error::Error>> {
+    let e = base();
+    let id = e.admit("parent", "main", Value::Null, authority("a"), 0)?;
+    e.advance(&id, 0)?;
+    let child = e.snapshot()?.runs[&id].children[0].clone();
+    e.advance(&child, 0)?;
+    e.advance(&id, 0)?;
+    assert!(!e.snapshot()?.runs[&child].status.terminal());
+    e.admit_event("pb02", event("fixture-check"), 0)?;
+    emit(json!({"fixture_check":"passed","state":counts(&e.snapshot()?)}));
+    Ok(())
+}
+fn append_history(
+    e: &Engine<MemoryStorage>,
+    range: std::ops::Range<usize>,
+    prefix: &str,
+) -> aq_playbooks_runner::Result<()> {
+    for i in range {
+        let now = i as i64;
+        let id = e.admit("a", "main", Value::Null, authority("a"), now)?;
+        e.advance(&id, now)?;
+        e.admit_event("pb02", event(&format!("{prefix}{i}")), now)?;
+    }
+    Ok(())
+}
+fn full(config: &str) -> Result<(), Box<dyn std::error::Error>> {
     let e = base();
     let empty = e.snapshot()?;
-    preflight(&config, &empty);
+    preflight(config, &empty);
     let mut previous = 0;
     for h in HISTORY {
-        for i in previous..h {
-            let id = e.admit("a", "main", Value::Null, authority("a"), i as i64)?;
-            e.advance(&id, i as i64)?;
-            e.admit_event("pb02", event(&format!("history-{i}")), i as i64)?;
-        }
+        append_history(&e, previous..h, "history-")?;
         previous = h;
         let state = e.snapshot()?;
         for kind in ["admit", "event"] {
-            report_phase(&config, &state, h, kind);
+            report_phase(config, &state, h, kind);
         }
         memory_phase(&state, h);
         for groups in [[4, 1, 1], [16, 4, 4]] {
-            fairness(&config, &state, h, groups);
+            fairness(config, &state, h, groups);
         }
     }
     for n in [0, 8, 32, 128] {
-        pending(&config, n);
+        pending(config, n);
     }
     for threads in [1, 2, 4] {
-        concurrent(&config, &empty, threads);
+        concurrent(config, &empty, threads);
     }
     // The quota-refusal scenario was removed with the namespace limits
     // (spec 0003, "no limits").
@@ -578,84 +616,118 @@ fn minimal(config: &str) {
     install(&seed, "a", artifact("minimal-return", "a", ret()));
     let mut previous = 0;
     for history in [0, 1, 8, 32] {
-        for i in previous..history {
-            let id = seed
-                .admit("a", "main", Value::Null, authority("a"), i as i64)
-                .unwrap();
-            seed.advance(&id, i as i64).unwrap();
-            seed.admit_event("pb02", event(&format!("minimal-history-{i}")), i as i64)
-                .unwrap();
-        }
+        append_history(&seed, previous..history, "minimal-history-").unwrap();
         previous = history;
         let state = seed.snapshot().unwrap();
         for repeat in 0..2 {
-            let (mut e, meter) = pg(config, &format!("minimal-event-{history}-{repeat}"), &state);
-            e.config = minimal_config();
-            let (wall, pure) = phase_n(&mut e, "event", 64);
-            let store = meter.report();
-            let end = e.snapshot().unwrap();
-            emit(
-                json!({"scenario":"minimal_event","history":history,"repeat":repeat,"installed_artifacts":end.artifacts.len(),"limits":e.config,"starting":counts(&state),"ending":counts(&end),"wall_us":stats(&wall),"transition_closure_us":stats(&pure),"store":store,"budget_pass":stats(&wall)["p95"].as_u64().unwrap()<25000&&stats(&pure)["p95"].as_u64().unwrap()<1000}),
-            );
-            e.release().unwrap();
+            let cell = MinimalCell {
+                config,
+                state: &state,
+                history,
+                repeat,
+            };
+            cell.events();
             for backlog in [1, 3] {
-                let mut calls = vec![];
-                let mut queue = vec![];
-                let mut final_counts = Value::Null;
-                for batch in 0..24 {
-                    let (mut e, _) = pg(
-                        config,
-                        &format!("minimal-ready-{history}-{repeat}-{backlog}-{batch}"),
-                        &state,
-                    );
-                    e.config = minimal_config();
-                    let mut admitted = BTreeMap::new();
-                    for i in 0..backlog {
-                        let id = e
-                            .admit("a", "main", Value::Null, authority("a"), NOW + i as i64)
-                            .unwrap();
-                        admitted.insert(id, Instant::now());
-                    }
-                    for _ in 0..backlog {
-                        let selected = e
-                            .query(&IndexQuery::Ready {
-                                scope_after: None,
-                                limit: 1,
-                            })
-                            .unwrap()
-                            .items
-                            .remove(0);
-                        let t = Instant::now();
-                        assert_eq!(e.drive(&mut FakeHost::default(), NOW + 100, 1).unwrap(), 1);
-                        calls.push(t.elapsed().as_micros() as u64);
-                        queue.push(admitted[&selected.key].elapsed().as_micros() as u64);
-                    }
-                    let end = e.snapshot().unwrap();
-                    assert!(end.runs.values().all(|r| r.status.terminal()));
-                    final_counts = counts(&end);
-                    e.release().unwrap();
-                }
-                emit(
-                    json!({"scenario":"minimal_ready_queue","history":history,"repeat":repeat,"backlog":backlog,"batches":24,"installed_artifacts":1,"limits":minimal_config(),"starting":counts(&state),"ending_each_batch":final_counts,"dispatch_call_us":stats(&calls),"admission_to_first_visit_upper_bound_us":stats(&queue),"budget_pass":stats(&calls)["p95"].as_u64().unwrap()<100000&&stats(&queue)["p95"].as_u64().unwrap()<100000}),
-                );
+                cell.ready_queue(backlog);
             }
         }
     }
 }
+struct MinimalCell<'a> {
+    config: &'a str,
+    state: &'a State,
+    history: usize,
+    repeat: usize,
+}
+impl MinimalCell<'_> {
+    fn events(&self) {
+        let Self {
+            config,
+            state,
+            history,
+            repeat,
+        } = *self;
+        let (mut e, meter) = pg(config, &format!("minimal-event-{history}-{repeat}"), state);
+        e.config = minimal_config();
+        let (wall, pure) = phase_n(&mut e, "event", 64);
+        let store = meter.report();
+        let end = e.snapshot().unwrap();
+        emit(
+            json!({"scenario":"minimal_event","history":history,"repeat":repeat,"installed_artifacts":end.artifacts.len(),"limits":e.config,"starting":counts(state),"ending":counts(&end),"wall_us":stats(&wall),"transition_closure_us":stats(&pure),"store":store,"budget_pass":stats(&wall)["p95"].as_u64().unwrap()<25000&&stats(&pure)["p95"].as_u64().unwrap()<1000}),
+        );
+        e.release().unwrap();
+    }
+    fn ready_queue(&self, backlog: usize) {
+        let Self {
+            state,
+            history,
+            repeat,
+            ..
+        } = *self;
+        let mut readings = QueueReadings::default();
+        let mut final_counts = Value::Null;
+        for batch in 0..24 {
+            final_counts = self.ready_batch(backlog, batch, &mut readings);
+        }
+        emit(
+            json!({"scenario":"minimal_ready_queue","history":history,"repeat":repeat,"backlog":backlog,"batches":24,"installed_artifacts":1,"limits":minimal_config(),"starting":counts(state),"ending_each_batch":final_counts,"dispatch_call_us":stats(&readings.dispatch_us),"admission_to_first_visit_upper_bound_us":stats(&readings.queue_us),"budget_pass":stats(&readings.dispatch_us)["p95"].as_u64().unwrap()<100000&&stats(&readings.queue_us)["p95"].as_u64().unwrap()<100000}),
+        );
+    }
+    fn ready_batch(&self, backlog: usize, batch: usize, readings: &mut QueueReadings) -> Value {
+        let Self {
+            config,
+            state,
+            history,
+            repeat,
+        } = *self;
+        let (mut e, _) = pg(
+            config,
+            &format!("minimal-ready-{history}-{repeat}-{backlog}-{batch}"),
+            state,
+        );
+        e.config = minimal_config();
+        let mut admitted = BTreeMap::new();
+        for i in 0..backlog {
+            let id = e
+                .admit("a", "main", Value::Null, authority("a"), NOW + i as i64)
+                .unwrap();
+            admitted.insert(id, Instant::now());
+        }
+        for _ in 0..backlog {
+            let selected = e
+                .query(&IndexQuery::Ready {
+                    scope_after: None,
+                    limit: 1,
+                })
+                .unwrap()
+                .items
+                .remove(0);
+            let t = Instant::now();
+            assert_eq!(e.drive(&mut FakeHost::default(), NOW + 100, 1).unwrap(), 1);
+            readings.dispatch_us.push(t.elapsed().as_micros() as u64);
+            readings
+                .queue_us
+                .push(admitted[&selected.key].elapsed().as_micros() as u64);
+        }
+        let end = e.snapshot().unwrap();
+        assert!(end.runs.values().all(|r| r.status.terminal()));
+        let result = counts(&end);
+        e.release().unwrap();
+        result
+    }
+}
 
+#[derive(Default)]
+struct QueueReadings {
+    dispatch_us: Vec<u64>,
+    queue_us: Vec<u64>,
+}
 fn state_costs() {
     use std::hint::black_box;
     let seed = base();
     let mut prior = 0;
     for history in HISTORY {
-        for i in prior..history {
-            let id = seed
-                .admit("a", "main", Value::Null, authority("a"), i as i64)
-                .unwrap();
-            seed.advance(&id, i as i64).unwrap();
-            seed.admit_event("pb02", event(&format!("cpu-history-{i}")), i as i64)
-                .unwrap();
-        }
+        append_history(&seed, prior..history, "cpu-history-").unwrap();
         prior = history;
         let state = seed.snapshot().unwrap();
         let value = serde_json::to_value(&state).unwrap();
