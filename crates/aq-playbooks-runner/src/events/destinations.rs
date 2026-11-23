@@ -52,11 +52,8 @@ impl Destinations {
     }
     pub(super) fn record_blockers(self, s: &mut State, key: &str, now_ms: i64) -> Vec<Destination> {
         for (destination, blocked_kind, reason) in self.blockers {
-            receipt(
+            ReceiptSite::new(&format!("event:{key}"), "admission", now_ms).record(
                 s,
-                &format!("event:{key}"),
-                "admission",
-                now_ms,
                 "destination_blocked",
                 json!({"destination":destination,"blocked_kind":blocked_kind,"reason":reason}),
             );

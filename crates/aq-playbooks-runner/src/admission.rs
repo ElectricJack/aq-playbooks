@@ -158,7 +158,7 @@ impl Admission<'_> {
         self.check_time(s)?;
         let activation = self.request.activation(s)?;
         let dependencies = self.request.dependencies(s, &activation)?;
-        let run_id = next_id(s, "run");
+        let run_id = s.next_id("run");
         Invocation {
             artifact: &activation.artifact,
             entry: &self.request.entry,

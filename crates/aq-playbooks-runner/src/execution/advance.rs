@@ -45,14 +45,8 @@ fn route_error(s: &mut State, run: &mut Run, message: String, now: i64) {
         .steps
         .get(&run.step)
         .and_then(|step| step.on_error.clone());
-    receipt(
-        s,
-        &run.id,
-        &run.step,
-        now,
-        "error",
-        json!({"reason":message}),
-    );
+    run.receipt_at(now)
+        .record(s, "error", json!({"reason":message}));
     let target = match run.loops.last().cloned() {
         None => step_target,
         Some(frame) if frame.failure == IterationFailure::Continue => Some(frame.site),

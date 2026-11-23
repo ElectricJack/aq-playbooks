@@ -14,11 +14,8 @@ impl<S: Storage> Engine<S> {
             }
             self.transaction_at(Some(now_ms), |s| {
                 EffectQueueKind::Recovery.advance_cursor(s, &item);
-                receipt(
+                intent.receipt_at(now_ms).record(
                     s,
-                    &intent.run,
-                    &intent.step,
-                    now_ms,
                     "recovery_attempt",
                     json!({"operation":intent.id}),
                 );
@@ -99,11 +96,8 @@ impl RecoveryAttempt<'_> {
             engine.transaction_at(Some(self.now_ms), |s| {
                 s.intents.get_mut(&intent.id).unwrap().cancel_dispatched = false;
                 indexes::mark_intent(s, &intent.id);
-                receipt(
+                intent.receipt_at(self.now_ms).record(
                     s,
-                    &intent.run,
-                    &intent.step,
-                    self.now_ms,
                     "cancel_retry_authorized_by_status",
                     json!({"operation":intent.id}),
                 );
@@ -136,11 +130,8 @@ impl RecoveryAttempt<'_> {
         engine.transaction_at(Some(self.now_ms), |s| {
             s.recovery_requests.get_mut(&request.id).unwrap().consumed = true;
             if audit {
-                receipt(
+                self.intent.receipt_at(self.now_ms).record(
                     s,
-                    &self.intent.run,
-                    &self.intent.step,
-                    self.now_ms,
                     "authorized_recovery",
                     json!({"request":request.id,"actor":request.actor}),
                 );

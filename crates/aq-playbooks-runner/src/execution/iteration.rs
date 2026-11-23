@@ -26,11 +26,8 @@ impl StepExecution<'_> {
         } else {
             self.start_loop(spec)?;
         }
-        receipt(
+        self.run.receipt_at(self.now).record(
             self.state,
-            &self.run.id,
-            &self.run.step,
-            self.now,
             "iteration",
             json!({"path":self.run.loops.iter().map(|x|x.index).collect::<Vec<_>>()}),
         );
@@ -98,4 +95,26 @@ impl StepExecution<'_> {
         }
         Ok(())
     }
+}
+
+fn reserve_iteration(s: &mut State, r: &Run, limits: &Limits) -> Result<()> {
+    let root = s
+        .runs
+        .get(&r.root)
+        .ok_or_else(|| invariant(format!("root {} of run {} is missing", r.root, r.id)))?;
+    let bound = s.artifacts[&root.artifact]
+        .content
+        .playbook
+        .limits
+        .max_iterations
+        .min(limits.max_iterations);
+    let b = s
+        .budgets
+        .get_mut(&r.root)
+        .ok_or_else(|| invariant(format!("budget of root {} is missing", r.root)))?;
+    if b.iterations >= bound {
+        return Err(Error::Exhausted("iterations".into()));
+    }
+    b.iterations += 1;
+    Ok(())
 }

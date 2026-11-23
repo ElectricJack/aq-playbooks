@@ -73,7 +73,7 @@ impl Invocation<'_> {
         s.runs.insert(id.into(), run);
         s.budgets.entry(root.into()).or_default();
         indexes::mark_run(s, id);
-        receipt(s, id, &step, now, "admitted", audit);
+        ReceiptSite::new(id, &step, now).record(s, "admitted", audit);
         Ok(())
     }
 

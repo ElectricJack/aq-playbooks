@@ -18,24 +18,43 @@ use completions::process_completions;
 mod clock_rebase;
 use clock_rebase::rebase_plan;
 pub use clock_rebase::{ClockRebaseReport, DeadlineAdjustment, REBASE_ADJUSTMENTS_LISTED};
+mod activation;
 mod controls;
+use activation::{BindingUpdate, record_binding_change};
+use controls::{check_authority, execution_allowed};
 mod dependencies;
 use dependencies::{ensure_admission_protection, resolve, resolve_at};
+mod state;
+pub use state::{
+    AcceptedEvent, Activation, ActivationControls, Authority, Budget, Destination,
+    EventDisposition, Intent, IntentStatus, LoopFrame, Pending, Receipt, RecoveryRequest, Run,
+    RunStatus, State, WaitRecord,
+};
 mod starts;
 use starts::{Invocation, Lineage};
 mod driver;
 mod effects;
+use effects::process_operation_deadlines;
 mod events;
 use events::{EventIngress, fanout_event, find_event};
 mod execution;
+mod expressions;
+use expressions::{check_bytes, context, known_expr};
 pub mod indexes;
 use execution::advance;
 mod pending;
 pub mod retention;
 use pending::poll_pending;
+mod request_time;
+use request_time::{ReplayWindow, refuse_stale};
+mod receipts;
+use receipts::ReceiptSite;
+mod run_transitions;
+use run_transitions::{Terminal, fail_run, request_cancel, settle_cancel, settled};
 mod results;
 use results::record_result;
 mod schedules;
+mod simulation;
 use aq_playbooks_model::*;
 pub use indexes::{EffectQueueKind, IndexItem, IndexPage, IndexQuery, RuntimeIndexes};
 pub use lazy::{LazyMap, LazySeq, LazySet};
@@ -43,6 +62,7 @@ pub use retention::{GcReport, RetentionPolicy, RetentionState};
 pub use schedules::{BindingSchedules, DeactivatedBinding};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+pub use simulation::{FakeHost, Simulation, SimulationReport};
 use std::collections::{BTreeMap, BTreeSet};
 pub use storage::{MemoryStorage, Storage, StorageError, VersionedState};
 pub use transition::{RecordStorage, TransitionOutcome, TransitionRequest};
@@ -65,7 +85,7 @@ pub enum Error {
     /// is at or before `cutoff_ms`: the later of `max(now, clock) - window`
     /// and the stale floor a clock rebase recorded. Its text starts with
     /// [`STALE_REQUEST`]. Nothing was written.
-    #[error("{}", stale_message(*.requested_at_ms, *.cutoff_ms, *.clock_ms, *.now_ms, *.window_ms, *.floor_ms))]
+    #[error("{}", ReplayWindow::new(*.clock_ms, *.now_ms, *.window_ms, *.floor_ms).stale_message(*.requested_at_ms, *.cutoff_ms))]
     Stale {
         requested_at_ms: i64,
         cutoff_ms: i64,
@@ -107,336 +127,6 @@ fn admin_text(actor: &str, reason: &str) -> Result<()> {
         ));
     }
     Ok(())
-}
-fn stale_message(
-    requested_at_ms: i64,
-    cutoff_ms: i64,
-    clock_ms: Option<i64>,
-    now_ms: i64,
-    window_ms: u64,
-    floor_ms: Option<i64>,
-) -> String {
-    let start = clock_ms.map_or(now_ms, |clock| clock.max(now_ms));
-    let mut message = format!(
-        "{STALE_REQUEST}: request time {requested_at_ms} ms is at or before the cut-off \
-         {cutoff_ms} ms (retention time {start} ms minus the {window_ms} ms window; host \
-         time {now_ms} ms"
-    );
-    if let Some(floor) = floor_ms {
-        message.push_str(&format!("; stale floor {floor} ms from a clock rebase"));
-    }
-    message.push(')');
-    if start > now_ms {
-        message.push_str(&format!(
-            "; the retention clock ({start} ms) is ahead of host time by {} ms, and while \
-             it is, every request that carries a real request time is refused as stale \
-             (a clock pinned by a far-future host time stays ahead until it is rebased)",
-            start.saturating_sub(now_ms)
-        ));
-    }
-    message
-}
-/// Refuse a request for a key the engine does not remember (absent, or
-/// expired and held by nothing) when its request time is at or before the
-/// cut-off: the window before `max(now, clock)`, the time expiry is judged
-/// against, or the stale floor if that is later. A request without a
-/// request time is not checked, and the window is not computed. The request
-/// time is only compared: it never moves the clock and is never stored.
-fn refuse_stale(
-    s: &State,
-    requested_at_ms: Option<i64>,
-    window_ms: impl FnOnce() -> u64,
-    now_ms: i64,
-) -> Result<()> {
-    let Some(requested_at_ms) = requested_at_ms else {
-        return Ok(());
-    };
-    let window_ms = window_ms();
-    let start = retention::window_start(s, now_ms);
-    let floor_ms = s.retention.stale_floor_ms;
-    let cutoff_ms = start
-        .saturating_sub(i64::try_from(window_ms).unwrap_or(i64::MAX))
-        .max(floor_ms.unwrap_or(i64::MIN));
-    if requested_at_ms > cutoff_ms {
-        return Ok(());
-    }
-    Err(Error::Stale {
-        requested_at_ms,
-        cutoff_ms,
-        clock_ms: s.retention.clock_ms,
-        now_ms,
-        window_ms,
-        floor_ms,
-    })
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Authority {
-    pub actor: String,
-    pub scope: String,
-    pub capabilities: BTreeSet<String>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Activation {
-    pub artifact: String,
-    pub authority: Authority,
-    pub revision: u64,
-    #[serde(default)]
-    pub controls: ActivationControls,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActivationControls {
-    pub calls_enabled: bool,
-    pub event_starts_enabled: bool,
-    pub execution_enabled: bool,
-}
-impl Default for ActivationControls {
-    fn default() -> Self {
-        Self {
-            calls_enabled: true,
-            event_starts_enabled: true,
-            execution_enabled: true,
-        }
-    }
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunStatus {
-    Admitted,
-    Running,
-    Waiting,
-    Finishing,
-    Cancelling,
-    Blocked,
-    Completed,
-    Failed,
-    Cancelled,
-}
-impl RunStatus {
-    pub fn terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
-    }
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Run {
-    #[serde(default)]
-    pub catalog_revision: u64,
-    pub id: String,
-    pub root: String,
-    pub parent: Option<String>,
-    pub origin: Option<String>,
-    pub artifact: String,
-    pub entry: String,
-    pub dependencies: BTreeMap<String, String>,
-    pub authority: Authority,
-    pub step: String,
-    pub status: RunStatus,
-    pub input: Value,
-    pub variables: BTreeMap<String, Value>,
-    pub outcome: Option<String>,
-    pub output: Option<Value>,
-    pub reason: Option<String>,
-    pub admitted_at_ms: i64,
-    pub visits: u64,
-    pub depth: u32,
-    pub children: Vec<String>,
-    pub pending: Option<Pending>,
-    pub loops: Vec<LoopFrame>,
-    pub attempts: BTreeMap<String, u32>,
-    pub pending_return: Option<(String, Value)>,
-    #[serde(default)]
-    pub pending_failure: bool,
-    pub terminal_sequence: Option<u64>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoopFrame {
-    pub site: String,
-    pub item: String,
-    pub items: Vec<Value>,
-    pub index: usize,
-    pub body: String,
-    pub next: String,
-    pub failure: IterationFailure,
-    pub previous: Option<Value>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Pending {
-    Effect {
-        intent: String,
-    },
-    Event {
-        wait: String,
-    },
-    Child {
-        child: String,
-        bind: String,
-    },
-    Join {
-        members: Vec<String>,
-        #[serde(default)]
-        member_keys: Vec<String>,
-        mode: JoinMode,
-        accepted: BTreeSet<String>,
-        deadline: i64,
-        remaining: RemainingPolicy,
-        bind: String,
-    },
-    Retry {
-        deadline: i64,
-    },
-}
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct Budget {
-    pub visits: u64,
-    pub children: u64,
-    pub iterations: u64,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Receipt {
-    pub sequence: u64,
-    pub run: String,
-    pub step: String,
-    pub at_ms: i64,
-    pub kind: String,
-    pub detail: Value,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IntentStatus {
-    Prepared,
-    Dispatched,
-    Accepted,
-    Completed,
-    Unknown,
-    Rejected,
-    Cancelled,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Intent {
-    pub id: String,
-    pub run: String,
-    pub step: String,
-    pub invocation: u64,
-    #[serde(default)]
-    pub deadline_at_ms: i64,
-    pub command: CommandContract,
-    pub input: Value,
-    pub input_digest: String,
-    pub authority: Authority,
-    pub status: IntentStatus,
-    #[serde(default)]
-    pub cancel_requested: bool,
-    #[serde(default)]
-    pub cancel_dispatched: bool,
-    pub handle: Option<String>,
-    pub result: Option<(String, Value)>,
-    pub reason: Option<String>,
-    #[serde(default)]
-    pub late_results: Vec<(String, Value)>,
-    #[serde(default)]
-    pub completion_event: Option<String>,
-    /// The namespace sequence of the commit that first dispatched the
-    /// operation (its first `dispatch` receipt; a re-dispatch after recovery
-    /// keeps it). Its completion can only be an event accepted later, so an
-    /// operation whose admission handle is lost holds only those
-    /// (`retention::event_held`). Absent until dispatch: an operation never
-    /// dispatched holds nothing. Operations dispatched before Task 8b get it
-    /// on open from their own first `dispatch` receipt.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dispatch_sequence: Option<u64>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WaitRecord {
-    pub id: String,
-    pub run: String,
-    pub step: String,
-    pub event: Option<ContractRef>,
-    pub scope: String,
-    pub correlation: BTreeMap<String, String>,
-    pub minimum_revision: Option<u64>,
-    pub deadline: i64,
-    pub bind: String,
-    pub winner: Option<String>,
-    pub expired: bool,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Destination {
-    pub key: String,
-    pub artifact: String,
-    pub entry: String,
-    pub input: Value,
-    pub authority: Authority,
-    pub dependencies: BTreeMap<String, String>,
-    pub run: Option<String>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AcceptedEvent {
-    pub key: String,
-    pub envelope: EventEnvelope,
-    pub digest: String,
-    pub accepted_at_ms: i64,
-    pub sequence: u64,
-    pub catalog_revision: u64,
-    pub destinations: Vec<Destination>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventDisposition {
-    pub key: String,
-    pub duplicate: bool,
-    pub destinations: usize,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct State {
-    #[serde(default)]
-    pub keyed_admissions: LazyMap<String, KeyedAdmissionReceipt>,
-    #[serde(default)]
-    pub catalog_history: BTreeMap<u64, BTreeMap<String, Activation>>,
-    #[serde(default)]
-    pub catalog_history_at_ms: BTreeMap<u64, i64>,
-    #[serde(default)]
-    pub retention: RetentionState,
-    #[serde(default)]
-    pub execution_denied: BTreeSet<String>,
-    #[serde(default)]
-    pub authority_revocations: BTreeMap<String, BTreeSet<String>>,
-    #[serde(default)]
-    pub recovery_requests: BTreeMap<String, RecoveryRequest>,
-    #[serde(skip)]
-    pub protection_available: bool,
-    /// Cohorts this commit removes from the State, handed to storage as
-    /// history in the same commit. Never stored with the State.
-    #[serde(skip)]
-    pub settled: Vec<SettledCohort>,
-    /// What this commit may have changed the hold of, for the eviction
-    /// order (`retention::rejoin`). Never stored.
-    #[serde(skip)]
-    pub replay_touched: retention::ReplayTouched,
-    #[serde(default)]
-    pub indexes: RuntimeIndexes,
-    pub artifacts: BTreeMap<String, Artifact>,
-    pub bindings: BTreeMap<String, Activation>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub binding_schedules: BTreeMap<String, BindingSchedules>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub deactivated_bindings: BTreeMap<String, DeactivatedBinding>,
-    pub catalog_revision: u64,
-    pub runs: LazyMap<String, Run>,
-    pub receipts: LazySeq<Receipt>,
-    pub intents: LazyMap<String, Intent>,
-    pub waits: LazyMap<String, WaitRecord>,
-    pub events: LazyMap<String, AcceptedEvent>,
-    pub budgets: LazyMap<String, Budget>,
-    pub sequence: u64,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecoveryRequest {
-    pub id: String,
-    pub intent: String,
-    pub actor: String,
-    pub reason: String,
-    pub evidence_refs: Vec<String>,
-    pub requested_at_ms: i64,
-    pub consumed: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -632,19 +322,12 @@ impl<S: Storage> Engine<S> {
         })
     }
     pub fn activate(&self, binding: &str, artifact: &str, authority: Authority) -> Result<()> {
-        let state = self.store.load(&self.namespace)?.state;
-        let derived = state
-            .receipts
-            .last()
-            .map(|receipt| receipt.at_ms)
-            .unwrap_or(0);
-        // Finished work leaves with its receipts; the clock still dates it.
-        let now_ms = state
-            .retention
-            .clock_ms
-            .map_or(derived, |clock| clock.max(derived));
-        // A derived time, not host time: the clock does not move.
-        self.activate_with(binding, artifact, authority, now_ms, None)
+        BindingUpdate {
+            binding,
+            artifact,
+            authority,
+        }
+        .commit(self, None)
     }
     pub fn activate_at(
         &self,
@@ -653,35 +336,12 @@ impl<S: Storage> Engine<S> {
         authority: Authority,
         now_ms: i64,
     ) -> Result<()> {
-        self.activate_with(binding, artifact, authority, now_ms, Some(now_ms))
-    }
-    fn activate_with(
-        &self,
-        binding: &str,
-        artifact: &str,
-        authority: Authority,
-        now_ms: i64,
-        host_ms: Option<i64>,
-    ) -> Result<()> {
-        self.transaction_at(host_ms, |s| {
-            activate_binding(s, binding, artifact, authority, now_ms)?;
-            if let Some(configuration) = s
-                .deactivated_bindings
-                .remove(binding)
-                .and_then(|d| d.configuration)
-            {
-                configuration.install(
-                    s,
-                    schedules::BindingSite {
-                        namespace: &self.namespace,
-                        binding,
-                        now_ms,
-                    },
-                    None,
-                )?;
-            }
-            Ok(())
-        })
+        BindingUpdate {
+            binding,
+            artifact,
+            authority,
+        }
+        .commit(self, Some(now_ms))
     }
     pub fn admit(
         &self,
@@ -701,7 +361,7 @@ impl<S: Storage> Engine<S> {
                 return Err(Error::Refused("new calls disabled".into()));
             }
             let dependencies = resolve(s, &activation.artifact, &authority)?;
-            let id = next_id(s, "run");
+            let id = s.next_id("run");
             Invocation {
                 artifact: &activation.artifact,
                 entry,
@@ -806,498 +466,12 @@ impl<S: Storage> Engine<S> {
         })
     }
 }
-fn check_bytes(value: &Value, limit: usize) -> Result<()> {
-    if canonical_bytes(value)?.len() > limit {
-        return Err(Error::Refused("payload byte limit".into()));
-    }
-    Ok(())
-}
-fn check_authority(artifact: &Artifact, authority: &Authority) -> Result<()> {
-    if artifact.content.playbook.scope != authority.scope
-        || !artifact
-            .content
-            .playbook
-            .required_capabilities
-            .is_subset(&authority.capabilities)
-    {
-        return Err(Error::Refused("scope or capability ceiling".into()));
-    }
-    Ok(())
-}
-fn next_id(s: &mut State, prefix: &str) -> String {
-    s.sequence += 1;
-    format!("{prefix}-{:016x}", s.sequence)
-}
-fn receipt(s: &mut State, run: &str, step: &str, now: i64, kind: &str, detail: Value) {
-    s.sequence += 1;
-    let offset = s.receipts.len();
-    s.indexes
-        .receipts
-        .entry(run.into())
-        .or_default()
-        .insert(s.sequence, offset);
-    s.indexes.all_receipts.insert(s.sequence, offset);
-    s.receipts.push(Receipt {
-        sequence: s.sequence,
-        run: run.into(),
-        step: step.into(),
-        at_ms: now,
-        kind: kind.into(),
-        detail,
-    });
-}
-fn context(s: &State, r: &Run) -> EvalContext {
-    let mut c = EvalContext::new();
-    c.insert("input".into(), EvalValue::Known(r.input.clone()));
-    c.insert("vars".into(), EvalValue::Known(json!(r.variables)));
-    for (k, v) in &r.variables {
-        c.insert(k.clone(), EvalValue::Known(v.clone()));
-    }
-    let definitions = &s.artifacts[&r.artifact].content.definitions;
-    c.insert(
-        "definitions".into(),
-        EvalValue::Known(Value::Object(
-            definitions
-                .iter()
-                .map(|(k, v)| (k.clone(), v.value.clone()))
-                .collect(),
-        )),
-    );
-    c
-}
-fn known_expr(expr: &Expr, ctx: &EvalContext) -> Result<Value> {
-    match eval(expr, ctx, &EvalLimits::default())? {
-        EvalValue::Known(v) => Ok(v),
-        EvalValue::Missing => Err(Error::Refused("expression input missing".into())),
-        EvalValue::Unknown(r) => Err(Error::Refused(format!("expression unknown: {r}"))),
-    }
-}
-fn activate_binding(
-    s: &mut State,
-    binding: &str,
-    artifact: &str,
-    authority: Authority,
-    now_ms: i64,
-) -> Result<()> {
-    let a = s
-        .artifacts
-        .get(artifact)
-        .ok_or_else(|| Error::NotFound(artifact.into()))?;
-    check_authority(a, &authority)?;
-    if let Some(schedules) = s.binding_schedules.get(binding) {
-        schedules::check_event(a, &authority.scope, &schedules.configuration.event)?;
-    }
-    s.catalog_revision += 1;
-    let controls = s
-        .bindings
-        .get(binding)
-        .map(|activation| activation.controls.clone())
-        .unwrap_or_default();
-    if !controls.execution_enabled {
-        s.execution_denied.insert(artifact.into());
-    }
-    s.bindings.insert(
-        binding.into(),
-        Activation {
-            artifact: artifact.into(),
-            authority,
-            revision: s.catalog_revision,
-            controls,
-        },
-    );
-    record_binding_change(s, binding, now_ms)
-}
-
-fn record_binding_change(s: &mut State, binding: &str, now_ms: i64) -> Result<()> {
-    s.catalog_history
-        .insert(s.catalog_revision, s.bindings.clone());
-    s.catalog_history_at_ms.insert(s.catalog_revision, now_ms);
-    indexes::index_activation(s, binding)
-}
-
 fn deadline(now: i64, duration: u64) -> Result<i64> {
     let duration =
         i64::try_from(duration).map_err(|_| Error::Refused("deadline overflow".into()))?;
     now.checked_add(duration)
         .ok_or_else(|| Error::Refused("deadline overflow".into()))
 }
-fn reserve_iteration(s: &mut State, r: &Run, limits: &Limits) -> Result<()> {
-    let root = s
-        .runs
-        .get(&r.root)
-        .ok_or_else(|| invariant(format!("root {} of run {} is missing", r.root, r.id)))?;
-    let bound = s.artifacts[&root.artifact]
-        .content
-        .playbook
-        .limits
-        .max_iterations
-        .min(limits.max_iterations);
-    let b = s
-        .budgets
-        .get_mut(&r.root)
-        .ok_or_else(|| invariant(format!("budget of root {} is missing", r.root)))?;
-    if b.iterations >= bound {
-        return Err(Error::Exhausted("iterations".into()));
-    }
-    b.iterations += 1;
-    Ok(())
-}
-fn follow(
-    s: &mut State,
-    r: &mut Run,
-    edges: &BTreeMap<String, String>,
-    outcome: &str,
-    now: i64,
-) -> Result<()> {
-    let target = edges
-        .get(outcome)
-        .ok_or_else(|| Error::Refused(format!("unhandled outcome {outcome}")))?;
-    receipt(
-        s,
-        &r.id,
-        &r.step,
-        now,
-        "branch",
-        json!({"outcome":outcome,"next":target}),
-    );
-    r.step = target.clone();
-    r.pending = None;
-    r.status = RunStatus::Running;
-    Ok(())
-}
-fn finish(
-    s: &mut State,
-    r: &mut Run,
-    status: RunStatus,
-    outcome: Option<String>,
-    output: Option<Value>,
-    now: i64,
-) {
-    r.status = status;
-    r.outcome = outcome;
-    r.output = output;
-    r.pending = None;
-    receipt(
-        s,
-        &r.id,
-        &r.step,
-        now,
-        "terminal",
-        json!({"status":r.status,"outcome":r.outcome}),
-    );
-    r.terminal_sequence = Some(s.sequence);
-    indexes::wake_dependents(s, &r.id);
-}
-fn settled(s: &State, r: &Run) -> Result<bool> {
-    // A cohort leaves only as a whole: a live run's children are live.
-    for id in &r.children {
-        let child = s
-            .runs
-            .get(id)
-            .ok_or_else(|| invariant(format!("child {id} of run {} is missing", r.id)))?;
-        if !child.status.terminal() {
-            return Ok(false);
-        }
-    }
-    Ok(match indexes::root_open_intents(s, &r.root) {
-        Some(open) => !open.iter().any(|id| s.intents[id].run == r.id),
-        None => s.intents.values().filter(|i| i.run == r.id).all(|i| {
-            matches!(
-                i.status,
-                IntentStatus::Completed | IntentStatus::Rejected | IntentStatus::Cancelled
-            )
-        }),
-    })
-}
-fn request_cancel(s: &mut State, id: &str, now: i64) -> Result<()> {
-    let mut r = s
-        .runs
-        .get(id)
-        .ok_or_else(|| Error::NotFound(id.into()))?
-        .clone();
-    if r.status.terminal() {
-        return Ok(());
-    }
-    r.status = RunStatus::Cancelling;
-    receipt(s, id, &r.step, now, "cancel_requested", Value::Null);
-    for child in r.children.clone() {
-        request_cancel(s, &child, now)?;
-    }
-    for i in s.intents.values_mut().filter(|i| i.run == id) {
-        if i.status == IntentStatus::Prepared {
-            i.status = IntentStatus::Cancelled;
-        } else if !matches!(
-            i.status,
-            IntentStatus::Completed | IntentStatus::Rejected | IntentStatus::Cancelled
-        ) {
-            i.cancel_requested = true;
-        }
-    }
-    s.runs.insert(id.into(), r);
-    indexes::mark_run(s, id);
-    let intents = s
-        .intents
-        .values()
-        .filter(|i| i.run == id)
-        .map(|i| i.id.clone())
-        .collect::<Vec<_>>();
-    for intent in intents {
-        indexes::mark_intent(s, &intent);
-    }
-    Ok(())
-}
-fn settle_cancel(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
-    if settled(s, r)? {
-        finish(s, r, RunStatus::Cancelled, None, None, now);
-    } else if s.intents.values().any(|i| {
-        i.run == r.id
-            && matches!(
-                i.status,
-                IntentStatus::Dispatched | IntentStatus::Unknown | IntentStatus::Accepted
-            )
-    }) {
-        r.reason = Some("cancellation awaits external operation settlement".into());
-    }
-    Ok(())
-}
-
-/// Fake dispatch data is keyed by exact command name. Responses are consumed in
-/// order and recorded by the same Engine used by embedded production hosts.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct FakeHost {
-    pub responses: BTreeMap<String, Vec<DispatchResult>>,
-    pub dispatched: Vec<String>,
-    pub reconciliations: Vec<String>,
-    pub revoked: BTreeSet<String>,
-    pub cancellation_responses: BTreeMap<String, Vec<CancellationResult>>,
-    pub cancelled: Vec<String>,
-}
-impl Host for FakeHost {
-    fn authorize(&self, a: &Authority, c: &CommandContract) -> bool {
-        c.capabilities.is_subset(&a.capabilities)
-            && c.scopes.contains(&a.scope)
-            && c.capabilities.is_disjoint(&self.revoked)
-    }
-    fn dispatch(&mut self, i: &Intent) -> DispatchResult {
-        self.dispatched.push(i.id.clone());
-        self.responses
-            .get_mut(&i.command.name)
-            .filter(|v| !v.is_empty())
-            .map(|v| v.remove(0))
-            .unwrap_or_else(|| DispatchResult::Unknown {
-                reason: format!("missing mock for {}", i.command.name),
-            })
-    }
-    fn reconcile(&mut self, i: &Intent) -> DispatchResult {
-        self.reconciliations.push(i.id.clone());
-        self.responses
-            .get_mut(&format!("reconcile:{}", i.command.name))
-            .filter(|v| !v.is_empty())
-            .map(|v| v.remove(0))
-            .unwrap_or_else(|| DispatchResult::Unknown {
-                reason: "missing reconciliation mock".into(),
-            })
-    }
-    fn cancel(&mut self, i: &Intent) -> CancellationResult {
-        self.cancelled.push(i.id.clone());
-        self.cancellation_responses
-            .get_mut(&i.command.name)
-            .filter(|v| !v.is_empty())
-            .map(|v| v.remove(0))
-            .unwrap_or(CancellationResult::Unknown)
-    }
-}
-pub struct Simulation {
-    pub engine: Engine<MemoryStorage>,
-    pub host: FakeHost,
-    pub now_ms: i64,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SimulationReport {
-    pub state: State,
-    pub transitions: usize,
-    pub incomplete: bool,
-    pub unknown_operations: Vec<String>,
-}
-impl Simulation {
-    pub fn new(host: FakeHost) -> Result<Self> {
-        Ok(Self {
-            engine: Engine::new(MemoryStorage::default(), "simulation", "fake-runtime")?,
-            host,
-            now_ms: 0,
-        })
-    }
-    pub fn advance_clock(&mut self, now_ms: i64) -> Result<()> {
-        if now_ms < self.now_ms {
-            return Err(Error::Refused("virtual clock cannot move backwards".into()));
-        }
-        self.now_ms = now_ms;
-        Ok(())
-    }
-    pub fn run(&mut self, max_transitions: usize) -> Result<SimulationReport> {
-        let transitions = self
-            .engine
-            .drive(&mut self.host, self.now_ms, max_transitions)?;
-        let state = self.engine.snapshot()?;
-        let unknown_operations = state
-            .intents
-            .values()
-            .filter(|i| i.status == IntentStatus::Unknown)
-            .map(|i| i.id.clone())
-            .collect();
-        let incomplete = state.runs.values().any(|r| !r.status.terminal());
-        Ok(SimulationReport {
-            state,
-            transitions,
-            incomplete,
-            unknown_operations,
-        })
-    }
-}
-struct Participant {
-    id: String,
-    sequence: u64,
-    accepted_at_ms: i64,
-    success: bool,
-    outcome: Option<String>,
-    output: Option<Value>,
-}
-fn participant(s: &State, id: &str) -> Option<Participant> {
-    if let Some(c) = s.runs.get(id)
-        && c.status.terminal()
-    {
-        return Some(Participant {
-            id: id.into(),
-            sequence: c.terminal_sequence.unwrap_or(u64::MAX),
-            accepted_at_ms: s
-                .receipts
-                .iter()
-                .find(|r| Some(r.sequence) == c.terminal_sequence)
-                .map(|r| r.at_ms)
-                .unwrap_or(i64::MAX),
-            success: c.status == RunStatus::Completed,
-            outcome: c.outcome.clone(),
-            output: c.output.clone(),
-        });
-    }
-    if let Some(i) = s.intents.get(id)
-        && matches!(
-            i.status,
-            IntentStatus::Completed | IntentStatus::Rejected | IntentStatus::Cancelled
-        )
-    {
-        let sequence = s
-            .receipts
-            .iter()
-            .rev()
-            .find(|r| {
-                r.detail.get("operation").and_then(Value::as_str) == Some(id)
-                    && matches!(
-                        r.kind.as_str(),
-                        "command_result" | "operation_rejected" | "cancel_response"
-                    )
-            })
-            .map(|r| r.sequence)
-            .unwrap_or(u64::MAX);
-        return Some(Participant {
-            id: id.into(),
-            sequence,
-            accepted_at_ms: s
-                .receipts
-                .iter()
-                .find(|r| r.sequence == sequence)
-                .map(|r| r.at_ms)
-                .unwrap_or(i64::MAX),
-            success: i.status == IntentStatus::Completed,
-            outcome: i.result.as_ref().map(|r| r.0.clone()),
-            output: i.result.as_ref().map(|r| r.1.clone()),
-        });
-    }
-    None
-}
-fn fail_run(s: &mut State, r: &mut Run, reason: String, now: i64) -> Result<()> {
-    r.pending = None;
-    r.reason = Some(reason.clone());
-    r.pending_failure = true;
-    for child in r.children.clone() {
-        request_cancel(s, &child, now)?;
-    }
-    for intent in s.intents.values_mut().filter(|i| i.run == r.id) {
-        if intent.status == IntentStatus::Prepared {
-            intent.status = IntentStatus::Cancelled;
-        } else if !matches!(
-            intent.status,
-            IntentStatus::Completed | IntentStatus::Rejected | IntentStatus::Cancelled
-        ) {
-            intent.cancel_requested = true;
-        }
-    }
-    let intents = s
-        .intents
-        .values()
-        .filter(|i| i.run == r.id)
-        .map(|i| i.id.clone())
-        .collect::<Vec<_>>();
-    for intent in intents {
-        indexes::mark_intent(s, &intent);
-    }
-    receipt(
-        s,
-        &r.id,
-        &r.step,
-        now,
-        "engine_failure",
-        json!({"reason":reason}),
-    );
-    if settled(s, r)? {
-        finish(s, r, RunStatus::Failed, None, None, now);
-    } else {
-        r.status = RunStatus::Finishing;
-    }
-    Ok(())
-}
-
-fn process_operation_deadlines(s: &mut State, now: i64) {
-    let timers = s
-        .indexes
-        .query(
-            s,
-            &IndexQuery::DueTimers {
-                now_ms: now,
-                limit: 64,
-            },
-        )
-        .items;
-    let expired = timers
-        .iter()
-        .filter_map(|item| s.indexes.timers.get(&item.key))
-        .filter_map(|timer| timer.intent.as_ref())
-        .filter_map(|id| s.intents.get(id))
-        .filter(|intent| {
-            matches!(
-                intent.status,
-                IntentStatus::Dispatched | IntentStatus::Accepted
-            )
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    for intent in expired {
-        indexes::remove_timer(s, &format!("effect:{}", intent.id));
-        indexes::mark_intent(s, &intent.id);
-        let current = s.intents.get_mut(&intent.id).unwrap();
-        current.status = IntentStatus::Unknown;
-        current.reason = Some("operation deadline elapsed with unresolved external outcome".into());
-        receipt(
-            s,
-            &intent.run,
-            &intent.step,
-            now,
-            "command_deadline_expired",
-            json!({"operation":intent.id,"issued":true}),
-        );
-    }
-}
-
 fn attempt_key(run: &Run) -> Result<String> {
     Ok(digest(&(
         &run.step,
@@ -1372,13 +546,10 @@ impl<S: Storage> Engine<S> {
         admin_text(actor, reason)?;
         self.transaction_licensed(|s| {
             let report = rebase_plan(s, to_ms, stale_floor_ms, now_ms)?;
-            receipt(
+            ReceiptSite::admin("retention", now_ms).record(
                 s,
-                "admin",
-                "retention",
-                now_ms,
                 retention::CLOCK_REBASE,
-                json!({"from_ms":report.from_ms,"to_ms":report.to_ms,"stale_floor_ms":report.stale_floor_ms,"capped_events":report.capped_events,"capped_admissions":report.capped_admissions,"capped_deadlines":report.capped_deadlines,"adjusted_runs":report.adjusted_runs,"needs_operator_action":report.needs_operator_action,"adjustments":report.adjustments,"adjustments_not_listed":report.adjustments_not_listed,"actor":actor,"reason":reason}),
+                report.receipt_detail(actor, reason),
             );
             Ok(report)
         })
@@ -1420,11 +591,8 @@ impl<S: Storage> Engine<S> {
                 )));
             }
             s.retention.stale_floor_ms = Some(to_ms);
-            receipt(
+            ReceiptSite::admin("retention", now_ms).record(
                 s,
-                "admin",
-                "retention",
-                now_ms,
                 retention::STALE_FLOOR_LOWERED,
                 json!({"from_ms":from_ms,"to_ms":to_ms,"actor":actor,"reason":reason}),
             );
@@ -1475,7 +643,7 @@ impl<S: Storage> Engine<S> {
             if s.indexes.root_active.values().all(BTreeSet::is_empty) {
                 s.retention.expired_correlations.retain(|_, (p, epoch)| p != producer || *epoch >= new_epoch);
             }
-            receipt(s, "admin", "replay", now_ms, "producer_epoch_retired", json!({
+            ReceiptSite::admin("replay",now_ms).record(s, "producer_epoch_retired", json!({
                 "producer": producer, "old_epoch": old, "new_epoch": new_epoch, "actor": actor, "reason": reason,
             }));
             Ok(())
@@ -1510,11 +678,8 @@ impl<S: Storage> Engine<S> {
                         consumed: false,
                     },
                 );
-                receipt(
+                i.receipt_at(now_ms).record(
                     s,
-                    &i.run,
-                    &i.step,
-                    now_ms,
                     "recovery_requested",
                     json!({"request":id,"operation":intent_id,"actor":actor}),
                 );
@@ -1525,15 +690,4 @@ impl<S: Storage> Engine<S> {
     pub fn query(&self, query: &IndexQuery) -> Result<IndexPage> {
         Ok(self.store.query(&self.namespace, query)?)
     }
-}
-fn execution_allowed(
-    s: &State,
-    artifact: &str,
-    authority: &Authority,
-    capabilities: &BTreeSet<String>,
-) -> Result<bool> {
-    Ok(!s.execution_denied.contains(artifact)
-        && s.authority_revocations
-            .get(&digest(&(&authority.actor, &authority.scope))?)
-            .is_none_or(|revoked| revoked.is_disjoint(capabilities)))
 }

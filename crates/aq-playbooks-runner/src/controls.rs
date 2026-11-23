@@ -18,11 +18,8 @@ impl ActivationControls {
         s.catalog_revision += 1;
         record_binding_change(s, binding, now_ms)?;
         update_runs(s, |r| r.artifact == artifact, self.execution_enabled);
-        receipt(
+        ReceiptSite::admin(binding, now_ms).record(
             s,
-            "admin",
-            binding,
-            now_ms,
             "activation_controls",
             json!({"artifact":artifact,"controls":self}),
         );
@@ -57,11 +54,8 @@ impl Subject<'_> {
         for id in intents {
             indexes::mark_intent(s, &id);
         }
-        receipt(
+        ReceiptSite::admin("authority", now_ms).record(
             s,
-            "admin",
-            "authority",
-            now_ms,
             "authority_changed",
             json!({"actor":actor,"scope":scope,"revoked_capabilities":revoked}),
         );
@@ -147,4 +141,29 @@ impl RetentionPolicy {
         }
         Ok(())
     }
+}
+
+pub(super) fn check_authority(artifact: &Artifact, authority: &Authority) -> Result<()> {
+    if artifact.content.playbook.scope != authority.scope
+        || !artifact
+            .content
+            .playbook
+            .required_capabilities
+            .is_subset(&authority.capabilities)
+    {
+        return Err(Error::Refused("scope or capability ceiling".into()));
+    }
+    Ok(())
+}
+
+pub(super) fn execution_allowed(
+    s: &State,
+    artifact: &str,
+    authority: &Authority,
+    capabilities: &BTreeSet<String>,
+) -> Result<bool> {
+    Ok(!s.execution_denied.contains(artifact)
+        && s.authority_revocations
+            .get(&digest(&(&authority.actor, &authority.scope))?)
+            .is_none_or(|revoked| revoked.is_disjoint(capabilities)))
 }

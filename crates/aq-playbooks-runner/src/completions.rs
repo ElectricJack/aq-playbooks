@@ -121,12 +121,6 @@ fn invalid(s: &mut State, i: &Intent, event: AcceptedEvent) {
     if !run.status.terminal() {
         run.reason = Some(REASON.into());
     }
-    receipt(
-        s,
-        &i.run,
-        &i.step,
-        event.accepted_at_ms,
-        "invalid_output",
-        json!({"operation":i.id}),
-    );
+    i.receipt_at(event.accepted_at_ms)
+        .record(s, "invalid_output", json!({"operation":i.id}));
 }

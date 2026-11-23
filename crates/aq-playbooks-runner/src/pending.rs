@@ -55,7 +55,9 @@ struct Poll<'a> {
 }
 impl Poll<'_> {
     fn follow(&mut self, outcome: &str) -> Result<()> {
-        follow(self.state, self.run, &self.step.edges, outcome, self.now)
+        self.run
+            .transition(self.state, self.now)
+            .follow(&self.step.edges, outcome)
     }
 
     fn effect(&mut self, id: &str) -> Result<()> {
@@ -169,17 +171,12 @@ fn schedule_retry(
         return Ok(false);
     }
     *attempts += 1;
+    let attempt = *attempts;
     run.pending = Some(Pending::Retry {
         deadline: deadline(now, policy.backoff_ms)?,
     });
-    receipt(
-        state,
-        &run.id,
-        &run.step,
-        now,
-        "business_retry",
-        json!({"attempt":attempts}),
-    );
+    run.receipt_at(now)
+        .record(state, "business_retry", json!({"attempt":attempt}));
     Ok(true)
 }
 
@@ -227,7 +224,7 @@ impl Join {
         let mut completed: Vec<_> = self
             .members
             .iter()
-            .filter_map(|id| participant(state, id))
+            .filter_map(|id| Participant::find(state, id))
             .filter(|p| p.accepted_at_ms <= self.deadline)
             .collect();
         completed.sort_by_key(|p| p.sequence);
@@ -287,7 +284,7 @@ impl Join {
         let unfinished: Vec<_> = self
             .members
             .into_iter()
-            .filter(|id| participant(state, id).is_none())
+            .filter(|id| Participant::find(state, id).is_none())
             .collect();
         if self.remaining == RemainingPolicy::Cancel {
             for id in unfinished {
@@ -300,5 +297,66 @@ impl Join {
             }
         }
         Ok(())
+    }
+}
+
+struct Participant {
+    id: String,
+    sequence: u64,
+    accepted_at_ms: i64,
+    success: bool,
+    outcome: Option<String>,
+    output: Option<Value>,
+}
+impl Participant {
+    fn find(s: &State, id: &str) -> Option<Self> {
+        if let Some(c) = s.runs.get(id)
+            && c.status.terminal()
+        {
+            return Some(Participant {
+                id: id.into(),
+                sequence: c.terminal_sequence.unwrap_or(u64::MAX),
+                accepted_at_ms: Self::receipt_time(s, c.terminal_sequence),
+                success: c.status == RunStatus::Completed,
+                outcome: c.outcome.clone(),
+                output: c.output.clone(),
+            });
+        }
+        if let Some(i) = s.intents.get(id)
+            && matches!(
+                i.status,
+                IntentStatus::Completed | IntentStatus::Rejected | IntentStatus::Cancelled
+            )
+        {
+            let sequence = s
+                .receipts
+                .iter()
+                .rev()
+                .find(|r| {
+                    r.detail.get("operation").and_then(Value::as_str) == Some(id)
+                        && matches!(
+                            r.kind.as_str(),
+                            "command_result" | "operation_rejected" | "cancel_response"
+                        )
+                })
+                .map(|r| r.sequence)
+                .unwrap_or(u64::MAX);
+            return Some(Participant {
+                id: id.into(),
+                sequence,
+                accepted_at_ms: Self::receipt_time(s, Some(sequence)),
+                success: i.status == IntentStatus::Completed,
+                outcome: i.result.as_ref().map(|r| r.0.clone()),
+                output: i.result.as_ref().map(|r| r.1.clone()),
+            });
+        }
+        None
+    }
+    fn receipt_time(s: &State, seq: Option<u64>) -> i64 {
+        s.receipts
+            .iter()
+            .find(|r| Some(r.sequence) == seq)
+            .map(|r| r.at_ms)
+            .unwrap_or(i64::MAX)
     }
 }

@@ -333,7 +333,12 @@ impl BindingSite<'_> {
             a.revision = s.catalog_revision;
             record_binding_change(s, binding, now_ms)?;
         } else {
-            activate_binding(s, binding, artifact, authority, now_ms)?;
+            BindingUpdate {
+                binding,
+                artifact,
+                authority,
+            }
+            .install(s, now_ms)?;
         }
         Ok(())
     }

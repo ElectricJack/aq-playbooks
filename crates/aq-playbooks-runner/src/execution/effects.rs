@@ -59,11 +59,8 @@ impl StepExecution<'_> {
         indexes::mark_intent(self.state, &id);
         self.run.pending = Some(Pending::Effect { intent: id.clone() });
         self.run.status = RunStatus::Waiting;
-        receipt(
+        self.run.receipt_at(self.now).record(
             self.state,
-            &self.run.id,
-            &self.run.step,
-            self.now,
             "intent",
             json!({"operation":id,"input_digest":self.state.intents[&id].input_digest}),
         );

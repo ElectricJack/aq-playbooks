@@ -53,11 +53,8 @@ impl StepExecution<'_> {
         if mode != CallMode::Independent {
             self.run.children.push(id.clone());
         }
-        receipt(
+        self.run.receipt_at(self.now).record(
             self.state,
-            &self.run.id,
-            &self.run.step,
-            self.now,
             "child_admitted",
             json!({"child":id,"mode":mode}),
         );
@@ -66,7 +63,9 @@ impl StepExecution<'_> {
             self.run.status = RunStatus::Waiting;
         } else {
             self.run.variables.insert(bind, json!({"child":id}));
-            follow(self.state, self.run, &self.edges, "started", self.now)?;
+            self.run
+                .transition(self.state, self.now)
+                .follow(&self.edges, "started")?;
         }
         Ok(())
     }

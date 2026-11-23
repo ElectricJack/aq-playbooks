@@ -110,3 +110,22 @@ pub(super) fn rebase_plan(
         adjustments: deadlines.adjustments,
     })
 }
+
+impl ClockRebaseReport {
+    pub(super) fn receipt_detail(&self, actor: &str, reason: &str) -> Value {
+        json!({
+            "from_ms":self.from_ms,
+            "to_ms":self.to_ms,
+            "stale_floor_ms":self.stale_floor_ms,
+            "capped_events":self.capped_events,
+            "capped_admissions":self.capped_admissions,
+            "capped_deadlines":self.capped_deadlines,
+            "adjusted_runs":self.adjusted_runs,
+            "needs_operator_action":self.needs_operator_action,
+            "adjustments":self.adjustments,
+            "adjustments_not_listed":self.adjustments_not_listed,
+            "actor":actor,
+            "reason":reason,
+        })
+    }
+}

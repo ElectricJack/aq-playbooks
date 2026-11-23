@@ -46,10 +46,11 @@ fn can_advance(s: &State, r: &mut Run) -> Result<bool> {
 fn settle_finishing(s: &mut State, r: &mut Run, now: i64) -> Result<()> {
     if settled(s, r)? {
         if r.pending_failure {
-            finish(s, r, RunStatus::Failed, None, None, now);
+            r.transition(s, now).finish(Terminal::Failed);
         } else {
             let (outcome, output) = r.pending_return.take().unwrap();
-            finish(s, r, RunStatus::Completed, Some(outcome), Some(output), now);
+            r.transition(s, now)
+                .finish(Terminal::Completed { outcome, output });
         }
     }
     Ok(())
@@ -233,7 +234,9 @@ impl StepExecution<'_> {
             EvalValue::Missing | EvalValue::Unknown(_) => "unknown",
             _ => return Err(Error::Refused("predicate must be boolean".into())),
         };
-        follow(self.state, self.run, &self.edges, outcome, self.now)?;
+        self.run
+            .transition(self.state, self.now)
+            .follow(&self.edges, outcome)?;
         Ok(())
     }
 
@@ -252,25 +255,15 @@ impl StepExecution<'_> {
                 .min(self.root_limits.max_payload_bytes),
         )?;
         if settled(self.state, self.run)? {
-            finish(
-                self.state,
-                self.run,
-                RunStatus::Completed,
-                Some(outcome),
-                Some(output),
-                self.now,
-            );
+            self.run
+                .transition(self.state, self.now)
+                .finish(Terminal::Completed { outcome, output });
         } else {
             self.run.pending_return = Some((outcome, output));
             self.run.status = RunStatus::Finishing;
-            receipt(
-                self.state,
-                &self.run.id,
-                &self.run.step,
-                self.now,
-                "finishing",
-                Value::Null,
-            );
+            self.run
+                .receipt_at(self.now)
+                .record(self.state, "finishing", Value::Null);
         }
         Ok(())
     }

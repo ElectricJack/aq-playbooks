@@ -45,11 +45,8 @@ impl Recording<'_> {
     }
 
     fn audit(&mut self, kind: &str) {
-        receipt(
+        self.intent.receipt_at(self.now_ms).record(
             self.state,
-            &self.intent.run,
-            &self.intent.step,
-            self.now_ms,
             kind,
             json!({"operation":self.intent.id}),
         );
@@ -143,11 +140,8 @@ impl Recording<'_> {
             })
             .unwrap_or(Value::Null);
         self.intent.status = IntentStatus::Completed;
-        receipt(
+        self.intent.receipt_at(self.now_ms).record(
             self.state,
-            &self.intent.run,
-            &self.intent.step,
-            self.now_ms,
             "command_result",
             json!({"operation":self.intent.id,"outcome":outcome,"public":public}),
         );
