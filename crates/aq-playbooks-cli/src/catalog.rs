@@ -94,3 +94,13 @@ pub const MANIFEST_2_5_JSON: &str = include_str!("../../../contracts/aq-host-2.5
 pub fn catalog_v2_5() -> Registry {
     serde_json::from_str(REGISTRY_2_5_JSON).expect("published AQ host registry 2.5.0")
 }
+
+/// Host catalog 2.6.0: the delivery lineage of 2.3.0 with `work.read` 2.6.0,
+/// whose facts add the task's `acceptance_criteria` and the `conclusion` of
+/// its latest result. Every other 2.3.0 contract is byte-identical.
+pub const VERSION_2_6: &str = "2.6.0";
+pub const REGISTRY_2_6_JSON: &str = include_str!("../../../contracts/aq-host-2.6.0/registry.json");
+pub const MANIFEST_2_6_JSON: &str = include_str!("../../../contracts/aq-host-2.6.0/manifest.json");
+pub fn catalog_v2_6() -> Registry {
+    serde_json::from_str(REGISTRY_2_6_JSON).expect("published AQ host registry 2.6.0")
+}

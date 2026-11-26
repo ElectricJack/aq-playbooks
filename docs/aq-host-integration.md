@@ -471,3 +471,13 @@ the earlier ones and replaces none of them. It is part of ordinary builds
 extends `work.read` (now 2.3.0) with the facts of the task's latest result.
 Every other 2.2.0 contract is byte-identical. The host adapter for these
 contracts is not part of this change.
+
+## AQ host catalog 2.6.0 (judging a result that changed nothing)
+
+The [2.6.0 bundle](../contracts/aq-host-2.6.0/README.md) is the delivery
+lineage of 2.3.0 (`catalog_v2_6`). Only `work.read` changes (now 2.6.0): its
+facts add the task's `acceptance_criteria` (at most 8192 bytes) and the
+`conclusion` of its latest result (at most 512 bytes), so that a delivery
+playbook can ask `judgment.assess` whether a result that changed nothing meets
+the task. Every other 2.3.0 contract is byte-identical. A host serving 2.3.0
+answers a 2.6.0 `work.read` with the two facts and a 2.3.0 one without them.
