@@ -104,3 +104,13 @@ pub const MANIFEST_2_6_JSON: &str = include_str!("../../../contracts/aq-host-2.6
 pub fn catalog_v2_6() -> Registry {
     serde_json::from_str(REGISTRY_2_6_JSON).expect("published AQ host registry 2.6.0")
 }
+
+/// Host catalog 2.7.0: 2.6.0 with `work.read` 2.7.0, whose `conclusion` fact
+/// holds up to 4096 bytes (the result report's new bound) instead of 512.
+/// Every other 2.6.0 contract is byte-identical.
+pub const VERSION_2_7: &str = "2.7.0";
+pub const REGISTRY_2_7_JSON: &str = include_str!("../../../contracts/aq-host-2.7.0/registry.json");
+pub const MANIFEST_2_7_JSON: &str = include_str!("../../../contracts/aq-host-2.7.0/manifest.json");
+pub fn catalog_v2_7() -> Registry {
+    serde_json::from_str(REGISTRY_2_7_JSON).expect("published AQ host registry 2.7.0")
+}

@@ -481,3 +481,12 @@ facts add the task's `acceptance_criteria` (at most 8192 bytes) and the
 playbook can ask `judgment.assess` whether a result that changed nothing meets
 the task. Every other 2.3.0 contract is byte-identical. A host serving 2.3.0
 answers a 2.6.0 `work.read` with the two facts and a 2.3.0 one without them.
+
+## AQ host catalog 2.7.0 (a longer conclusion)
+
+The [2.7.0 bundle](../contracts/aq-host-2.7.0/README.md) is the delivery
+lineage of 2.6.0 (`catalog_v2_7`). Only `work.read` changes (now 2.7.0): its
+`conclusion` fact holds up to 4096 bytes, the result report's bound, instead
+of 512, so that a judgment sees the evidence the agent reported. Every other
+2.6.0 contract is byte-identical. A host serving 2.6.0 answers a 2.7.0
+`work.read` with the conclusion cut at 4096 bytes and a 2.6.0 one cut at 512.
