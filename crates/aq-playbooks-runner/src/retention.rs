@@ -81,7 +81,23 @@ pub struct RetentionPolicy {
     /// commits. Positive.
     #[serde(default = "default_settle_cohorts")]
     pub settle_cohorts_per_commit: usize,
+    /// The rollback window: of the activated artifacts of one source
+    /// (`content.source.header` scope and id), the newest this many by last
+    /// activation are kept even when nothing else references them (and,
+    /// by automatic disposal, of the never activated, the newest this many
+    /// installed). Every
+    /// other installed artifact is disposed of once no binding, deactivated
+    /// binding, live run, accepted event or catalog revision they pin
+    /// references it ([`dispose_unreferenced`]). Positive.
+    #[serde(default = "default_artifact_keep")]
+    pub artifact_keep: usize,
 }
+fn default_artifact_keep() -> usize {
+    ARTIFACT_KEEP
+}
+/// The default of `RetentionPolicy::artifact_keep`: the active artifact of a
+/// source and the three installed before it.
+pub const ARTIFACT_KEEP: usize = 4;
 fn default_settle_cohorts() -> usize {
     COHORTS_PER_COMMIT
 }
@@ -137,6 +153,7 @@ impl Default for RetentionPolicy {
             history_trim_per_commit: default_history_trim(),
             gc_page_limit: default_gc_page_limit(),
             settle_cohorts_per_commit: default_settle_cohorts(),
+            artifact_keep: default_artifact_keep(),
         }
     }
 }
@@ -166,6 +183,19 @@ pub struct RetentionState {
     pub expired_correlations: LazyMap<String, (String, u64)>,
     pub event_tombstones: LazyMap<String, EventTombstone>,
     pub artifact_disposals: BTreeMap<String, i64>,
+    /// Install order of the installed artifacts (digest to a number that
+    /// grows with each new install), which ranks them in the rollback
+    /// window (`policy.artifact_keep`). An artifact installed before it was
+    /// recorded has no entry and ranks below every recorded one. An entry
+    /// leaves with its artifact.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub artifact_installs: BTreeMap<String, u64>,
+    /// Last activation of the installed artifacts that a binding has
+    /// activated (digest to a number from the same order as
+    /// `artifact_installs`): the rollback window (`policy.artifact_keep`)
+    /// keeps the newest of each source. An entry leaves with its artifact.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub artifact_activations: BTreeMap<String, u64>,
     pub disposals: LazySeq<Disposal>,
     pub gc_cursor: Option<String>,
     /// The latest host time any commit carried; never decreases.
@@ -479,6 +509,13 @@ pub struct CommitReport {
     /// namespace not done, expired window entries past the drop bound, or
     /// entries past `replay_keep` past the eviction bound.
     pub more: bool,
+    /// Artifacts disposed of because the runs or events this commit removed
+    /// were the last to reference them ([`dispose_unreferenced`]).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub artifacts: usize,
+}
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 mod cohorts;
 pub(crate) use cohorts::{candidate_roots, move_unowned_receipts, settle};
@@ -623,6 +660,11 @@ fn remove_event(s: &mut State, key: &str, report: &mut CommitReport) -> Result<(
     let Some(event) = s.events.remove(key) else {
         return Ok(());
     };
+    for destination in &event.destinations {
+        s.released_artifacts.insert(destination.artifact.clone());
+        s.released_artifacts
+            .extend(destination.dependencies.values().cloned());
+    }
     s.retention.replay_order.remove(&event_order_key(&event));
     crate::indexes::unindex_contract_event(s, &event)?;
     s.retention.event_epochs.remove(key);
@@ -844,6 +886,11 @@ pub(crate) fn finish_commit(
     let evictions = s.retention.policy.replay_evictions_per_commit;
     evict(s, evictions, &mut report)?;
     move_admin_receipts(s, started, &mut report)?;
+    let released = artifacts::released(s);
+    if !released.is_empty() {
+        let at = disposal_time(s, now_ms);
+        report.artifacts = dispose_unreferenced(s, Some(&released), at);
+    }
     Ok(report)
 }
 mod drain;
@@ -856,7 +903,16 @@ pub use drain::{
 };
 
 mod artifacts;
-pub(crate) use artifacts::gc;
-pub use artifacts::{GcReport, artifact_referenced, verify_artifact_removals};
+pub use artifacts::{
+    GcReport, artifact_referenced, referenced_artifacts, verify_artifact_removals,
+};
+pub(crate) use artifacts::{dispose_unreferenced, gc, record_activation, record_install};
+/// The time an artifact disposal outside a host-timed commit is recorded
+/// at: the retention clock (0 before any host time).
+pub(crate) fn disposal_time(s: &State, now_ms: Option<i64>) -> i64 {
+    now_ms.map_or(s.retention.clock_ms.unwrap_or(0), |now| {
+        window_start(s, now)
+    })
+}
 #[cfg(test)]
 mod window_tests;

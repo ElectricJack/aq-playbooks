@@ -317,7 +317,14 @@ impl<S: Storage> Engine<S> {
             {
                 return Err(Error::Conflict("artifact replacement".into()));
             }
-            s.artifacts.insert(artifact.digest.clone(), artifact);
+            let digest = artifact.digest.clone();
+            if s.artifacts.insert(digest.clone(), artifact).is_none() {
+                // The newest of its source: an older one may leave the
+                // rollback window.
+                retention::record_install(s, &digest);
+                let at = retention::disposal_time(s, None);
+                retention::dispose_unreferenced(s, None, at);
+            }
             Ok(())
         })
     }
@@ -511,6 +518,8 @@ impl<S: Storage> Engine<S> {
         policy.validate_bounds()?;
         self.transaction_at(None, |s| {
             s.retention.policy = policy;
+            let at = retention::disposal_time(s, None);
+            retention::dispose_unreferenced(s, None, at);
             Ok(())
         })
     }

@@ -83,5 +83,12 @@ pub(super) fn record_binding_change(s: &mut State, binding: &str, now_ms: i64) -
     s.catalog_history
         .insert(s.catalog_revision, s.bindings.clone());
     s.catalog_history_at_ms.insert(s.catalog_revision, now_ms);
-    indexes::index_activation(s, binding)
+    indexes::index_activation(s, binding)?;
+    if let Some(artifact) = s.bindings.get(binding).map(|a| a.artifact.clone()) {
+        retention::record_activation(s, &artifact);
+    }
+    // The binding's previous artifact may no longer be referenced.
+    let at = retention::window_start(s, now_ms);
+    retention::dispose_unreferenced(s, None, at);
+    Ok(())
 }

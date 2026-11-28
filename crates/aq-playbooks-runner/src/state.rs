@@ -243,6 +243,11 @@ pub struct State {
     /// order (`retention::rejoin`). Never stored.
     #[serde(skip)]
     pub replay_touched: retention::ReplayTouched,
+    /// Artifacts something this commit removed from the State referenced
+    /// (an accepted event that left): the commit judges them for disposal
+    /// ([`retention::dispose_unreferenced`]). Never stored.
+    #[serde(skip)]
+    pub released_artifacts: BTreeSet<String>,
     #[serde(default)]
     pub indexes: RuntimeIndexes,
     pub artifacts: BTreeMap<String, Artifact>,

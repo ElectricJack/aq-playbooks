@@ -121,6 +121,9 @@ impl RetentionPolicy {
         {
             return Err(Error::Refused("retention windows must be positive".into()));
         }
+        if self.artifact_keep == 0 {
+            return Err(Error::Refused("artifact_keep must be positive".into()));
+        }
         if self.replay_keep == 0 {
             return Err(Error::Refused("replay_keep must be positive".into()));
         }
