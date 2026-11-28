@@ -498,6 +498,9 @@ mod retention_bounds;
 #[path = "live_state/garbage_collection.rs"]
 mod garbage_collection;
 
+#[path = "live_state/artifact_disposal.rs"]
+mod artifact_disposal;
+
 #[path = "live_state/completion_lapses.rs"]
 mod completion_lapses;
 

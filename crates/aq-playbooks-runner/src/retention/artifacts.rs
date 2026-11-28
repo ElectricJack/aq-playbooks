@@ -33,6 +33,14 @@ pub struct GcReport {
     #[serde(default)]
     pub evicted: usize,
 }
+/// Whether anything keeps artifact `id` installed: a binding activation, a
+/// deactivated binding (its last activation), a live run (its artifact and
+/// dependency manifest), an accepted event's destination, the catalog
+/// revision the current catalog, a live run or an accepted event pins, or the
+/// rollback window ([`rollback_window`]); and, transitively, a dependency
+/// of a kept artifact. Operations, waits and recovery requests belong to a
+/// live run, so they keep its artifact. Catalog history kept only for audit
+/// keeps no artifact.
 pub fn artifact_referenced(s: &State, id: &str) -> bool {
     let mut pending = referenced_roots(s);
     let mut seen = BTreeSet::new();
@@ -49,24 +57,247 @@ pub fn artifact_referenced(s: &State, id: &str) -> bool {
     }
     false
 }
+/// Every artifact [`artifact_referenced`] keeps.
+pub fn referenced_artifacts(s: &State) -> BTreeSet<String> {
+    closure(s, referenced_roots(s))
+}
+fn closure(s: &State, mut pending: Vec<String>) -> BTreeSet<String> {
+    let mut seen = BTreeSet::new();
+    while let Some(hash) = pending.pop() {
+        if !seen.insert(hash.clone()) {
+            continue;
+        }
+        if let Some(artifact) = s.artifacts.get(&hash) {
+            add_dependencies(s, artifact, &mut pending);
+        }
+    }
+    seen
+}
 fn referenced_roots(s: &State) -> Vec<String> {
+    let mut pending = catalog_roots(s);
+    let mut revisions = BTreeSet::new();
+    for run in s.runs.values() {
+        pending.push(run.artifact.clone());
+        pending.extend(run.dependencies.values().cloned());
+        revisions.insert(run.catalog_revision);
+    }
+    for event in s.events.values() {
+        revisions.insert(event.catalog_revision);
+        for destination in &event.destinations {
+            pending.push(destination.artifact.clone());
+            pending.extend(destination.dependencies.values().cloned());
+        }
+    }
+    for revision in revisions {
+        if let Some(bindings) = s.catalog_history.get(&revision) {
+            pending.extend(bindings.values().map(|a| a.artifact.clone()));
+        }
+    }
+    pending
+}
+/// The roots that need no scan of runs or events: the bindings, the current
+/// catalog revision, the deactivated bindings and the rollback window.
+fn catalog_roots(s: &State) -> Vec<String> {
     let mut pending = s
         .bindings
         .values()
         .map(|a| a.artifact.clone())
         .collect::<Vec<_>>();
-    for bindings in s.catalog_history.values() {
+    if let Some(bindings) = s.catalog_history.get(&s.catalog_revision) {
         pending.extend(bindings.values().map(|a| a.artifact.clone()));
     }
-    for run in s.runs.values() {
-        pending.push(run.artifact.clone());
-        pending.extend(run.dependencies.values().cloned());
-    }
-    for destination in s.events.values().flat_map(|event| &event.destinations) {
-        pending.push(destination.artifact.clone());
-        pending.extend(destination.dependencies.values().cloned());
-    }
+    pending.extend(
+        last_activations(s)
+            .into_values()
+            .map(|(_, activation)| activation.artifact.clone()),
+    );
+    pending.extend(rollback_window(s));
     pending
+}
+/// For each deactivated binding, its last activation: the newest catalog
+/// revision that still has it bound, with that activation.
+fn last_activations(s: &State) -> BTreeMap<&str, (u64, &crate::Activation)> {
+    s.deactivated_bindings
+        .keys()
+        .filter_map(|binding| {
+            s.catalog_history
+                .iter()
+                .rev()
+                .find_map(|(revision, bindings)| Some((*revision, bindings.get(binding)?)))
+                .map(|found| (binding.as_str(), found))
+        })
+        .collect()
+}
+fn deactivated_revisions(s: &State) -> BTreeSet<u64> {
+    last_activations(s)
+        .into_values()
+        .map(|(revision, _)| revision)
+        .collect()
+}
+/// The rollback window: the newest `policy.artifact_keep` activated
+/// artifacts of each source (`content.source.header` scope and id), by
+/// their last activation (`retention.artifact_activations`). An artifact
+/// activated before that order was recorded ranks below every recorded one,
+/// by the newest catalog revision that bound it. An artifact never
+/// activated is no rollback target.
+fn rollback_window(s: &State) -> Vec<String> {
+    newest_per_source(s, |rank| rank.activated)
+}
+/// The installs no activation has used yet that automatic disposal leaves
+/// in place (an install is usually followed by its activation in a later
+/// commit): of the never activated artifacts of each source, the newest
+/// `policy.artifact_keep` by install order (`retention.artifact_installs`;
+/// unrecorded ones rank lowest). `collect_garbage` does not keep them.
+fn pending_installs(s: &State) -> Vec<String> {
+    newest_per_source(s, |rank| match rank.activated {
+        Some(_) => None,
+        None => Some(rank.installed),
+    })
+}
+struct Rank {
+    activated: Option<(bool, u64)>,
+    installed: (bool, u64),
+}
+fn newest_per_source(s: &State, rank: impl Fn(&Rank) -> Option<(bool, u64)>) -> Vec<String> {
+    let keep = s.retention.policy.artifact_keep;
+    let installs = &s.retention.artifact_installs;
+    let activations = &s.retention.artifact_activations;
+    let mut last_bound = BTreeMap::<&str, u64>::new();
+    if s.artifacts.keys().any(|id| !activations.contains_key(id)) {
+        for (revision, bindings) in &s.catalog_history {
+            for activation in bindings.values() {
+                last_bound.insert(&activation.artifact, *revision);
+            }
+        }
+        for activation in s.bindings.values() {
+            last_bound
+                .entry(&activation.artifact)
+                .or_insert(s.catalog_revision);
+        }
+    }
+    let mut sources = BTreeMap::<(&str, &str), Vec<((bool, u64), &String)>>::new();
+    for (id, artifact) in &s.artifacts {
+        let ranked = Rank {
+            activated: match activations.get(id) {
+                Some(order) => Some((true, *order)),
+                None => last_bound
+                    .get(id.as_str())
+                    .map(|revision| (false, *revision)),
+            },
+            installed: installs.get(id).map_or((false, 0), |order| (true, *order)),
+        };
+        let Some(key) = rank(&ranked) else {
+            continue;
+        };
+        let header = &artifact.content.source.header;
+        sources
+            .entry((&header.scope, &header.id))
+            .or_default()
+            .push((key, id));
+    }
+    let mut kept = vec![];
+    for mut ranked in sources.into_values() {
+        ranked.sort_unstable_by(|a, b| b.cmp(a));
+        kept.extend(ranked.into_iter().take(keep).map(|(_, id)| id.clone()));
+    }
+    kept
+}
+fn next_order(s: &State) -> u64 {
+    let r = &s.retention;
+    r.artifact_installs
+        .values()
+        .chain(r.artifact_activations.values())
+        .max()
+        .map_or(1, |n| n.saturating_add(1))
+}
+/// Record the install of artifact `id`, new in the State: the newest
+/// install of its source.
+pub(crate) fn record_install(s: &mut State, id: &str) {
+    let next = next_order(s);
+    s.retention.artifact_installs.insert(id.into(), next);
+}
+/// Record that `id` is now (again) a binding's artifact: the newest of its
+/// source in the rollback window.
+pub(crate) fn record_activation(s: &mut State, id: &str) {
+    let next = next_order(s);
+    s.retention.artifact_activations.insert(id.into(), next);
+}
+/// Dispose of the installed artifacts among `candidates` (every installed
+/// artifact when `None`) that nothing references ([`artifact_referenced`]),
+/// nor the automatic-disposal installs ([`pending_installs`]), at most
+/// `policy.gc_page_limit` of them, recording each disposal at
+/// `at_ms`; then prune the disposals past `policy.audit_ms` before `at_ms`.
+/// A candidate the bindings, the current catalog or the rollback window
+/// keep is decided without a scan of runs and events; only the others are
+/// checked against the whole State. Returns how many were disposed of.
+pub(crate) fn dispose_unreferenced(
+    s: &mut State,
+    candidates: Option<&BTreeSet<String>>,
+    at_ms: i64,
+) -> usize {
+    if let Some(candidates) = candidates
+        && candidates.iter().all(|id| {
+            !s.artifacts.contains_key(id) || s.bindings.values().any(|a| a.artifact == *id)
+        })
+    {
+        // The usual commit: its runs used a bound artifact.
+        return 0;
+    }
+    let pending = pending_installs(s);
+    let mut roots = catalog_roots(s);
+    roots.extend(pending.iter().cloned());
+    let kept = closure(s, roots);
+    let open = match candidates {
+        None => s
+            .artifacts
+            .keys()
+            .filter(|id| !kept.contains(*id))
+            .cloned()
+            .collect::<Vec<_>>(),
+        Some(candidates) => candidates
+            .iter()
+            .filter(|id| s.artifacts.contains_key(*id) && !kept.contains(*id))
+            .cloned()
+            .collect(),
+    };
+    if open.is_empty() {
+        return 0;
+    }
+    let mut roots = referenced_roots(s);
+    roots.extend(pending);
+    let referenced = closure(s, roots);
+    let most = s.retention.policy.gc_page_limit;
+    let mut disposed = 0;
+    for id in open {
+        if disposed == most {
+            break;
+        }
+        if referenced.contains(&id) {
+            continue;
+        }
+        s.artifacts.remove(&id);
+        s.retention.artifact_installs.remove(&id);
+        s.retention.artifact_activations.remove(&id);
+        s.retention.artifact_disposals.insert(id, at_ms);
+        disposed += 1;
+    }
+    if disposed > 0 {
+        let audit_ms = i64::try_from(s.retention.policy.audit_ms).unwrap_or(i64::MAX);
+        let cutoff = at_ms.saturating_sub(audit_ms);
+        s.retention.artifact_disposals.retain(|_, at| *at >= cutoff);
+    }
+    disposed
+}
+/// The artifacts the runs this commit settled, and the events it removed,
+/// referenced: the candidates [`dispose_unreferenced`] judges at the end of
+/// every commit. Empty (no scan) when nothing left.
+pub(crate) fn released(s: &mut State) -> BTreeSet<String> {
+    let mut released = std::mem::take(&mut s.released_artifacts);
+    for run in s.settled.iter().flat_map(|cohort| &cohort.runs) {
+        released.insert(run.artifact.clone());
+        released.extend(run.dependencies.values().cloned());
+    }
+    released
 }
 fn add_dependencies(s: &State, artifact: &aq_playbooks_model::Artifact, pending: &mut Vec<String>) {
     for dependency in artifact.content.dependencies.values() {
@@ -156,6 +387,8 @@ fn dispose_page(s: &mut State, now: i64, limit: usize) -> Result<GcReport> {
             continue;
         }
         s.artifacts.remove(&id);
+        s.retention.artifact_installs.remove(&id);
+        s.retention.artifact_activations.remove(&id);
         s.retention.artifact_disposals.insert(id, now);
         report.artifacts += 1;
     }
@@ -187,6 +420,7 @@ fn prune_history(s: &mut State, cutoff: i64) {
         .chain(s.events.values().map(|e| e.catalog_revision))
         .collect::<BTreeSet<_>>();
     revisions.insert(s.catalog_revision);
+    revisions.extend(deactivated_revisions(s));
     revisions.extend(
         s.catalog_history_at_ms
             .iter()

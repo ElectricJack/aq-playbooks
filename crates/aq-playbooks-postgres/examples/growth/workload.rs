@@ -142,6 +142,13 @@ fn steps(
     ])
 }
 
+/// Revision `n` of the playbook's document, as an authoring save installs
+/// it: the same source and steps, another purpose (so another digest).
+pub(crate) fn saved_revision(n: usize) -> Artifact {
+    let mut content = playbook().content;
+    content.playbook.purpose = format!("engine growth measurement, save {n}");
+    Artifact::seal(content).unwrap()
+}
 pub(crate) fn playbook() -> Artifact {
     let prepare = command("bench.prepare");
     let finish = command("bench.finish");

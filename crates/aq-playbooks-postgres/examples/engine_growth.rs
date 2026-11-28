@@ -44,6 +44,17 @@
 //!   the record size, the legacy cohorts and legacy window entries left in
 //!   the State it wrote, history rows, legacy tombstone rows and the drain
 //!   state. Gathered outside the timed window.
+//!
+//! Authoring saves (configs a-e): `ENGINE_GROWTH_SAVE_EVERY=<k>` makes the
+//! owner save the document after every `k`th run: one install and one
+//! activation of a new revision of the playbook for the binding, outside
+//! the timed window. A `checkpoint` line is printed at each save (before
+//! it), with `saves` and `artifacts` (installed artifacts in the State),
+//! and a `save` line after it with the artifacts in the State and the
+//! namespace's artifact rows. `ENGINE_GROWTH_ARTIFACT_KEEP=<n>` sets
+//! `artifact_keep` (the rollback window, default 4). Per-transition time
+//! staying flat across the checkpoints while `saves` grows past 14 is the
+//! measurement of artifact disposal.
 use aq_playbooks_model::*;
 use aq_playbooks_postgres::{PostgresStorage, ProtectionKeyring};
 use aq_playbooks_runner::{
@@ -581,8 +592,45 @@ struct Measurement {
     ids: Vec<String>,
     started: Instant,
     stopped: Option<usize>,
+    /// Authoring saves so far (`ENGINE_GROWTH_SAVE_EVERY`).
+    saves: usize,
 }
 impl Measurement {
+    /// One authoring save after run `k`, at `now`: install a new revision of
+    /// the playbook and activate it for the binding, outside the timed
+    /// window; prints its `save` line.
+    fn save(&mut self, bench: &mut Bench, k: usize, now: i64) {
+        let e = bench.e;
+        self.saves += 1;
+        let a = workload::saved_revision(self.saves);
+        let digest = a.digest.clone();
+        e.store.close_unchanged();
+        let t0 = Instant::now();
+        e.install(a).unwrap();
+        e.activate_at("growth", &digest, authority(), now).unwrap();
+        let us = t0.elapsed().as_micros() as u64;
+        e.store.close_unchanged();
+        e.store.drain();
+        let state = e.snapshot().unwrap();
+        bench.activation_revision = state.bindings["growth"].revision;
+        let rows: i64 = e
+            .store
+            .monitor
+            .lock()
+            .unwrap()
+            .query_one(
+                "SELECT count(*) FROM aq_playbooks.namespace_artifacts WHERE namespace=$1",
+                &[&NS],
+            )
+            .unwrap()
+            .get(0);
+        println!(
+            "{}",
+            json!({"kind":"save","save":self.saves,"after_run":k,"us":us,
+                   "artifacts":state.artifacts.len(),"namespace_artifact_rows":rows,
+                   "artifact_disposals":state.retention.artifact_disposals.len()})
+        );
+    }
     /// Serves run `k` at `now`, prints its `run` line and, at a checkpoint
     /// (or when `checkpoint`), its `checkpoint` line.
     fn run(&mut self, b: &Bench, sample: RunSample, checkpoint: bool) {
@@ -684,6 +732,7 @@ impl Measurement {
                    "transition_median_us": med, "transition_p95_us": p95, "transition_max_us": max,
                    "wal_per_transition_median": wal_med, "wal_per_transition_max": wal_max,
                    "last_run_status": status, "runs_in_state": state.runs.len(), "completed_ok_in_state": completed,
+                   "saves": self.saves, "artifacts": state.artifacts.len(),
                    "gc_last20_us": recent_gc,
                    "stats": format!("{:?}", e.store.inner.transition_stats()),
                    "elapsed_s": self.started.elapsed().as_secs_f64(),
@@ -748,6 +797,11 @@ struct Experiment {
     prefix: String,
     start_ms: i64,
     commit_log: u64,
+    /// `ENGINE_GROWTH_SAVE_EVERY`: an authoring save after every this many
+    /// runs (0: none).
+    save_every: usize,
+    /// `ENGINE_GROWTH_ARTIFACT_KEEP`: the policy's `artifact_keep`.
+    artifact_keep: Option<usize>,
 }
 impl Experiment {
     fn from_args(args: &[String]) -> Self {
@@ -792,6 +846,8 @@ impl Experiment {
             prefix,
             start_ms,
             commit_log: env("ENGINE_GROWTH_COMMIT_LOG").map_or(0, |v| v.parse().unwrap()),
+            save_every: env("ENGINE_GROWTH_SAVE_EVERY").map_or(0, |v| v.parse().unwrap()),
+            artifact_keep: env("ENGINE_GROWTH_ARTIFACT_KEEP").map(|v| v.parse().unwrap()),
         }
     }
     fn connect(&self) -> PostgresStorage {
@@ -819,8 +875,11 @@ impl Experiment {
             })
             .unwrap();
         }
-        if self.window_ms.is_some() || self.history_keep.is_some() {
+        if self.window_ms.is_some() || self.history_keep.is_some() || self.artifact_keep.is_some() {
             let mut policy = e.snapshot().unwrap().retention.policy;
+            if let Some(keep) = self.artifact_keep {
+                policy.artifact_keep = keep;
+            }
             if let Some(window_ms) = self.window_ms {
                 policy.event_replay_ms = window_ms;
                 policy.admission_replay_ms = window_ms;
@@ -865,11 +924,13 @@ impl Experiment {
             ids: vec![],
             started: Instant::now(),
             stopped: None,
+            saves: 0,
         }
     }
-    fn measure_runs(&self, bench: &Bench, b: &mut Measurement) {
+    fn measure_runs(&self, bench: &mut Bench, b: &mut Measurement) {
         for k in 1..=self.runs {
             let now = self.start_ms + k as i64 * self.spacing;
+            let save = self.save_every > 0 && k % self.save_every == 0;
             b.run(
                 bench,
                 RunSample {
@@ -877,10 +938,13 @@ impl Experiment {
                     at_ms: now,
                     step_ms: self.step,
                 },
-                k == self.runs,
+                k == self.runs || save,
             );
             if b.stopped.is_some() {
                 break;
+            }
+            if save {
+                b.save(bench, k, now + self.step.max(1) * 50);
             }
         }
     }
@@ -893,7 +957,7 @@ impl Experiment {
         e.activate_at("growth", &digest, authority(), 0).unwrap();
         let policy = self.policy(&e);
         self.print_setup(&e, &digest, &policy);
-        let bench = Bench {
+        let mut bench = Bench {
             e: &e,
             activation_revision: e.snapshot().unwrap().bindings["growth"].revision,
             prefix: self.prefix.clone(),
@@ -901,7 +965,7 @@ impl Experiment {
         };
         e.store.drain();
         let mut b = self.measurement();
-        self.measure_runs(&bench, &mut b);
+        self.measure_runs(&mut bench, &mut b);
         if b.stopped.is_none() {
             match self.mode.as_str() {
                 "steady" => steady_verdict(&b, self.runs),

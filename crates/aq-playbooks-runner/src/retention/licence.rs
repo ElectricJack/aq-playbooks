@@ -183,6 +183,7 @@ pub(crate) fn check_licensed_header(
         protection_available: _,
         settled: _,
         replay_touched: _,
+        released_artifacts: _,
         // Compared in same_catalog_and_recovery.
         catalog_history: _,
         catalog_history_at_ms,
@@ -241,6 +242,8 @@ fn same_retention_header(previous: &RetentionState, r: &RetentionState) -> bool 
         policy,
         producer_epochs,
         artifact_disposals,
+        artifact_installs,
+        artifact_activations,
         gc_cursor,
         // A licensed commit drains nothing and judges no event again.
         drain,
@@ -252,6 +255,8 @@ fn same_retention_header(previous: &RetentionState, r: &RetentionState) -> bool 
         && producer_epochs == &r.producer_epochs
         && (last_gc_at_ms, gc_cursor, artifact_disposals)
             == (&r.last_gc_at_ms, &r.gc_cursor, &r.artifact_disposals)
+        && (artifact_installs, artifact_activations)
+            == (&r.artifact_installs, &r.artifact_activations)
 }
 /// Without a licence the stale floor never changes (a format 3 bounded
 /// commit never carries one).

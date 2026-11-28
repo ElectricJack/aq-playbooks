@@ -1017,6 +1017,37 @@ constant), so a stored policy decodes with or without it and may set it;
 | `drain_cohorts_per_commit` | 50 | (Task 9) |
 | `drain_entries_per_commit` | 500 | (Task 9) |
 
+`artifact_keep` (default 4, positive) is not a per-commit bound but the
+rollback window of automatic artifact disposal: see the next section.
+
+## Automatic artifact disposal
+
+A namespace keeps an installed artifact only while something references it:
+a binding activation, a deactivated binding (its last activation), a live
+run (its artifact and dependency manifest; its operations and recovery
+requests belong to it), an accepted event's destinations, the catalog
+revision the current catalog, a live run or an accepted event pins, and,
+transitively, a dependency of a kept artifact; or while it is in the
+rollback window: the newest `artifact_keep` activated artifacts of each
+source (`content.source.header` scope and id) by last activation. Catalog
+history kept only for audit keeps no artifact. Install and activation order
+are recorded in `retention.artifact_installs` and
+`retention.artifact_activations` (an artifact an older engine installed
+ranks lowest, by the newest catalog revision that bound it).
+
+Disposal is part of the commits that can release an artifact: an install,
+a binding change (activation, deactivation, controls), a policy change, and
+a commit that removes runs or events that referenced one (judged only for
+those artifacts, so the commits of runs on the bound artifact scan
+nothing). These also keep, of the never activated artifacts of each source,
+the newest `artifact_keep` installed, so an install followed by its
+activation in a later commit is never disposed of in between;
+`collect_garbage` does not keep those. At most `gc_page_limit` artifacts
+leave per commit; each disposal is recorded in `artifact_disposals` (and,
+on PostgreSQL, as a `disposal_tombstones` row), and disposals older than
+`audit_ms` are pruned in the same commit. `verify_removals` checks every
+removal against the same references and window on every backend.
+
 `window_drops_per_commit` also bounds the events a commit judges again
 after a contract's uncertain operations change (see the hold lapse below).
 
