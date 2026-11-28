@@ -2,6 +2,7 @@
 use super::*;
 mod artifacts;
 mod payload;
+pub(crate) use payload::VerifiedArtifacts;
 
 pub(super) struct Commit<'a> {
     pub(super) storage: &'a PostgresStorage,

@@ -44,9 +44,10 @@ impl Commit<'_> {
         let state = self.state;
         for (digest, artifact) in &state.artifacts {
             tx.phase("artifact_compare");
-            // Previous bytes were freshly read, authenticated and fully verified
-            // under this namespace's row/revision/owner locks. Equality checks the
-            // entire typed artifact, never just its supplied address. No cache.
+            // Previous bytes were freshly read and authenticated under this
+            // namespace's row/revision/owner locks, and fully verified (now, or
+            // earlier for the identical bytes). Equality checks the entire
+            // typed artifact, never just its supplied address.
             if !previous.refresh_artifacts && previous.state.artifacts.get(digest) == Some(artifact)
             {
                 tx.skipped();
