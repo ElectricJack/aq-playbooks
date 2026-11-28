@@ -78,6 +78,10 @@ pub struct PostgresStorage {
     /// probes once again. A commit that writes legacy rows (legacy GC)
     /// takes its namespace out.
     tombstones_drained: Mutex<std::collections::BTreeSet<String>>,
+    /// Per namespace, the artifacts this handle last read, each with the
+    /// exact authenticated canonical bytes it verified. Identical bytes are
+    /// not parsed and verified again on every read.
+    verified_artifacts: Mutex<BTreeMap<String, snapshot::VerifiedArtifacts>>,
     #[cfg(test)]
     lose_catalog_commit_reply: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -151,6 +155,7 @@ impl PostgresStorage {
             records: false,
             stats: Mutex::new(TransitionStats::default()),
             tombstones_drained: Mutex::new(Default::default()),
+            verified_artifacts: Mutex::new(Default::default()),
             #[cfg(test)]
             lose_catalog_commit_reply: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]

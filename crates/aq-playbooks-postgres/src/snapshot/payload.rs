@@ -1,6 +1,9 @@
 //! Snapshot envelope and canonical artifact decoding for the stored state.
 use super::*;
 
+/// Digest to (the exact canonical bytes verified, the artifact).
+pub(crate) type VerifiedArtifacts = BTreeMap<String, (Zeroizing<Vec<u8>>, Artifact)>;
+
 pub(crate) struct SnapshotEnvelope {
     pub(crate) plaintext: Option<Value>,
     pub(crate) key_id: Option<String>,
@@ -15,8 +18,7 @@ impl PostgresStorage {
         revision: u64,
         state: &State,
     ) -> Result<SnapshotEnvelope, StorageError> {
-        let mut value = serde_json::to_value(state).map_err(backend)?;
-        value["artifacts"] = serde_json::json!({});
+        let value = state.to_value_without_artifacts().map_err(backend)?;
         if let Some(keyring) = &self.keyring {
             let plaintext = Zeroizing::new(serde_json::to_vec(&value).map_err(backend)?);
             let sealed = keyring.seal(namespace, revision, &plaintext)?;
@@ -75,6 +77,13 @@ impl PostgresStorage {
         protected: bool,
     ) -> Result<BTreeMap<String, Artifact>, StorageError> {
         let mut artifacts = BTreeMap::new();
+        let mut cache = self
+            .verified_artifacts
+            .lock()
+            .map_err(|_| backend("artifact cache mutex poisoned"))?;
+        // Only the artifacts of this read stay cached: removed ones leave.
+        let mut known = cache.remove(namespace).unwrap_or_default();
+        let mut current = VerifiedArtifacts::new();
         let rows = tx.query("SELECT n.digest,a.canonical_bytes,e.key_id,e.nonce,e.ciphertext FROM aq_playbooks.namespace_artifacts n LEFT JOIN aq_playbooks.artifacts a ON a.digest=n.digest LEFT JOIN aq_playbooks.encrypted_artifacts e ON e.namespace=n.namespace AND e.digest=n.digest WHERE n.namespace=$1 ORDER BY n.digest",&[&namespace]).map_err(backend)?;
         for artifact_row in rows {
             let digest: String = artifact_row.get(0);
@@ -97,14 +106,23 @@ impl PostgresStorage {
                         .ok_or_else(|| backend("missing plaintext artifact payload"))?,
                 )
             };
-            let started = tx.clock();
-            let artifact = Artifact::from_canonical_bytes(&bytes).map_err(backend)?;
-            tx.verified(started);
+            let artifact = match known.remove(&digest) {
+                // The same bytes this handle already parsed and verified.
+                Some((verified, artifact)) if *verified == *bytes => artifact,
+                _ => {
+                    let started = tx.clock();
+                    let artifact = Artifact::from_canonical_bytes(&bytes).map_err(backend)?;
+                    tx.verified(started);
+                    artifact
+                }
+            };
             if artifact.digest != digest {
                 return Err(backend("artifact address integrity mismatch"));
             }
-            artifacts.insert(digest, artifact);
+            artifacts.insert(digest.clone(), artifact.clone());
+            current.insert(digest, (bytes, artifact));
         }
+        cache.insert(namespace.to_owned(), current);
         Ok(artifacts)
     }
 }

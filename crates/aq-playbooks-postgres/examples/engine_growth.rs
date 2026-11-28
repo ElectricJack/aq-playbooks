@@ -44,6 +44,10 @@
 //!   the record size, the legacy cohorts and legacy window entries left in
 //!   the State it wrote, history rows, legacy tombstone rows and the drain
 //!   state. Gathered outside the timed window.
+//! - `ENGINE_GROWTH_EXTRA_ARTIFACTS=<dir>`: also install every `*.json`
+//!   artifact in `dir`, as a namespace that keeps many sealed playbooks;
+//! - `ENGINE_GROWTH_PROFILE` (any value): a `storage_profile` line with the
+//!   storage stage times of the measured runs.
 use aq_playbooks_model::*;
 use aq_playbooks_postgres::{PostgresStorage, ProtectionKeyring};
 use aq_playbooks_runner::{
@@ -890,6 +894,7 @@ impl Experiment {
         let a = playbook();
         let digest = a.digest.clone();
         e.install(a).unwrap();
+        install_extra_artifacts(&e);
         e.activate_at("growth", &digest, authority(), 0).unwrap();
         let policy = self.policy(&e);
         self.print_setup(&e, &digest, &policy);
@@ -901,7 +906,13 @@ impl Experiment {
         };
         e.store.drain();
         let mut b = self.measurement();
+        e.store
+            .inner
+            .set_profiling(std::env::var("ENGINE_GROWTH_PROFILE").is_ok());
         self.measure_runs(&bench, &mut b);
+        if let Some(profile) = e.store.inner.profiling_snapshot() {
+            println!("{}", json!({"kind":"storage_profile","profile":profile}));
+        }
         if b.stopped.is_none() {
             match self.mode.as_str() {
                 "steady" => steady_verdict(&b, self.runs),
@@ -998,6 +1009,23 @@ fn burst_verdict(b: &mut Measurement, bench: &Bench, experiment: &Experiment, re
                    "literal_after_20_ratio":literal.total_bytes as f64 / first.total_bytes as f64,
                    "median_us_at_1":first.median_us,"median_us_at_burst_end":last.median_us})
     );
+}
+/// `ENGINE_GROWTH_EXTRA_ARTIFACTS`: install the artifacts (never activated).
+fn install_extra_artifacts(e: &Engine<Measured>) {
+    let Ok(dir) = std::env::var("ENGINE_GROWTH_EXTRA_ARTIFACTS") else {
+        return;
+    };
+    let mut paths: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    paths.sort();
+    for path in &paths {
+        let artifact: Artifact = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        e.install(artifact).unwrap();
+    }
+    eprintln!("installed {} extra artifacts", paths.len());
 }
 fn main() {
     Experiment::from_args(&std::env::args().collect::<Vec<_>>()).execute();
